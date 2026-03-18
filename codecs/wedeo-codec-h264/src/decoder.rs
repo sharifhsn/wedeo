@@ -9,6 +9,8 @@
 use std::collections::VecDeque;
 
 use tracing::{debug, warn};
+#[cfg(feature = "tracing-detail")]
+use tracing::trace;
 use wedeo_codec::bitstream::{BitRead, BitReadBE, get_ue_golomb};
 use wedeo_codec::decoder::{CodecParameters, Decoder, DecoderDescriptor};
 use wedeo_codec::descriptor::{CodecCapabilities, CodecDescriptor, CodecProperties};
@@ -273,7 +275,8 @@ impl H264Decoder {
 
                     // Build reference list for P-slices
                     if hdr.slice_type.is_p() {
-                        self.ref_list_l0 = refs::build_ref_list_p(&self.dpb, &hdr, hdr.frame_num);
+                        let max_frame_num = 1u32 << sps.log2_max_frame_num;
+                        self.ref_list_l0 = refs::build_ref_list_p(&self.dpb, &hdr, hdr.frame_num, max_frame_num);
                     } else {
                         self.ref_list_l0.clear();
                     }
@@ -288,6 +291,29 @@ impl H264Decoder {
                         .iter()
                         .filter_map(|&dpb_idx| self.dpb.get(dpb_idx).map(|e| &e.pic))
                         .collect();
+
+                    #[cfg(feature = "tracing-detail")]
+                    if hdr.slice_type.is_p() {
+                        for &dpb_idx in &self.ref_list_l0 {
+                            if let Some(e) = self.dpb.get(dpb_idx) {
+                                let s = e.pic.y_stride;
+                                // Sample pixels at y=128, x=155-165
+                                let row128: Vec<u8> = (155..166usize).map(|x| {
+                                    if 128 < e.pic.height as usize && x < e.pic.width as usize {
+                                        e.pic.y[128 * s + x]
+                                    } else { 0 }
+                                }).collect();
+                                trace!(
+                                    frame_num = self.frame_num,
+                                    dpb_idx,
+                                    ref_frame_num = e.frame_num,
+                                    status = ?e.status,
+                                    row128 = ?row128,
+                                    "ref_pic_list entry"
+                                );
+                            }
+                        }
+                    }
 
                     match self.decode_slice_into(
                         &nalu.data,
@@ -446,12 +472,6 @@ impl H264Decoder {
         let mut mb_addr = first_mb;
 
         while mb_addr < total_mbs {
-            // Check if we've consumed all RBSP data (end of slice).
-            // Leave at least 8 bits margin for trailing bits and stop bit.
-            if br.consumed() + 8 >= rbsp_bits {
-                break;
-            }
-
             let mb_x = mb_addr % mb_width;
             let mb_y = mb_addr / mb_width;
 
@@ -462,8 +482,14 @@ impl H264Decoder {
             }
 
             if is_inter_slice {
-                // Parse mb_skip_run (ue(v))
+                // For inter slices, mb_skip_run MUST be parsed before any
+                // early-exit check.  The skip run can signal that the very last
+                // MB in the frame is a P_SKIP; if we broke out before parsing
+                // it (because only the run + RBSP trailing bits remain), that
+                // MB would stay at the zero-initialised value.
                 let mb_skip_run = get_ue_golomb(&mut br)?;
+                #[cfg(feature = "tracing-detail")]
+                trace!(mb_addr, mb_skip_run, bits = br.consumed(), "mb_skip_run");
 
                 // Process skipped MBs
                 for _ in 0..mb_skip_run {
@@ -485,7 +511,8 @@ impl H264Decoder {
                     break; // Skip run consumed remaining MBs
                 }
 
-                // Check if we've consumed all RBSP data after skip run
+                // Check if we've consumed all RBSP data after skip run —
+                // only now is it safe to stop before the coded MB.
                 if br.consumed() + 8 >= rbsp_bits {
                     break;
                 }
@@ -496,6 +523,11 @@ impl H264Decoder {
                 if mb_x == 0 && mb_addr != first_mb {
                     fdc.neighbor_ctx.new_row();
                     fdc.neighbor_ctx.top_available = mb_y > 0;
+                }
+            } else {
+                // Intra slice: no skip run, but guard against reading past end.
+                if br.consumed() + 8 >= rbsp_bits {
+                    break;
                 }
             }
 

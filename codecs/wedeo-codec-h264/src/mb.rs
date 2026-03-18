@@ -500,22 +500,24 @@ pub fn decode_macroblock(
 
     // 6. Update neighbor context
     // Build intra4x4 mode array for neighbor tracking.
-    // For I_4x4 MBs, pass the decoded modes. For others, pass -1 (unavailable).
-    // Build intra4x4 mode array for neighbor tracking.
     // For I_4x4 MBs: pass the decoded modes.
-    // For other intra MBs (I_16x16, I_PCM): pass 2 (DC_PRED), matching FFmpeg's
-    //   fill_decode_caches which sets `2 - 3 * !(type & type_mask)` = 2 for intra.
-    // For inter MBs: pass -1 (unavailable).
+    // For other MBs (I_16x16, I_PCM, inter): pass 2 (DC_PRED).
+    //
+    // H.264 spec 8.3.1.1: when a neighbor is not Intra_4x4, its prediction
+    // mode is inferred as DC_PRED (2). FFmpeg's fill_decode_caches uses
+    // `2 - 3 * !(type & type_mask)` which yields 2 for all non-I_4x4 types
+    // (both intra-16x16 and inter).  Previously we stored -1 for inter MBs,
+    // which made the "unavailable" path fire and always predicted DC_PRED=2
+    // — correct in isolation, but wrong when min(left, top) would yield a
+    // smaller predicted mode (e.g., min(2, 1) = 1 ≠ 2).
     let intra4x4_modes: [i8; 16] = if mb.is_intra4x4 {
         let mut modes = [-1i8; 16];
         for (i, mode) in modes.iter_mut().enumerate() {
             *mode = mb.intra4x4_pred_mode[i] as i8;
         }
         modes
-    } else if mb.is_intra {
-        [2i8; 16] // DC_PRED for I_16x16 / I_PCM
     } else {
-        [-1i8; 16]
+        [2i8; 16] // DC_PRED for I_16x16, I_PCM, and inter MBs
     };
     ctx.neighbor_ctx
         .update_after_mb(mb_x, &mb.non_zero_count, &intra4x4_modes);
@@ -570,11 +572,22 @@ fn decode_inter_mb(
         return;
     }
 
+    #[cfg(feature = "tracing-detail")]
+    trace!(mb_x, mb_y, mb_type = mb.mb_type, "inter MB");
+
     match mb.mb_type {
         0 => {
             // P_L0_16x16: one 16x16 partition
             let ref_idx = mb.ref_idx_l0[0].max(0) as usize;
             let n = ctx.mv_ctx.get_neighbors(mb_x, mb_y, 0, 0, 4);
+            #[cfg(feature = "tracing-detail")]
+            trace!(
+                mb_x, mb_y,
+                mv_a = ?n.mv_a, ref_a = n.ref_a, a_avail = n.a_avail,
+                mv_b = ?n.mv_b, ref_b = n.ref_b, b_avail = n.b_avail,
+                mv_c = ?n.mv_c, ref_c = n.ref_c, c_avail = n.c_avail,
+                ref_idx, "16x16 neighbors"
+            );
             let mvp = mvpred::predict_mv(
                 n.mv_a,
                 n.mv_b,
@@ -591,6 +604,8 @@ fn decode_inter_mb(
                 mvp[0].wrapping_add(mb.mvd_l0[0][0]),
                 mvp[1].wrapping_add(mb.mvd_l0[0][1]),
             ];
+            #[cfg(feature = "tracing-detail")]
+            trace!(mb_x, mb_y, mvp = ?mvp, mvd = ?mb.mvd_l0[0], mv = ?mv, "16x16 MV");
 
             let ref_pic = ref_pics[ref_idx.min(ref_pics.len() - 1)];
             apply_mc_partition(ctx, ref_pic, mb_x, mb_y, 0, 0, 16, 16, mv);
@@ -683,11 +698,21 @@ fn decode_inter_mb(
                 let part_y = (i8x8 / 2) as u32 * 2; // 0 or 2
 
                 let sub_type = mb.sub_mb_type[i8x8];
+                #[cfg(feature = "tracing-detail")]
+                trace!(mb_x, mb_y, i8x8, sub_type, ref_idx, "P_8x8 sub");
 
                 match sub_type {
                     0 => {
                         // 8x8 sub-partition
                         let n = ctx.mv_ctx.get_neighbors(mb_x, mb_y, part_x, part_y, 2);
+                        #[cfg(feature = "tracing-detail")]
+                        trace!(
+                            mb_x, mb_y, i8x8, part_x, part_y,
+                            mv_a = ?n.mv_a, ref_a = n.ref_a, a_avail = n.a_avail,
+                            mv_b = ?n.mv_b, ref_b = n.ref_b, b_avail = n.b_avail,
+                            mv_c = ?n.mv_c, ref_c = n.ref_c, c_avail = n.c_avail,
+                            ref_idx, "P_8x8 neighbors"
+                        );
                         let mvp = mvpred::predict_mv(
                             n.mv_a,
                             n.mv_b,
@@ -705,6 +730,8 @@ fn decode_inter_mb(
                             mvp[0].wrapping_add(mb.mvd_l0[mvd_idx][0]),
                             mvp[1].wrapping_add(mb.mvd_l0[mvd_idx][1]),
                         ];
+                        #[cfg(feature = "tracing-detail")]
+                        trace!(mb_x, mb_y, i8x8, mvp = ?mvp, mvd = ?mb.mvd_l0[mvd_idx], mv = ?mv, "P_8x8 MV");
 
                         let ref_pic = ref_pics[ref_idx.min(ref_pics.len() - 1)];
                         apply_mc_partition(
@@ -753,6 +780,12 @@ fn decode_inter_mb(
                                 mvp[0].wrapping_add(mb.mvd_l0[mvd_idx][0]),
                                 mvp[1].wrapping_add(mb.mvd_l0[mvd_idx][1]),
                             ];
+                            #[cfg(feature = "tracing-detail")]
+                            trace!(mb_x, mb_y, i8x8, sub, part_x, sub_y,
+                                mv_a = ?n.mv_a, ref_a = n.ref_a, a_avail = n.a_avail,
+                                mv_b = ?n.mv_b, ref_b = n.ref_b, b_avail = n.b_avail,
+                                mv_c = ?n.mv_c, ref_c = n.ref_c, c_avail = n.c_avail,
+                                mvp = ?mvp, mvd = ?mb.mvd_l0[mvd_idx], mv = ?mv, "P_8x4 MV");
 
                             let ref_pic = ref_pics[ref_idx.min(ref_pics.len() - 1)];
                             apply_mc_partition(
@@ -800,6 +833,12 @@ fn decode_inter_mb(
                                 mvp[0].wrapping_add(mb.mvd_l0[mvd_idx][0]),
                                 mvp[1].wrapping_add(mb.mvd_l0[mvd_idx][1]),
                             ];
+                            #[cfg(feature = "tracing-detail")]
+                            trace!(mb_x, mb_y, i8x8, sub, sub_x, part_y,
+                                mv_a = ?n.mv_a, ref_a = n.ref_a, a_avail = n.a_avail,
+                                mv_b = ?n.mv_b, ref_b = n.ref_b, b_avail = n.b_avail,
+                                mv_c = ?n.mv_c, ref_c = n.ref_c, c_avail = n.c_avail,
+                                mvp = ?mvp, mvd = ?mb.mvd_l0[mvd_idx], mv = ?mv, "P_4x8 MV");
 
                             let ref_pic = ref_pics[ref_idx.min(ref_pics.len() - 1)];
                             apply_mc_partition(
@@ -959,6 +998,25 @@ fn apply_mc_partition(
     let luma_dy = (mvy & 3) as u8;
 
     let luma_offset = dst_y as usize * ctx.pic.y_stride + dst_x as usize;
+
+    #[cfg(feature = "tracing-detail")]
+    if mb_x == 10 && mb_y == 8 {
+        // Print first row of ref data that the MC will read
+        let ry = luma_ref_y.clamp(0, ref_pic.height as i32 - 1) as usize;
+        let stride = ref_pic.y_stride;
+        let ref_ptr = ref_pic.y.as_ptr();
+        let cur_ptr = ctx.pic.y.as_ptr();
+        let same_buf = std::ptr::eq(ref_ptr, cur_ptr);
+        let ref_row: Vec<u8> = (0..21).map(|i| {
+            let rx = (luma_ref_x as i32 - 2 + i as i32).clamp(0, ref_pic.width as i32 - 1) as usize;
+            ref_pic.y[ry * stride + rx]
+        }).collect();
+        trace!(mb_x, mb_y, luma_ref_x, luma_ref_y, luma_dx, luma_dy,
+               ref_ptr = ?ref_ptr, cur_ptr = ?cur_ptr, same_buf,
+               ref_pic_width = ref_pic.width, ref_pic_height = ref_pic.height,
+               ref_row = ?ref_row, "MC ref row");
+    }
+
     mc::mc_luma(
         &mut ctx.pic.y[luma_offset..],
         ctx.pic.y_stride,
@@ -1050,9 +1108,19 @@ pub fn decode_skip_mb(
     } else {
         // Compute skip MV from neighbors
         let n = ctx.mv_ctx.get_neighbors(mb_x, mb_y, 0, 0, 4);
+        #[cfg(feature = "tracing-detail")]
+        trace!(
+            mb_x, mb_y,
+            mv_a = ?n.mv_a, ref_a = n.ref_a, a_avail = n.a_avail,
+            mv_b = ?n.mv_b, ref_b = n.ref_b, b_avail = n.b_avail,
+            mv_c = ?n.mv_c, ref_c = n.ref_c, c_avail = n.c_avail,
+            "P_SKIP neighbors"
+        );
         let mv = mvpred::predict_mv_skip_full(
             n.mv_a, n.mv_b, n.mv_c, n.ref_a, n.ref_b, n.ref_c, n.a_avail, n.b_avail, n.c_avail,
         );
+        #[cfg(feature = "tracing-detail")]
+        trace!(mb_x, mb_y, mv = ?mv, "P_SKIP MV");
 
         // Apply motion compensation from ref_pics[0]
         apply_mc_partition(ctx, ref_pics[0], mb_x, mb_y, 0, 0, 16, 16, mv);
@@ -1063,9 +1131,11 @@ pub fn decode_skip_mb(
         }
     }
 
-    // Update neighbor context: all non_zero_count = 0, inter modes = -1
+    // Update neighbor context: all non_zero_count = 0, modes = DC_PRED.
+    // Inter MBs use DC_PRED (2) as intra4x4 mode context, not -1.
+    // See decode_macroblock() comment for full explanation.
     let nz = [0u8; 24];
-    let modes = [-1i8; 16];
+    let modes = [2i8; 16];
     ctx.neighbor_ctx.update_after_mb(mb_x, &nz, &modes);
     ctx.neighbor_ctx.left_available = true;
 
