@@ -149,21 +149,19 @@ See `H264.md` for detailed architecture, module map, and known issues.
 - Access unit grouping (AUD, SPS, first_mb_in_slice boundaries)
 - File extensions: .264, .h264, .h26l, .avc
 
-**FATE Baseline conformance: 4/17 tests bitexact** (2026-03-18):
+**FATE Baseline conformance: 15/17 tests bitexact** (2026-03-18):
 
-| Test | Resolution | QP | Types | Status |
-|------|-----------|-----|-------|--------|
-| BA1_Sony_D | 176x144 | 28 | I+P | **BITEXACT** (17 frames) |
-| SVA_BA1_B | 176x144 | 26 | I+P | **BITEXACT** (17 frames) |
-| SVA_NL1_B | 176x144 | 26 | I+P | **BITEXACT** (17 frames) |
-| BAMQ1_JVC_C | 176x144 | 24 | I | **BITEXACT** (30 frames, per-MB QP) |
-| BA_MW_D, BANM, AUD | 176x144 | 24-28 | I+P | frames 0-30 match, intra4x4 neighbor bug at f31 |
-| BA2_Sony_F | 176x144 | 28 | I+P | frames 0-61 match, same bug |
-| BAMQ2, SVA_BA2_D, SVA_NL2_E | 176x144 | 24-26 | I+P | early P-frame diffs at f2 |
-| SVA_Base_B, SVA_FM1_E, SVA_CL1_E | 176x144 | 26 | I+P | multi-slice I-frame corruption |
-| BASQP1_Sony_C | 176x144 | 0 | I | multi-slice CAVLC desync |
-| BA1_FT_C | 352x288 | 30 | I+P | frame 0 broken, dimension issue |
-| BA3_SVA_C | 176x144 | 26 | I+P | P-frame fully wrong |
+| Test | Resolution | Types | Status |
+|------|-----------|-------|--------|
+| BA1_Sony_D, SVA_BA1_B, SVA_NL1_B | 176x144 | I+P | **BITEXACT** |
+| BAMQ1_JVC_C | 176x144 | I | **BITEXACT** (per-MB QP) |
+| BA_MW_D, BANM_MW_D, AUD_MW_E | 176x144 | I+P | **BITEXACT** |
+| BA2_Sony_F | 176x144 | I+P | **BITEXACT** (300 frames) |
+| BAMQ2_JVC_C, SVA_BA2_D, SVA_NL2_E | 176x144 | I+P | **BITEXACT** |
+| BASQP1_Sony_C | 176x144 | I | **BITEXACT** (QP=0, multi-slice) |
+| SVA_Base_B, SVA_FM1_E, SVA_CL1_E | 176x144 | I+P | **BITEXACT** (multi-slice) |
+| BA1_FT_C | 352x288 | I+P | 260/299 frames match, late multi-slice diff |
+| BA3_SVA_C | 176x144 | I+P+B | B-frames not implemented |
 
 ### FFmpeg audio parity via symphonia
 

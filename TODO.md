@@ -17,7 +17,7 @@
 - [x] **Pixel format conversion** — wedeo-scale now wraps dcv-color-primitives for I420/NV12↔RGB24/BGR24/RGBA/BGRA conversions. Converter struct with metadata preservation. 11 unit tests.
 
 ### Video codecs (native Rust, no existing crate covers these)
-- [~] **H.264 Baseline decoder** — 4/17 BITEXACT (no-deblock), all 17 decode all frames. See `H264.md` for detailed status. Remaining:
+- [~] **H.264 Baseline decoder** — 15/17 BITEXACT, all 17 decode all frames. See `H264.md` for detailed status. Remaining:
   - [x] Wire P-frame inter prediction (mb_skip_run + P_SKIP + coded P-MB types 0-4)
   - [x] Fix demuxer access unit grouping (SPS/AUD/first_mb_in_slice boundaries)
   - [x] Write FATE integration tests (4 bitexact + 4 frame count regression tests)
@@ -29,12 +29,13 @@
   - [x] Fix ref list frame_num wrap-around — pic_num with MaxFrameNum per spec 8.2.4.1
   - [x] Fix MV neighbor C availability — only use C from already-decoded MBs
   - [x] Fix slice loop early-exit — parse mb_skip_run before RBSP exhaustion check
-  - [ ] Fix intra4x4 neighbor modes from inter MBs — root cause identified (mode=-1 vs DC_PRED)
-  - [ ] Fix multi-slice I-frame corruption — SVA_Base_B, SVA_FM1_E, SVA_CL1_E
-  - [ ] Fix BASQP1 multi-slice CAVLC desync — continuation slices garbled
-  - [ ] Fix early P-frame diffs — BAMQ2, SVA_BA2_D, SVA_NL2_E, BA3_SVA_C
-  - [ ] Fix BA1_FT_C 352x288 — frame 0 already wrong
-  - [ ] Pass remaining Baseline FATE conformance tests (13 remaining)
+  - [x] Fix intra4x4 neighbor modes from inter MBs — store DC_PRED(2) not -1 (7 files)
+  - [x] Fix multi-slice neighbor availability — slice_table + per-MB top_available (BASQP1 + I-frames)
+  - [x] Fix slice-aware MV prediction — cross-slice MV neighbors unavailable
+  - [x] Fix RBSP exhaustion margin — 8→1 bit, prevents dropping last MB of slice (SVA_Base_B/FM1_E/CL1_E)
+  - [ ] Fix BA1_FT_C late diff at frame 261 — likely another RBSP/slice edge case
+  - [ ] Implement B-frame decode — BA3_SVA_C has B-frames (slice_type=6)
+  - [ ] Pass remaining Baseline FATE conformance tests (2 remaining)
 - [ ] **VP9 decoder** — second priority for WebM support. Reference: `FFmpeg/libavcodec/vp9*.c`.
 - [ ] **HEVC decoder** — similar to H.264 but more complex (CTU/CTB structure).
 - [ ] **AV1 decoder** — check if Prossimo's rav1d (pure Rust AV1 decoder) is available as a crate. If so, wrap it like symphonia. If not, write from scratch.
