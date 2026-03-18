@@ -1,0 +1,41 @@
+[workspace]
+members = [
+    "crates/wedeo-core",
+    "crates/wedeo-codec",
+    "crates/wedeo-format",
+    "crates/wedeo-filter",
+    "crates/wedeo-resample",
+    "crates/wedeo-scale",
+    "codecs/wedeo-codec-pcm",
+    "codecs/wedeo-codec-h264",
+    "formats/wedeo-format-wav",
+    "formats/wedeo-format-h264",
+    "adapters/wedeo-symphonia",
+    "bins/wedeo-cli",
+    "tests/fate",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Clean-room Rust rewrite of FFmpeg"
+
+[workspace.dependencies]
+bitflags = "2"
+inventory = "0.3"
+tracing = { version = "0.1", default-features = false }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+wedeo-core = { path = "crates/wedeo-core" }
+wedeo-codec = { path = "crates/wedeo-codec" }
+wedeo-format = { path = "crates/wedeo-format" }
+wedeo-filter = { path = "crates/wedeo-filter" }
+wedeo-resample = { path = "crates/wedeo-resample" }
+wedeo-scale = { path = "crates/wedeo-scale" }
+wedeo-codec-pcm = { path = "codecs/wedeo-codec-pcm" }
+wedeo-format-wav = { path = "formats/wedeo-format-wav" }
+wedeo-codec-h264 = { path = "codecs/wedeo-codec-h264" }
+wedeo-format-h264 = { path = "formats/wedeo-format-h264" }
+wedeo-symphonia = { path = "adapters/wedeo-symphonia" }

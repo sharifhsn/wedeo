@@ -1,0 +1,15 @@
+[package]
+name = "wedeo-resample"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Audio resampling for wedeo (libswresample equivalent)"
+
+[features]
+tracing-detail = ["tracing/attributes"]
+
+[dependencies]
+wedeo-core = { workspace = true }
+tracing = { workspace = true }
+rubato = "1"
+audioadapter-buffers = "2"

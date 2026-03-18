@@ -1,0 +1,15 @@
+[package]
+name = "wedeo-codec-h264"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "H.264/AVC video codec for wedeo"
+
+[features]
+tracing-detail = ["tracing/attributes"]
+
+[dependencies]
+wedeo-core = { workspace = true }
+wedeo-codec = { workspace = true }
+inventory = { workspace = true }
+tracing = { workspace = true }

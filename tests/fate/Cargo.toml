@@ -1,0 +1,40 @@
+[package]
+name = "wedeo-fate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "FATE test suite harness for wedeo"
+
+[[bin]]
+name = "wedeo-audiogen"
+path = "src/audiogen.rs"
+
+[[bin]]
+name = "wedeo-framecrc"
+path = "src/framecrc.rs"
+
+[features]
+tracing = [
+    "dep:tracing-subscriber",
+    "wedeo-core/tracing-detail",
+    "wedeo-codec/tracing-detail",
+    "wedeo-format/tracing-detail",
+    "wedeo-codec-pcm/tracing-detail",
+    "wedeo-codec-h264/tracing-detail",
+    "wedeo-format-wav/tracing-detail",
+    "wedeo-format-h264/tracing-detail",
+    "wedeo-symphonia/tracing-detail",
+]
+
+[dependencies]
+wedeo-core = { workspace = true }
+wedeo-codec = { workspace = true }
+wedeo-format = { workspace = true }
+wedeo-codec-pcm = { workspace = true }
+wedeo-codec-h264 = { workspace = true }
+wedeo-format-wav = { workspace = true }
+wedeo-format-h264 = { workspace = true }
+wedeo-symphonia = { workspace = true }
+tracing-subscriber = { workspace = true, optional = true }
+adler2 = "2.0.1"
+md-5 = "0.10.6"

@@ -1,0 +1,35 @@
+[package]
+name = "wedeo-symphonia"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Symphonia audio backend adapter for wedeo"
+
+[features]
+tracing-detail = ["tracing/attributes"]
+
+[dependencies]
+wedeo-core = { workspace = true }
+wedeo-codec = { workspace = true }
+wedeo-format = { workspace = true }
+inventory = { workspace = true }
+tracing = { workspace = true }
+symphonia = { version = "0.5.5", default-features = false, features = [
+    "aac",
+    "alac",
+    "flac",
+    "mp1",
+    "mp2",
+    "mp3",
+    "pcm",
+    "vorbis",
+    "isomp4",
+    "mkv",
+    "ogg",
+    "wav",
+    "aiff",
+    "caf",
+    "adpcm",
+    "opt-simd",
+] }
+opus-decoder = "0.1.1"

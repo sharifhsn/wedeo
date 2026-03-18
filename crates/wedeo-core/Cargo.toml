@@ -1,0 +1,17 @@
+[package]
+name = "wedeo-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Core types for wedeo (libavutil equivalent)"
+
+[features]
+tracing-detail = ["tracing/attributes"]
+
+[dependencies]
+aligned-vec = "0.6.4"
+av-bitstream = "0.2.1"
+bitflags = { workspace = true }
+tracing = { workspace = true }
+v_frame = "0.5.1"
+yuvxyb = "0.5.0"

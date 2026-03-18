@@ -1,0 +1,14 @@
+[package]
+name = "wedeo-scale"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Video scaling for wedeo (libswscale equivalent)"
+
+[features]
+tracing-detail = ["tracing/attributes"]
+
+[dependencies]
+dcv-color-primitives = "1.0.0"
+wedeo-core = { workspace = true }
+tracing = { workspace = true }

@@ -1,0 +1,15 @@
+[package]
+name = "wedeo-codec-pcm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PCM audio codec for wedeo"
+
+[features]
+tracing-detail = ["tracing/attributes"]
+
+[dependencies]
+wedeo-core = { workspace = true }
+wedeo-codec = { workspace = true }
+inventory = { workspace = true }
+tracing = { workspace = true }

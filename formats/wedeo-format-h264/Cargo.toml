@@ -1,0 +1,17 @@
+[package]
+name = "wedeo-format-h264"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "H.264 Annex B raw bitstream demuxer for wedeo"
+
+[features]
+tracing-detail = ["tracing/attributes"]
+
+[dependencies]
+wedeo-core = { workspace = true }
+wedeo-format = { workspace = true }
+wedeo-codec = { workspace = true }
+wedeo-codec-h264 = { workspace = true }
+inventory = { workspace = true }
+tracing = { workspace = true }

@@ -1,0 +1,15 @@
+[package]
+name = "wedeo-filter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Filter framework for wedeo (libavfilter equivalent)"
+
+[features]
+tracing-detail = ["tracing/attributes"]
+
+[dependencies]
+wedeo-core = { workspace = true }
+bitflags = { workspace = true }
+inventory = { workspace = true }
+tracing = { workspace = true }

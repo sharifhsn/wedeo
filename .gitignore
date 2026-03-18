@@ -1,0 +1,19 @@
+# Build
+/target
+
+# FATE test samples (download via scripts/fetch-fate-suite.sh)
+/fate-suite
+
+# Planning artifacts
+start.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db

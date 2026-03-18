@@ -1,0 +1,16 @@
+[package]
+name = "wedeo-codec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Codec framework for wedeo (libavcodec equivalent)"
+
+[features]
+tracing-detail = ["tracing/attributes"]
+
+[dependencies]
+wedeo-core = { workspace = true }
+bitflags = { workspace = true }
+inventory = { workspace = true }
+tracing = { workspace = true }
+av-bitstream = "0.2.1"
