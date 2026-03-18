@@ -122,7 +122,14 @@ Made BASQP1 BITEXACT and fixed SVA_Base_B/FM1_E/CL1_E frame 0.
   buffer. Frame 1 is stored at y_ptr=0xae4c33000 but frame 2's ref_pics[0]
   points to 0xae4c3a000 (a different buffer with zeros at MB(10,2)).
   The ref list uses dpb_idx that doesn't match the stored frame.
-  ROOT CAUSE: likely a DPB store/retrieve index mismatch or frame being
-  replaced in DPB before it's used as reference.
+  **Key data from MC ref check trace**:
+  - Frame 1 MC for MB(10,2): ref_y_ptr=0x83d024000, ref_at_160_32=160 (correct, from frame 0)
+  - Frame 2 MC for MB(10,2): ref_y_ptr=0x83d039000, ref_at_160_32=0 (ZEROS!)
+  - DPB store check shows frame 1 stored with pixel0=150 (correct)
+  - But MC reads from a DIFFERENT buffer (0x83d039000 ≠ frame 1's stored buffer)
+  - The MC ref check for frame 2 is from a P_SKIP path (no :decode_macroblock span)
+
+  ROOT CAUSE: likely a DPB store/retrieve index mismatch — the ref_pic_list
+  points to the wrong DPB entry or an entry that was overwritten.
 - SVA_CL1_E: likely same DPB issue
 - BA1_FT_C: 260 frames match, f261 diffs — may be different cause

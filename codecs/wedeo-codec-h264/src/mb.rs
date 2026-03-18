@@ -1009,6 +1009,19 @@ fn apply_mc_partition(
     let dst_x = (mb_x * 16 + px_offset_x) as i32;
     let dst_y = (mb_y * 16 + px_offset_y) as i32;
 
+    // Temporary debug trace for SVA_Base_B MB(10,2) investigation
+    #[cfg(feature = "tracing-detail")]
+    if mb_x == 10 && mb_y == 2 {
+        let ref_val = ref_pic.y[32 * ref_pic.y_stride + 160];
+        let ref_val2 = ref_pic.y[32 * ref_pic.y_stride + 162];
+        trace!(mb_x, mb_y, px_offset_y, mv = ?mv,
+            ref_y_ptr = ?ref_pic.y.as_ptr(),
+            ref_stride = ref_pic.y_stride,
+            ref_at_160_32 = ref_val,
+            ref_at_162_32 = ref_val2,
+            "MC ref check");
+    }
+
     // Quarter-pixel MV components
     let mvx = mv[0] as i32;
     let mvy = mv[1] as i32;
