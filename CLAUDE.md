@@ -20,7 +20,7 @@ to FFmpeg 8.0.1 across all PCM formats and all FATE suite WAV samples.
 
 ```
 wedeo/
-  Cargo.toml                    # workspace root (13 crates)
+  Cargo.toml                    # workspace root (14 crates)
   FFmpeg/                       # C reference source (read-only, not compiled)
   fate-suite/                   # FATE test samples (synced externally)
   start.json                    # original planning conversation
@@ -39,7 +39,7 @@ wedeo/
 
   codecs/
     wedeo-codec-pcm/            # PCM decoder + encoder — S16LE/BE, S24LE/BE, S32LE/BE, U8/16/24/32, F32/F64, alaw, mulaw
-    wedeo-codec-h264/           # H.264/AVC Baseline decoder — 19 modules, ~14,600 lines (see H264.md)
+    wedeo-codec-h264/           # H.264/AVC Baseline decoder — 19 modules, ~15,300 lines (see H264.md)
 
   formats/
     wedeo-format-wav/           # WAV demuxer + muxer — RIFF/RIFX/RF64/BW64 probe, WAVEFORMATEXTENSIBLE, streaming
@@ -47,6 +47,7 @@ wedeo/
 
   bins/
     wedeo-cli/                  # CLI tools: info (like ffprobe), decode, codecs, formats
+    wedeo-play/                 # Simple video player (decode + YUV→RGBA + minifb display)
 
   tests/
     fate/                       # FATE test harness
@@ -56,14 +57,14 @@ wedeo/
       tests/fate_symphonia.rs   # Symphonia adapter tests (priority, lossless bitexact, lossy SNR)
 ```
 
-## Current Status (423 tests, ~26000 lines of Rust, 0 clippy warnings)
+## Current Status (0 clippy warnings)
 
 ### H.264 video decoder (native Rust, in progress)
 
 First native video codec. Decodes H.264 Baseline profile I-frames to YUV420p.
 See `H264.md` for detailed architecture, module map, and known issues.
 
-**Decoder** (`codecs/wedeo-codec-h264/`, ~15,200 lines, 309 tests):
+**Decoder** (`codecs/wedeo-codec-h264/`, ~15,300 lines):
 - NAL parsing (Annex B + NALFF/avcC), SPS/PPS, slice header with MMCO
 - CAVLC entropy decoding (all VLC tables, level/run decode, mb_type parsing)
 - 17 intra prediction modes (9 Intra4x4 + 4 Intra16x16 + 4 chroma)
@@ -100,7 +101,7 @@ symphonia wrappers (priority 50) when both exist (e.g., WAV/PCM always uses nati
 
 | Codec | Source | Verified | Quality |
 |-------|--------|----------|---------|
-| PCM (17 variants) | Symphonia | FATE bitexact | Byte-identical to FFmpeg 8.0.1 |
+| PCM (17 variants) | Native | FATE bitexact | Byte-identical to FFmpeg 8.0.1 |
 | FLAC 16/24-bit | Symphonia | Bitexact vs FFmpeg | Byte-identical |
 | WavPack 16/24-bit | Symphonia | Bitexact vs FFmpeg | Byte-identical |
 | Vorbis | Symphonia | SNR verified | ~140 dB SNR (float rounding only) |
@@ -158,6 +159,7 @@ symphonia wrappers (priority 50) when both exist (e.g., WAV/PCM always uses nati
 - **Demuxer trait**: No read_close, no chapters/programs, no find_stream_info equivalent.
 - **Filter graph**: No format negotiation, no frame passing mechanism (queues, push/pull). The stub topology is correct but the data flow is missing.
 - **Error**: No error context (where/why), no codec-specific error codes.
+
 ### In progress
 - **H.264 Baseline decoder** — I-frame decode pipeline works end-to-end, P-frame inter prediction implemented but not wired. See `H264.md`.
 
@@ -176,12 +178,11 @@ See `TODO.md` for the full task list and `DIVERGENCES.md` for known behavioral d
 ## Rust Development Practices
 
 ### Build & Check Commands
-- Always use `cargo` commands: `cargo build`, `cargo test`, `cargo run`
 - Prefer `cargo nextest run` over `cargo test` — provides process isolation, slow test detection, and leak detection
 - Run `cargo clippy` to detect warnings/errors and fix them before considering code complete
 - Run `cargo fmt` to format code before considering code complete
-- Run `cargo nextest run` (or `cargo test`) to verify changes don't break existing functionality
 - Use `cargo check` for fast compilation checks during development
+- Use [Conventional Commits](https://www.conventionalcommits.org/) — see CONTRIBUTING.md for types and scopes
 
 ### FATE Verification
 - Run FATE tests: `FATE_SUITE=./fate-suite cargo nextest run --profile fate -p wedeo-fate` (or `FATE_SUITE=./fate-suite cargo test -p wedeo-fate`)
@@ -216,19 +217,10 @@ See `TODO.md` for the full task list and `DIVERGENCES.md` for known behavioral d
 - Packet sizes must match FFmpeg's `ff_pcm_default_packet_size`: `bitrate / 8 / 10 / block_align`, rounded down to power of 2
 - Channel layout Display must use FFmpeg's standard names ("stereo", "5.1", etc.) not raw channel lists
 
-### Adding a New Codec
-1. Create `codecs/wedeo-codec-<name>/` with `Cargo.toml` depending on `wedeo-core` + `wedeo-codec` + `inventory`
-2. Implement the `Decoder` trait (send_packet/receive_frame/flush)
-3. Create a `DecoderFactory` impl and register with `inventory::submit!`
-4. Add the crate to `workspace.members` in root `Cargo.toml`
-5. Add `use wedeo_codec_<name> as _;` in `wedeo-cli` and `wedeo-fate` to ensure linking
-6. Add FATE tests comparing framecrc output against FFmpeg
+### Adding New Codecs/Formats
 
-### Adding a New Format
-1. Create `formats/wedeo-format-<name>/` with `Cargo.toml` depending on `wedeo-core` + `wedeo-format` + `inventory`
-2. Implement the `Demuxer` trait (read_header/read_packet/seek) and `DemuxerFactory` with probe()
-3. Register with `inventory::submit!`
-4. Add FATE tests
+See [CONTRIBUTING.md](CONTRIBUTING.md) for step-by-step instructions on adding
+new codecs and formats.
 
 ### Reference
 - FFmpeg source is at `./FFmpeg/` for reference — read C code before writing Rust equivalents

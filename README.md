@@ -16,7 +16,7 @@ The verification target is **bit-for-bit output parity** with FFmpeg's
 
 ## Status
 
-~26,000 lines of Rust across 13 workspace crates, 423 tests, 0 clippy warnings.
+14 workspace crates, 0 clippy warnings.
 
 ### What works
 
@@ -53,6 +53,7 @@ wedeo/
     wedeo-format-h264/   # H.264 Annex B demuxer
   bins/
     wedeo-cli/           # CLI: info, decode, codecs, formats
+    wedeo-play/          # Simple video player (decode + display)
   tests/
     fate/                # FATE test harness with FFmpeg cross-validation
 ```
@@ -89,7 +90,7 @@ FATE tests require sample files from FFmpeg's FATE server:
 
 ```bash
 ./scripts/fetch-fate-suite.sh        # downloads ~1.2 GB of test samples
-FATE_SUITE=./fate-suite cargo test -p wedeo-fate
+FATE_SUITE=./fate-suite cargo nextest run --profile fate -p wedeo-fate
 ```
 
 Cross-validate against FFmpeg:

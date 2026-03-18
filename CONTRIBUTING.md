@@ -89,7 +89,7 @@ Every PR must include these sections:
 1. **What** — one sentence
 2. **Why** — problem solved or capability added
 3. **Verification** — test output, FATE comparison, or benchmark
-4. **FFmpeg reference** — which C source files were read
+4. **FFmpeg reference** (codec/format work) — which C source files were read
 
 ## For AI agents
 
