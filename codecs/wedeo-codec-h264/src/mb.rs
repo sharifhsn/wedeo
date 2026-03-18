@@ -424,6 +424,7 @@ pub fn decode_macroblock(
         mb_x,
         mb_y,
         ctx.mb_width,
+        slice_hdr.num_ref_idx_l0_active,
     )?;
 
     // 2. Update QP with mb_qp_delta

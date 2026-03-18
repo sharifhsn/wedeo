@@ -732,14 +732,16 @@ const P_SUB_MB_PARTITION_COUNT: [u8; 4] = [1, 2, 2, 4];
 ///
 /// Reference: FFmpeg `ff_h264_decode_mb_cavlc` in h264_cavlc.c.
 #[cfg_attr(feature = "tracing-detail", tracing::instrument(skip_all, fields(mb_x, mb_y = _mb_y, slice_type = ?slice_type)))]
+#[allow(clippy::too_many_arguments)]
 pub fn decode_mb_cavlc(
     br: &mut BitReadBE<'_>,
     slice_type: SliceType,
-    pps: &Pps,
+    _pps: &Pps,
     neighbor: &NeighborContext,
     mb_x: u32,
     _mb_y: u32,
     _mb_width: u32,
+    num_ref_idx_l0_active: u32,
 ) -> Result<MacroblockCavlc> {
     let mut mb = MacroblockCavlc::default();
 
@@ -817,6 +819,8 @@ pub fn decode_mb_cavlc(
     }
 
     // 3. Intra prediction modes
+    #[cfg(feature = "tracing-detail")]
+    tracing::trace!(bits_after_mb_type = br.consumed(), "CAVLC MB header");
     if mb.is_intra4x4 {
         // Parse and resolve intra4x4 prediction modes for each 4x4 block.
         //
@@ -885,6 +889,8 @@ pub fn decode_mb_cavlc(
         }
     }
 
+    #[cfg(feature = "tracing-detail")]
+    tracing::trace!(bits_after_pred_modes = br.consumed(), "CAVLC MB header");
     if is_intra {
         // Parse chroma intra prediction mode.
         mb.chroma_pred_mode = get_ue_golomb(br)? as u8;
@@ -898,14 +904,14 @@ pub fn decode_mb_cavlc(
         match mb.mb_type {
             0 => {
                 // P_L0_16x16: one ref_idx, one mvd
-                mb.ref_idx_l0[0] = read_ref_idx(br, pps.num_ref_idx_l0_default_active)? as i8;
+                mb.ref_idx_l0[0] = read_ref_idx(br, num_ref_idx_l0_active)? as i8;
                 mb.mvd_l0[0][0] = get_se_golomb(br)? as i16;
                 mb.mvd_l0[0][1] = get_se_golomb(br)? as i16;
             }
             1 => {
                 // P_L0_L0_16x8: two ref_idx, two mvd
-                mb.ref_idx_l0[0] = read_ref_idx(br, pps.num_ref_idx_l0_default_active)? as i8;
-                mb.ref_idx_l0[1] = read_ref_idx(br, pps.num_ref_idx_l0_default_active)? as i8;
+                mb.ref_idx_l0[0] = read_ref_idx(br, num_ref_idx_l0_active)? as i8;
+                mb.ref_idx_l0[1] = read_ref_idx(br, num_ref_idx_l0_active)? as i8;
                 mb.mvd_l0[0][0] = get_se_golomb(br)? as i16;
                 mb.mvd_l0[0][1] = get_se_golomb(br)? as i16;
                 mb.mvd_l0[1][0] = get_se_golomb(br)? as i16;
@@ -913,8 +919,8 @@ pub fn decode_mb_cavlc(
             }
             2 => {
                 // P_L0_L0_8x16: two ref_idx, two mvd
-                mb.ref_idx_l0[0] = read_ref_idx(br, pps.num_ref_idx_l0_default_active)? as i8;
-                mb.ref_idx_l0[1] = read_ref_idx(br, pps.num_ref_idx_l0_default_active)? as i8;
+                mb.ref_idx_l0[0] = read_ref_idx(br, num_ref_idx_l0_active)? as i8;
+                mb.ref_idx_l0[1] = read_ref_idx(br, num_ref_idx_l0_active)? as i8;
                 mb.mvd_l0[0][0] = get_se_golomb(br)? as i16;
                 mb.mvd_l0[0][1] = get_se_golomb(br)? as i16;
                 mb.mvd_l0[1][0] = get_se_golomb(br)? as i16;
@@ -934,7 +940,7 @@ pub fn decode_mb_cavlc(
                 let ref_count = if mb.mb_type == 4 {
                     1 // P_8x8ref0: all refs forced to 0
                 } else {
-                    pps.num_ref_idx_l0_default_active
+                    num_ref_idx_l0_active
                 };
                 for i in 0..4 {
                     mb.ref_idx_l0[i] = read_ref_idx(br, ref_count)? as i8;
@@ -957,6 +963,8 @@ pub fn decode_mb_cavlc(
     }
 
     // 5. CBP
+    #[cfg(feature = "tracing-detail")]
+    tracing::trace!(bits_before_cbp = br.consumed(), "CAVLC MB header");
     if !mb.is_intra16x16 {
         let cbp_code = get_ue_golomb(br)?;
         if cbp_code > 47 {
@@ -971,8 +979,16 @@ pub fn decode_mb_cavlc(
     // For I_16x16, cbp was already set from mb_type.
 
     // 6. mb_qp_delta and residual coefficients
+    #[cfg(feature = "tracing-detail")]
+    tracing::trace!(bits_before_qp_delta = br.consumed(), "CAVLC MB header");
     if mb.cbp > 0 || mb.is_intra16x16 {
         mb.mb_qp_delta = get_se_golomb(br)?;
+        #[cfg(feature = "tracing-detail")]
+        tracing::trace!(
+            bits_after_qp_delta = br.consumed(),
+            mb_qp_delta = mb.mb_qp_delta,
+            "CAVLC MB header"
+        );
         decode_residual_blocks(br, &mut mb, neighbor, mb_x)?;
     }
 
