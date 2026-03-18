@@ -142,12 +142,21 @@ def main():
         sys.exit(1)
     print(f"Comparing frames {args.start_frame}..{end_frame - 1} of {actual_frames} decoded frames\n")
 
+    cw = width // 2
+    ch = height // 2
+
     total_diffs = 0
+    total_chroma_diffs = 0
     for frame_idx in range(args.start_frame, end_frame):
         base = frame_idx * frame_size
         w_y = np.frombuffer(wedeo_data[base:base + y_size], dtype=np.uint8).reshape(height, width)
         f_y = np.frombuffer(ffmpeg_data[base:base + y_size], dtype=np.uint8).reshape(height, width)
+        w_u = np.frombuffer(wedeo_data[base + y_size:base + y_size + uv_size], dtype=np.uint8).reshape(ch, cw)
+        f_u = np.frombuffer(ffmpeg_data[base + y_size:base + y_size + uv_size], dtype=np.uint8).reshape(ch, cw)
+        w_v = np.frombuffer(wedeo_data[base + y_size + uv_size:base + frame_size], dtype=np.uint8).reshape(ch, cw)
+        f_v = np.frombuffer(ffmpeg_data[base + y_size + uv_size:base + frame_size], dtype=np.uint8).reshape(ch, cw)
 
+        # Luma comparison (per-MB)
         frame_diffs = 0
         first_diff_mb = None
         for my in range(mb_h):
@@ -164,12 +173,20 @@ def main():
                         mean_diff = float(diff[diff > 0].mean())
                         first_diff_mb = (mx, my, max_diff, mean_diff)
 
+        # Chroma comparison (whole-plane)
+        u_diff = np.abs(w_u.astype(np.int16) - f_u.astype(np.int16))
+        v_diff = np.abs(w_v.astype(np.int16) - f_v.astype(np.int16))
+        u_max = int(u_diff.max())
+        v_max = int(v_diff.max())
+        chroma_ok = u_max == 0 and v_max == 0
+
         if frame_diffs > 0:
             total_diffs += frame_diffs
             mx, my, max_d, mean_d = first_diff_mb
+            chroma_note = "" if chroma_ok else f" [chroma: U_max={u_max} V_max={v_max}]"
             print(
                 f"Frame {frame_idx}: {frame_diffs}/{mb_w * mb_h} MBs differ "
-                f"(first: MB({mx},{my}), max_diff={max_d}, mean_diff={mean_d:.1f})"
+                f"(first: MB({mx},{my}), max_diff={max_d}, mean_diff={mean_d:.1f}){chroma_note}"
             )
             print(
                 f"  Debug: RUST_LOG=wedeo_codec_h264::mb=trace "
@@ -177,11 +194,14 @@ def main():
                 f"-- {input_path} --raw-yuv /dev/null 2>/tmp/trace.txt && "
                 f'grep "MB({mx},{my})" /tmp/trace.txt | head -20'
             )
+        elif not chroma_ok:
+            total_chroma_diffs += 1
+            print(f"Frame {frame_idx}: luma MATCH, chroma diff U_max={u_max} V_max={v_max}")
         else:
             print(f"Frame {frame_idx}: MATCH")
 
-    print(f"\nTotal: {total_diffs} differing MBs across {end_frame - args.start_frame} frames")
-    if total_diffs == 0:
+    print(f"\nTotal: {total_diffs} luma-differing MBs, {total_chroma_diffs} chroma-only diffs across {end_frame - args.start_frame} frames")
+    if total_diffs == 0 and total_chroma_diffs == 0:
         print("BITEXACT!")
 
 
