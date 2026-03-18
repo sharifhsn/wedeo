@@ -58,6 +58,7 @@ const TC0_TABLE: [[i32; 3]; 52] = [
     [1, 1, 1],
     [1, 1, 1],
     [1, 1, 1],
+    [1, 1, 1],
     [1, 1, 2],
     [1, 1, 2],
     [1, 1, 2],
@@ -82,7 +83,6 @@ const TC0_TABLE: [[i32; 3]; 52] = [
     [9, 12, 18],
     [10, 13, 20],
     [11, 15, 23],
-    [13, 17, 25],
     [13, 17, 25],
 ];
 
@@ -1175,16 +1175,27 @@ mod tests {
     }
 
     #[test]
-    fn tc0_table_known_values() {
-        // Low QP: all zeros
-        assert_eq!(TC0_TABLE[0], [0, 0, 0]);
-        assert_eq!(TC0_TABLE[16], [0, 0, 0]);
-        // QP 17: [0, 0, 1]
-        assert_eq!(TC0_TABLE[17], [0, 0, 1]);
-        // QP 23: [1, 1, 1]
-        assert_eq!(TC0_TABLE[23], [1, 1, 1]);
-        // QP 51: [13, 17, 25]
-        assert_eq!(TC0_TABLE[51], [13, 17, 25]);
+    fn tc0_table_matches_ffmpeg() {
+        // Full table verified against FFmpeg tc0_table in h264_loopfilter.c
+        // (bS=1,2,3 columns; bS=0 column is -1 in FFmpeg, not stored here)
+        let expected: [[i32; 3]; 52] = [
+            [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0],
+            [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0],
+            [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 1],
+            [0, 0, 1], [0, 0, 1], [0, 0, 1], [0, 1, 1], [0, 1, 1], [1, 1, 1],
+            [1, 1, 1], [1, 1, 1], [1, 1, 1], [1, 1, 2], [1, 1, 2], [1, 1, 2],
+            [1, 1, 2], [1, 2, 3], [1, 2, 3], [2, 2, 3], [2, 2, 4], [2, 3, 4],
+            [2, 3, 4], [3, 3, 5], [3, 4, 6], [3, 4, 6], [4, 5, 7], [4, 5, 8],
+            [4, 6, 9], [5, 7, 10], [6, 8, 11], [6, 8, 13], [7, 10, 14],
+            [8, 11, 16], [9, 12, 18], [10, 13, 20], [11, 15, 23], [13, 17, 25],
+        ];
+        for i in 0..52 {
+            assert_eq!(
+                TC0_TABLE[i], expected[i],
+                "TC0_TABLE[{i}]: got {:?}, expected {:?}",
+                TC0_TABLE[i], expected[i]
+            );
+        }
     }
 
     #[test]
@@ -1281,9 +1292,9 @@ mod tests {
 
     #[test]
     fn normal_filter_luma_basic() {
-        // QP=30, bS=2 => tc0 = TC0_TABLE[30][1] = 2
+        // QP=30, bS=2 => tc0 = TC0_TABLE[30][1] = 1
         let tc0 = get_tc0(30, 0, 2);
-        assert_eq!(tc0, 2);
+        assert_eq!(tc0, 1);
 
         let (alpha, beta) = get_thresholds(30, 0, 0);
         // alpha=25, beta=8
@@ -1298,8 +1309,8 @@ mod tests {
         //       = clip3(-tc, tc, (20 - 15 + 4) >> 3) = clip3(-tc, tc, 9 >> 3) = clip3(-tc, tc, 1)
         // Need to compute tc: |p2-p0|=10 >= beta=8 => no p1 filter, no tc increment from p
         //                      |q2-q0|=10 >= beta=8 => no q1 filter, no tc increment from q
-        // tc = tc0 = 2
-        // delta = clip3(-2, 2, 1) = 1
+        // tc = tc0 = 1
+        // delta = clip3(-1, 1, 1) = 1
         assert_eq!(new_p0, 131); // 130 + 1
         assert_eq!(new_q0, 134); // 135 - 1
         // p1 and q1 unchanged since |p2-p0| and |q2-q0| >= beta
