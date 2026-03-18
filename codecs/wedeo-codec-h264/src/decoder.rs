@@ -660,7 +660,11 @@ impl H264Decoder {
                     fdc.neighbor_ctx.top_available = skip_y > 0
                         && fdc.slice_table[(mb_addr - mb_width) as usize]
                             == fdc.current_slice;
-                    mb::decode_skip_mb(fdc, hdr, skip_x, skip_y, ref_pics, ref_pics_l1);
+                    if hdr.slice_type.is_b() {
+                        mb::decode_b_skip_mb(fdc, hdr, skip_x, skip_y, ref_pics, ref_pics_l1);
+                    } else {
+                        mb::decode_skip_mb(fdc, hdr, skip_x, skip_y, ref_pics, ref_pics_l1);
+                    }
                     mb_addr += 1;
                     mbs_decoded += 1;
                 }

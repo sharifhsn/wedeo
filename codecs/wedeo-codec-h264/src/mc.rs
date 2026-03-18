@@ -1143,6 +1143,33 @@ pub fn mc_block(
 }
 
 // ---------------------------------------------------------------------------
+// Bi-directional averaging (in-place)
+// ---------------------------------------------------------------------------
+
+/// Average dst with src in-place: dst[i] = (dst[i] + src[i] + 1) >> 1.
+///
+/// Used for unweighted bi-directional prediction (weighted_bipred_idc == 0).
+/// `dst` already contains the L0 prediction; `src` is the L1 prediction.
+pub fn avg_pixels_inplace(
+    dst: &mut [u8],
+    dst_stride: usize,
+    src: &[u8],
+    src_stride: usize,
+    w: usize,
+    h: usize,
+) {
+    for row in 0..h {
+        let d_off = row * dst_stride;
+        let s_off = row * src_stride;
+        for col in 0..w {
+            let a = dst[d_off + col] as u16;
+            let b = src[s_off + col] as u16;
+            dst[d_off + col] = ((a + b + 1) >> 1) as u8;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
 

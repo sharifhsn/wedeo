@@ -244,10 +244,14 @@ pub fn predict_mv_skip_full(
 /// frame, laid out as `[mb_addr * 16 + blk_idx]` where `blk_idx` is the
 /// raster-scan index of the 4x4 block within a macroblock (0..16).
 pub struct MvContext {
-    /// Motion vectors per 4x4 block for the current frame.
+    /// Motion vectors per 4x4 block for the current frame (list 0).
     pub mv: Vec<[i16; 2]>,
-    /// Reference indices per 4x4 block.
+    /// Reference indices per 4x4 block (list 0).
     pub ref_idx: Vec<i8>,
+    /// Motion vectors per 4x4 block (list 1, for B-slices).
+    pub mv_l1: Vec<[i16; 2]>,
+    /// Reference indices per 4x4 block (list 1, for B-slices).
+    pub ref_idx_l1: Vec<i8>,
     /// MB width in the current frame.
     pub mb_width: u32,
     /// MB height in the current frame.
@@ -276,6 +280,8 @@ impl MvContext {
         Self {
             mv: vec![[0i16; 2]; total_blocks],
             ref_idx: vec![-1i8; total_blocks],
+            mv_l1: vec![[0i16; 2]; total_blocks],
+            ref_idx_l1: vec![-1i8; total_blocks],
             mb_width,
             mb_height,
         }
@@ -294,11 +300,18 @@ impl MvContext {
         (self.mv[idx], self.ref_idx[idx])
     }
 
-    /// Set the MV and ref_idx for a 4x4 block.
+    /// Set the MV and ref_idx for a 4x4 block (list 0).
     pub fn set(&mut self, mb_x: u32, mb_y: u32, blk_idx: usize, mv: [i16; 2], ref_idx: i8) {
         let idx = self.linear_idx(mb_x, mb_y, blk_idx);
         self.mv[idx] = mv;
         self.ref_idx[idx] = ref_idx;
+    }
+
+    /// Set the MV and ref_idx for a 4x4 block (list 1).
+    pub fn set_l1(&mut self, mb_x: u32, mb_y: u32, blk_idx: usize, mv: [i16; 2], ref_idx: i8) {
+        let idx = self.linear_idx(mb_x, mb_y, blk_idx);
+        self.mv_l1[idx] = mv;
+        self.ref_idx_l1[idx] = ref_idx;
     }
 
     /// Get neighbor A (left) for a block at position (blk_x, blk_y) within
