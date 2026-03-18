@@ -73,6 +73,26 @@ Always strip ANSI codes when grepping trace files:
 - AUD_MW_E: f31 MB(5,5) max_diff=45
 - BA2_Sony_F: f62 MB(5,5) max_diff=40
 
+## Active Investigation: Multi-slice I-frame corruption
+
+### What we know (verified empirically)
+- SVA_Base_B: 3 slices per frame: first_mb=0,33,66 (11 MBs per row, 3 rows per slice)
+- Frame 0: MBs 0-32 (rows 0-2) are correct, MB 33+ (row 3+) are wrong
+- First diff is at MB(0,3) = mb_addr=33 = start of second slice
+- max_diff=224, mean_diff=173.8 → completely wrong pixels, not small diffs
+
+### ROOT CAUSE FOUND (2026-03-18)
+Cross-slice neighbor availability not tracked. The decoder sets
+`top_available = mb_y > 0` unconditionally, but H.264 spec requires
+neighbors from different slices to be treated as unavailable.
+
+FFmpeg uses `h->slice_table[top_xy] != sl->slice_num` to check this.
+Wedeo has no slice_table.
+
+**FIXED (2026-03-18)**: Added `slice_table: Vec<u16>` and `current_slice: u16`
+to FrameDecodeContext. Check slice_table when computing has_top/has_left.
+Made BASQP1 BITEXACT and fixed SVA_Base_B/FM1_E/CL1_E frame 0.
+
 ## Issue Categories (for tracking)
 
 1. **Intra4x4 neighbor bug** — f31 MB(5,5), affects 4 files
