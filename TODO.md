@@ -33,7 +33,8 @@
   - [x] Fix multi-slice neighbor availability — slice_table + per-MB top_available (BASQP1 + I-frames)
   - [x] Fix slice-aware MV prediction — cross-slice MV neighbors unavailable
   - [x] Fix RBSP exhaustion margin — 8→1 bit, prevents dropping last MB of slice (SVA_Base_B/FM1_E/CL1_E)
-  - [ ] Fix BA1_FT_C late diff at frame 261 — likely another RBSP/slice edge case
+  - [x] Fix BA1_FT_C luma — MV neighbor C/D slice check for all blk_y values
+  - [ ] Fix chroma V ±1 rounding — affects 4 multi-slice files (V-only, max_diff 1-3)
   - [ ] Implement B-frame decode — BA3_SVA_C has B-frames (slice_type=6)
   - [ ] Pass remaining Baseline FATE conformance tests (2 remaining)
 - [ ] **VP9 decoder** — second priority for WebM support. Reference: `FFmpeg/libavcodec/vp9*.c`.
