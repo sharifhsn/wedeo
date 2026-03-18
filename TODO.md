@@ -17,7 +17,7 @@
 - [x] **Pixel format conversion** — wedeo-scale now wraps dcv-color-primitives for I420/NV12↔RGB24/BGR24/RGBA/BGRA conversions. Converter struct with metadata preservation. 11 unit tests.
 
 ### Video codecs (native Rust, no existing crate covers these)
-- [~] **H.264 Baseline decoder** — 16/17 BITEXACT (with deblocking), all 17 decode all frames. See `H264.md` for detailed status. Remaining:
+- [~] **H.264 Baseline decoder** — 16/17 BITEXACT + BA1_FT_C now 299/299 frames + B-frame infrastructure. See `H264.md` for detailed status. Remaining:
   - [x] Wire P-frame inter prediction (mb_skip_run + P_SKIP + coded P-MB types 0-4)
   - [x] Fix demuxer access unit grouping (SPS/AUD/first_mb_in_slice boundaries)
   - [x] Write FATE integration tests (4 bitexact + 4 frame count regression tests)
@@ -36,8 +36,9 @@
   - [x] Fix BA1_FT_C luma — MV neighbor C/D slice check for all blk_y values
   - [x] Fix chroma V ±1 rounding — CHROMA_QP_TABLE had transcription error at index 36 (extra 33)
   - [x] Fix deblocking filter diffs — TC0_TABLE had transcription error at QP 26 (missing [1,1,1] entry)
-  - [ ] Implement B-frame decode — BA3_SVA_C has B-frames (slice_type=6)
-  - [ ] Pass remaining Baseline FATE conformance tests (1 remaining: BA3_SVA_C B-frames)
+  - [~] Implement B-frame decode — infrastructure complete (POC, ref lists, CAVLC, MC, reorder), I/P frames in BA3_SVA_C BITEXACT, B-frame pixels diverge (MV prediction needs refinement)
+  - [ ] Fix B-frame MV prediction — L1 neighbor context, spatial direct col_zero_flag
+  - [ ] Pass remaining Baseline FATE conformance tests (BA3_SVA_C B-frames: 17/33 match)
 - [ ] **VP9 decoder** — second priority for WebM support. Reference: `FFmpeg/libavcodec/vp9*.c`.
 - [ ] **HEVC decoder** — similar to H.264 but more complex (CTU/CTB structure).
 - [ ] **AV1 decoder** — check if Prossimo's rav1d (pure Rust AV1 decoder) is available as a crate. If so, wrap it like symphonia. If not, write from scratch.
