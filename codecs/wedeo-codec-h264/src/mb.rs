@@ -75,6 +75,11 @@ pub struct FrameDecodeContext {
     pub dequant4: Dequant4Table,
     /// Motion vector context for inter prediction across MBs.
     pub mv_ctx: MvContext,
+    /// Per-MB slice number for cross-slice neighbor availability.
+    /// H.264 spec requires neighbors from different slices to be unavailable.
+    pub slice_table: Vec<u16>,
+    /// Current slice number (incremented per slice within a frame).
+    pub current_slice: u16,
 }
 
 impl FrameDecodeContext {
@@ -111,6 +116,8 @@ impl FrameDecodeContext {
             mb_height,
             dequant4: Dequant4Table::new(&sps.scaling_matrix4),
             mv_ctx: MvContext::new(mb_width, mb_height),
+            slice_table: vec![u16::MAX; total_mbs],
+            current_slice: 0,
         }
     }
 }
@@ -288,9 +295,9 @@ fn decode_chroma(
     mb_x: u32,
     mb_y: u32,
     chroma_qp: u8,
+    has_top: bool,
+    has_left: bool,
 ) {
-    let has_top = mb_y > 0;
-    let has_left = mb_x > 0;
     let cbp_chroma = (mb.cbp >> 4) & 3;
 
     for plane_idx in 0..2usize {
@@ -441,8 +448,12 @@ pub fn decode_macroblock(
     let chroma_qp_idx = (qp as i32 + pps.chroma_qp_index_offset[0]).clamp(0, 51) as usize;
     let c_qp = CHROMA_QP_TABLE[chroma_qp_idx];
 
-    let has_top = mb_y > 0;
-    let has_left = mb_x > 0;
+    // Check neighbor availability with slice boundary awareness.
+    // H.264 spec: neighbors from different slices are unavailable.
+    let cur_slice = ctx.current_slice;
+    let has_top = mb_y > 0
+        && ctx.slice_table[mb_idx - ctx.mb_width as usize] == cur_slice;
+    let has_left = mb_x > 0 && ctx.slice_table[mb_idx - 1] == cur_slice;
 
     trace!(
         mb_x,
@@ -519,6 +530,7 @@ pub fn decode_macroblock(
     } else {
         [2i8; 16] // DC_PRED for I_16x16, I_PCM, and inter MBs
     };
+    ctx.slice_table[mb_idx] = ctx.current_slice;
     ctx.neighbor_ctx
         .update_after_mb(mb_x, &mb.non_zero_count, &intra4x4_modes);
     ctx.neighbor_ctx.left_available = true;
@@ -1098,8 +1110,6 @@ pub fn decode_skip_mb(
     mb_y: u32,
     ref_pics: &[&PictureBuffer],
 ) {
-    let mb_idx = (mb_y * ctx.mb_width + mb_x) as usize;
-
     if ref_pics.is_empty() {
         fill_mb_gray(ctx, mb_x, mb_y);
         for blk in 0..16 {
@@ -1131,11 +1141,11 @@ pub fn decode_skip_mb(
         }
     }
 
-    // Update neighbor context: all non_zero_count = 0, modes = DC_PRED.
-    // Inter MBs use DC_PRED (2) as intra4x4 mode context, not -1.
-    // See decode_macroblock() comment for full explanation.
+    // Record slice ownership and update neighbor context.
+    let mb_idx = (mb_y * ctx.mb_width + mb_x) as usize;
+    ctx.slice_table[mb_idx] = ctx.current_slice;
     let nz = [0u8; 24];
-    let modes = [2i8; 16];
+    let modes = [2i8; 16]; // DC_PRED for inter MBs
     ctx.neighbor_ctx.update_after_mb(mb_x, &nz, &modes);
     ctx.neighbor_ctx.left_available = true;
 
@@ -1351,7 +1361,7 @@ fn decode_intra4x4(
     }
 
     // Decode chroma
-    decode_chroma(ctx, mb, mb_x, mb_y, chroma_qp);
+    decode_chroma(ctx, mb, mb_x, mb_y, chroma_qp, has_top, has_left);
 }
 
 // ---------------------------------------------------------------------------
@@ -1448,5 +1458,5 @@ fn decode_intra16x16(
     }
 
     // Decode chroma
-    decode_chroma(ctx, mb, mb_x, mb_y, chroma_qp);
+    decode_chroma(ctx, mb, mb_x, mb_y, chroma_qp, has_top, has_left);
 }

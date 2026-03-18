@@ -285,6 +285,12 @@ impl H264Decoder {
                 // Decode this slice into the current frame context.
                 // Take the fdc temporarily to avoid borrow conflicts.
                 if let Some(mut fdc) = self.current_fdc.take() {
+                    // Track slice boundaries for neighbor availability.
+                    // First slice (first_mb==0) starts at 0; continuations increment.
+                    if hdr.first_mb_in_slice > 0 {
+                        fdc.current_slice += 1;
+                    }
+
                     // Build list of reference PictureBuffer pointers
                     let ref_pic_list: Vec<&PictureBuffer> = self
                         .ref_list_l0
@@ -478,7 +484,17 @@ impl H264Decoder {
             // Update neighbor context at the start of each row
             if mb_x == 0 {
                 fdc.neighbor_ctx.new_row();
-                fdc.neighbor_ctx.top_available = mb_y > 0;
+                // Top is available only if it exists AND is in the same slice.
+                fdc.neighbor_ctx.top_available = mb_y > 0
+                    && fdc.slice_table[(mb_addr - mb_width) as usize]
+                        == fdc.current_slice;
+            } else if mb_addr == first_mb {
+                // First MB of a continuation slice that doesn't start at
+                // column 0: the left neighbor is from the previous slice.
+                fdc.neighbor_ctx.left_available = false;
+                fdc.neighbor_ctx.top_available = mb_y > 0
+                    && fdc.slice_table[(mb_addr - mb_width) as usize]
+                        == fdc.current_slice;
             }
 
             if is_inter_slice {
@@ -500,7 +516,9 @@ impl H264Decoder {
                     let skip_y = mb_addr / mb_width;
                     if skip_x == 0 && mb_addr != first_mb {
                         fdc.neighbor_ctx.new_row();
-                        fdc.neighbor_ctx.top_available = skip_y > 0;
+                        fdc.neighbor_ctx.top_available = skip_y > 0
+                            && fdc.slice_table[(mb_addr - mb_width) as usize]
+                                == fdc.current_slice;
                     }
                     mb::decode_skip_mb(fdc, hdr, skip_x, skip_y, ref_pics);
                     mb_addr += 1;
@@ -522,7 +540,9 @@ impl H264Decoder {
                 let mb_y = mb_addr / mb_width;
                 if mb_x == 0 && mb_addr != first_mb {
                     fdc.neighbor_ctx.new_row();
-                    fdc.neighbor_ctx.top_available = mb_y > 0;
+                    fdc.neighbor_ctx.top_available = mb_y > 0
+                        && fdc.slice_table[(mb_addr - mb_width) as usize]
+                            == fdc.current_slice;
                 }
             } else {
                 // Intra slice: no skip run, but guard against reading past end.
