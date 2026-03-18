@@ -3,16 +3,18 @@
 **Purpose**: Persistent scratch pad for debug findings. Read this file at the
 start of every context window to avoid re-discovering the same things.
 
-**Current status**: 15/17 BITEXACT. See H264.md for full conformance table.
+**Current status**: 16/17 LUMA BITEXACT (no-deblock). Chroma V has ±1-3 diffs
+on 4 multi-slice files. See H264.md for full conformance table.
 
 ## WEDEO_NO_DEBLOCK usage
 
 `WEDEO_NO_DEBLOCK=1` disables wedeo's deblocking filter; `mb_compare.py`
 also passes `-skip_loop_filter all` to FFmpeg when this env var is set.
-This gives clean per-MB pixel isolation for debugging. **Verified**: files
-that are BITEXACT without deblocking are also BITEXACT with deblocking
-(the deblocking filter is correct). Keep using it for debugging, drop it
-for final verification / regression tests.
+This gives clean per-MB pixel isolation for debugging.
+
+**Note**: the deblocking filter has a chroma issue on BA1_FT_C (all frames
+differ with deblocking). Files that are BITEXACT without deblocking may NOT
+be bitexact with deblocking if they have a chroma V rounding issue.
 
 ## How to extract trace data (DON'T LOOP ON THIS)
 
@@ -38,18 +40,7 @@ update the binary that mb_compare.py uses.
 See memory/feedback_empirical_debug_workflow.md for details. Use lldb for
 one-off questions, not C programs.
 
-## Remaining 2 failures
-
-### BA1_FT_C (352x288, multi-slice) — 260/299 frames match
-
-- First diff at frame 261 MB(19,9)
-- 352x288 = 22x18 MBs, many slices per frame with non-uniform first_mb
-- Slice boundaries: first_mb = 0,7,15,23,31,45,63,88,119,153,...
-- MB(19,9) = mb_addr = 9*22+19 = 217. Need to check which slice this is in.
-- Likely the same RBSP exhaustion margin issue or another slice boundary
-  edge case. The 1-bit margin fix solved SVA files but may not cover all cases.
-- **Next step**: Run mb_compare on just frames 260-265 to isolate the diff.
-  Then use the MC ref check trace to see if the reference has valid data.
+## Remaining issues
 
 ### BA3_SVA_C — B-frames (slice_type=6) not implemented
 
@@ -62,7 +53,26 @@ one-off questions, not C programs.
   - B-frame specific mb_type parsing
   - Direct mode MV derivation
 
-## Bugs fixed this session (for reference)
+### Chroma V (Cr) ±1 rounding issue
+
+- Affects: SVA_BA2_D (1/17), SVA_NL2_E (3/17), SVA_Base_B (8/17),
+  SVA_CL1_E (43/50), BA1_FT_C (29/299)
+- Y and U planes are perfect. Only V (Cr) has ±1 to ±3 diffs.
+- Pattern: uniform ±1 across 4x4 or 8x4 chroma sub-blocks
+- Not slice-boundary related (SVA_BA2_D is single-slice)
+- Both U and V use identical code paths (same mc_chroma, same IDCT)
+- The `second_chroma_qp_index_offset` is same as first for Baseline, so QP is not the issue
+- **Next step**: Extract actual chroma coefficients and MC output from both
+  decoders for a simple case (SVA_BA2_D frame 16, MB(7,8)) and find WHERE
+  the V values first diverge.
+
+### Deblocking filter chroma issue
+
+- BA1_FT_C: all frames differ with deblocking but 270/299 match without
+- Other files may also have deblocking chroma issues
+- Likely related to or caused by the chroma V rounding issue
+
+## Bugs fixed (for reference)
 
 1. IDCT pass order (row-first then column) — all I-frames bitexact
 2. Inter MB intra4x4 mode context (DC_PRED not -1) — 7 files
@@ -71,10 +81,14 @@ one-off questions, not C programs.
 5. Slice boundary tracking (slice_table + per-MB top_available)
 6. Slice-aware MV prediction neighbors
 7. RBSP exhaustion margin (8→1 bit) — SVA_Base_B/FM1_E/CL1_E
+8. RBSP exhaustion graceful error (mb_skip_run parse at end-of-slice)
+9. MV neighbor C/D slice check for blk_y > 0 — BA1_FT_C luma bitexact
 
 ## Key technical notes for future sessions
 
 - `mb_compare.py` checks target/debug FIRST, then target/release
+- `mb_compare.py --start-frame N` skips to frame N for faster debugging
+- **mb_compare.py only checks LUMA** — chroma diffs won't be caught
 - `cargo run --features tracing` builds a DIFFERENT binary than `cargo build`
   without features — they don't share the cache, so rebuilding one doesn't
   update the other
