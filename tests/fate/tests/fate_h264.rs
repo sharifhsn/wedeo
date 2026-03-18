@@ -270,6 +270,86 @@ fn fate_h264_demuxer_au_grouping() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Bitexact regression tests (framecrc parity with FFmpeg)
+// ---------------------------------------------------------------------------
+
+/// BA1_Sony_D.jsv: Baseline BITEXACT — 17 frames, 176x144, QP=28, I+P.
+#[test]
+fn fate_h264_ba1_sony_d_bitexact() {
+    let path = conformance_file("BA1_Sony_D.jsv");
+    if !path.exists() {
+        return;
+    }
+
+    let wedeo = match wedeo_fate::run_wedeo_framecrc(&path) {
+        Ok(lines) => lines,
+        Err(e) => panic!("wedeo-framecrc failed: {e}"),
+    };
+
+    let Some(ffmpeg) = wedeo_fate::run_ffmpeg_framecrc_video(&path) else {
+        eprintln!("SKIP: ffmpeg not available for cross-validation");
+        return;
+    };
+
+    match wedeo_fate::compare_framecrc_lines(&wedeo, &ffmpeg) {
+        Ok(()) => eprintln!("PASS: BA1_Sony_D.jsv BITEXACT"),
+        Err(e) => panic!("BA1_Sony_D.jsv NOT BITEXACT:\n{e}"),
+    }
+}
+
+/// SVA_BA1_B.264: Baseline BITEXACT — single-slice I-frames, 176x144.
+#[test]
+fn fate_h264_sva_ba1_b_bitexact() {
+    let path = conformance_file("SVA_BA1_B.264");
+    if !path.exists() {
+        return;
+    }
+
+    let wedeo = match wedeo_fate::run_wedeo_framecrc(&path) {
+        Ok(lines) => lines,
+        Err(e) => panic!("wedeo-framecrc failed: {e}"),
+    };
+
+    let Some(ffmpeg) = wedeo_fate::run_ffmpeg_framecrc_video(&path) else {
+        eprintln!("SKIP: ffmpeg not available for cross-validation");
+        return;
+    };
+
+    match wedeo_fate::compare_framecrc_lines(&wedeo, &ffmpeg) {
+        Ok(()) => eprintln!("PASS: SVA_BA1_B.264 BITEXACT"),
+        Err(e) => panic!("SVA_BA1_B.264 NOT BITEXACT:\n{e}"),
+    }
+}
+
+/// SVA_NL1_B.264: Baseline BITEXACT — single-slice I-frames, 176x144.
+#[test]
+fn fate_h264_sva_nl1_b_bitexact() {
+    let path = conformance_file("SVA_NL1_B.264");
+    if !path.exists() {
+        return;
+    }
+
+    let wedeo = match wedeo_fate::run_wedeo_framecrc(&path) {
+        Ok(lines) => lines,
+        Err(e) => panic!("wedeo-framecrc failed: {e}"),
+    };
+
+    let Some(ffmpeg) = wedeo_fate::run_ffmpeg_framecrc_video(&path) else {
+        eprintln!("SKIP: ffmpeg not available for cross-validation");
+        return;
+    };
+
+    match wedeo_fate::compare_framecrc_lines(&wedeo, &ffmpeg) {
+        Ok(()) => eprintln!("PASS: SVA_NL1_B.264 BITEXACT"),
+        Err(e) => panic!("SVA_NL1_B.264 NOT BITEXACT:\n{e}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Demuxer tests
+// ---------------------------------------------------------------------------
+
 /// Test that the demuxer produces correct packet count for a multi-slice file.
 /// SVA_Base_B.264 has 3 slices per frame.
 #[test]
