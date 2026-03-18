@@ -166,7 +166,21 @@ pub fn mark_reference(
     current_dpb_idx: Option<usize>,
 ) {
     if is_idr {
-        dpb.clear();
+        // Clear all entries except the current one. The current entry
+        // was just stored with RefStatus::Unused and needs to survive
+        // the clear so it can be marked as a reference picture.
+        for (i, entry) in dpb.entries.iter_mut().enumerate() {
+            if Some(i) == current_dpb_idx {
+                continue;
+            }
+            if let Some(e) = entry {
+                if e.needs_output {
+                    e.status = RefStatus::Unused;
+                } else {
+                    *entry = None;
+                }
+            }
+        }
         if let Some(idx) = current_dpb_idx
             && let Some(entry) = dpb.get_mut(idx)
         {
@@ -265,7 +279,19 @@ fn apply_mmco(
             }
 
             MmcoOp::Reset => {
-                dpb.clear();
+                // Clear all entries except the current one
+                for (i, entry) in dpb.entries.iter_mut().enumerate() {
+                    if Some(i) == current_dpb_idx {
+                        continue;
+                    }
+                    if let Some(e) = entry {
+                        if e.needs_output {
+                            e.status = RefStatus::Unused;
+                        } else {
+                            *entry = None;
+                        }
+                    }
+                }
                 current_marked = true;
                 if let Some(idx) = current_dpb_idx
                     && let Some(entry) = dpb.get_mut(idx)
