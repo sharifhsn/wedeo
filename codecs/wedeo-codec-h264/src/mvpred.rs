@@ -534,33 +534,56 @@ impl MvContext {
         // Neighbor C (top-right, falling back to D=top-left)
         // The neighbor_c method handles the complex availability logic
         // within a MB. For cross-MB access, check slice boundary.
-        let (mv_c, ref_c, c_avail) = if blk_y == 0 && slice_table.is_some() {
-            // Top-right/top-left are cross-MB — need slice check.
-            // Determine which MB neighbor_c would access.
+        let (mv_c, ref_c, c_avail) = if slice_table.is_some() {
+            // Determine which MB the C/D result comes from and check slices.
+            // C candidate: (blk_x + part_width, blk_y - 1)
             let cr_x = blk_x + part_width;
-            if cr_x < 4 {
-                // Top-right is in the MB above (same column or next)
-                if mb_y > 0 && same_slice(mb_x, mb_y - 1) {
-                    match self.neighbor_c(mb_x, mb_y, blk_x, blk_y, part_width) {
-                        Some((mv, r)) => (mv, r, true),
-                        None => ([0, 0], -1, false),
-                    }
-                } else {
-                    ([0, 0], -1, false)
+            let cr_y = blk_y.wrapping_sub(1);
+            let abs_cr_x = mb_x as i32 * 4 + cr_x as i32;
+            let abs_cr_y = mb_y as i32 * 4 + cr_y as i32;
+
+            // Check C availability: must be in-bounds and in a decoded MB
+            let c_mb_ok = if abs_cr_x >= 0
+                && abs_cr_y >= 0
+                && abs_cr_x < self.mb_width as i32 * 4
+                && abs_cr_y < self.mb_height as i32 * 4
+            {
+                let c_mb_x = abs_cr_x as u32 / 4;
+                let c_mb_y = abs_cr_y as u32 / 4;
+                let is_same_mb = c_mb_x == mb_x && c_mb_y == mb_y;
+                let is_past = c_mb_y < mb_y || (c_mb_y == mb_y && c_mb_x <= mb_x);
+                is_same_mb || (is_past && same_slice(c_mb_x, c_mb_y))
+            } else {
+                false
+            };
+
+            if c_mb_ok {
+                match self.neighbor_c(mb_x, mb_y, blk_x, blk_y, part_width) {
+                    Some((mv, r)) => (mv, r, true),
+                    None => ([0, 0], -1, false),
                 }
             } else {
-                // cr_x >= 4 → top-right would be in MB above-right
-                let tr_mb_x = mb_x + 1;
-                if mb_y > 0 && tr_mb_x < self.mb_width && same_slice(tr_mb_x, mb_y - 1) {
-                    match self.neighbor_c(mb_x, mb_y, blk_x, blk_y, part_width) {
-                        Some((mv, r)) => (mv, r, true),
-                        None => ([0, 0], -1, false),
-                    }
-                } else if mb_y > 0 && mb_x > 0 && same_slice(mb_x - 1, mb_y - 1) {
-                    // Fall back to D (top-left), but also need slice check for it
-                    // neighbor_c already falls back to D internally, but we need
-                    // to check its slice too. Call neighbor_c and let it handle D.
-                    match self.neighbor_c(mb_x, mb_y, blk_x, blk_y, part_width) {
+                // C not available — try D (top-left fallback)
+                let dl_x = blk_x.wrapping_sub(1);
+                let dl_y = blk_y.wrapping_sub(1);
+                let abs_dl_x = mb_x as i32 * 4 + dl_x as i32;
+                let abs_dl_y = mb_y as i32 * 4 + dl_y as i32;
+
+                let d_mb_ok = if abs_dl_x >= 0
+                    && abs_dl_y >= 0
+                    && abs_dl_x < self.mb_width as i32 * 4
+                    && abs_dl_y < self.mb_height as i32 * 4
+                {
+                    let d_mb_x = abs_dl_x as u32 / 4;
+                    let d_mb_y = abs_dl_y as u32 / 4;
+                    let is_same_mb = d_mb_x == mb_x && d_mb_y == mb_y;
+                    is_same_mb || same_slice(d_mb_x, d_mb_y)
+                } else {
+                    false
+                };
+
+                if d_mb_ok {
+                    match self.try_get_neighbor(mb_x, mb_y, dl_x, dl_y) {
                         Some((mv, r)) => (mv, r, true),
                         None => ([0, 0], -1, false),
                     }
