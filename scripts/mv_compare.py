@@ -234,6 +234,19 @@ def main():
         print(f"Error: {input_path} not found", file=sys.stderr)
         sys.exit(1)
 
+    # Validate --mb argument early
+    target_mb = None
+    if args.mb:
+        parts = args.mb.split(",")
+        if len(parts) != 2:
+            print(f"Error: --mb must be X,Y (e.g., '2,0'), got '{args.mb}'", file=sys.stderr)
+            sys.exit(1)
+        try:
+            target_mb = (int(parts[0]), int(parts[1]))
+        except ValueError:
+            print(f"Error: --mb must be integers X,Y, got '{args.mb}'", file=sys.stderr)
+            sys.exit(1)
+
     width, height = get_dimensions(input_path)
     mb_w, mb_h = width // 16, height // 16
     print(f"Dimensions: {width}x{height} ({mb_w}x{mb_h} MBs)")
@@ -243,9 +256,12 @@ def main():
     wedeo_mvs = extract_wedeo_mvs(input_path, args.frame)
 
     if not wedeo_mvs:
-        print(f"Warning: no MV data found for frame {args.frame}", file=sys.stderr)
-        print("Make sure wedeo-framecrc was built with tracing:")
-        print("  cargo build --bin wedeo-framecrc -p wedeo-fate --features tracing")
+        print(f"Warning: no MV data found for frame {args.frame}.", file=sys.stderr)
+        print(
+            "  Hint: build with tracing support:\n"
+            "  cargo build --bin wedeo-framecrc -p wedeo-fate --features tracing",
+            file=sys.stderr,
+        )
 
     # Pixel comparison
     wedeo_data = b""
@@ -259,10 +275,9 @@ def main():
             print(f"Warning: decode failed: {e}", file=sys.stderr)
             wedeo_data = ffmpeg_data = b""
 
-    if args.mb:
+    if target_mb:
         # Single MB mode
-        parts = args.mb.split(",")
-        mx, my = int(parts[0]), int(parts[1])
+        mx, my = target_mb
 
         print(f"\n=== MB({mx},{my}) frame {args.frame} ===")
         if (mx, my) in wedeo_mvs:
