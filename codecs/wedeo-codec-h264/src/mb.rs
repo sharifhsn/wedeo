@@ -591,7 +591,7 @@ fn decode_inter_mb(
         0 => {
             // P_L0_16x16: one 16x16 partition
             let ref_idx = mb.ref_idx_l0[0].max(0) as usize;
-            let n = ctx.mv_ctx.get_neighbors(mb_x, mb_y, 0, 0, 4);
+            let n = ctx.mv_ctx.get_neighbors_slice(mb_x, mb_y, 0, 0, 4, Some(&ctx.slice_table), ctx.current_slice);
             #[cfg(feature = "tracing-detail")]
             trace!(
                 mb_x, mb_y,
@@ -632,7 +632,7 @@ fn decode_inter_mb(
             for part in 0..2u32 {
                 let ref_idx = mb.ref_idx_l0[part as usize].max(0) as usize;
                 let blk_y = part * 2; // 0 for top, 2 for bottom
-                let n = ctx.mv_ctx.get_neighbors(mb_x, mb_y, 0, blk_y, 4);
+                let n = ctx.mv_ctx.get_neighbors_slice(mb_x, mb_y, 0, blk_y, 4, Some(&ctx.slice_table), ctx.current_slice);
                 let mvp = mvpred::predict_mv_16x8(
                     n.mv_a,
                     n.mv_b,
@@ -668,7 +668,7 @@ fn decode_inter_mb(
             for part in 0..2u32 {
                 let ref_idx = mb.ref_idx_l0[part as usize].max(0) as usize;
                 let blk_x = part * 2; // 0 for left, 2 for right
-                let n = ctx.mv_ctx.get_neighbors(mb_x, mb_y, blk_x, 0, 2);
+                let n = ctx.mv_ctx.get_neighbors_slice(mb_x, mb_y, blk_x, 0, 2, Some(&ctx.slice_table), ctx.current_slice);
                 let mvp = mvpred::predict_mv_8x16(
                     n.mv_a,
                     n.mv_b,
@@ -716,7 +716,7 @@ fn decode_inter_mb(
                 match sub_type {
                     0 => {
                         // 8x8 sub-partition
-                        let n = ctx.mv_ctx.get_neighbors(mb_x, mb_y, part_x, part_y, 2);
+                        let n = ctx.mv_ctx.get_neighbors_slice(mb_x, mb_y, part_x, part_y, 2, Some(&ctx.slice_table), ctx.current_slice);
                         #[cfg(feature = "tracing-detail")]
                         trace!(
                             mb_x, mb_y, i8x8, part_x, part_y,
@@ -774,7 +774,7 @@ fn decode_inter_mb(
                         // 8x4 sub-partition: two 8x4 blocks
                         for sub in 0..2u32 {
                             let sub_y = part_y + sub;
-                            let n = ctx.mv_ctx.get_neighbors(mb_x, mb_y, part_x, sub_y, 2);
+                            let n = ctx.mv_ctx.get_neighbors_slice(mb_x, mb_y, part_x, sub_y, 2, Some(&ctx.slice_table), ctx.current_slice);
                             let mvp = mvpred::predict_mv(
                                 n.mv_a,
                                 n.mv_b,
@@ -827,7 +827,7 @@ fn decode_inter_mb(
                         // 4x8 sub-partition: two 4x8 blocks
                         for sub in 0..2u32 {
                             let sub_x = part_x + sub;
-                            let n = ctx.mv_ctx.get_neighbors(mb_x, mb_y, sub_x, part_y, 1);
+                            let n = ctx.mv_ctx.get_neighbors_slice(mb_x, mb_y, sub_x, part_y, 1, Some(&ctx.slice_table), ctx.current_slice);
                             let mvp = mvpred::predict_mv(
                                 n.mv_a,
                                 n.mv_b,
@@ -881,7 +881,7 @@ fn decode_inter_mb(
                         for sub in 0..4u32 {
                             let sub_x = part_x + (sub % 2);
                             let sub_y = part_y + (sub / 2);
-                            let n = ctx.mv_ctx.get_neighbors(mb_x, mb_y, sub_x, sub_y, 1);
+                            let n = ctx.mv_ctx.get_neighbors_slice(mb_x, mb_y, sub_x, sub_y, 1, Some(&ctx.slice_table), ctx.current_slice);
                             let mvp = mvpred::predict_mv(
                                 n.mv_a,
                                 n.mv_b,
@@ -1117,7 +1117,7 @@ pub fn decode_skip_mb(
         }
     } else {
         // Compute skip MV from neighbors
-        let n = ctx.mv_ctx.get_neighbors(mb_x, mb_y, 0, 0, 4);
+        let n = ctx.mv_ctx.get_neighbors_slice(mb_x, mb_y, 0, 0, 4, Some(&ctx.slice_table), ctx.current_slice);
         #[cfg(feature = "tracing-detail")]
         trace!(
             mb_x, mb_y,

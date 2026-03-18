@@ -472,17 +472,107 @@ impl MvContext {
         blk_y: u32,
         part_width: u32,
     ) -> NeighborInfo {
-        let (mv_a, ref_a, a_avail) = match self.neighbor_a(mb_x, mb_y, blk_x, blk_y) {
-            Some((mv, r)) => (mv, r, true),
-            None => ([0, 0], -1, false),
+        self.get_neighbors_slice(mb_x, mb_y, blk_x, blk_y, part_width, None, 0)
+    }
+
+    /// Like `get_neighbors` but with slice-boundary awareness.
+    /// If `slice_table` is Some, neighbors from different slices are unavailable.
+    #[allow(clippy::too_many_arguments)] // slice-awareness needs both table + current_slice
+    pub fn get_neighbors_slice(
+        &self,
+        mb_x: u32,
+        mb_y: u32,
+        blk_x: u32,
+        blk_y: u32,
+        part_width: u32,
+        slice_table: Option<&[u16]>,
+        current_slice: u16,
+    ) -> NeighborInfo {
+        // Helper: check if a neighbor MB is in the same slice
+        let same_slice = |nb_mb_x: u32, nb_mb_y: u32| -> bool {
+            match slice_table {
+                None => true,
+                Some(st) => {
+                    let idx = (nb_mb_y * self.mb_width + nb_mb_x) as usize;
+                    idx < st.len() && st[idx] == current_slice
+                }
+            }
         };
-        let (mv_b, ref_b, b_avail) = match self.neighbor_b(mb_x, mb_y, blk_x, blk_y) {
-            Some((mv, r)) => (mv, r, true),
-            None => ([0, 0], -1, false),
+
+        // Neighbor A (left)
+        let (mv_a, ref_a, a_avail) = if blk_x > 0 {
+            // Within same MB — always available
+            match self.neighbor_a(mb_x, mb_y, blk_x, blk_y) {
+                Some((mv, r)) => (mv, r, true),
+                None => ([0, 0], -1, false),
+            }
+        } else if mb_x > 0 && same_slice(mb_x - 1, mb_y) {
+            match self.neighbor_a(mb_x, mb_y, blk_x, blk_y) {
+                Some((mv, r)) => (mv, r, true),
+                None => ([0, 0], -1, false),
+            }
+        } else {
+            ([0, 0], -1, false)
         };
-        let (mv_c, ref_c, c_avail) = match self.neighbor_c(mb_x, mb_y, blk_x, blk_y, part_width) {
-            Some((mv, r)) => (mv, r, true),
-            None => ([0, 0], -1, false),
+
+        // Neighbor B (top)
+        let (mv_b, ref_b, b_avail) = if blk_y > 0 {
+            // Within same MB
+            match self.neighbor_b(mb_x, mb_y, blk_x, blk_y) {
+                Some((mv, r)) => (mv, r, true),
+                None => ([0, 0], -1, false),
+            }
+        } else if mb_y > 0 && same_slice(mb_x, mb_y - 1) {
+            match self.neighbor_b(mb_x, mb_y, blk_x, blk_y) {
+                Some((mv, r)) => (mv, r, true),
+                None => ([0, 0], -1, false),
+            }
+        } else {
+            ([0, 0], -1, false)
+        };
+
+        // Neighbor C (top-right, falling back to D=top-left)
+        // The neighbor_c method handles the complex availability logic
+        // within a MB. For cross-MB access, check slice boundary.
+        let (mv_c, ref_c, c_avail) = if blk_y == 0 && slice_table.is_some() {
+            // Top-right/top-left are cross-MB — need slice check.
+            // Determine which MB neighbor_c would access.
+            let cr_x = blk_x + part_width;
+            if cr_x < 4 {
+                // Top-right is in the MB above (same column or next)
+                if mb_y > 0 && same_slice(mb_x, mb_y - 1) {
+                    match self.neighbor_c(mb_x, mb_y, blk_x, blk_y, part_width) {
+                        Some((mv, r)) => (mv, r, true),
+                        None => ([0, 0], -1, false),
+                    }
+                } else {
+                    ([0, 0], -1, false)
+                }
+            } else {
+                // cr_x >= 4 → top-right would be in MB above-right
+                let tr_mb_x = mb_x + 1;
+                if mb_y > 0 && tr_mb_x < self.mb_width && same_slice(tr_mb_x, mb_y - 1) {
+                    match self.neighbor_c(mb_x, mb_y, blk_x, blk_y, part_width) {
+                        Some((mv, r)) => (mv, r, true),
+                        None => ([0, 0], -1, false),
+                    }
+                } else if mb_y > 0 && mb_x > 0 && same_slice(mb_x - 1, mb_y - 1) {
+                    // Fall back to D (top-left), but also need slice check for it
+                    // neighbor_c already falls back to D internally, but we need
+                    // to check its slice too. Call neighbor_c and let it handle D.
+                    match self.neighbor_c(mb_x, mb_y, blk_x, blk_y, part_width) {
+                        Some((mv, r)) => (mv, r, true),
+                        None => ([0, 0], -1, false),
+                    }
+                } else {
+                    ([0, 0], -1, false)
+                }
+            }
+        } else {
+            match self.neighbor_c(mb_x, mb_y, blk_x, blk_y, part_width) {
+                Some((mv, r)) => (mv, r, true),
+                None => ([0, 0], -1, false),
+            }
         };
 
         NeighborInfo {
