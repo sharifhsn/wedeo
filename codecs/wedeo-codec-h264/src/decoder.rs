@@ -9,7 +9,7 @@
 use std::collections::VecDeque;
 
 use tracing::{debug, warn};
-use wedeo_codec::bitstream::{BitRead, BitReadBE};
+use wedeo_codec::bitstream::{BitRead, BitReadBE, get_ue_golomb};
 use wedeo_codec::decoder::{CodecParameters, Decoder, DecoderDescriptor};
 use wedeo_codec::descriptor::{CodecCapabilities, CodecDescriptor, CodecProperties};
 use wedeo_codec::registry::DecoderFactory;
@@ -441,7 +441,10 @@ impl H264Decoder {
         // Decode macroblocks for this slice
         let first_mb = hdr.first_mb_in_slice;
         let mut mbs_decoded = 0u32;
-        for mb_addr in first_mb..total_mbs {
+        let is_inter_slice = hdr.slice_type.is_p() || hdr.slice_type.is_b();
+        let mut mb_addr = first_mb;
+
+        while mb_addr < total_mbs {
             // Check if we've consumed all RBSP data (end of slice).
             // Leave at least 8 bits margin for trailing bits and stop bit.
             if br.consumed() + 8 >= rbsp_bits {
@@ -457,7 +460,53 @@ impl H264Decoder {
                 fdc.neighbor_ctx.top_available = mb_y > 0;
             }
 
-            mb::decode_macroblock(fdc, &mut br, hdr, sps, pps, mb_x, mb_y, ref_pics)?;
+            if is_inter_slice {
+                // Parse mb_skip_run (ue(v))
+                let mb_skip_run = get_ue_golomb(&mut br)?;
+
+                // Process skipped MBs
+                for _ in 0..mb_skip_run {
+                    let skip_x = mb_addr % mb_width;
+                    let skip_y = mb_addr / mb_width;
+                    if skip_x == 0 && mb_addr != first_mb {
+                        fdc.neighbor_ctx.new_row();
+                        fdc.neighbor_ctx.top_available = skip_y > 0;
+                    }
+                    mb::decode_skip_mb(fdc, hdr, skip_x, skip_y, ref_pics);
+                    mb_addr += 1;
+                    mbs_decoded += 1;
+                }
+
+                if mb_addr >= total_mbs {
+                    break; // Skip run consumed remaining MBs
+                }
+
+                // Check if we've consumed all RBSP data after skip run
+                if br.consumed() + 8 >= rbsp_bits {
+                    break;
+                }
+
+                // Re-check row boundary after skips
+                let mb_x = mb_addr % mb_width;
+                let mb_y = mb_addr / mb_width;
+                if mb_x == 0 && mb_addr != first_mb {
+                    fdc.neighbor_ctx.new_row();
+                    fdc.neighbor_ctx.top_available = mb_y > 0;
+                }
+            }
+
+            // Decode coded MB (existing path)
+            mb::decode_macroblock(
+                fdc,
+                &mut br,
+                hdr,
+                sps,
+                pps,
+                mb_addr % mb_width,
+                mb_addr / mb_width,
+                ref_pics,
+            )?;
+            mb_addr += 1;
             mbs_decoded += 1;
         }
 

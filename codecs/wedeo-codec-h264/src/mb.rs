@@ -986,6 +986,68 @@ fn apply_mc_partition(
     );
 }
 
+/// Decode a P_SKIP macroblock.
+///
+/// P_SKIP macroblocks have no residual, no QP delta, and no bitstream data.
+/// The motion vector is derived from neighbors (A=left, B=top, C=top-right).
+/// QP carries forward from the previous macroblock.
+///
+/// Reference: ITU-T H.264 Section 7.4.5, 8.4.1.1
+pub fn decode_skip_mb(
+    ctx: &mut FrameDecodeContext,
+    slice_hdr: &SliceHeader,
+    mb_x: u32,
+    mb_y: u32,
+    ref_pics: &[&PictureBuffer],
+) {
+    let mb_idx = (mb_y * ctx.mb_width + mb_x) as usize;
+
+    if ref_pics.is_empty() {
+        fill_mb_gray(ctx, mb_x, mb_y);
+        for blk in 0..16 {
+            ctx.mv_ctx.set(mb_x, mb_y, blk, [0, 0], 0);
+        }
+    } else {
+        // Compute skip MV from neighbors
+        let n = ctx.mv_ctx.get_neighbors(mb_x, mb_y, 0, 0, 4);
+        let mv = mvpred::predict_mv_skip_full(
+            n.mv_a, n.mv_b, n.mv_c, n.ref_a, n.ref_b, n.ref_c, n.a_avail, n.b_avail, n.c_avail,
+        );
+
+        // Apply motion compensation from ref_pics[0]
+        apply_mc_partition(ctx, ref_pics[0], mb_x, mb_y, 0, 0, 16, 16, mv);
+
+        // Fill MV context for all 16 4x4 blocks
+        for blk in 0..16 {
+            ctx.mv_ctx.set(mb_x, mb_y, blk, mv, 0);
+        }
+    }
+
+    // Update neighbor context: all non_zero_count = 0, inter modes = -1
+    let nz = [0u8; 24];
+    let modes = [-1i8; 16];
+    ctx.neighbor_ctx.update_after_mb(mb_x, &nz, &modes);
+    ctx.neighbor_ctx.left_available = true;
+
+    // Store deblocking info
+    let mb_idx_base = mb_idx * 16;
+    let mut deblock_ref = [-1i8; 16];
+    let mut deblock_mv = [[0i16; 2]; 16];
+    if mb_idx_base + 16 <= ctx.mv_ctx.mv.len() {
+        deblock_ref.copy_from_slice(&ctx.mv_ctx.ref_idx[mb_idx_base..mb_idx_base + 16]);
+        deblock_mv.copy_from_slice(&ctx.mv_ctx.mv[mb_idx_base..mb_idx_base + 16]);
+    }
+    ctx.mb_info[mb_idx] = MbDeblockInfo {
+        is_intra: false,
+        qp: ctx.qp,
+        non_zero_count: [0; 24],
+        ref_idx: deblock_ref,
+        mv: deblock_mv,
+    };
+
+    let _ = slice_hdr; // reserved for future use (e.g. weighted prediction)
+}
+
 /// Fill a macroblock with gray (128) for all planes.
 ///
 /// Used when no reference frame is available for inter prediction.
