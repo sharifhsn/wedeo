@@ -346,6 +346,113 @@ fn fate_h264_sva_nl1_b_bitexact() {
     }
 }
 
+/// BAMQ1_JVC_C.264: Baseline BITEXACT — I-only with per-MB QP variation, 176x144.
+/// 30 frames, all I-frames. The per-MB QP delta exercises the full dequant/IDCT
+/// path at various quantization levels within each frame.
+#[test]
+fn fate_h264_bamq1_jvc_c_bitexact() {
+    let path = conformance_file("BAMQ1_JVC_C.264");
+    if !path.exists() {
+        return;
+    }
+
+    let wedeo = match wedeo_fate::run_wedeo_framecrc(&path) {
+        Ok(lines) => lines,
+        Err(e) => panic!("wedeo-framecrc failed: {e}"),
+    };
+
+    let Some(ffmpeg) = wedeo_fate::run_ffmpeg_framecrc_video(&path) else {
+        eprintln!("SKIP: ffmpeg not available for cross-validation");
+        return;
+    };
+
+    match wedeo_fate::compare_framecrc_lines(&wedeo, &ffmpeg) {
+        Ok(()) => eprintln!("PASS: BAMQ1_JVC_C.264 BITEXACT"),
+        Err(e) => panic!("BAMQ1_JVC_C.264 NOT BITEXACT:\n{e}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P-frame decode regression tests
+// ---------------------------------------------------------------------------
+
+/// BA_MW_D.264: Baseline I+P, 100 frames. All 100 frames should decode.
+/// P-frame decode works after DPB reference marking and CAVLC ref count fixes.
+#[test]
+fn fate_h264_ba_mw_d_frame_count() {
+    let path = conformance_file("BA_MW_D.264");
+    if !path.exists() {
+        return;
+    }
+
+    let frames = decode_all_frames(&path);
+    assert_eq!(
+        frames.len(),
+        100,
+        "BA_MW_D.264 should decode 100 frames"
+    );
+    for (i, &(w, h, pf, _)) in frames.iter().enumerate() {
+        assert_eq!(w, 176, "Frame {} width", i);
+        assert_eq!(h, 144, "Frame {} height", i);
+        assert_eq!(pf, PixelFormat::Yuv420p, "Frame {} pixel format", i);
+    }
+}
+
+/// SVA_Base_B.264: Multi-slice Baseline I+P, 17 frames.
+/// Previously panicked with OOB at fill_mb_gray; now decodes all 17 frames.
+#[test]
+fn fate_h264_sva_base_b_frame_count() {
+    let path = conformance_file("SVA_Base_B.264");
+    if !path.exists() {
+        return;
+    }
+
+    let frames = decode_all_frames(&path);
+    assert_eq!(
+        frames.len(),
+        17,
+        "SVA_Base_B.264 should decode 17 frames"
+    );
+}
+
+/// SVA_FM1_E.264: Multi-slice Baseline, 17 frames.
+/// Previously panicked; now decodes all 17 frames.
+#[test]
+fn fate_h264_sva_fm1_e_frame_count() {
+    let path = conformance_file("SVA_FM1_E.264");
+    if !path.exists() {
+        return;
+    }
+
+    let frames = decode_all_frames(&path);
+    assert_eq!(
+        frames.len(),
+        17,
+        "SVA_FM1_E.264 should decode 17 frames"
+    );
+}
+
+/// BA1_FT_C.264: Baseline 352x288, 299 frames.
+/// Previously decoded only 26/299; now all 299 frames.
+#[test]
+fn fate_h264_ba1_ft_c_frame_count() {
+    let path = conformance_file("BA1_FT_C.264");
+    if !path.exists() {
+        return;
+    }
+
+    let frames = decode_all_frames(&path);
+    assert_eq!(
+        frames.len(),
+        299,
+        "BA1_FT_C.264 should decode 299 frames"
+    );
+    for (i, &(w, h, _, _)) in frames.iter().enumerate() {
+        assert_eq!(w, 352, "Frame {} width", i);
+        assert_eq!(h, 288, "Frame {} height", i);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Demuxer tests
 // ---------------------------------------------------------------------------
