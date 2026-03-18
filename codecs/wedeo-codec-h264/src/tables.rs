@@ -42,7 +42,7 @@ pub const FIELD_SCAN_8X8: [u8; 64] = [
 /// dequantization. From FFmpeg `ff_h264_chroma_qp` (depth=8 row).
 pub const CHROMA_QP_TABLE: [u8; 52] = [
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
-    26, 27, 28, 29, 29, 30, 31, 32, 32, 33, 33, 34, 34, 35, 35, 36, 36, 37, 37, 37, 38, 38, 38, 39,
+    26, 27, 28, 29, 29, 30, 31, 32, 32, 33, 34, 34, 35, 35, 36, 36, 37, 37, 37, 38, 38, 38, 39, 39,
     39, 39,
 ];
 
@@ -202,10 +202,19 @@ mod tests {
 
     #[test]
     fn chroma_qp_clamps_above_29() {
-        // QP 30 maps to 29 (first clamped value)
-        assert_eq!(CHROMA_QP_TABLE[30], 29);
-        // QP 51 maps to 39 (maximum chroma QP)
-        assert_eq!(CHROMA_QP_TABLE[51], 39);
+        // Full table from H.264 spec Table 8-15, verified against FFmpeg CHROMA_QP_TABLE_END(8)
+        let expected: [u8; 52] = [
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+            23, 24, 25, 26, 27, 28, 29, 29, 30, 31, 32, 32, 33, 34, 34, 35, 35, 36, 36, 37, 37,
+            37, 38, 38, 38, 39, 39, 39, 39,
+        ];
+        for i in 0..52 {
+            assert_eq!(
+                CHROMA_QP_TABLE[i], expected[i],
+                "CHROMA_QP_TABLE[{i}]: got {}, expected {}",
+                CHROMA_QP_TABLE[i], expected[i]
+            );
+        }
     }
 
     #[test]

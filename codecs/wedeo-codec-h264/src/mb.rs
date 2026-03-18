@@ -1234,6 +1234,14 @@ fn decode_chroma_inter(
             let mut chroma_dc_out = [0i32; 4];
             idct::chroma_dc_dequant_idct(&mut chroma_dc_out, &mb.chroma_dc[plane_idx], qmul);
 
+            #[cfg(feature = "tracing-detail")]
+            {
+                let plane_name = if plane_idx == 0 { "U" } else { "V" };
+                trace!(mb_x, mb_y, plane = plane_name,
+                    dc_in = ?mb.chroma_dc[plane_idx], dc_out = ?chroma_dc_out,
+                    qmul, chroma_qp, "inter chroma DC");
+            }
+
             for (blk_idx, &dc_val) in chroma_dc_out.iter().enumerate() {
                 let blk_x = (blk_idx & 1) as u32;
                 let blk_y = (blk_idx >> 1) as u32;
@@ -1258,6 +1266,13 @@ fn decode_chroma_inter(
                 } else {
                     // DC-only
                     let dc_add = (dc_val + 32) >> 6;
+                    #[cfg(feature = "tracing-detail")]
+                    {
+                        let plane_name = if plane_idx == 0 { "U" } else { "V" };
+                        let mc_row0: Vec<u8> = (0..4).map(|i| plane_data[c_offset + i]).collect();
+                        trace!(mb_x, mb_y, plane = plane_name, blk_x, blk_y,
+                            dc_val, dc_add, mc_pred_row0 = ?mc_row0, "inter chroma DC-add");
+                    }
                     for j in 0..4 {
                         for i in 0..4 {
                             let idx = c_offset + j * c_stride + i;
