@@ -17,13 +17,18 @@
 - [x] **Pixel format conversion** — wedeo-scale now wraps dcv-color-primitives for I420/NV12↔RGB24/BGR24/RGBA/BGRA conversions. Converter struct with metadata preservation. 11 unit tests.
 
 ### Video codecs (native Rust, no existing crate covers these)
-- [~] **H.264 Baseline decoder** — I-frame pipeline working (CAVLC, intra pred, IDCT, deblocking). See `H264.md` for detailed status. Remaining:
-  - [ ] Fix CAVLC multi-slice bitstream desync (1-2 bit error in level decode)
-  - [ ] Wire P-frame inter prediction (mc.rs + mvpred.rs + refs.rs + dpb.rs all implemented)
-  - [ ] Achieve bitexact pixel parity with FFmpeg
-  - [ ] Fix demuxer access unit grouping (currently puts all NALs in one packet)
-  - [ ] Write FATE integration tests (compare framecrc output vs FFmpeg references)
-  - [ ] Pass all 17 Baseline FATE conformance tests
+- [~] **H.264 Baseline decoder** — 4/17 BITEXACT, all 17 decode all frames. See `H264.md` for detailed status. Remaining:
+  - [x] Wire P-frame inter prediction (mb_skip_run + P_SKIP + coded P-MB types 0-4)
+  - [x] Fix demuxer access unit grouping (SPS/AUD/first_mb_in_slice boundaries)
+  - [x] Write FATE integration tests (4 bitexact + 4 frame count regression tests)
+  - [x] Add per-MB debug infrastructure (tracing in mb.rs, scripts/mb_compare.py)
+  - [x] Fix BAMQ1 ±1 pixel diffs — IDCT pass order was row-major column-first instead of row-first
+  - [x] Fix multi-slice OOB panic — skip run bounds check prevents mb_y >= mb_height
+  - [x] Fix DPB IDR marking — current entry survives dpb.clear() to be marked ShortTerm
+  - [x] Fix CAVLC ref_idx desync — use slice header's num_ref_idx_l0_active, not PPS default
+  - [ ] Fix P-frame small diffs (max_diff ~28) — likely MV prediction for P_8x8 neighbor C
+  - [ ] Fix multi-slice continuation CAVLC desync — BASQP1, SVA_Base_B, SVA_FM1_E
+  - [ ] Pass remaining Baseline FATE conformance tests (13 remaining)
 - [ ] **VP9 decoder** — second priority for WebM support. Reference: `FFmpeg/libavcodec/vp9*.c`.
 - [ ] **HEVC decoder** — similar to H.264 but more complex (CTU/CTB structure).
 - [ ] **AV1 decoder** — check if Prossimo's rav1d (pure Rust AV1 decoder) is available as a crate. If so, wrap it like symphonia. If not, write from scratch.
