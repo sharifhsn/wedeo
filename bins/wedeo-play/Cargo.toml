@@ -1,0 +1,22 @@
+[package]
+name = "wedeo-play"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Simple video player for wedeo (decode + display)"
+
+[[bin]]
+name = "wedeo-play"
+path = "src/main.rs"
+
+[dependencies]
+wedeo-core = { workspace = true }
+wedeo-codec = { workspace = true }
+wedeo-format = { workspace = true }
+wedeo-scale = { workspace = true }
+wedeo-codec-pcm = { workspace = true }
+wedeo-codec-h264 = { workspace = true }
+wedeo-format-wav = { workspace = true }
+wedeo-format-h264 = { workspace = true }
+wedeo-symphonia = { workspace = true }
+minifb = "0.28"

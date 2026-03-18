@@ -12,6 +12,7 @@ members = [
     "formats/wedeo-format-h264",
     "adapters/wedeo-symphonia",
     "bins/wedeo-cli",
+    "bins/wedeo-play",
     "tests/fate",
 ]
 resolver = "3"
@@ -28,6 +29,7 @@ inventory = "0.3"
 tracing = { version = "0.1", default-features = false }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
+minifb = "0.28"
 wedeo-core = { path = "crates/wedeo-core" }
 wedeo-codec = { path = "crates/wedeo-codec" }
 wedeo-format = { path = "crates/wedeo-format" }
