@@ -633,6 +633,13 @@ fn decode_inter_mb(
                 let ref_idx = mb.ref_idx_l0[part as usize].max(0) as usize;
                 let blk_y = part * 2; // 0 for top, 2 for bottom
                 let n = ctx.mv_ctx.get_neighbors_slice(mb_x, mb_y, 0, blk_y, 4, Some(&ctx.slice_table), ctx.current_slice);
+                #[cfg(feature = "tracing-detail")]
+                trace!(mb_x, mb_y, part, ref_idx, blk_y,
+                    mv_a = ?n.mv_a, ref_a = n.ref_a, a_avail = n.a_avail,
+                    mv_b = ?n.mv_b, ref_b = n.ref_b, b_avail = n.b_avail,
+                    mv_c = ?n.mv_c, ref_c = n.ref_c, c_avail = n.c_avail,
+                    ref_pics_len = ref_pics.len(),
+                    "16x8 neighbors");
                 let mvp = mvpred::predict_mv_16x8(
                     n.mv_a,
                     n.mv_b,
@@ -650,6 +657,9 @@ fn decode_inter_mb(
                     mvp[0].wrapping_add(mb.mvd_l0[part as usize][0]),
                     mvp[1].wrapping_add(mb.mvd_l0[part as usize][1]),
                 ];
+
+                #[cfg(feature = "tracing-detail")]
+                trace!(mb_x, mb_y, part, mvp = ?mvp, mvd = ?mb.mvd_l0[part as usize], mv = ?mv, ref_idx, "16x8 MV");
 
                 let ref_pic = ref_pics[ref_idx.min(ref_pics.len() - 1)];
                 apply_mc_partition(ctx, ref_pic, mb_x, mb_y, 0, blk_y * 4, 16, 8, mv);
@@ -1012,7 +1022,7 @@ fn apply_mc_partition(
     let luma_offset = dst_y as usize * ctx.pic.y_stride + dst_x as usize;
 
     #[cfg(feature = "tracing-detail")]
-    if mb_x == 10 && mb_y == 8 {
+    if mb_x == 10 && mb_y == 2 {
         // Print first row of ref data that the MC will read
         let ry = luma_ref_y.clamp(0, ref_pic.height as i32 - 1) as usize;
         let stride = ref_pic.y_stride;

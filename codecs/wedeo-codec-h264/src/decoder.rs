@@ -394,6 +394,23 @@ impl H264Decoder {
                 vec![-1i8; total_blocks]
             };
 
+            // Debug: check if MB(10,2) is populated
+            #[cfg(feature = "tracing-detail")]
+            {
+                let px = 10 * 16;
+                let py = 2 * 16;
+                let s = fdc.pic.y_stride;
+                let val = fdc.pic.y[py * s + px];
+                let val2 = fdc.pic.y[py * s + px + 2];
+                tracing::trace!(
+                    frame_num = self.frame_num,
+                    mb10_2_pixel0 = val,
+                    mb10_2_pixel2 = val2,
+                    y_ptr = ?fdc.pic.y.as_ptr(),
+                    "DPB store check"
+                );
+            }
+
             let entry = DpbEntry {
                 pic: fdc.pic,
                 poc: self.current_pts as i32 * 2, // Simple POC = 2 * decode order

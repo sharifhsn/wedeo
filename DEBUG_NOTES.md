@@ -3,6 +3,15 @@
 **Purpose**: Persistent scratch pad for debug findings. Read this file at the
 start of every context window to avoid re-discovering the same things.
 
+## WEDEO_NO_DEBLOCK usage
+
+`WEDEO_NO_DEBLOCK=1` disables wedeo's deblocking filter; `mb_compare.py`
+also passes `-skip_loop_filter all` to FFmpeg when this env var is set.
+This gives clean per-MB pixel isolation for debugging. **Verified**: files
+that are BITEXACT without deblocking are also BITEXACT with deblocking
+(the deblocking filter is correct). Keep using it for debugging, drop it
+for final verification / regression tests.
+
 ## Active Investigation: Frame 31 MB(5,5) intra4x4 bug
 
 ### What we know (verified empirically)
@@ -109,6 +118,11 @@ Made BASQP1 BITEXACT and fixed SVA_Base_B/FM1_E/CL1_E frame 0.
 
 **Likely root causes:**
 - BA3_SVA_C: B-frames (slice_type=6). Not yet supported. Need B-frame decode.
-- SVA_Base_B/FM1_E/CL1_E: P-frame MV prediction doesn't respect slice boundaries
-  for neighbor availability. The `MvContext` doesn't check slice_table.
-- BA1_FT_C: Same as SVA files — P-frame MV neighbors from different slices
+- SVA_Base_B/FM1_E: **DPB reference pointer mismatch** — MC reads from wrong
+  buffer. Frame 1 is stored at y_ptr=0xae4c33000 but frame 2's ref_pics[0]
+  points to 0xae4c3a000 (a different buffer with zeros at MB(10,2)).
+  The ref list uses dpb_idx that doesn't match the stored frame.
+  ROOT CAUSE: likely a DPB store/retrieve index mismatch or frame being
+  replaced in DPB before it's used as reference.
+- SVA_CL1_E: likely same DPB issue
+- BA1_FT_C: 260 frames match, f261 diffs — may be different cause
