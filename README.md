@@ -69,6 +69,20 @@ cargo test
 cargo clippy
 ```
 
+### Using nextest (recommended)
+
+[cargo-nextest](https://nexte.st/) provides process-per-test isolation, slow test
+detection, and leak detection. Profiles are configured in `.config/nextest.toml`.
+
+```bash
+cargo install cargo-nextest --locked
+cargo nextest run                              # local dev (fail-fast, full parallelism)
+cargo nextest run --profile ci                 # CI mode (collects all failures, JUnit XML)
+cargo nextest run -p wedeo-codec-h264          # single crate
+FATE_SUITE=./fate-suite cargo nextest run --profile fate -p wedeo-fate
+cargo nextest list                             # list all tests
+```
+
 ## FATE testing
 
 FATE tests require sample files from FFmpeg's FATE server:

@@ -9,8 +9,9 @@ Contributions are welcome from both humans and AI agents.
 3. Read the FFmpeg C source for whatever you're implementing (`./FFmpeg/` submodule)
 4. Build and run tests to confirm your environment works:
    ```bash
-   cargo build && cargo test && cargo clippy
+   cargo build && cargo nextest run && cargo clippy
    ```
+   If nextest is not installed, `cargo test` also works.
 
 ## What we accept
 
@@ -57,21 +58,25 @@ Every PR must pass:
 
 - `cargo clippy` — zero warnings
 - `cargo fmt --check` — pass
-- `cargo test` — all existing tests pass
+- `cargo nextest run` (or `cargo test`) — all existing tests pass
 - FATE tests pass for any codec/format changes
 - Bitexact framecrc or SNR measurement vs FFmpeg for codec work
 - New divergences documented in [DIVERGENCES.md](DIVERGENCES.md)
 
 ## Commit message format
 
+We use [Conventional Commits](https://www.conventionalcommits.org/):
+
 ```
-<area>: <description>
+<type>(<scope>): <description>
 
 <body: why, not what>
 ```
 
-Areas: `core`, `codec/pcm`, `codec/h264`, `format/wav`, `format/h264`, `cli`,
-`fate`, `symphonia`, `docs`, `ci`
+**Types:** `feat`, `fix`, `refactor`, `perf`, `test`, `docs`, `ci`, `build`, `chore`
+
+**Scopes** (optional): `core`, `codec/pcm`, `codec/h264`, `format/wav`,
+`format/h264`, `play`, `cli`, `fate`, `symphonia`
 
 ## PR body
 

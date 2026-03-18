@@ -177,13 +177,14 @@ See `TODO.md` for the full task list and `DIVERGENCES.md` for known behavioral d
 
 ### Build & Check Commands
 - Always use `cargo` commands: `cargo build`, `cargo test`, `cargo run`
+- Prefer `cargo nextest run` over `cargo test` — provides process isolation, slow test detection, and leak detection
 - Run `cargo clippy` to detect warnings/errors and fix them before considering code complete
 - Run `cargo fmt` to format code before considering code complete
-- Run `cargo test` to verify changes don't break existing functionality
+- Run `cargo nextest run` (or `cargo test`) to verify changes don't break existing functionality
 - Use `cargo check` for fast compilation checks during development
 
 ### FATE Verification
-- Run FATE tests: `FATE_SUITE=./fate-suite cargo test -p wedeo-fate`
+- Run FATE tests: `FATE_SUITE=./fate-suite cargo nextest run --profile fate -p wedeo-fate` (or `FATE_SUITE=./fate-suite cargo test -p wedeo-fate`)
 - Cross-validate audio with FFmpeg: `cargo run --bin wedeo-framecrc -- <file>` vs `ffmpeg -bitexact -i <file> -c copy -f framecrc -`
 - Cross-validate video with FFmpeg: `cargo run --bin wedeo-framecrc -- <file>` vs `ffmpeg -bitexact -i <file> -f framecrc -`
 - Generate bitexact test WAVs: `cargo run --bin wedeo-audiogen -- output.wav 44100 2`
