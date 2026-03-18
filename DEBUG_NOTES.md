@@ -93,10 +93,22 @@ Wedeo has no slice_table.
 to FrameDecodeContext. Check slice_table when computing has_top/has_left.
 Made BASQP1 BITEXACT and fixed SVA_Base_B/FM1_E/CL1_E frame 0.
 
-## Issue Categories (for tracking)
+## Current status: 12/17 BITEXACT
 
-1. **Intra4x4 neighbor bug** — f31 MB(5,5), affects 4 files
-2. **Multi-slice I-frame corruption** — SVA_Base_B, SVA_FM1_E, SVA_CL1_E
-3. **BASQP1 CAVLC desync** — QP=0 multi-slice
-4. **Early P-frame diffs** — BAMQ2 f2, SVA_BA2_D f2, SVA_NL2_E f2, BA3_SVA_C f1
-5. **BA1_FT_C 352x288** — frame 0 broken
+**FIXED issues:**
+1. Intra4x4 neighbor bug — store DC_PRED(2) for inter MBs (7 files)
+2. Multi-slice I-frame corruption — slice_table for neighbor availability (BASQP1 + I-frames)
+3. Per-MB top_available — check slice_table per-MB not per-row (BA1_FT_C I-frame)
+
+**Remaining 5 files** (all have correct I-frames, P-frame diffs only):
+1. SVA_Base_B — I+P, multi-slice (3 slices/frame), f1 first diff MB(2,3)
+2. SVA_FM1_E — I+P, multi-slice, similar
+3. SVA_CL1_E — I+P, multi-slice, similar
+4. BA3_SVA_C — I+P+B, 90/99 MBs wrong in f1 → **has B-frames** (not implemented!)
+5. BA1_FT_C — I+P, multi-slice, f2 first diff MB(11,15)
+
+**Likely root causes:**
+- BA3_SVA_C: B-frames (slice_type=6). Not yet supported. Need B-frame decode.
+- SVA_Base_B/FM1_E/CL1_E: P-frame MV prediction doesn't respect slice boundaries
+  for neighbor availability. The `MvContext` doesn't check slice_table.
+- BA1_FT_C: Same as SVA files — P-frame MV neighbors from different slices
