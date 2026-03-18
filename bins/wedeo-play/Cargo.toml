@@ -19,4 +19,4 @@ wedeo-codec-h264 = { workspace = true }
 wedeo-format-wav = { workspace = true }
 wedeo-format-h264 = { workspace = true }
 wedeo-symphonia = { workspace = true }
-minifb = "0.28"
+minifb = { workspace = true }
