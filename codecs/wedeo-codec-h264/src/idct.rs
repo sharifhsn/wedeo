@@ -23,23 +23,18 @@ pub fn idct4x4_add(dst: &mut [u8], stride: usize, coeffs: &mut [i16; 16]) {
     // Add rounding bias to DC coefficient (same as FFmpeg's block[0] += 1 << 5)
     coeffs[0] = coeffs[0].wrapping_add(32);
 
-    // First pass: column transform (iterates over columns i=0..3, reads rows)
-    // This matches FFmpeg which iterates i=0..3 and accesses block[i + 4*row]
-    for i in 0..4 {
-        let z0 = coeffs[i] as i32 + coeffs[i + 8] as i32;
-        let z1 = coeffs[i] as i32 - coeffs[i + 8] as i32;
-        let z2 = (coeffs[i + 4] as i32 >> 1) - coeffs[i + 12] as i32;
-        let z3 = coeffs[i + 4] as i32 + (coeffs[i + 12] as i32 >> 1);
+    // FFmpeg stores coefficients in COLUMN-MAJOR (transposed) order and applies
+    // the same loop structure. With our ROW-MAJOR coefficients, we must swap the
+    // pass order to match FFmpeg's effective computation:
+    //   FFmpeg: row-transform first, column-transform second (on transposed data)
+    //   Wedeo:  row-transform first, column-transform second (on row-major data)
+    //
+    // The >>1 truncation in the butterfly makes pass order significant.
+    //
+    // Reference: FFmpeg `ff_h264_idct_add` in h264idct_template.c, noting that
+    // FFmpeg's block layout is transposed via h264_slice.c:757 TRANSPOSE().
 
-        coeffs[i] = (z0 + z3) as i16;
-        coeffs[i + 4] = (z1 + z2) as i16;
-        coeffs[i + 8] = (z1 - z2) as i16;
-        coeffs[i + 12] = (z0 - z3) as i16;
-    }
-
-    // Second pass: row transform and add to destination.
-    // Our coefficients are in row-major order (standard zigzag descan), so we
-    // write block row i → destination row i (no transpose).
+    // First pass: row transform (iterates over rows, mixes columns within each row)
     for i in 0..4 {
         let row = 4 * i;
         let z0 = coeffs[row] as i32 + coeffs[row + 2] as i32;
@@ -47,11 +42,23 @@ pub fn idct4x4_add(dst: &mut [u8], stride: usize, coeffs: &mut [i16; 16]) {
         let z2 = (coeffs[row + 1] as i32 >> 1) - coeffs[row + 3] as i32;
         let z3 = coeffs[row + 1] as i32 + (coeffs[row + 3] as i32 >> 1);
 
-        let d = i * stride;
-        dst[d] = (dst[d] as i32 + ((z0 + z3) >> 6)).clamp(0, 255) as u8;
-        dst[d + 1] = (dst[d + 1] as i32 + ((z1 + z2) >> 6)).clamp(0, 255) as u8;
-        dst[d + 2] = (dst[d + 2] as i32 + ((z1 - z2) >> 6)).clamp(0, 255) as u8;
-        dst[d + 3] = (dst[d + 3] as i32 + ((z0 - z3) >> 6)).clamp(0, 255) as u8;
+        coeffs[row] = (z0 + z3) as i16;
+        coeffs[row + 1] = (z1 + z2) as i16;
+        coeffs[row + 2] = (z1 - z2) as i16;
+        coeffs[row + 3] = (z0 - z3) as i16;
+    }
+
+    // Second pass: column transform and add to destination
+    for i in 0..4 {
+        let z0 = coeffs[i] as i32 + coeffs[i + 8] as i32;
+        let z1 = coeffs[i] as i32 - coeffs[i + 8] as i32;
+        let z2 = (coeffs[i + 4] as i32 >> 1) - coeffs[i + 12] as i32;
+        let z3 = coeffs[i + 4] as i32 + (coeffs[i + 12] as i32 >> 1);
+
+        dst[i] = (dst[i] as i32 + ((z0 + z3) >> 6)).clamp(0, 255) as u8;
+        dst[stride + i] = (dst[stride + i] as i32 + ((z1 + z2) >> 6)).clamp(0, 255) as u8;
+        dst[2 * stride + i] = (dst[2 * stride + i] as i32 + ((z1 - z2) >> 6)).clamp(0, 255) as u8;
+        dst[3 * stride + i] = (dst[3 * stride + i] as i32 + ((z0 - z3) >> 6)).clamp(0, 255) as u8;
     }
 
     // Zero the coefficient block (FFmpeg: memset(block, 0, 16 * sizeof(dctcoef)))
