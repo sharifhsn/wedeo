@@ -48,22 +48,34 @@ NO_BUILD=""
 BUILD_ONLY=""
 INPUT_FILE=""
 
+# Helper: require a value after a flag
+need_arg() {
+    if [[ $# -lt 2 || "$2" == --* ]]; then
+        echo "Error: $1 requires a value" >&2
+        exit 1
+    fi
+}
+
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --level)
+            need_arg "$@"
             RUST_LOG_LEVEL="$2"
             shift 2
             ;;
         --trace)
+            need_arg "$@"
             TRACE_FILE="$2"
             shift 2
             ;;
         --framecrc)
+            need_arg "$@"
             FRAMECRC_FILE="$2"
             shift 2
             ;;
         --grep)
+            need_arg "$@"
             GREP_PATTERN="$2"
             shift 2
             ;;
@@ -166,6 +178,13 @@ fi
 # the clean trace to TRACE_FILE. Stdout (framecrc) goes to FRAMECRC_FILE
 # or /dev/null.
 
+# Validate trace file path is writable
+TRACE_DIR=$(dirname "$TRACE_FILE")
+if [[ ! -d "$TRACE_DIR" ]]; then
+    echo "Error: trace directory $TRACE_DIR does not exist" >&2
+    exit 1
+fi
+
 FRAMECRC_DST="${FRAMECRC_FILE:-/dev/null}"
 
 echo "Running: RUST_LOG=$RUST_LOG $WEDEO_BIN $INPUT_FILE" >&2
@@ -176,12 +195,26 @@ fi
 
 # Run the binary directly (not cargo run) to avoid cargo stderr pollution.
 # Strip ANSI from stderr and write to trace file.
+#
+# We use a FIFO to redirect stderr through sed while preserving the
+# binary's exit code. Process substitution `2> >(sed ...)` swallows exit codes.
+TRACE_FIFO=$(mktemp -u)
+mkfifo "$TRACE_FIFO"
+trap 'rm -f "$TRACE_FIFO"' EXIT
+
+# Start sed reading from the FIFO in the background
+sed 's/\x1b\[[0-9;]*m//g' < "$TRACE_FIFO" > "$TRACE_FILE" &
+SED_PID=$!
+
+# Run wedeo with stderr going to the FIFO
+WEDEO_EXIT=0
 "$WEDEO_BIN" "$INPUT_FILE" \
     1>"$FRAMECRC_DST" \
-    2> >(sed 's/\x1b\[[0-9;]*m//g' > "$TRACE_FILE")
+    2>"$TRACE_FIFO" \
+    || WEDEO_EXIT=$?
 
-# Wait for the background sed process to finish
-wait
+# Wait for sed to finish processing (FIFO cleaned up by EXIT trap)
+wait "$SED_PID" 2>/dev/null
 
 TRACE_LINES=$(wc -l < "$TRACE_FILE")
 echo "Trace captured: $TRACE_LINES lines in $TRACE_FILE" >&2
@@ -191,8 +224,14 @@ if [[ "$TRACE_LINES" -eq 0 ]]; then
     echo "  Rebuild: cargo build --bin wedeo-framecrc -p wedeo-fate --features tracing" >&2
 fi
 
+if [[ "$WEDEO_EXIT" -ne 0 ]]; then
+    echo "WARNING: wedeo-framecrc exited with code $WEDEO_EXIT" >&2
+fi
+
 # Step 4: Optional grep
 if [[ -n "$GREP_PATTERN" ]]; then
     echo "--- grep '$GREP_PATTERN' ---" >&2
     grep -- "$GREP_PATTERN" "$TRACE_FILE" || echo "(no matches)" >&2
 fi
+
+exit "$WEDEO_EXIT"
