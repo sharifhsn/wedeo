@@ -52,6 +52,10 @@ it will be closed without review.
 8. **No drive-by annotations.** Don't add type annotations, docstrings, or
    comments to code you didn't change.
 
+9. **No CLAUDE.md changes without maintainer approval.** `CLAUDE.md` is the
+   project's source of truth for architecture, conventions, and AI agent
+   instructions. Changes require explicit sign-off from a maintainer.
+
 ## Verification requirements
 
 Every PR must pass:
