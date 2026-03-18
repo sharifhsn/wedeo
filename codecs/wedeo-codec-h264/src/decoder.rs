@@ -532,7 +532,15 @@ impl H264Decoder {
                 // MB in the frame is a P_SKIP; if we broke out before parsing
                 // it (because only the run + RBSP trailing bits remain), that
                 // MB would stay at the zero-initialised value.
-                let mb_skip_run = get_ue_golomb(&mut br)?;
+                //
+                // However, if parsing fails because we've consumed almost all
+                // RBSP data (only trailing bits remain), that's a normal end
+                // of slice, not an error.
+                let mb_skip_run = match get_ue_golomb(&mut br) {
+                    Ok(v) => v,
+                    Err(_) if br.consumed() + 8 >= rbsp_bits => break,
+                    Err(e) => return Err(e),
+                };
                 #[cfg(feature = "tracing-detail")]
                 trace!(mb_addr, mb_skip_run, bits = br.consumed(), "mb_skip_run");
 
