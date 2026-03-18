@@ -436,6 +436,7 @@ impl H264Decoder {
         padded.extend_from_slice(rbsp);
         padded.resize(rbsp.len() + 8, 0);
         let mut br = BitReadBE::new(&padded);
+        tracing::debug!(header_bits = hdr.header_bits, "slice header size");
         br.skip_bits(hdr.header_bits);
 
         // Decode macroblocks for this slice
@@ -466,6 +467,9 @@ impl H264Decoder {
 
                 // Process skipped MBs
                 for _ in 0..mb_skip_run {
+                    if mb_addr >= total_mbs {
+                        break;
+                    }
                     let skip_x = mb_addr % mb_width;
                     let skip_y = mb_addr / mb_width;
                     if skip_x == 0 && mb_addr != first_mb {
