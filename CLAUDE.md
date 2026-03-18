@@ -31,14 +31,14 @@ wedeo/
     wedeo-codec/                # libavcodec — Decoder/Encoder traits, registry (inventory crate)
     wedeo-format/               # libavformat — Demuxer/Muxer traits, BufferedIo, InputContext
     wedeo-filter/               # libavfilter — Filter trait, FilterGraph (stub)
-    wedeo-resample/             # libswresample (stub)
-    wedeo-scale/                # libswscale (stub)
+    wedeo-resample/             # libswresample — rubato wrapper, interleaved I/O
+    wedeo-scale/                # libswscale — dcv-color-primitives wrapper
 
   adapters/
     wedeo-symphonia/            # Wraps symphonia decoders/demuxers behind wedeo traits (priority 50)
 
   codecs/
-    wedeo-codec-pcm/            # PCM decoder + encoder — S16LE/BE, S24LE/BE, S32LE/BE, U8/16/24/32, F32/F64, alaw, mulaw
+    wedeo-codec-pcm/            # PCM encoder (17 formats); decoders registered via symphonia at pri 100
     wedeo-codec-h264/           # H.264/AVC Baseline decoder — 19 modules, ~15,300 lines (see H264.md)
 
   formats/
@@ -56,124 +56,6 @@ wedeo/
       tests/fate_pcm_wav.rs     # Integration tests with FFmpeg cross-validation
       tests/fate_symphonia.rs   # Symphonia adapter tests (priority, lossless bitexact, lossy SNR)
 ```
-
-## Current Status (0 clippy warnings)
-
-### H.264 video decoder (native Rust, in progress)
-
-First native video codec. Decodes H.264 Baseline profile I-frames to YUV420p.
-See `H264.md` for detailed architecture, module map, and known issues.
-
-**Decoder** (`codecs/wedeo-codec-h264/`, ~15,300 lines):
-- NAL parsing (Annex B + NALFF/avcC), SPS/PPS, slice header with MMCO
-- CAVLC entropy decoding (all VLC tables, level/run decode, mb_type parsing)
-- 17 intra prediction modes (9 Intra4x4 + 4 Intra16x16 + 4 chroma)
-- 4x4/8x8 integer IDCT, luma/chroma DC Hadamard transforms (i32 precision)
-- Flat dequantization (spec-equivalent, avoids i16 overflow in FFmpeg's precomputed tables)
-- In-loop deblocking filter (boundary strength, strong/normal filtering, luma+chroma)
-- Quarter-pel luma MC (6-tap FIR), eighth-pel chroma bilinear (ready, not wired)
-- MV prediction, reference list construction, MMCO, DPB (ready, not wired)
-- Cross-MB intra4x4 prediction mode tracking (top/left neighbor modes)
-- Multi-slice frame support, avcC extradata parsing
-
-**Demuxer** (`formats/wedeo-format-h264/`, ~480 lines):
-- Annex B start code scanning, SPS-based probe (score 100)
-- Access unit grouping (AUD, SPS, first_mb_in_slice boundaries)
-- File extensions: .264, .h264, .h26l, .avc
-
-**FATE Baseline conformance: 1/9 tests bitexact** (2026-03-17):
-
-| Test | Resolution | QP | Types | Status |
-|------|-----------|-----|-------|--------|
-| BA1_Sony_D | 176x144 | 28 | I | **BITEXACT** (17 frames) |
-| BAMQ1_JVC_C | 176x144 | 24 | I | 71 dB (±1-4 diffs, per-MB QP variation) |
-| BASQP1_Sony_C | 176x144 | 0 | I | 5.8 dB (QP=0 dequant issue) |
-| BA1_FT_C | 352x288 | 30 | I | 3.7 dB (different resolution) |
-| BA_MW_D, BA2_Sony_F, BAMQ2, BANM, BA3 | 176x144 | 24-28 | I+P/B | P/B-frame decode not wired |
-
-### FFmpeg audio parity via symphonia
-
-wedeo can decode the most common audio formats by wrapping symphonia 0.5.5 behind
-wedeo's trait interfaces. Native Rust implementations (priority 100) win over
-symphonia wrappers (priority 50) when both exist (e.g., WAV/PCM always uses native).
-
-**Decode coverage (28 decoders):**
-
-| Codec | Source | Verified | Quality |
-|-------|--------|----------|---------|
-| PCM (17 variants) | Native | FATE bitexact | Byte-identical to FFmpeg 8.0.1 |
-| FLAC 16/24-bit | Symphonia | Bitexact vs FFmpeg | Byte-identical |
-| WavPack 16/24-bit | Symphonia | Bitexact vs FFmpeg | Byte-identical |
-| Vorbis | Symphonia | SNR verified | ~140 dB SNR (float rounding only) |
-| AAC (ADTS + M4A) | Symphonia | SNR verified | ~120-134 dB SNR after alignment |
-| MP3 | Symphonia | SNR verified | ~128 dB SNR after alignment (gapless trim differs) |
-| MP1/MP2 | Symphonia | Registered | Untested |
-| Opus | opus-decoder | SNR verified | CELT ~48 dB, SILK ~11-14 dB (crate quality gap) |
-| ALAC | Symphonia | Registered | Untested (no FATE samples) |
-| ADPCM IMA WAV | Symphonia | Registered | Untested |
-| ADPCM MS | Symphonia | Registered | Untested |
-
-**Encode coverage (17 encoders):** All PCM formats, native, bitexact roundtrip verified.
-
-**Demux coverage (9 demuxers):**
-
-| Format | Source | Verified |
-|--------|--------|----------|
-| WAV (RIFF/RIFX/RF64/BW64) | Native | FATE bitexact, 13/13 FATE suite files |
-| OGG | Symphonia | Probe + Vorbis decode verified |
-| FLAC | Symphonia | Probe + decode bitexact verified |
-| MP4/M4A | Symphonia | Probe verified |
-| MKV/WebM | Symphonia | Probe verified |
-| AIFF/AIFC | Symphonia | Probe verified |
-| CAF | Symphonia | Probe verified |
-| MP3 (ID3v2/sync) | Symphonia | Probe + decode SNR verified |
-
-**Mux coverage (1 muxer):** WAV — bitexact roundtrip (demux → decode → encode → mux → demux = identical).
-
-**Gapless support:** MP3 (via symphonia's LAME/Xing header parsing), AAC in M4A (via iTunSMPB metadata parsing), OGG/Vorbis (via symphonia's gapless mode). Trim applied through `Packet.trim_start`/`trim_end` fields.
-
-**Audio resampling:** `wedeo-resample` wraps `rubato` with Fast/Normal/High quality modes, interleaved I/O, chunked processing.
-
-### Fully implemented and verified
-- **WAV demuxer**: All PCM format tags (0x0001 PCM, 0x0003 IEEE float, 0x0006 A-law, 0x0007 mu-law, 0xFFFE extensible). Streaming support (data_size=0xFFFFFFFF). Post-data metadata scanning. Truncated file handling. RIFX/RF64/BW64 probe detection. 13/13 FATE suite PCM WAV files pass bitexact vs FFmpeg 8.0.1.
-- **PCM decoder + encoder**: 17 registered decoders + 17 registered encoders covering S16LE/BE, S24LE/BE, S32LE/BE, U8, U16LE/BE, U24LE/BE, U32LE/BE, F32LE/BE, F64LE/BE. Byte-swapping, unsigned-to-signed conversion, 24-bit-to-32-bit expansion all matching FFmpeg's pcm.c DECODE macro behavior. Encoder is the exact reverse (encode_samples).
-- **WAV muxer**: Writes standard RIFF/WAVE files with fmt + data chunks. Supports PCM, IEEE float, A-law, mu-law format tags. Patches RIFF/data sizes in trailer on seekable outputs. Roundtrip (demux → decode → encode → mux) is bitexact.
-- **Symphonia audio backend** (`adapters/wedeo-symphonia/`): Wraps symphonia 0.5.5 decoders and demuxers behind wedeo's traits. 8 decoder factories (FLAC, MP3, AAC, Vorbis, ALAC, WavPack, ADPCM IMA WAV, ADPCM MS) and 8 demuxer factories (OGG, FLAC, MP4, MKV, AIFF, CAF, MP3, WAV). I/O bridge transfers ownership via `BufferedIo::take_inner()`. Channel layout, metadata, and sample format conversion modules.
-- **Core types**: Rational (with FFmpeg-exact `av_rescale_rnd` and `av_reduce`), Buffer (Arc-based CoW with SIMD padding), Frame (with side data matching all 32 `AVFrameSideDataType` values, video fields: ColorPrimaries/ColorTransferCharacteristic/ChromaLocation enums matching FFmpeg pixfmt.h, crop rect, pkt_dts, best_effort_timestamp, repeat_pict), Packet (with 41 side data types), Metadata (ordered, case-insensitive), 36 standard channel layout names, all CodecId discriminants verified against FFmpeg headers.
-- **Codec registry**: Priority-based selection — `find_decoder`/`find_encoder` pick the highest-priority factory when multiple implementations exist. Demuxer `probe()` uses priority as tie-breaker.
-- **Codec options**: `CodecOptions` type with typed getters (i64/f64/bool), threaded through CodecParameters → DecoderBuilder → factory. CodecParameters also carries `thread_count` and `codec_tag`.
-- **OutputContext**: High-level muxer wrapper (create → write_packet → finish) mirroring InputContext.
-- **FATE harness**: Bitexact audiogen (byte-identical to FFmpeg's tests/audiogen.c), framecrc generator with FFmpeg-compatible Adler-32, cross-validation integration tests, lossless bitexact tests, lossy SNR tests.
-
-### Framework ready, awaiting implementation
-- **wedeo-codec**: Decoder/Encoder traits, DecoderBuilder with codec-private options, inventory-based registry, bitstream utilities (exp-golomb parsing via av-bitstream) — ready for new codecs.
-- **wedeo-format**: Demuxer/Muxer traits, BufferedIo (with read/write buffering, typed methods, take_inner), InputContext/OutputContext, protocol layer — ready for new formats.
-- **wedeo-filter**: Filter trait, FilterGraph skeleton — needs format negotiation and frame queues before use.
-- **wedeo-resample**: Wraps `rubato` for sample rate conversion. Fast (polynomial), Normal (sinc 128pt), High (sinc 256pt) quality modes. Handles deinterleave/reinterleave and chunked processing.
-- **wedeo-scale**: Pixel format converter wrapping `dcv-color-primitives`. Supports I420/NV12↔RGB24/BGR24/RGBA/BGRA and RGB↔BGRA conversions. Converter struct preserves frame metadata through conversion.
-
-### Known architectural gaps (from adversarial review)
-- **Buffer**: No buffer pool (needed for high-throughput decode), no custom free callback (needed for hw accel / zero-copy). `Vec<u8>` doesn't guarantee SIMD alignment.
-- **Frame**: Missing opaque user data. color_primaries, color_trc, chroma_location, crop rect, pkt_dts, best_effort_timestamp, repeat_pict are now implemented.
-- **Decoder trait**: No get_buffer callback (needed for hw accel / zero-copy buffer allocation).
-- **Demuxer trait**: No read_close, no chapters/programs, no find_stream_info equivalent.
-- **Filter graph**: No format negotiation, no frame passing mechanism (queues, push/pull). The stub topology is correct but the data flow is missing.
-- **Error**: No error context (where/why), no codec-specific error codes.
-
-### In progress
-- **H.264 Baseline decoder** — I-frame decode pipeline works end-to-end, P-frame inter prediction implemented but not wired. See `H264.md`.
-
-### Not yet started
-- Video codecs (HEVC, VP9, AV1, etc.) — native Rust implementations, no existing crate covers these
-- Non-WAV muxers (MP4, MKV, etc.)
-- Hardware acceleration
-
-### Available infrastructure crates (added as dependencies)
-- `v_frame` 0.5.1 — YUV frame buffers from rav1e (21M downloads), 64-byte aligned. For video Frame expansion.
-- `av-bitstream` 0.2.1 — Bitstream reader/writer for video codec parsing (exp-golomb, CABAC).
-- `yuvxyb` 0.5.0 — Colorspace conversions (YUV ↔ XYB/RGB). For wedeo-scale.
-
-See `TODO.md` for the full task list and `DIVERGENCES.md` for known behavioral differences vs FFmpeg.
 
 ## Rust Development Practices
 
@@ -228,3 +110,116 @@ new codecs and formats.
 - The original planning conversation is in `start.json`
 - FFmpeg codec_id.h values are sequential enums — count positions carefully, don't guess
 - FFmpeg's `tests/audiogen.c` is the canonical synthetic audio generator — our port is bitexact
+
+## Current Status (0 clippy warnings)
+
+### H.264 video decoder (native Rust, in progress)
+
+First native video codec. Decodes H.264 Baseline profile I-frames to YUV420p.
+See `H264.md` for detailed architecture, module map, and known issues.
+
+**Decoder** (`codecs/wedeo-codec-h264/`, ~15,300 lines):
+- NAL parsing (Annex B + NALFF/avcC), SPS/PPS, slice header with MMCO
+- CAVLC entropy decoding (all VLC tables, level/run decode, mb_type parsing)
+- 17 intra prediction modes (9 Intra4x4 + 4 Intra16x16 + 4 chroma)
+- 4x4/8x8 integer IDCT, luma/chroma DC Hadamard transforms (i32 precision)
+- Flat dequantization (spec-equivalent, avoids i16 overflow in FFmpeg's precomputed tables)
+- In-loop deblocking filter (boundary strength, strong/normal filtering, luma+chroma)
+- Quarter-pel luma MC (6-tap FIR), eighth-pel chroma bilinear (ready, not wired)
+- MV prediction, reference list construction, MMCO, DPB (ready, not wired)
+- Cross-MB intra4x4 prediction mode tracking (top/left neighbor modes)
+- Multi-slice frame support, avcC extradata parsing
+
+**Demuxer** (`formats/wedeo-format-h264/`, ~480 lines):
+- Annex B start code scanning, SPS-based probe (score 100)
+- Access unit grouping (AUD, SPS, first_mb_in_slice boundaries)
+- File extensions: .264, .h264, .h26l, .avc
+
+**FATE Baseline conformance: 1/9 tests bitexact** (2026-03-17):
+
+| Test | Resolution | QP | Types | Status |
+|------|-----------|-----|-------|--------|
+| BA1_Sony_D | 176x144 | 28 | I | **BITEXACT** (17 frames) |
+| BAMQ1_JVC_C | 176x144 | 24 | I | 71 dB (±1-4 diffs, per-MB QP variation) |
+| BASQP1_Sony_C | 176x144 | 0 | I | 5.8 dB (QP=0 dequant issue) |
+| BA1_FT_C | 352x288 | 30 | I | 3.7 dB (different resolution) |
+| BA_MW_D, BA2_Sony_F, BAMQ2, BANM, BA3 | 176x144 | 24-28 | I+P/B | P/B-frame decode not wired |
+
+### FFmpeg audio parity via symphonia
+
+wedeo can decode the most common audio formats by wrapping symphonia 0.5.5 behind
+wedeo's trait interfaces. Native Rust implementations (priority 100) win over
+symphonia wrappers (priority 50) when both exist (e.g., WAV/PCM always uses native).
+
+**Decode coverage (28 decoders):**
+
+| Codec | Source | Verified | Quality |
+|-------|--------|----------|---------|
+| PCM (17 variants) | Symphonia (pri 100) | FATE bitexact | Byte-identical to FFmpeg 8.0.1 |
+| FLAC 16/24-bit | Symphonia | Bitexact vs FFmpeg | Byte-identical |
+| WavPack 16/24-bit | Symphonia | Bitexact vs FFmpeg | Byte-identical |
+| Vorbis | Symphonia | SNR verified | ~140 dB SNR (float rounding only) |
+| AAC (ADTS + M4A) | Symphonia | SNR verified | ~120-134 dB SNR after alignment |
+| MP3 | Symphonia | SNR verified | ~128 dB SNR after alignment (gapless trim differs) |
+| MP1/MP2 | Symphonia | Registered | Untested |
+| Opus | opus-decoder | SNR verified | CELT ~48 dB, SILK ~11-14 dB (crate quality gap) |
+| ALAC | Symphonia | Registered | Untested (no FATE samples) |
+| ADPCM IMA WAV | Symphonia | Registered | Untested |
+| ADPCM MS | Symphonia | Registered | Untested |
+
+**Encode coverage (17 encoders):** All PCM formats, native (`wedeo-codec-pcm`), bitexact roundtrip verified.
+
+**Demux coverage (10 demuxers):**
+
+| Format | Source | Verified |
+|--------|--------|----------|
+| WAV (RIFF/RIFX/RF64/BW64) | Native | FATE bitexact, 13/13 FATE suite files |
+| H.264 Annex B | Native | Probe + decode verified |
+| OGG | Symphonia | Probe + Vorbis decode verified |
+| FLAC | Symphonia | Probe + decode bitexact verified |
+| MP4/M4A | Symphonia | Probe verified |
+| MKV/WebM | Symphonia | Probe verified |
+| AIFF/AIFC | Symphonia | Probe verified |
+| CAF | Symphonia | Probe verified |
+| MP3 (ID3v2/sync) | Symphonia | Probe + decode SNR verified |
+
+**Mux coverage (1 muxer):** WAV — bitexact roundtrip (demux → decode → encode → mux → demux = identical).
+
+**Gapless support:** MP3 (via symphonia's LAME/Xing header parsing), AAC in M4A (via iTunSMPB metadata parsing), OGG/Vorbis (via symphonia's gapless mode). Trim applied through `Packet.trim_start`/`trim_end` fields.
+
+**Audio resampling:** `wedeo-resample` wraps `rubato` with Fast/Normal/High quality modes, interleaved I/O, chunked processing.
+
+### Fully implemented and verified
+- **WAV demuxer**: RIFF/RIFX/RF64/BW64 probe, all PCM format tags, streaming, truncated file handling. 13/13 FATE suite files bitexact vs FFmpeg 8.0.1.
+- **PCM codec**: 17 decoders (via symphonia adapter at priority 100) + 17 native encoders (`wedeo-codec-pcm`). Byte-swapping, unsigned-to-signed conversion, 24→32-bit expansion matching FFmpeg's pcm.c.
+- **WAV muxer**: RIFF/WAVE with fmt + data chunks, PCM/float/alaw/mulaw format tags. Roundtrip bitexact.
+- **Symphonia audio backend** (`adapters/wedeo-symphonia/`): 10 non-PCM decoder factories (FLAC, MP1, MP2, MP3, AAC, Vorbis, ALAC, WavPack, ADPCM IMA/MS) + 17 PCM decoder factories + 1 Opus (`opus-decoder` crate) + 8 demuxer factories.
+- **Core types**: Rational (`av_rescale_rnd`/`av_reduce`), Buffer (Arc CoW + SIMD padding), Frame (32 side data types, video fields), Packet (41 side data types), Metadata (ordered), 36 channel layout names, all CodecId discriminants.
+- **Codec registry**: Priority-based `find_decoder`/`find_encoder`. Demuxer `probe()` uses priority as tie-breaker.
+- **FATE harness**: Bitexact audiogen, framecrc with FFmpeg-compatible Adler-32, cross-validation tests.
+
+### Framework ready, awaiting implementation
+- **wedeo-filter**: Filter trait, FilterGraph skeleton — needs format negotiation and frame queues before use.
+
+### Known architectural gaps
+- **Buffer**: No buffer pool, no custom free callback, no guaranteed SIMD alignment.
+- **Frame**: Missing opaque user data.
+- **Decoder trait**: No get_buffer callback (needed for hw accel / zero-copy).
+- **Demuxer trait**: No read_close, no chapters/programs, no find_stream_info equivalent.
+- **Filter graph**: No format negotiation, no frame passing mechanism.
+- **Error**: No error context (where/why), no codec-specific error codes.
+
+### In progress
+- **H.264 Baseline decoder** — I-frame decode pipeline works end-to-end, P-frame inter prediction implemented but not wired. See `H264.md`.
+
+### Not yet started
+- Video codecs (HEVC, VP9, AV1, etc.) — native Rust implementations, no existing crate covers these
+- Non-WAV muxers (MP4, MKV, etc.)
+- Hardware acceleration
+
+### Available infrastructure crates (added as dependencies)
+- `v_frame` 0.5.1 — YUV frame buffers from rav1e (21M downloads), 64-byte aligned. For video Frame expansion.
+- `av-bitstream` 0.2.1 — Bitstream reader/writer for video codec parsing (exp-golomb, CABAC).
+- `yuvxyb` 0.5.0 — Colorspace conversions (YUV ↔ XYB/RGB). For wedeo-scale.
+
+See `TODO.md` for the full task list and `DIVERGENCES.md` for known behavioral differences vs FFmpeg.

@@ -47,7 +47,7 @@ wedeo/
     wedeo-symphonia/     # Wraps symphonia decoders/demuxers (priority 50)
   codecs/
     wedeo-codec-pcm/     # Native PCM codec (priority 100)
-    wedeo-codec-h264/    # Native H.264 decoder (~15,200 lines)
+    wedeo-codec-h264/    # Native H.264 decoder (~15,300 lines)
   formats/
     wedeo-format-wav/    # Native WAV demuxer + muxer
     wedeo-format-h264/   # H.264 Annex B demuxer
