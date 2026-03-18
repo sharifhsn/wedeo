@@ -3,8 +3,8 @@
 **Purpose**: Persistent scratch pad for debug findings. Read this file at the
 start of every context window to avoid re-discovering the same things.
 
-**Current status**: 16/17 LUMA BITEXACT (no-deblock). Chroma V has ±1-3 diffs
-on 4 multi-slice files. See H264.md for full conformance table.
+**Current status**: 16/17 BITEXACT (with deblocking). Only BA3_SVA_C (B-frames)
+remains. See H264.md for full conformance table.
 
 ## WEDEO_NO_DEBLOCK usage
 
@@ -53,24 +53,18 @@ one-off questions, not C programs.
   - B-frame specific mb_type parsing
   - Direct mode MV derivation
 
-### Chroma V (Cr) ±1 rounding issue
+### Chroma V (Cr) ±1 rounding — FIXED (2026-03-18)
 
-- Affects: SVA_BA2_D (1/17), SVA_NL2_E (3/17), SVA_Base_B (8/17),
-  SVA_CL1_E (43/50), BA1_FT_C (29/299)
-- Y and U planes are perfect. Only V (Cr) has ±1 to ±3 diffs.
-- Pattern: uniform ±1 across 4x4 or 8x4 chroma sub-blocks
-- Not slice-boundary related (SVA_BA2_D is single-slice)
-- Both U and V use identical code paths (same mc_chroma, same IDCT)
-- The `second_chroma_qp_index_offset` is same as first for Baseline, so QP is not the issue
-- **Next step**: Extract actual chroma coefficients and MC output from both
-  decoders for a simple case (SVA_BA2_D frame 16, MB(7,8)) and find WHERE
-  the V values first diverge.
+Root cause: `CHROMA_QP_TABLE[36]` was 33 instead of 34 (transcription error).
+Shifted all chroma QPs for luma QP >= 36 by -1, causing wrong dequant scale.
+Fixed → 16/17 BITEXACT (no-deblock), up from 11/17.
 
-### Deblocking filter chroma issue
+### Deblocking filter diffs — FIXED (2026-03-18)
 
-- BA1_FT_C: all frames differ with deblocking but 270/299 match without
-- Other files may also have deblocking chroma issues
-- Likely related to or caused by the chroma V rounding issue
+Root cause: `TC0_TABLE` had only 3 entries of `[1,1,1]` at QP 23-25
+instead of 4 at QP 23-26, shifting all tc0 values from QP 26 onwards.
+This caused wrong clipping thresholds in the deblocking filter.
+Fixed → 16/17 BITEXACT with full deblocking (up from 10/17).
 
 ## Bugs fixed (for reference)
 
@@ -83,6 +77,8 @@ one-off questions, not C programs.
 7. RBSP exhaustion margin (8→1 bit) — SVA_Base_B/FM1_E/CL1_E
 8. RBSP exhaustion graceful error (mb_skip_run parse at end-of-slice)
 9. MV neighbor C/D slice check for blk_y > 0 — BA1_FT_C luma bitexact
+10. CHROMA_QP_TABLE transcription error at index 36 — 16/17 BITEXACT (no-deblock)
+11. TC0_TABLE transcription error at QP 26 — 16/17 BITEXACT (with deblocking)
 
 ## Key technical notes for future sessions
 
