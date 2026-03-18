@@ -1,0 +1,57 @@
+# cargo-nextest configuration for wedeo
+# https://nexte.st/docs/configuration/
+
+[store]
+dir = "target/nextest"
+
+# --- Default profile (local dev) ---
+[profile.default]
+test-threads = "num-cpus"
+slow-timeout = { period = "10s", terminate-after = 6 }
+leak-timeout = "500ms"
+retries = 0
+fail-fast = true
+failure-output = "immediate"
+success-output = "never"
+
+# --- CI profile ---
+[profile.ci]
+fail-fast = false
+failure-output = "immediate-final"
+success-output = "final"
+retries = 0
+
+[profile.ci.junit]
+path = "junit.xml"
+
+# --- FATE profile (focused FATE debugging) ---
+[profile.fate]
+test-threads = 4
+fail-fast = false
+status-level = "all"
+final-status-level = "all"
+slow-timeout = { period = "30s", terminate-after = 4 }
+
+[profile.fate.junit]
+path = "junit.xml"
+
+# --- Per-test overrides ---
+
+# FATE integration tests get more time (they do file I/O and spawn subprocesses)
+[[profile.default.overrides]]
+filter = "package(wedeo-fate) & kind(test)"
+slow-timeout = { period = "30s", terminate-after = 4 }
+leak-timeout = "2s"
+test-group = "fate-integration"
+
+[[profile.ci.overrides]]
+filter = "package(wedeo-fate) & kind(test)"
+slow-timeout = { period = "30s", terminate-after = 4 }
+leak-timeout = "2s"
+test-group = "fate-integration"
+
+# --- Test groups ---
+# FATE tests write to shared /tmp/wedeo-fate/ directories — limit concurrency
+# to avoid filename collisions on files like asynth-44100-2.wav
+[test-groups.fate-integration]
+max-threads = 4
