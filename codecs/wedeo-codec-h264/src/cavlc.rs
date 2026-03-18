@@ -742,6 +742,7 @@ pub fn decode_mb_cavlc(
     _mb_y: u32,
     _mb_width: u32,
     num_ref_idx_l0_active: u32,
+    _num_ref_idx_l1_active: u32,
 ) -> Result<MacroblockCavlc> {
     let mut mb = MacroblockCavlc::default();
 

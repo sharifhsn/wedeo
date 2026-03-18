@@ -99,6 +99,115 @@ pub fn build_ref_list_p(
     list
 }
 
+/// Build reference lists L0 and L1 for a B-slice (frame-only).
+///
+/// L0: short-term with POC <= current (descending by POC),
+///     then short-term with POC > current (ascending by POC),
+///     then long-term (ascending by long_term_frame_idx).
+/// L1: short-term with POC > current (ascending by POC),
+///     then short-term with POC <= current (descending by POC),
+///     then long-term (ascending by long_term_frame_idx).
+/// If L0 == L1 and len > 1, swap L1[0] and L1[1].
+///
+/// Returns (list0, list1) as DPB indices.
+///
+/// Reference: FFmpeg `h264_initialise_ref_list`, H.264 spec 8.2.4.2.3-4.
+pub fn build_ref_list_b(
+    dpb: &Dpb,
+    slice_hdr: &SliceHeader,
+    current_poc: i32,
+) -> (Vec<usize>, Vec<usize>) {
+    // Collect short-term references split by POC relative to current.
+    let mut st_before: Vec<(usize, i32)> = Vec::new(); // POC <= current
+    let mut st_after: Vec<(usize, i32)> = Vec::new(); // POC > current
+
+    for (i, entry) in dpb.entries.iter().enumerate() {
+        if let Some(e) = entry
+            && e.status == RefStatus::ShortTerm
+        {
+            if e.poc <= current_poc {
+                st_before.push((i, e.poc));
+            } else {
+                st_after.push((i, e.poc));
+            }
+        }
+    }
+
+    // Sort: before = descending POC, after = ascending POC
+    st_before.sort_by_key(|&(_, poc)| std::cmp::Reverse(poc));
+    st_after.sort_by_key(|&(_, poc)| poc);
+
+    // Collect long-term references sorted by long_term_frame_idx ascending
+    let mut long_term: Vec<(usize, u32)> = Vec::new();
+    for (i, entry) in dpb.entries.iter().enumerate() {
+        if let Some(e) = entry
+            && e.status == RefStatus::LongTerm
+        {
+            long_term.push((i, e.long_term_frame_idx));
+        }
+    }
+    long_term.sort_by_key(|&(_, lt_idx)| lt_idx);
+    let lt_indices: Vec<usize> = long_term.iter().map(|&(idx, _)| idx).collect();
+
+    // Build L0: before + after + long-term
+    let mut list0: Vec<usize> = st_before
+        .iter()
+        .map(|&(idx, _)| idx)
+        .chain(st_after.iter().map(|&(idx, _)| idx))
+        .chain(lt_indices.iter().copied())
+        .collect();
+
+    // Build L1: after + before + long-term
+    let mut list1: Vec<usize> = st_after
+        .iter()
+        .map(|&(idx, _)| idx)
+        .chain(st_before.iter().map(|&(idx, _)| idx))
+        .chain(lt_indices.iter().copied())
+        .collect();
+
+    // If L0 == L1 and len > 1, swap L1[0] and L1[1]
+    if list0.len() > 1 && list0 == list1 {
+        list1.swap(0, 1);
+    }
+
+    // Apply ref_pic_list_modification for L0
+    if !slice_hdr.ref_pic_list_modification_l0.is_empty() {
+        // For B-slice list modification, we need the current frame_num
+        // but the modification commands use poc-based addressing.
+        // The existing apply_ref_pic_list_modification works for frame_num-based.
+        // For B-slices, modification_of_pic_nums_idc 0/1 still use frame_num.
+        apply_ref_pic_list_modification(
+            &mut list0,
+            &slice_hdr.ref_pic_list_modification_l0,
+            dpb,
+            slice_hdr.frame_num,
+            slice_hdr.num_ref_idx_l0_active as usize,
+        );
+    }
+    // Apply ref_pic_list_modification for L1
+    if !slice_hdr.ref_pic_list_modification_l1.is_empty() {
+        apply_ref_pic_list_modification(
+            &mut list1,
+            &slice_hdr.ref_pic_list_modification_l1,
+            dpb,
+            slice_hdr.frame_num,
+            slice_hdr.num_ref_idx_l1_active as usize,
+        );
+    }
+
+    // Truncate to active counts
+    let max_l0 = slice_hdr.num_ref_idx_l0_active as usize;
+    if list0.len() > max_l0 {
+        list0.truncate(max_l0);
+    }
+    let max_l1 = slice_hdr.num_ref_idx_l1_active as usize;
+    if list1.len() > max_l1 {
+        list1.truncate(max_l1);
+    }
+
+    (list0, list1)
+}
+
 /// Apply ref_pic_list_modification() reordering commands to a reference list.
 fn apply_ref_pic_list_modification(
     list: &mut Vec<usize>,

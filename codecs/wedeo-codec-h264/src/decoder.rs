@@ -73,6 +73,8 @@ pub struct H264Decoder {
     dpb: Dpb,
     /// Reference list 0 (DPB indices) for the current slice.
     ref_list_l0: Vec<usize>,
+    /// Reference list 1 (DPB indices) for B-slices.
+    ref_list_l1: Vec<usize>,
     /// Whether the current NAL is an IDR.
     current_is_idr: bool,
     /// frame_num from the current slice header.
@@ -114,6 +116,7 @@ impl H264Decoder {
             current_pts: 0,
             dpb: Dpb::new(16),
             ref_list_l0: Vec::new(),
+            ref_list_l1: Vec::new(),
             current_is_idr: false,
             current_frame_num_h264: 0,
             prev_poc_msb: 0,
@@ -325,12 +328,18 @@ impl H264Decoder {
                         self.current_poc = self.frame_num as i32 * 2;
                     }
 
-                    // Build reference list for P-slices
+                    // Build reference lists
                     if hdr.slice_type.is_p() {
                         let max_frame_num = 1u32 << sps.log2_max_frame_num;
                         self.ref_list_l0 = refs::build_ref_list_p(&self.dpb, &hdr, hdr.frame_num, max_frame_num);
+                        self.ref_list_l1.clear();
+                    } else if hdr.slice_type.is_b() {
+                        let (l0, l1) = refs::build_ref_list_b(&self.dpb, &hdr, self.current_poc);
+                        self.ref_list_l0 = l0;
+                        self.ref_list_l1 = l1;
                     } else {
                         self.ref_list_l0.clear();
+                        self.ref_list_l1.clear();
                     }
                 }
 
@@ -349,9 +358,14 @@ impl H264Decoder {
                         .iter()
                         .filter_map(|&dpb_idx| self.dpb.get(dpb_idx).map(|e| &e.pic))
                         .collect();
+                    let ref_pic_list_l1: Vec<&PictureBuffer> = self
+                        .ref_list_l1
+                        .iter()
+                        .filter_map(|&dpb_idx| self.dpb.get(dpb_idx).map(|e| &e.pic))
+                        .collect();
 
                     #[cfg(feature = "tracing-detail")]
-                    if hdr.slice_type.is_p() {
+                    if hdr.slice_type.is_p() || hdr.slice_type.is_b() {
                         for &dpb_idx in &self.ref_list_l0 {
                             if let Some(e) = self.dpb.get(dpb_idx) {
                                 let s = e.pic.y_stride;
@@ -365,9 +379,10 @@ impl H264Decoder {
                                     frame_num = self.frame_num,
                                     dpb_idx,
                                     ref_frame_num = e.frame_num,
+                                    ref_poc = e.poc,
                                     status = ?e.status,
                                     row128 = ?row128,
-                                    "ref_pic_list entry"
+                                    "ref_pic_list L0 entry"
                                 );
                             }
                         }
@@ -380,6 +395,7 @@ impl H264Decoder {
                         &pps,
                         &mut fdc,
                         &ref_pic_list,
+                        &ref_pic_list_l1,
                     ) {
                         Ok(mbs) => {
                             self.current_mbs_decoded += mbs;
@@ -557,7 +573,9 @@ impl H264Decoder {
     /// Decode a slice into a FrameDecodeContext.
     ///
     /// `ref_pics` contains the reference pictures for inter prediction (list 0).
+    /// `ref_pics_l1` contains the list 1 reference pictures (B-slices only).
     /// Returns the number of MBs decoded in this slice.
+    #[allow(clippy::too_many_arguments)] // H.264 slice decode needs all parameters
     #[cfg_attr(feature = "tracing-detail", tracing::instrument(skip_all, fields(first_mb = hdr.first_mb_in_slice, slice_type = ?hdr.slice_type)))]
     fn decode_slice_into(
         &self,
@@ -567,6 +585,7 @@ impl H264Decoder {
         pps: &Pps,
         fdc: &mut FrameDecodeContext,
         ref_pics: &[&PictureBuffer],
+        ref_pics_l1: &[&PictureBuffer],
     ) -> Result<u32> {
         let mb_width = sps.mb_width;
         let mb_height = sps.mb_height;
@@ -641,7 +660,7 @@ impl H264Decoder {
                     fdc.neighbor_ctx.top_available = skip_y > 0
                         && fdc.slice_table[(mb_addr - mb_width) as usize]
                             == fdc.current_slice;
-                    mb::decode_skip_mb(fdc, hdr, skip_x, skip_y, ref_pics);
+                    mb::decode_skip_mb(fdc, hdr, skip_x, skip_y, ref_pics, ref_pics_l1);
                     mb_addr += 1;
                     mbs_decoded += 1;
                 }
@@ -693,6 +712,7 @@ impl H264Decoder {
                 mb_x,
                 mb_y,
                 ref_pics,
+                ref_pics_l1,
             )?;
             mb_addr += 1;
             mbs_decoded += 1;
@@ -894,6 +914,7 @@ impl Decoder for H264Decoder {
         self.frame_num = 0;
         self.dpb.clear();
         self.ref_list_l0.clear();
+        self.ref_list_l1.clear();
         self.current_fdc = None;
         self.current_last_hdr = None;
         self.prev_poc_msb = 0;

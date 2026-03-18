@@ -419,6 +419,7 @@ pub fn decode_macroblock(
     mb_x: u32,
     mb_y: u32,
     ref_pics: &[&PictureBuffer],
+    ref_pics_l1: &[&PictureBuffer],
 ) -> Result<()> {
     let mb_idx = (mb_y * ctx.mb_width + mb_x) as usize;
 
@@ -432,6 +433,7 @@ pub fn decode_macroblock(
         mb_y,
         ctx.mb_width,
         slice_hdr.num_ref_idx_l0_active,
+        slice_hdr.num_ref_idx_l1_active,
     )?;
 
     // 2. Update QP with mb_qp_delta
@@ -506,7 +508,7 @@ pub fn decode_macroblock(
         decode_intra16x16(ctx, &mut mb, mb_x, mb_y, qp, c_qp, has_top, has_left);
     } else if !mb.is_intra {
         // Inter macroblock (P or B)
-        decode_inter_mb(ctx, &mut mb, slice_hdr, mb_x, mb_y, qp, c_qp, ref_pics);
+        decode_inter_mb(ctx, &mut mb, slice_hdr, mb_x, mb_y, qp, c_qp, ref_pics, ref_pics_l1);
     }
 
     // 6. Update neighbor context
@@ -573,6 +575,7 @@ fn decode_inter_mb(
     qp: u8,
     chroma_qp: u8,
     ref_pics: &[&PictureBuffer],
+    _ref_pics_l1: &[&PictureBuffer],
 ) {
     if ref_pics.is_empty() {
         // No reference frames available — fill with gray and return.
@@ -1132,6 +1135,7 @@ pub fn decode_skip_mb(
     mb_x: u32,
     mb_y: u32,
     ref_pics: &[&PictureBuffer],
+    _ref_pics_l1: &[&PictureBuffer],
 ) {
     if ref_pics.is_empty() {
         fill_mb_gray(ctx, mb_x, mb_y);
