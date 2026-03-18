@@ -29,9 +29,20 @@ from pathlib import Path
 # Parsers
 # ---------------------------------------------------------------------------
 
+def _strip_c_comments(content: str) -> str:
+    """Remove C-style // and /* */ comments from source code."""
+    # Remove /* ... */ comments (non-greedy, handles multi-line)
+    content = re.sub(r'/\*.*?\*/', '', content, flags=re.DOTALL)
+    # Remove // comments (to end of line)
+    content = re.sub(r'//[^\n]*', '', content)
+    return content
+
 def parse_c_array_1d(content: str, name: str, expected_len: int | None = None) -> list[int]:
-    """Parse a 1D C array like `static const uint8_t name[N] = { ... };`."""
-    pattern = rf'{re.escape(name)}\s*\[[^\]]*\]\s*=\s*\{{([^;]+)\}};'
+    """Parse a 1D C array like `static const uint8_t name[N] = { ... };`.
+
+    Requires `const` before the name to avoid matching usage sites or comments.
+    """
+    pattern = rf'const\s+\w+\s+{re.escape(name)}\s*\[[^\]]*\]\s*=\s*\{{([^;]+)\}};'
     match = re.search(pattern, content, re.DOTALL)
     if not match:
         raise ValueError(f"Could not find array '{name}' in source")
@@ -43,8 +54,11 @@ def parse_c_array_1d(content: str, name: str, expected_len: int | None = None) -
 
 
 def parse_c_array_2d(content: str, name: str) -> list[list[int]]:
-    """Parse a 2D C array like `static const uint8_t name[N][M] = { {a,b}, ... };`."""
-    pattern = rf'{re.escape(name)}\s*\[[^\]]*\]\s*\[[^\]]*\]\s*=\s*\{{(.*?)\}};'
+    """Parse a 2D C array like `static const uint8_t name[N][M] = { {a,b}, ... };`.
+
+    Requires `const` before the name to avoid matching usage sites or comments.
+    """
+    pattern = rf'const\s+\w+\s+{re.escape(name)}\s*\[[^\]]*\]\s*\[[^\]]*\]\s*=\s*\{{(.*?)\}};'
     match = re.search(pattern, content, re.DOTALL)
     if not match:
         raise ValueError(f"Could not find array '{name}' in source")
@@ -118,11 +132,14 @@ def compare_arrays(name: str, expected: list, actual: list,
     return errors + element_errors
 
 
-def read_file(path: Path) -> str:
+def read_file(path: Path, strip_comments: bool = False) -> str:
     """Read a file, raising a clear error if not found."""
     if not path.exists():
         raise FileNotFoundError(f"File not found: {path}")
-    return path.read_text()
+    content = path.read_text()
+    if strip_comments:
+        content = _strip_c_comments(content)
+    return content
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +148,7 @@ def read_file(path: Path) -> str:
 
 def check_tc0_table(ffmpeg_dir: Path, wedeo_dir: Path) -> int:
     print("Checking TC0_TABLE...")
-    loopfilter = read_file(ffmpeg_dir / "libavcodec" / "h264_loopfilter.c")
+    loopfilter = read_file(ffmpeg_dir / "libavcodec" / "h264_loopfilter.c", strip_comments=True)
     deblock = read_file(wedeo_dir / "codecs" / "wedeo-codec-h264" / "src" / "deblock.rs")
     ffmpeg_rows = parse_c_array_2d(loopfilter, "tc0_table")
     ffmpeg_tc0 = [row[1:4] for row in ffmpeg_rows[52:104]]
@@ -141,7 +158,7 @@ def check_tc0_table(ffmpeg_dir: Path, wedeo_dir: Path) -> int:
 
 def check_alpha_table(ffmpeg_dir: Path, wedeo_dir: Path) -> int:
     print("Checking ALPHA_TABLE...")
-    loopfilter = read_file(ffmpeg_dir / "libavcodec" / "h264_loopfilter.c")
+    loopfilter = read_file(ffmpeg_dir / "libavcodec" / "h264_loopfilter.c", strip_comments=True)
     deblock = read_file(wedeo_dir / "codecs" / "wedeo-codec-h264" / "src" / "deblock.rs")
     ffmpeg_alpha = parse_c_array_1d(loopfilter, "alpha_table", 52 * 3)
     wedeo_alpha = parse_rust_array_1d(deblock, "ALPHA_TABLE")
@@ -150,7 +167,7 @@ def check_alpha_table(ffmpeg_dir: Path, wedeo_dir: Path) -> int:
 
 def check_beta_table(ffmpeg_dir: Path, wedeo_dir: Path) -> int:
     print("Checking BETA_TABLE...")
-    loopfilter = read_file(ffmpeg_dir / "libavcodec" / "h264_loopfilter.c")
+    loopfilter = read_file(ffmpeg_dir / "libavcodec" / "h264_loopfilter.c", strip_comments=True)
     deblock = read_file(wedeo_dir / "codecs" / "wedeo-codec-h264" / "src" / "deblock.rs")
     ffmpeg_beta = parse_c_array_1d(loopfilter, "beta_table", 52 * 3)
     wedeo_beta = parse_rust_array_1d(deblock, "BETA_TABLE")
@@ -179,7 +196,7 @@ def check_chroma_qp_table(ffmpeg_dir: Path, wedeo_dir: Path) -> int:
 
 def check_cbp_tables(ffmpeg_dir: Path, wedeo_dir: Path) -> int:
     print("Checking GOLOMB_TO_INTRA4X4_CBP, GOLOMB_TO_INTER_CBP...")
-    h264data = read_file(ffmpeg_dir / "libavcodec" / "h264data.c")
+    h264data = read_file(ffmpeg_dir / "libavcodec" / "h264data.c", strip_comments=True)
     tables = read_file(wedeo_dir / "codecs" / "wedeo-codec-h264" / "src" / "tables.rs")
     errors = 0
     for ffmpeg_name, wedeo_name in [
@@ -194,7 +211,7 @@ def check_cbp_tables(ffmpeg_dir: Path, wedeo_dir: Path) -> int:
 
 def check_scan_tables(ffmpeg_dir: Path, wedeo_dir: Path) -> int:
     print("Checking CHROMA_DC_SCAN, CHROMA422_DC_SCAN...")
-    h264data = read_file(ffmpeg_dir / "libavcodec" / "h264data.c")
+    h264data = read_file(ffmpeg_dir / "libavcodec" / "h264data.c", strip_comments=True)
     tables = read_file(wedeo_dir / "codecs" / "wedeo-codec-h264" / "src" / "tables.rs")
     errors = 0
     # FFmpeg uses C expressions like "(0 + 1 * 2) * 16" — need eval.
@@ -202,7 +219,7 @@ def check_scan_tables(ffmpeg_dir: Path, wedeo_dir: Path) -> int:
         ("ff_h264_chroma_dc_scan", "CHROMA_DC_SCAN"),
         ("ff_h264_chroma422_dc_scan", "CHROMA422_DC_SCAN"),
     ]:
-        pattern = rf'{re.escape(ffmpeg_name)}\s*\[[^\]]*\]\s*=\s*\{{([^;]+)\}};'
+        pattern = rf'const\s+\w+\s+{re.escape(ffmpeg_name)}\s*\[[^\]]*\]\s*=\s*\{{([^;]+)\}};'
         match = re.search(pattern, h264data, re.DOTALL)
         if not match:
             print(f"  ERROR: Could not find {ffmpeg_name}")
@@ -227,7 +244,7 @@ def _eval_c_expr(expr: str) -> int:
 
 def check_field_scan_tables(ffmpeg_dir: Path, wedeo_dir: Path) -> int:
     print("Checking FIELD_SCAN_4X4, FIELD_SCAN_8X8...")
-    h264_slice = read_file(ffmpeg_dir / "libavcodec" / "h264_slice.c")
+    h264_slice = read_file(ffmpeg_dir / "libavcodec" / "h264_slice.c", strip_comments=True)
     tables = read_file(wedeo_dir / "codecs" / "wedeo-codec-h264" / "src" / "tables.rs")
     errors = 0
     # FFmpeg stores these as 1D arrays with expressions like "0 + 1 * 4".
@@ -236,7 +253,7 @@ def check_field_scan_tables(ffmpeg_dir: Path, wedeo_dir: Path) -> int:
         ("field_scan", "FIELD_SCAN_4X4"),
         ("field_scan8x8", "FIELD_SCAN_8X8"),
     ]:
-        pattern = rf'{re.escape(ffmpeg_name)}\s*\[[^\]]*\]\s*=\s*\{{([^;]+)\}};'
+        pattern = rf'const\s+\w+\s+{re.escape(ffmpeg_name)}\s*\[[^\]]*\]\s*=\s*\{{([^;]+)\}};'
         match = re.search(pattern, h264_slice, re.DOTALL)
         if not match:
             print(f"  ERROR: Could not find {ffmpeg_name}")
@@ -253,7 +270,7 @@ def check_field_scan_tables(ffmpeg_dir: Path, wedeo_dir: Path) -> int:
 
 def check_default_scaling(ffmpeg_dir: Path, wedeo_dir: Path) -> int:
     print("Checking DEFAULT_SCALING4, DEFAULT_SCALING8...")
-    h264_ps = read_file(ffmpeg_dir / "libavcodec" / "h264_ps.c")
+    h264_ps = read_file(ffmpeg_dir / "libavcodec" / "h264_ps.c", strip_comments=True)
     tables = read_file(wedeo_dir / "codecs" / "wedeo-codec-h264" / "src" / "tables.rs")
     errors = 0
     for ffmpeg_name, wedeo_name in [
@@ -268,7 +285,7 @@ def check_default_scaling(ffmpeg_dir: Path, wedeo_dir: Path) -> int:
 
 def check_dequant_tables(ffmpeg_dir: Path, wedeo_dir: Path) -> int:
     print("Checking DEQUANT4_COEFF_INIT, DEQUANT8_COEFF_INIT, DEQUANT8_COEFF_INIT_SCAN...")
-    h264data = read_file(ffmpeg_dir / "libavcodec" / "h264data.c")
+    h264data = read_file(ffmpeg_dir / "libavcodec" / "h264data.c", strip_comments=True)
     tables = read_file(wedeo_dir / "codecs" / "wedeo-codec-h264" / "src" / "tables.rs")
     errors = 0
     # 2D tables
@@ -292,7 +309,7 @@ def check_dequant_tables(ffmpeg_dir: Path, wedeo_dir: Path) -> int:
 
 def check_cavlc_coeff_token(ffmpeg_dir: Path, wedeo_dir: Path) -> int:
     print("Checking COEFF_TOKEN_LEN/BITS (4 tables), COEFF_TOKEN_TABLE_INDEX...")
-    cavlc = read_file(ffmpeg_dir / "libavcodec" / "h264_cavlc.c")
+    cavlc = read_file(ffmpeg_dir / "libavcodec" / "h264_cavlc.c", strip_comments=True)
     cavlc_tables = read_file(wedeo_dir / "codecs" / "wedeo-codec-h264" / "src" / "cavlc_tables.rs")
     errors = 0
 
@@ -315,7 +332,7 @@ def check_cavlc_coeff_token(ffmpeg_dir: Path, wedeo_dir: Path) -> int:
 
 def check_cavlc_chroma_dc_coeff(ffmpeg_dir: Path, wedeo_dir: Path) -> int:
     print("Checking CHROMA_DC_COEFF_TOKEN_LEN/BITS...")
-    cavlc = read_file(ffmpeg_dir / "libavcodec" / "h264_cavlc.c")
+    cavlc = read_file(ffmpeg_dir / "libavcodec" / "h264_cavlc.c", strip_comments=True)
     cavlc_tables = read_file(wedeo_dir / "codecs" / "wedeo-codec-h264" / "src" / "cavlc_tables.rs")
     errors = 0
     for ffmpeg_name, wedeo_name in [
@@ -330,7 +347,7 @@ def check_cavlc_chroma_dc_coeff(ffmpeg_dir: Path, wedeo_dir: Path) -> int:
 
 def check_cavlc_total_zeros(ffmpeg_dir: Path, wedeo_dir: Path) -> int:
     print("Checking TOTAL_ZEROS_LEN/BITS, CHROMA_DC_TOTAL_ZEROS_LEN/BITS...")
-    cavlc = read_file(ffmpeg_dir / "libavcodec" / "h264_cavlc.c")
+    cavlc = read_file(ffmpeg_dir / "libavcodec" / "h264_cavlc.c", strip_comments=True)
     cavlc_tables = read_file(wedeo_dir / "codecs" / "wedeo-codec-h264" / "src" / "cavlc_tables.rs")
     errors = 0
     for ffmpeg_name, wedeo_name in [
@@ -347,7 +364,7 @@ def check_cavlc_total_zeros(ffmpeg_dir: Path, wedeo_dir: Path) -> int:
 
 def check_cavlc_run_before(ffmpeg_dir: Path, wedeo_dir: Path) -> int:
     print("Checking RUN_BEFORE_LEN/BITS...")
-    cavlc = read_file(ffmpeg_dir / "libavcodec" / "h264_cavlc.c")
+    cavlc = read_file(ffmpeg_dir / "libavcodec" / "h264_cavlc.c", strip_comments=True)
     cavlc_tables = read_file(wedeo_dir / "codecs" / "wedeo-codec-h264" / "src" / "cavlc_tables.rs")
     errors = 0
     for ffmpeg_name, wedeo_name in [
