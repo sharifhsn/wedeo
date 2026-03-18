@@ -531,13 +531,15 @@ impl H264Decoder {
 
     /// Convert a completed FrameDecodeContext to a Frame.
     fn fdc_to_frame(&self, fdc: &mut FrameDecodeContext, hdr: &SliceHeader, pts: i64) -> Frame {
-        deblock::deblock_frame(
-            &mut fdc.pic,
-            &fdc.mb_info,
-            hdr.disable_deblocking_filter_idc,
-            hdr.slice_alpha_c0_offset,
-            hdr.slice_beta_offset,
-        );
+        if std::env::var("WEDEO_NO_DEBLOCK").is_err() {
+            deblock::deblock_frame(
+                &mut fdc.pic,
+                &fdc.mb_info,
+                hdr.disable_deblocking_filter_idc,
+                hdr.slice_alpha_c0_offset,
+                hdr.slice_beta_offset,
+            );
+        }
 
         // Convert PictureBuffer to Frame.
         let width = self.width as usize;
