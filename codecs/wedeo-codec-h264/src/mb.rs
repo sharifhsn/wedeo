@@ -321,6 +321,14 @@ fn decode_chroma(
             has_left,
         );
 
+        #[cfg(feature = "tracing-detail")]
+        {
+            let mut pred_row0 = [0u8; 8];
+            pred_row0.copy_from_slice(&plane_data[offset..offset + 8]);
+            let plane_name = if plane_idx == 0 { "U" } else { "V" };
+            trace!(mb_x, mb_y, plane = plane_name, row0 = ?pred_row0, "chroma prediction");
+        }
+
         if cbp_chroma > 0 {
             // Chroma DC: inverse Hadamard + dequant (i32 output to avoid i16 overflow)
             let qmul = dequant::dc_dequant_scale(&ctx.dequant4, 1, chroma_qp);
@@ -362,6 +370,17 @@ fn decode_chroma(
                             plane_data[idx] = (plane_data[idx] as i32 + dc_add).clamp(0, 255) as u8;
                         }
                     }
+                }
+
+                #[cfg(feature = "tracing-detail")]
+                {
+                    let mut final_px = [0u8; 16];
+                    for r in 0..4 {
+                        let off = c_offset + r * c_stride;
+                        final_px[r * 4..r * 4 + 4].copy_from_slice(&plane_data[off..off + 4]);
+                    }
+                    let plane_name = if plane_idx == 0 { "U" } else { "V" };
+                    trace!(mb_x, mb_y, plane = plane_name, blk_x, blk_y, pixels = ?final_px, "chroma final");
                 }
             }
         }
@@ -867,6 +886,16 @@ fn decode_inter_mb(
         }
     }
 
+    #[cfg(feature = "tracing-detail")]
+    {
+        let lx = (mb_x * 16) as usize;
+        let ly = (mb_y * 16) as usize;
+        let stride = ctx.pic.y_stride;
+        let mut mc_row0 = [0u8; 16];
+        mc_row0.copy_from_slice(&ctx.pic.y[ly * stride + lx..ly * stride + lx + 16]);
+        trace!(mb_x, mb_y, row0 = ?mc_row0, "inter MC luma");
+    }
+
     // Add residual on top of the motion-compensated prediction
     let cbp_luma = mb.cbp & 0x0F;
     if cbp_luma != 0 {
@@ -883,6 +912,16 @@ fn decode_inter_mb(
                 );
             }
         }
+    }
+
+    #[cfg(feature = "tracing-detail")]
+    {
+        let lx = (mb_x * 16) as usize;
+        let ly = (mb_y * 16) as usize;
+        let stride = ctx.pic.y_stride;
+        let mut final_row0 = [0u8; 16];
+        final_row0.copy_from_slice(&ctx.pic.y[ly * stride + lx..ly * stride + lx + 16]);
+        trace!(mb_x, mb_y, row0 = ?final_row0, "inter final luma");
     }
 
     // Decode chroma for inter MB (same as intra, but prediction is from MC)
@@ -1194,17 +1233,49 @@ fn decode_intra4x4(
             block_has_top_right,
         );
 
+        #[cfg(feature = "tracing-detail")]
+        {
+            let mut pred = [0u8; 16];
+            for r in 0..4 {
+                let off = offset + r * stride;
+                pred[r * 4..r * 4 + 4].copy_from_slice(&ctx.pic.y[off..off + 4]);
+            }
+            trace!(mb_x, mb_y, blk_x, blk_y, pred = ?pred, "intra4x4 prediction");
+        }
+
         // Dequant and IDCT residual if CBP indicates this 8x8 group is coded
         let group_8x8 = (blk_y / 2) * 2 + (blk_x / 2);
         if cbp_luma & (1 << group_8x8) != 0 {
             let raster_idx = block_to_raster(block);
+
+            #[cfg(feature = "tracing-detail")]
+            {
+                trace!(mb_x, mb_y, blk_x, blk_y, coeffs = ?mb.luma_coeffs[raster_idx], "intra4x4 pre-dequant");
+            }
+
             dequant::dequant_4x4_flat(&mut mb.luma_coeffs[raster_idx], qp);
+
+            #[cfg(feature = "tracing-detail")]
+            {
+                trace!(mb_x, mb_y, blk_x, blk_y, coeffs = ?mb.luma_coeffs[raster_idx], "intra4x4 post-dequant");
+            }
+
             let (offset, stride) = luma_block_offset(&ctx.pic, mb_x, mb_y, blk_x, blk_y);
             idct::idct4x4_add(
                 &mut ctx.pic.y[offset..],
                 stride,
                 &mut mb.luma_coeffs[raster_idx],
             );
+
+            #[cfg(feature = "tracing-detail")]
+            {
+                let mut final_px = [0u8; 16];
+                for r in 0..4 {
+                    let off = offset + r * stride;
+                    final_px[r * 4..r * 4 + 4].copy_from_slice(&ctx.pic.y[off..off + 4]);
+                }
+                trace!(mb_x, mb_y, blk_x, blk_y, pixels = ?final_px, "intra4x4 post-IDCT");
+            }
         }
     }
 
@@ -1246,10 +1317,22 @@ fn decode_intra16x16(
         has_left,
     );
 
+    #[cfg(feature = "tracing-detail")]
+    {
+        let mut pred_row0 = [0u8; 16];
+        pred_row0.copy_from_slice(&ctx.pic.y[offset..offset + 16]);
+        trace!(mb_x, mb_y, mode = mb.intra16x16_mode, row0 = ?pred_row0, "intra16x16 prediction");
+    }
+
     // Luma DC: inverse Hadamard + dequant (i32 output to avoid i16 overflow)
     let qmul = dequant::dc_dequant_scale(&ctx.dequant4, 0, qp);
     let mut luma_dc_out = [0i32; 16];
     idct::luma_dc_dequant_idct(&mut luma_dc_out, &mb.luma_dc, qmul);
+
+    #[cfg(feature = "tracing-detail")]
+    {
+        trace!(mb_x, mb_y, dc_out = ?luma_dc_out, "intra16x16 luma DC Hadamard");
+    }
 
     let cbp_luma = mb.cbp & 0x0F;
 
