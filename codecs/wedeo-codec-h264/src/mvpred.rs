@@ -351,14 +351,18 @@ impl MvContext {
 
     /// Get neighbor C (top-right, falling back to top-left D).
     ///
-    /// C is the block at (blk_x + part_width, blk_y - 1). If that is
-    /// unavailable (outside picture or to the right of the MB row), fall
-    /// back to D = (blk_x - 1, blk_y - 1), the top-left neighbor.
+    /// C is the block at (blk_x + part_width, blk_y - 1). C is only
+    /// available if the block has already been decoded, i.e. it belongs to
+    /// a macroblock in a previous row, or the same row to the left/same MB.
+    /// Same-row MBs to the right (mb_x + 1, mb_y, …) are NOT yet decoded
+    /// and must be treated as PART_NOT_AVAILABLE → fall back to D.
     ///
     /// `part_width` is the width of the partition in 4x4 block units
     /// (1 for 4-wide, 2 for 8-wide, 4 for 16-wide).
     ///
     /// Returns `None` if neither C nor D is available.
+    ///
+    /// Reference: ITU-T H.264 8.4.1.2.1, FFmpeg fill_decode_caches
     pub fn neighbor_c(
         &self,
         mb_x: u32,
@@ -369,18 +373,41 @@ impl MvContext {
     ) -> Option<([i16; 2], i8)> {
         // Try top-right (C)
         let cr_x = blk_x + part_width;
-        let cr_y = blk_y.wrapping_sub(1);
+        let cr_y = blk_y.wrapping_sub(1); // u32::MAX when blk_y==0 → wraps to -1 in i32
 
-        if let Some(result) = self.try_get_neighbor(mb_x, mb_y, cr_x, cr_y) {
-            // Top-right is not available when inside a partition that has
-            // already been decoded (below-and-right of the current block).
-            // This check is simplified: C is unavailable if:
-            // - cr_y wraps (blk_y was 0, need above row)
-            //   AND above-right MB doesn't exist
-            // - or cr_x >= 4 and we need the MB to the right
-            //   AND above-right MB doesn't exist
-            // The try_get_neighbor handles bounds correctly.
-            return Some(result);
+        // Compute absolute block coordinates to determine whether C is in a
+        // decoded (past) macroblock.  cr_y wraps to u32::MAX when blk_y=0,
+        // which becomes -1 in i32 arithmetic → targets the row above (OK).
+        let abs_cr_x = mb_x as i32 * 4 + cr_x as i32;
+        let abs_cr_y = mb_y as i32 * 4 + cr_y as i32;
+
+        // C is in a "future" (not-yet-decoded) macroblock when its row is the
+        // same as the current MB and it is to the right (target_mb_x > mb_x),
+        // or when it is in a future row.  In those cases fall through to D.
+        let (c_is_past, c_is_same_mb) = if abs_cr_x >= 0 && abs_cr_y >= 0 {
+            let target_mb_x = (abs_cr_x as u32) / 4;
+            let target_mb_y = (abs_cr_y as u32) / 4;
+            let past = target_mb_y < mb_y || (target_mb_y == mb_y && target_mb_x <= mb_x);
+            let same = target_mb_y == mb_y && target_mb_x == mb_x;
+            (past, same)
+        } else {
+            // Negative coordinates → out of picture → try_get_neighbor will return None.
+            // The bounds check is handled there; mark as "past" so we attempt the lookup.
+            (true, false)
+        };
+
+        if c_is_past
+            && let Some(result) = self.try_get_neighbor(mb_x, mb_y, cr_x, cr_y)
+        {
+            // If C is within the current MB and ref_idx=-1, the target 4x4 block
+            // has not been decoded yet (e.g., sub 3 when processing sub 2 of a
+            // P_8x8 MB).  FFmpeg marks these positions PART_NOT_AVAILABLE and
+            // falls back to D; wedeo must do the same.  ref_idx=-1 from a
+            // *different* MB means intra-coded (LIST_NOT_USED) and is valid.
+            if !c_is_same_mb || result.1 >= 0 {
+                return Some(result);
+            }
+            // Same MB + ref=-1 → fall through to D
         }
 
         // Fall back to top-left (D)
