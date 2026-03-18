@@ -59,6 +59,9 @@ def main():
     parser.add_argument(
         "--max-frames", type=int, default=5, help="Max frames to compare"
     )
+    parser.add_argument(
+        "--start-frame", type=int, default=0, help="First frame to compare"
+    )
     args = parser.parse_args()
 
     input_path = Path(args.input).resolve()
@@ -133,11 +136,14 @@ def main():
         sys.exit(1)
 
     actual_frames = min(len(wedeo_data), len(ffmpeg_data)) // frame_size
-    compare_frames = min(actual_frames, args.max_frames)
-    print(f"Comparing {compare_frames} of {actual_frames} decoded frames\n")
+    end_frame = min(actual_frames, args.start_frame + args.max_frames)
+    if args.start_frame >= actual_frames:
+        print(f"Error: start-frame {args.start_frame} >= {actual_frames} actual frames")
+        sys.exit(1)
+    print(f"Comparing frames {args.start_frame}..{end_frame - 1} of {actual_frames} decoded frames\n")
 
     total_diffs = 0
-    for frame_idx in range(compare_frames):
+    for frame_idx in range(args.start_frame, end_frame):
         base = frame_idx * frame_size
         w_y = np.frombuffer(wedeo_data[base:base + y_size], dtype=np.uint8).reshape(height, width)
         f_y = np.frombuffer(ffmpeg_data[base:base + y_size], dtype=np.uint8).reshape(height, width)
@@ -174,7 +180,7 @@ def main():
         else:
             print(f"Frame {frame_idx}: MATCH")
 
-    print(f"\nTotal: {total_diffs} differing MBs across {compare_frames} frames")
+    print(f"\nTotal: {total_diffs} differing MBs across {end_frame - args.start_frame} frames")
     if total_diffs == 0:
         print("BITEXACT!")
 
