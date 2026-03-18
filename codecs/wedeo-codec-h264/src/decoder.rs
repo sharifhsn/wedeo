@@ -77,6 +77,14 @@ pub struct H264Decoder {
     current_is_idr: bool,
     /// frame_num from the current slice header.
     current_frame_num_h264: u32,
+    /// POC type 0 state: previous reference picture's PicOrderCntMsb.
+    prev_poc_msb: i32,
+    /// POC type 0 state: previous reference picture's pic_order_cnt_lsb.
+    prev_poc_lsb: u32,
+    /// Computed POC for the current picture.
+    current_poc: i32,
+    /// nal_ref_idc of the current picture (non-zero = reference).
+    current_nal_ref_idc: u8,
 }
 
 impl H264Decoder {
@@ -108,6 +116,10 @@ impl H264Decoder {
             ref_list_l0: Vec::new(),
             current_is_idr: false,
             current_frame_num_h264: 0,
+            prev_poc_msb: 0,
+            prev_poc_lsb: 0,
+            current_poc: 0,
+            current_nal_ref_idc: 0,
         };
 
         // Parse avcC extradata if present (MP4/NALFF format).
@@ -197,6 +209,37 @@ impl H264Decoder {
         Ok(())
     }
 
+    /// Compute Picture Order Count (type 0) per ITU-T H.264 Section 8.2.1.1.
+    ///
+    /// For IDR: POC = 0, reset prev_poc_msb/lsb.
+    /// For non-IDR: compute poc_msb from wrap-around detection of poc_lsb,
+    /// then poc = poc_msb + pic_order_cnt_lsb.
+    fn compute_poc_type0(&mut self, sps: &Sps, hdr: &SliceHeader, is_idr: bool, _nal_ref_idc: u8) -> i32 {
+        if is_idr {
+            self.prev_poc_msb = 0;
+            self.prev_poc_lsb = 0;
+            return hdr.pic_order_cnt_lsb as i32;
+        }
+
+        let max_poc_lsb = 1u32 << sps.log2_max_poc_lsb;
+        let poc_lsb = hdr.pic_order_cnt_lsb;
+
+        // Detect MSB wrap-around (spec 8-3)
+        let poc_msb = if poc_lsb < self.prev_poc_lsb
+            && (self.prev_poc_lsb.wrapping_sub(poc_lsb)) >= max_poc_lsb / 2
+        {
+            self.prev_poc_msb + max_poc_lsb as i32
+        } else if poc_lsb > self.prev_poc_lsb
+            && (poc_lsb.wrapping_sub(self.prev_poc_lsb)) > max_poc_lsb / 2
+        {
+            self.prev_poc_msb - max_poc_lsb as i32
+        } else {
+            self.prev_poc_msb
+        };
+
+        poc_msb + poc_lsb as i32
+    }
+
     /// Update decoder dimensions from an SPS.
     fn apply_sps(&mut self, sps: &Sps) {
         let w = sps.width();
@@ -272,6 +315,15 @@ impl H264Decoder {
                     self.current_pts = self.frame_num as i64;
                     self.current_is_idr = is_idr;
                     self.current_frame_num_h264 = hdr.frame_num;
+                    self.current_nal_ref_idc = nalu.nal_ref_idc;
+
+                    // Compute spec-compliant POC (type 0)
+                    if sps.poc_type == 0 {
+                        self.current_poc = self.compute_poc_type0(&sps, &hdr, is_idr, nalu.nal_ref_idc);
+                    } else {
+                        // POC type 1/2 not yet implemented; fall back to decode order
+                        self.current_poc = self.frame_num as i32 * 2;
+                    }
 
                     // Build reference list for P-slices
                     if hdr.slice_type.is_p() {
@@ -413,7 +465,7 @@ impl H264Decoder {
 
             let entry = DpbEntry {
                 pic: fdc.pic,
-                poc: self.current_pts as i32 * 2, // Simple POC = 2 * decode order
+                poc: self.current_poc,
                 frame_num: self.current_frame_num_h264,
                 status: RefStatus::Unused,
                 long_term_frame_idx: 0,
@@ -465,6 +517,37 @@ impl H264Decoder {
                     sps_max_refs,
                     Some(dpb_idx),
                 );
+            }
+
+            // Update POC type 0 state for reference pictures only.
+            // Non-reference pictures (nal_ref_idc == 0, e.g. B-frames)
+            // do not update the POC state.
+            if self.current_nal_ref_idc > 0 {
+                let max_poc_lsb = self
+                    .sps_list
+                    .iter()
+                    .find_map(|s| s.as_ref().map(|sps| 1u32 << sps.log2_max_poc_lsb))
+                    .unwrap_or(16);
+                let poc_lsb = last_hdr.pic_order_cnt_lsb;
+                // Recompute poc_msb using the same logic as compute_poc_type0
+                if self.current_is_idr {
+                    self.prev_poc_msb = 0;
+                    self.prev_poc_lsb = 0;
+                } else {
+                    let poc_msb = if poc_lsb < self.prev_poc_lsb
+                        && (self.prev_poc_lsb.wrapping_sub(poc_lsb)) >= max_poc_lsb / 2
+                    {
+                        self.prev_poc_msb + max_poc_lsb as i32
+                    } else if poc_lsb > self.prev_poc_lsb
+                        && (poc_lsb.wrapping_sub(self.prev_poc_lsb)) > max_poc_lsb / 2
+                    {
+                        self.prev_poc_msb - max_poc_lsb as i32
+                    } else {
+                        self.prev_poc_msb
+                    };
+                    self.prev_poc_msb = poc_msb;
+                    self.prev_poc_lsb = poc_lsb;
+                }
             }
 
             self.frame_num += 1;
@@ -813,6 +896,10 @@ impl Decoder for H264Decoder {
         self.ref_list_l0.clear();
         self.current_fdc = None;
         self.current_last_hdr = None;
+        self.prev_poc_msb = 0;
+        self.prev_poc_lsb = 0;
+        self.current_poc = 0;
+        self.current_nal_ref_idc = 0;
         // SPS/PPS are retained across flush (matching FFmpeg behavior).
     }
 
