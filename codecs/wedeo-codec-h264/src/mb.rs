@@ -1513,11 +1513,9 @@ fn decode_b_inter_mb(
                 }
             }
 
-            // Compute L1 MV (use L1 MV context for neighbors — currently we only
-            // have L0 context, so L1 uses the same neighbor lookup. This is
-            // sufficient for BA3_SVA_C where B-frames don't reference each other.)
+            // Compute L1 MV using L1 neighbor context
             let mv_l1 = if uses_l1 {
-                let n = ctx.mv_ctx.get_neighbors_slice(
+                let n = ctx.mv_ctx.get_neighbors_list(
                     mb_x,
                     mb_y,
                     blk_x,
@@ -1525,6 +1523,7 @@ fn decode_b_inter_mb(
                     part_width_4x4,
                     Some(&ctx.slice_table),
                     ctx.current_slice,
+                    1,
                 );
                 let mvp = match part_size {
                     1 => mvpred::predict_mv_16x8(

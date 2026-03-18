@@ -294,10 +294,16 @@ impl MvContext {
         mb_addr * 16 + blk_idx
     }
 
-    /// Get the MV and ref_idx for a 4x4 block at (mb_x, mb_y, blk_idx).
+    /// Get the MV and ref_idx for a 4x4 block at (mb_x, mb_y, blk_idx) (list 0).
     pub fn get(&self, mb_x: u32, mb_y: u32, blk_idx: usize) -> ([i16; 2], i8) {
         let idx = self.linear_idx(mb_x, mb_y, blk_idx);
         (self.mv[idx], self.ref_idx[idx])
+    }
+
+    /// Get the L1 MV and ref_idx for a 4x4 block.
+    pub fn get_l1(&self, mb_x: u32, mb_y: u32, blk_idx: usize) -> ([i16; 2], i8) {
+        let idx = self.linear_idx(mb_x, mb_y, blk_idx);
+        (self.mv_l1[idx], self.ref_idx_l1[idx])
     }
 
     /// Set the MV and ref_idx for a 4x4 block (list 0).
@@ -484,6 +490,174 @@ impl MvContext {
         part_width: u32,
     ) -> NeighborInfo {
         self.get_neighbors_slice(mb_x, mb_y, blk_x, blk_y, part_width, None, 0)
+    }
+
+    /// Get neighbors for a specific list (0 = L0, 1 = L1).
+    /// List 1 reads from mv_l1/ref_idx_l1 arrays.
+    #[allow(clippy::too_many_arguments)]
+    pub fn get_neighbors_list(
+        &self,
+        mb_x: u32,
+        mb_y: u32,
+        blk_x: u32,
+        blk_y: u32,
+        part_width: u32,
+        slice_table: Option<&[u16]>,
+        current_slice: u16,
+        list: u8,
+    ) -> NeighborInfo {
+        if list == 0 {
+            self.get_neighbors_slice(
+                mb_x,
+                mb_y,
+                blk_x,
+                blk_y,
+                part_width,
+                slice_table,
+                current_slice,
+            )
+        } else {
+            // For L1, we need to read from L1 MV/ref arrays.
+            // Create a temporary "view" by reading L1 data.
+            self.get_neighbors_l1_impl(
+                mb_x,
+                mb_y,
+                blk_x,
+                blk_y,
+                part_width,
+                slice_table,
+                current_slice,
+            )
+        }
+    }
+
+    /// Internal L1 neighbor lookup — same logic as get_neighbors_slice but reads L1 arrays.
+    #[allow(clippy::too_many_arguments)]
+    fn get_neighbors_l1_impl(
+        &self,
+        mb_x: u32,
+        mb_y: u32,
+        blk_x: u32,
+        blk_y: u32,
+        part_width: u32,
+        slice_table: Option<&[u16]>,
+        current_slice: u16,
+    ) -> NeighborInfo {
+        let same_slice = |nb_mb_x: u32, nb_mb_y: u32| -> bool {
+            match slice_table {
+                None => true,
+                Some(st) => {
+                    let idx = (nb_mb_y * self.mb_width + nb_mb_x) as usize;
+                    idx < st.len() && st[idx] == current_slice
+                }
+            }
+        };
+
+        // Helper to read from L1 arrays
+        let get_l1 = |mb_x: u32, mb_y: u32, blk_idx: usize| -> ([i16; 2], i8) {
+            let idx = self.linear_idx(mb_x, mb_y, blk_idx);
+            (self.mv_l1[idx], self.ref_idx_l1[idx])
+        };
+
+        // Neighbor A (left) — L1
+        let (mv_a, ref_a, a_avail) = if blk_x > 0 {
+            let blk_idx = ((blk_x - 1) + blk_y * 4) as usize;
+            let (mv, r) = get_l1(mb_x, mb_y, blk_idx);
+            (mv, r, true)
+        } else if mb_x > 0 && same_slice(mb_x - 1, mb_y) {
+            let blk_idx = (3 + blk_y * 4) as usize;
+            let (mv, r) = get_l1(mb_x - 1, mb_y, blk_idx);
+            (mv, r, true)
+        } else {
+            ([0, 0], -1, false)
+        };
+
+        // Neighbor B (top) — L1
+        let (mv_b, ref_b, b_avail) = if blk_y > 0 {
+            let blk_idx = (blk_x + (blk_y - 1) * 4) as usize;
+            let (mv, r) = get_l1(mb_x, mb_y, blk_idx);
+            (mv, r, true)
+        } else if mb_y > 0 && same_slice(mb_x, mb_y - 1) {
+            let blk_idx = (blk_x + 3 * 4) as usize;
+            let (mv, r) = get_l1(mb_x, mb_y - 1, blk_idx);
+            (mv, r, true)
+        } else {
+            ([0, 0], -1, false)
+        };
+
+        // Neighbor C (top-right / top-left fallback) — L1
+        // Simplified: reuse the L0 neighbor_c logic but read from L1
+        let (mv_c, ref_c, c_avail) = {
+            let cr_x = blk_x + part_width;
+            let cr_y = blk_y.wrapping_sub(1);
+            let abs_cr_x = mb_x as i32 * 4 + cr_x as i32;
+            let abs_cr_y = mb_y as i32 * 4 + cr_y as i32;
+
+            let c_ok = if abs_cr_x >= 0
+                && abs_cr_y >= 0
+                && abs_cr_x < self.mb_width as i32 * 4
+                && abs_cr_y < self.mb_height as i32 * 4
+            {
+                let c_mb_x = abs_cr_x as u32 / 4;
+                let c_mb_y = abs_cr_y as u32 / 4;
+                let is_past = c_mb_y < mb_y || (c_mb_y == mb_y && c_mb_x <= mb_x);
+                is_past && (slice_table.is_none() || same_slice(c_mb_x, c_mb_y))
+            } else {
+                false
+            };
+
+            if c_ok {
+                let target_mb_x = abs_cr_x as u32 / 4;
+                let target_mb_y = abs_cr_y as u32 / 4;
+                let target_blk_x = abs_cr_x as u32 % 4;
+                let target_blk_y = abs_cr_y as u32 % 4;
+                let blk_idx = (target_blk_x + target_blk_y * 4) as usize;
+                let (mv, r) = get_l1(target_mb_x, target_mb_y, blk_idx);
+                (mv, r, true)
+            } else {
+                // Fallback to D (top-left)
+                let dl_x = blk_x.wrapping_sub(1);
+                let dl_y = blk_y.wrapping_sub(1);
+                let abs_dl_x = mb_x as i32 * 4 + dl_x as i32;
+                let abs_dl_y = mb_y as i32 * 4 + dl_y as i32;
+
+                let d_ok = if abs_dl_x >= 0
+                    && abs_dl_y >= 0
+                    && abs_dl_x < self.mb_width as i32 * 4
+                    && abs_dl_y < self.mb_height as i32 * 4
+                {
+                    let d_mb_x = abs_dl_x as u32 / 4;
+                    let d_mb_y = abs_dl_y as u32 / 4;
+                    slice_table.is_none() || same_slice(d_mb_x, d_mb_y)
+                } else {
+                    false
+                };
+
+                if d_ok {
+                    let target_mb_x = abs_dl_x as u32 / 4;
+                    let target_mb_y = abs_dl_y as u32 / 4;
+                    let target_blk_x = abs_dl_x as u32 % 4;
+                    let target_blk_y = abs_dl_y as u32 % 4;
+                    let blk_idx = (target_blk_x + target_blk_y * 4) as usize;
+                    let (mv, r) = get_l1(target_mb_x, target_mb_y, blk_idx);
+                    (mv, r, true)
+                } else {
+                    ([0, 0], -1, false)
+                }
+            }
+        };
+
+        NeighborInfo {
+            mv_a,
+            ref_a,
+            a_avail,
+            mv_b,
+            ref_b,
+            b_avail,
+            mv_c,
+            ref_c,
+            c_avail,
+        }
     }
 
     /// Like `get_neighbors` but with slice-boundary awareness.
