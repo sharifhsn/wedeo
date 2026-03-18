@@ -17,7 +17,7 @@
 - [x] **Pixel format conversion** — wedeo-scale now wraps dcv-color-primitives for I420/NV12↔RGB24/BGR24/RGBA/BGRA conversions. Converter struct with metadata preservation. 11 unit tests.
 
 ### Video codecs (native Rust, no existing crate covers these)
-- [~] **H.264 Baseline decoder** — 4/17 BITEXACT, all 17 decode all frames. See `H264.md` for detailed status. Remaining:
+- [~] **H.264 Baseline decoder** — 4/17 BITEXACT (no-deblock), all 17 decode all frames. See `H264.md` for detailed status. Remaining:
   - [x] Wire P-frame inter prediction (mb_skip_run + P_SKIP + coded P-MB types 0-4)
   - [x] Fix demuxer access unit grouping (SPS/AUD/first_mb_in_slice boundaries)
   - [x] Write FATE integration tests (4 bitexact + 4 frame count regression tests)
@@ -26,8 +26,14 @@
   - [x] Fix multi-slice OOB panic — skip run bounds check prevents mb_y >= mb_height
   - [x] Fix DPB IDR marking — current entry survives dpb.clear() to be marked ShortTerm
   - [x] Fix CAVLC ref_idx desync — use slice header's num_ref_idx_l0_active, not PPS default
-  - [ ] Fix P-frame small diffs (max_diff ~28) — likely MV prediction for P_8x8 neighbor C
-  - [ ] Fix multi-slice continuation CAVLC desync — BASQP1, SVA_Base_B, SVA_FM1_E
+  - [x] Fix ref list frame_num wrap-around — pic_num with MaxFrameNum per spec 8.2.4.1
+  - [x] Fix MV neighbor C availability — only use C from already-decoded MBs
+  - [x] Fix slice loop early-exit — parse mb_skip_run before RBSP exhaustion check
+  - [ ] Fix intra4x4 neighbor modes from inter MBs — root cause identified (mode=-1 vs DC_PRED)
+  - [ ] Fix multi-slice I-frame corruption — SVA_Base_B, SVA_FM1_E, SVA_CL1_E
+  - [ ] Fix BASQP1 multi-slice CAVLC desync — continuation slices garbled
+  - [ ] Fix early P-frame diffs — BAMQ2, SVA_BA2_D, SVA_NL2_E, BA3_SVA_C
+  - [ ] Fix BA1_FT_C 352x288 — frame 0 already wrong
   - [ ] Pass remaining Baseline FATE conformance tests (13 remaining)
 - [ ] **VP9 decoder** — second priority for WebM support. Reference: `FFmpeg/libavcodec/vp9*.c`.
 - [ ] **HEVC decoder** — similar to H.264 but more complex (CTU/CTB structure).

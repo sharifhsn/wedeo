@@ -73,6 +73,20 @@ wedeo/
 - Generate bitexact test WAVs: `cargo run --bin wedeo-audiogen -- output.wav 44100 2`
 - The framecrc tool auto-detects: audio uses packet passthrough (checksums raw packets), video uses decode mode (checksums decoded YUV frames)
 
+### Debugging H.264 Differences
+- **Read the FFmpeg C code FIRST** — before investigating any wedeo code path, open the corresponding FFmpeg function in `./FFmpeg/` and compare line by line. Key files: `h264_cavlc.c`, `h264idct_template.c`, `h264_mb.c`, `h264_mb_template.c`, `h264_ps.c`.
+- **HARD RULE:** After 2 failed hypotheses about pixel diffs, **STOP theorizing**. Extract actual intermediate values from FFmpeg (via lldb or C program) and wedeo (via `--features tracing`). Find **WHERE** the values first diverge before explaining **WHY**.
+- **Never infer intermediate values from outputs** — don't compute total_zeros from block positions or levels from dequant values. Measure directly via lldb: `breakpoint set -f file.c -l N` → `frame variable` / `expression`.
+- **FFmpeg's block layout is transposed** — `h264_slice.c:757` applies `TRANSPOSE()` to the zigzag scan, storing coefficients in column-major order. When reading block memory via lldb, `block[i]` = position `(i%4, i/4)` NOT `(i/4, i%4)`. The IDCT pass order must account for this.
+- **FFmpeg's `gb->index` includes NAL header** — 8-bit offset vs wedeo's `br.consumed()` which starts after the NAL header.
+- Use `scripts/mb_compare.py` to find differing MBs, then `--features tracing` trace output for intermediates.
+- Use `ffmpeg -bsf:v trace_headers -f null -` for exact bit-level slice header layout.
+- **Slice header overrides PPS defaults** — CAVLC must use slice-level `num_ref_idx_l0_active`, not `pps.num_ref_idx_l0_default_active`. Using PPS default when the slice header overrides to fewer refs causes CAVLC bitstream desync (extra bits consumed for ref_idx).
+- **DPB `dpb.clear()` deletes `needs_output=false` entries** — when storing a DPB entry then calling `mark_reference` (which calls `dpb.clear()` for IDR), the entry must be protected or the clear must skip it. Otherwise the entry is removed before it can be marked as ShortTerm, leaving the DPB empty for subsequent P-frames.
+- **For CAVLC desync bugs**: add `trace!()` at ALL `InvalidData` return sites in `decode_mb_cavlc`, plus at the `decode_macroblock` call site. Run with `RUST_LOG=wedeo_codec_h264::cavlc=trace,wedeo_codec_h264::mb=trace`. One run reveals WHAT failed and WHERE.
+- **Never use `eprintln!` for debug traces** — always use `tracing` crate macros (`trace!`, `debug!`) gated by `#[cfg(feature = "tracing")]`. They compile away in release builds without the feature and don't pollute CI output.
+- **When existing logs don't reveal the divergence, get better logs** — don't re-read the same trace output hoping to see something new. Options in order of effort: (1) add `trace!()` calls closer to the suspect operation in wedeo, (2) run FFmpeg with more output (`-loglevel debug`, `trace_headers` BSF, `-report`), (3) use `lldb` on FFmpeg to extract ground-truth values at the exact divergence point. Any of these takes less time than further analysis of insufficient data.
+
 ### Code Quality
 - Fix all clippy warnings unless there's a documented reason not to
 - No `#[allow(clippy::*)]` without a comment explaining why
@@ -115,18 +129,18 @@ new codecs and formats.
 
 ### H.264 video decoder (native Rust, in progress)
 
-First native video codec. Decodes H.264 Baseline profile I-frames to YUV420p.
+First native video codec. Decodes H.264 Baseline profile I+P frames to YUV420p.
 See `H264.md` for detailed architecture, module map, and known issues.
 
-**Decoder** (`codecs/wedeo-codec-h264/`, ~15,300 lines):
+**Decoder** (`codecs/wedeo-codec-h264/`, ~15,400 lines):
 - NAL parsing (Annex B + NALFF/avcC), SPS/PPS, slice header with MMCO
 - CAVLC entropy decoding (all VLC tables, level/run decode, mb_type parsing)
 - 17 intra prediction modes (9 Intra4x4 + 4 Intra16x16 + 4 chroma)
 - 4x4/8x8 integer IDCT, luma/chroma DC Hadamard transforms (i32 precision)
 - Flat dequantization (spec-equivalent, avoids i16 overflow in FFmpeg's precomputed tables)
 - In-loop deblocking filter (boundary strength, strong/normal filtering, luma+chroma)
-- Quarter-pel luma MC (6-tap FIR), eighth-pel chroma bilinear (ready, not wired)
-- MV prediction, reference list construction, MMCO, DPB (ready, not wired)
+- Quarter-pel luma MC (6-tap FIR), eighth-pel chroma bilinear
+- MV prediction (median, P_SKIP, 16x8/8x16/8x8 sub-partitions), reference list construction with frame_num wrap-around, MMCO, sliding window DPB
 - Cross-MB intra4x4 prediction mode tracking (top/left neighbor modes)
 - Multi-slice frame support, avcC extradata parsing
 
@@ -135,15 +149,21 @@ See `H264.md` for detailed architecture, module map, and known issues.
 - Access unit grouping (AUD, SPS, first_mb_in_slice boundaries)
 - File extensions: .264, .h264, .h26l, .avc
 
-**FATE Baseline conformance: 1/9 tests bitexact** (2026-03-17):
+**FATE Baseline conformance: 4/17 tests bitexact** (2026-03-18):
 
 | Test | Resolution | QP | Types | Status |
 |------|-----------|-----|-------|--------|
-| BA1_Sony_D | 176x144 | 28 | I | **BITEXACT** (17 frames) |
-| BAMQ1_JVC_C | 176x144 | 24 | I | 71 dB (±1-4 diffs, per-MB QP variation) |
-| BASQP1_Sony_C | 176x144 | 0 | I | 5.8 dB (QP=0 dequant issue) |
-| BA1_FT_C | 352x288 | 30 | I | 3.7 dB (different resolution) |
-| BA_MW_D, BA2_Sony_F, BAMQ2, BANM, BA3 | 176x144 | 24-28 | I+P/B | P/B-frame decode not wired |
+| BA1_Sony_D | 176x144 | 28 | I+P | **BITEXACT** (17 frames) |
+| SVA_BA1_B | 176x144 | 26 | I+P | **BITEXACT** (17 frames) |
+| SVA_NL1_B | 176x144 | 26 | I+P | **BITEXACT** (17 frames) |
+| BAMQ1_JVC_C | 176x144 | 24 | I | **BITEXACT** (30 frames, per-MB QP) |
+| BA_MW_D, BANM, AUD | 176x144 | 24-28 | I+P | frames 0-30 match, intra4x4 neighbor bug at f31 |
+| BA2_Sony_F | 176x144 | 28 | I+P | frames 0-61 match, same bug |
+| BAMQ2, SVA_BA2_D, SVA_NL2_E | 176x144 | 24-26 | I+P | early P-frame diffs at f2 |
+| SVA_Base_B, SVA_FM1_E, SVA_CL1_E | 176x144 | 26 | I+P | multi-slice I-frame corruption |
+| BASQP1_Sony_C | 176x144 | 0 | I | multi-slice CAVLC desync |
+| BA1_FT_C | 352x288 | 30 | I+P | frame 0 broken, dimension issue |
+| BA3_SVA_C | 176x144 | 26 | I+P | P-frame fully wrong |
 
 ### FFmpeg audio parity via symphonia
 
