@@ -158,6 +158,108 @@ pub const DEQUANT8_COEFF_INIT: [[u8; 6]; 6] = [
     [36, 32, 58, 34, 46, 43],
 ];
 
+// ---------------------------------------------------------------------------
+// B-frame macroblock type tables
+// ---------------------------------------------------------------------------
+
+/// B-slice macroblock type info.
+///
+/// Each entry: (partition_size, partition_count, [part0_l0, part0_l1, part1_l0, part1_l1])
+/// where partition_size is: 0=16x16, 1=16x8, 2=8x16, 3=8x8, 4=direct.
+/// Per-partition L0/L1 flags indicate which reference lists are used.
+///
+/// Index 0 = B_Direct_16x16 (spatial/temporal direct mode).
+/// Indices 1-22 = various partition types.
+///
+/// From FFmpeg `ff_h264_b_mb_type_info` in h264data.c, decoded into a
+/// more usable representation.
+///
+/// Fields: (partition_count, part_size, [[l0, l1]; 2])
+/// part_size: 0=16x16, 1=16x8, 2=8x16, 3=8x8
+pub const B_MB_TYPE_INFO: [(u8, u8, [[bool; 2]; 2]); 23] = [
+    // 0: B_Direct_16x16
+    (4, 0, [[true, true], [true, true]]),
+    // 1: B_L0_16x16
+    (1, 0, [[true, false], [false, false]]),
+    // 2: B_L1_16x16
+    (1, 0, [[false, true], [false, false]]),
+    // 3: B_Bi_16x16
+    (1, 0, [[true, true], [false, false]]),
+    // 4: B_L0_L0_16x8
+    (2, 1, [[true, false], [true, false]]),
+    // 5: B_L0_L0_8x16
+    (2, 2, [[true, false], [true, false]]),
+    // 6: B_L1_L1_16x8
+    (2, 1, [[false, true], [false, true]]),
+    // 7: B_L1_L1_8x16
+    (2, 2, [[false, true], [false, true]]),
+    // 8: B_L0_L1_16x8
+    (2, 1, [[true, false], [false, true]]),
+    // 9: B_L0_L1_8x16
+    (2, 2, [[true, false], [false, true]]),
+    // 10: B_L1_L0_16x8
+    (2, 1, [[false, true], [true, false]]),
+    // 11: B_L1_L0_8x16
+    (2, 2, [[false, true], [true, false]]),
+    // 12: B_L0_Bi_16x8
+    (2, 1, [[true, false], [true, true]]),
+    // 13: B_L0_Bi_8x16
+    (2, 2, [[true, false], [true, true]]),
+    // 14: B_L1_Bi_16x8
+    (2, 1, [[false, true], [true, true]]),
+    // 15: B_L1_Bi_8x16
+    (2, 2, [[false, true], [true, true]]),
+    // 16: B_Bi_L0_16x8
+    (2, 1, [[true, true], [true, false]]),
+    // 17: B_Bi_L0_8x16
+    (2, 2, [[true, true], [true, false]]),
+    // 18: B_Bi_L1_16x8
+    (2, 1, [[true, true], [false, true]]),
+    // 19: B_Bi_L1_8x16
+    (2, 2, [[true, true], [false, true]]),
+    // 20: B_Bi_Bi_16x8
+    (2, 1, [[true, true], [true, true]]),
+    // 21: B_Bi_Bi_8x16
+    (2, 2, [[true, true], [true, true]]),
+    // 22: B_8x8
+    (4, 3, [[true, true], [true, true]]),
+];
+
+/// B-slice sub-macroblock type info (for B_8x8 partitions).
+///
+/// Each entry: (sub_partition_count, sub_part_size, l0, l1)
+/// sub_part_size: 0=8x8, 1=8x4, 2=4x8, 3=4x4, 4=direct
+///
+/// From FFmpeg `ff_h264_b_sub_mb_type_info` in h264data.c.
+pub const B_SUB_MB_TYPE_INFO: [(u8, u8, bool, bool); 13] = [
+    // 0: B_Direct_8x8
+    (4, 4, true, true),
+    // 1: B_L0_8x8
+    (1, 0, true, false),
+    // 2: B_L1_8x8
+    (1, 0, false, true),
+    // 3: B_Bi_8x8
+    (1, 0, true, true),
+    // 4: B_L0_8x4
+    (2, 1, true, false),
+    // 5: B_L0_4x8
+    (2, 2, true, false),
+    // 6: B_L1_8x4
+    (2, 1, false, true),
+    // 7: B_L1_4x8
+    (2, 2, false, true),
+    // 8: B_Bi_8x4
+    (2, 1, true, true),
+    // 9: B_Bi_4x8
+    (2, 2, true, true),
+    // 10: B_L0_4x4
+    (4, 3, true, false),
+    // 11: B_L1_4x4
+    (4, 3, false, true),
+    // 12: B_Bi_4x4
+    (4, 3, true, true),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;

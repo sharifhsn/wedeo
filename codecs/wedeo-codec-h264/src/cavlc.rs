@@ -14,7 +14,9 @@ use crate::cavlc_tables::{
 };
 use crate::pps::Pps;
 use crate::slice::SliceType;
-use crate::tables::{GOLOMB_TO_INTER_CBP, GOLOMB_TO_INTRA4X4_CBP};
+use crate::tables::{
+    B_MB_TYPE_INFO, B_SUB_MB_TYPE_INFO, GOLOMB_TO_INTER_CBP, GOLOMB_TO_INTRA4X4_CBP,
+};
 
 // ---------------------------------------------------------------------------
 // Neighbor context for nC computation
@@ -595,6 +597,13 @@ pub struct MacroblockCavlc {
     pub mvd_l1: [[i16; 2]; 16],
     /// Number of partitions for this macroblock type.
     pub partition_count: u8,
+    /// True for B_Direct_16x16 (mb_type 0 in B-slice).
+    pub is_direct: bool,
+    /// Per-partition L0/L1 usage flags for B-slices.
+    /// [partition][0=l0, 1=l1]. Only valid for B-slice inter MBs.
+    pub b_list_flags: [[bool; 2]; 2],
+    /// Partition size for B-slices: 0=16x16, 1=16x8, 2=8x16, 3=8x8.
+    pub b_part_size: u8,
 }
 
 impl Default for MacroblockCavlc {
@@ -621,6 +630,9 @@ impl Default for MacroblockCavlc {
             mvd_l0: [[0; 2]; 16],
             mvd_l1: [[0; 2]; 16],
             partition_count: 0,
+            is_direct: false,
+            b_list_flags: [[false; 2]; 2],
+            b_part_size: 0,
         }
     }
 }
@@ -779,15 +791,14 @@ pub fn decode_mb_cavlc(
             }
         }
         SliceType::B => {
-            // B-slice macroblock types are more complex.
-            // For now, signal unsupported for B-slices.
             if raw_mb_type < 23 {
                 is_intra = false;
                 mb.mb_type = raw_mb_type;
-                // B-slice partition counts would be looked up from B_MB_TYPE_INFO.
-                // Stub: just set partition_count based on type.
-                mb.partition_count = if raw_mb_type == 0 { 1 } else { 2 };
-                // TODO: full B-slice mb_type decoding
+                let info = &B_MB_TYPE_INFO[raw_mb_type as usize];
+                mb.partition_count = info.0;
+                mb.b_part_size = info.1;
+                mb.b_list_flags = info.2;
+                mb.is_direct = raw_mb_type == 0;
             } else {
                 let mt = raw_mb_type - 23;
                 if mt > 25 {
@@ -960,6 +971,95 @@ pub fn decode_mb_cavlc(
                 }
             }
             _ => {}
+        }
+    }
+
+    // 4b. Inter prediction (B-slice, not intra)
+    if !is_intra && slice_type == SliceType::B && !mb.is_direct {
+        let part_count = mb.partition_count as usize;
+
+        if mb.mb_type == 22 {
+            // B_8x8: parse sub_mb_type for each 8x8 partition
+            for i in 0..4 {
+                let sub_mt = get_ue_golomb(br)?;
+                if sub_mt >= 13 {
+                    return Err(Error::InvalidData);
+                }
+                mb.sub_mb_type[i] = sub_mt as u8;
+            }
+
+            // Parse ref_idx L0 for each 8x8 partition that uses L0
+            for i in 0..4 {
+                let info = &B_SUB_MB_TYPE_INFO[mb.sub_mb_type[i] as usize];
+                if info.2 {
+                    // uses L0
+                    mb.ref_idx_l0[i] = read_ref_idx(br, num_ref_idx_l0_active)? as i8;
+                }
+            }
+            // Parse ref_idx L1 for each 8x8 partition that uses L1
+            for i in 0..4 {
+                let info = &B_SUB_MB_TYPE_INFO[mb.sub_mb_type[i] as usize];
+                if info.3 {
+                    // uses L1
+                    mb.ref_idx_l1[i] = read_ref_idx(br, _num_ref_idx_l1_active)? as i8;
+                }
+            }
+            // Parse mvd L0 for each sub-partition
+            for i in 0..4 {
+                let info = &B_SUB_MB_TYPE_INFO[mb.sub_mb_type[i] as usize];
+                if info.2 {
+                    let sub_part_count = info.0 as usize;
+                    for j in 0..sub_part_count {
+                        let mvd_idx = i * 4 + j;
+                        if mvd_idx < 16 {
+                            mb.mvd_l0[mvd_idx][0] = get_se_golomb(br)? as i16;
+                            mb.mvd_l0[mvd_idx][1] = get_se_golomb(br)? as i16;
+                        }
+                    }
+                }
+            }
+            // Parse mvd L1 for each sub-partition
+            for i in 0..4 {
+                let info = &B_SUB_MB_TYPE_INFO[mb.sub_mb_type[i] as usize];
+                if info.3 {
+                    let sub_part_count = info.0 as usize;
+                    for j in 0..sub_part_count {
+                        let mvd_idx = i * 4 + j;
+                        if mvd_idx < 16 {
+                            mb.mvd_l1[mvd_idx][0] = get_se_golomb(br)? as i16;
+                            mb.mvd_l1[mvd_idx][1] = get_se_golomb(br)? as i16;
+                        }
+                    }
+                }
+            }
+        } else {
+            // Non-8x8 B-slice partitions (1 or 2 partitions)
+            // Parse ref_idx L0 for all partitions that use L0
+            for p in 0..part_count {
+                if mb.b_list_flags[p][0] {
+                    mb.ref_idx_l0[p] = read_ref_idx(br, num_ref_idx_l0_active)? as i8;
+                }
+            }
+            // Parse ref_idx L1 for all partitions that use L1
+            for p in 0..part_count {
+                if mb.b_list_flags[p][1] {
+                    mb.ref_idx_l1[p] = read_ref_idx(br, _num_ref_idx_l1_active)? as i8;
+                }
+            }
+            // Parse mvd L0 for all partitions that use L0
+            for p in 0..part_count {
+                if mb.b_list_flags[p][0] {
+                    mb.mvd_l0[p][0] = get_se_golomb(br)? as i16;
+                    mb.mvd_l0[p][1] = get_se_golomb(br)? as i16;
+                }
+            }
+            // Parse mvd L1 for all partitions that use L1
+            for p in 0..part_count {
+                if mb.b_list_flags[p][1] {
+                    mb.mvd_l1[p][0] = get_se_golomb(br)? as i16;
+                    mb.mvd_l1[p][1] = get_se_golomb(br)? as i16;
+                }
+            }
         }
     }
 
