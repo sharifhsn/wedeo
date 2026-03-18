@@ -49,6 +49,8 @@ def run_framecrc(cmd, env=None):
     """Run a framecrc command and return parsed lines as (frame_idx, crc) tuples."""
     full_env = {**subprocess.os.environ, **(env or {})}
     result = subprocess.run(cmd, capture_output=True, env=full_env)
+    if result.returncode != 0:
+        print(f"WARN: {' '.join(cmd[:3])}... exited with {result.returncode}", file=sys.stderr)
     lines = result.stdout.decode().splitlines()
     frames = []
     for line in lines:
@@ -103,13 +105,13 @@ def compare_one(input_path, wedeo_bin, no_deblock=False, pixel_detail=False):
     plane_info = None
     if pixel_detail and diffs:
         plane_info = pixel_plane_analysis(
-            input_path, wedeo_bin, no_deblock, diffs, total
+            input_path, wedeo_bin, no_deblock, diffs
         )
 
     return total, matching, diffs, plane_info
 
 
-def pixel_plane_analysis(input_path, wedeo_bin, no_deblock, diff_frames, total_frames):
+def pixel_plane_analysis(input_path, wedeo_bin, no_deblock, diff_frames):
     """Decode raw YUV and compare Y/U/V planes for differing frames."""
     import numpy as np
 

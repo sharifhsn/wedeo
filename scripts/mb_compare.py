@@ -21,23 +21,6 @@ from pathlib import Path
 import numpy as np
 
 
-def decode_yuv(cmd: list[str], env: dict | None = None) -> bytes:
-    """Run a command that writes raw YUV to a temp file, return the bytes."""
-    with tempfile.NamedTemporaryFile(suffix=".yuv", delete=False) as f:
-        tmp = f.name
-
-    full_env = dict(**subprocess.os.environ, **(env or {}))
-    result = subprocess.run(cmd + [tmp], capture_output=True, env=full_env)
-    if result.returncode != 0:
-        print(f"FAIL: {' '.join(cmd)}", file=sys.stderr)
-        print(result.stderr.decode(errors="replace"), file=sys.stderr)
-        sys.exit(1)
-
-    data = Path(tmp).read_bytes()
-    Path(tmp).unlink(missing_ok=True)
-    return data
-
-
 def get_dimensions_from_framecrc(lines: list[str]) -> tuple[int, int]:
     """Extract width x height from framecrc header comments."""
     for line in lines:
@@ -62,6 +45,10 @@ def main():
     parser.add_argument(
         "--start-frame", type=int, default=0, help="First frame to compare"
     )
+    parser.add_argument(
+        "--deblock", action="store_true",
+        help="Compare WITH deblocking (default: deblocking disabled)"
+    )
     args = parser.parse_args()
 
     input_path = Path(args.input).resolve()
@@ -80,11 +67,16 @@ def main():
         print("Error: wedeo-framecrc not found. Run `cargo build -p wedeo-fate`", file=sys.stderr)
         sys.exit(1)
 
+    # Build env: disable deblocking by default unless --deblock is passed
+    wedeo_env = {**subprocess.os.environ}
+    if not args.deblock:
+        wedeo_env["WEDEO_NO_DEBLOCK"] = "1"
+
     # Step 1: Get dimensions from wedeo framecrc header
     result = subprocess.run(
         [wedeo_bin, str(input_path)],
         capture_output=True,
-        env={**subprocess.os.environ, "WEDEO_NO_DEBLOCK": "1"},
+        env=wedeo_env,
     )
     wedeo_lines = result.stdout.decode().splitlines()
     width, height = get_dimensions_from_framecrc(wedeo_lines)
@@ -100,27 +92,18 @@ def main():
     with tempfile.NamedTemporaryFile(suffix=".yuv", delete=False) as f:
         ffmpeg_yuv_path = f.name
 
-    # wedeo: WEDEO_NO_DEBLOCK=1
     subprocess.run(
         [wedeo_bin, str(input_path), "--raw-yuv", wedeo_yuv_path],
         capture_output=True,
-        env={**subprocess.os.environ, "WEDEO_NO_DEBLOCK": "1"},
+        env=wedeo_env,
         check=True,
     )
 
-    # ffmpeg: -skip_loop_filter all
-    subprocess.run(
-        [
-            "ffmpeg", "-y", "-bitexact",
-            "-skip_loop_filter", "all",
-            "-i", str(input_path),
-            "-pix_fmt", "yuv420p",
-            "-f", "rawvideo",
-            ffmpeg_yuv_path,
-        ],
-        capture_output=True,
-        check=True,
-    )
+    ffmpeg_cmd = ["ffmpeg", "-y", "-bitexact"]
+    if not args.deblock:
+        ffmpeg_cmd += ["-skip_loop_filter", "all"]
+    ffmpeg_cmd += ["-i", str(input_path), "-pix_fmt", "yuv420p", "-f", "rawvideo", ffmpeg_yuv_path]
+    subprocess.run(ffmpeg_cmd, capture_output=True, check=True)
 
     wedeo_data = Path(wedeo_yuv_path).read_bytes()
     ffmpeg_data = Path(ffmpeg_yuv_path).read_bytes()
@@ -189,10 +172,11 @@ def main():
                 f"(first: MB({mx},{my}), max_diff={max_d}, mean_diff={mean_d:.1f}){chroma_note}"
             )
             print(
-                f"  Debug: RUST_LOG=wedeo_codec_h264::mb=trace "
-                f"cargo run --release --bin wedeo-framecrc --features tracing "
-                f"-- {input_path} --raw-yuv /dev/null 2>/tmp/trace.txt && "
-                f'grep "MB({mx},{my})" /tmp/trace.txt | head -20'
+                f"  Debug: cargo build --bin wedeo-framecrc -p wedeo-fate --features tracing && "
+                f"WEDEO_NO_DEBLOCK=1 RUST_LOG=wedeo_codec_h264::mb=trace "
+                f"./target/debug/wedeo-framecrc {input_path} "
+                f">/dev/null 2>/tmp/trace.log && "
+                f'sed \'s/\\x1b\\[[0-9;]*m//g\' /tmp/trace.log | grep "MB({mx},{my})" | head -20'
             )
         elif not chroma_ok:
             total_chroma_diffs += 1
