@@ -439,6 +439,18 @@ impl H264Decoder {
             }
 
             if let Some(dpb_idx) = self.dpb.store(entry) {
+                #[cfg(feature = "tracing-detail")]
+                {
+                    let e = self.dpb.get(dpb_idx).unwrap();
+                    tracing::trace!(
+                        internal_frame = self.frame_num,
+                        dpb_idx,
+                        h264_frame_num = e.frame_num,
+                        y_ptr = ?e.pic.y.as_ptr(),
+                        pixel_160_32 = e.pic.y[32 * e.pic.y_stride + 160],
+                        "DPB stored entry"
+                    );
+                }
                 // Apply reference picture marking
                 let sps_max_refs = self
                     .sps_list
@@ -547,9 +559,11 @@ impl H264Decoder {
                     break; // Skip run consumed remaining MBs
                 }
 
-                // Check if we've consumed all RBSP data after skip run —
-                // only now is it safe to stop before the coded MB.
-                if br.consumed() + 8 >= rbsp_bits {
+                // Check if we've consumed all RBSP data after skip run.
+                // Use a tight margin: the stop bit is 1 bit + ≤7 alignment
+                // zeros, but after a skip run we may still have a coded MB.
+                // A coded MB needs at least a mb_type UE code (1 bit min).
+                if br.consumed() + 1 >= rbsp_bits {
                     break;
                 }
 
