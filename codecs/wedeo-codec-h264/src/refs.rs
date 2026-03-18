@@ -16,8 +16,13 @@ use crate::slice::{MmcoOp, RefPicListModification, SliceHeader};
 
 /// Build reference list 0 for a P-slice (Baseline profile, frame-only).
 ///
-/// Short-term references are sorted by frame_num descending (most recent
-/// first). Long-term references are appended after, sorted by
+/// Short-term references are sorted by pic_num descending (most recent
+/// first). pic_num handles frame_num wrap-around per H.264 spec 8.2.4.1:
+///   pic_num = frame_num                    if frame_num <= CurrFrameNum
+///   pic_num = frame_num - MaxFrameNum      if frame_num > CurrFrameNum
+/// where MaxFrameNum = 2^log2_max_frame_num.
+///
+/// Long-term references are appended after, sorted by
 /// long_term_frame_idx ascending.
 ///
 /// The list is then optionally reordered by ref_pic_list_modification
@@ -26,19 +31,33 @@ use crate::slice::{MmcoOp, RefPicListModification, SliceHeader};
 /// Returns a Vec of DPB indices representing list 0.
 ///
 /// Reference: FFmpeg `h264_initialise_ref_list` and `ff_h264_build_ref_list`.
-pub fn build_ref_list_p(dpb: &Dpb, slice_hdr: &SliceHeader, current_frame_num: u32) -> Vec<usize> {
-    // Collect short-term references with DPB indices
-    let mut short_term: Vec<(usize, u32)> = Vec::new();
+pub fn build_ref_list_p(
+    dpb: &Dpb,
+    slice_hdr: &SliceHeader,
+    current_frame_num: u32,
+    max_frame_num: u32,
+) -> Vec<usize> {
+    // Compute pic_num with wrap-around handling (H.264 spec 8.2.4.1).
+    let pic_num = |fn_: u32| -> i64 {
+        if fn_ <= current_frame_num {
+            fn_ as i64
+        } else {
+            fn_ as i64 - max_frame_num as i64
+        }
+    };
+
+    // Collect short-term references with their pic_num values.
+    let mut short_term: Vec<(usize, i64)> = Vec::new();
     for (i, entry) in dpb.entries.iter().enumerate() {
         if let Some(e) = entry
             && e.status == RefStatus::ShortTerm
         {
-            short_term.push((i, e.frame_num));
+            short_term.push((i, pic_num(e.frame_num)));
         }
     }
 
-    // Sort by frame_num descending (most recent first).
-    short_term.sort_by_key(|b| std::cmp::Reverse(b.1));
+    // Sort by pic_num descending (most recent first).
+    short_term.sort_by_key(|&(_, p)| std::cmp::Reverse(p));
 
     // Collect long-term references
     let mut long_term: Vec<(usize, u32)> = Vec::new();
@@ -377,7 +396,7 @@ mod tests {
         dpb.store(make_entry(5, 10, RefStatus::ShortTerm));
 
         let hdr = default_slice_header();
-        let list = build_ref_list_p(&dpb, &hdr, 8);
+        let list = build_ref_list_p(&dpb, &hdr, 8, 256);
 
         assert_eq!(list.len(), 3);
         let frame_nums: Vec<u32> = list
@@ -397,7 +416,7 @@ mod tests {
         dpb.store(lt_entry);
 
         let hdr = default_slice_header();
-        let list = build_ref_list_p(&dpb, &hdr, 8);
+        let list = build_ref_list_p(&dpb, &hdr, 8, 256);
 
         assert_eq!(list.len(), 2);
         assert_eq!(dpb.get(list[0]).unwrap().status, RefStatus::ShortTerm);
@@ -413,7 +432,7 @@ mod tests {
 
         let mut hdr = default_slice_header();
         hdr.num_ref_idx_l0_active = 3;
-        let list = build_ref_list_p(&dpb, &hdr, 10);
+        let list = build_ref_list_p(&dpb, &hdr, 10, 256);
 
         assert_eq!(list.len(), 3);
     }
@@ -422,8 +441,39 @@ mod tests {
     fn test_build_ref_list_p_empty_dpb() {
         let dpb = Dpb::new(4);
         let hdr = default_slice_header();
-        let list = build_ref_list_p(&dpb, &hdr, 0);
+        let list = build_ref_list_p(&dpb, &hdr, 0, 16);
         assert!(list.is_empty());
+    }
+
+    /// Test that frame_num wrap-around is handled correctly.
+    ///
+    /// Scenario: max_frame_num=16, CurrFrameNum=1 (frame 17 in decode order,
+    /// which has H.264 frame_num=1 after wrap). The DPB contains:
+    ///   - frame_num=0 (frame 16, just decoded before wrap — most recent)
+    ///   - frame_num=15 (frame 15, older)
+    ///   - frame_num=14 (frame 14, oldest)
+    ///
+    /// Without wrap-around, raw u32 sort gives [15, 14, 0] (wrong).
+    /// With wrap-around: pic_num(0)=0, pic_num(15)=15-16=-1, pic_num(14)=-2
+    /// → sorted desc: [0, -1, -2] → frame_nums [0, 15, 14] (correct).
+    #[test]
+    fn test_build_ref_list_p_frame_num_wraparound() {
+        let mut dpb = Dpb::new(4);
+        dpb.store(make_entry(0, 0, RefStatus::ShortTerm)); // most recent (after wrap)
+        dpb.store(make_entry(15, 30, RefStatus::ShortTerm)); // one before wrap
+        dpb.store(make_entry(14, 28, RefStatus::ShortTerm)); // two before wrap
+
+        let hdr = default_slice_header();
+        // CurrFrameNum=1 (wrapped), MaxFrameNum=16
+        let list = build_ref_list_p(&dpb, &hdr, 1, 16);
+
+        assert_eq!(list.len(), 3);
+        let frame_nums: Vec<u32> = list
+            .iter()
+            .map(|&idx| dpb.get(idx).unwrap().frame_num)
+            .collect();
+        // frame_num=0 (pic_num=0) must be first (most recent)
+        assert_eq!(frame_nums, vec![0, 15, 14]);
     }
 
     #[test]
