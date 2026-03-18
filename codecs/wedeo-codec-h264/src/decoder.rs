@@ -516,10 +516,11 @@ impl H264Decoder {
                     let skip_y = mb_addr / mb_width;
                     if skip_x == 0 && mb_addr != first_mb {
                         fdc.neighbor_ctx.new_row();
-                        fdc.neighbor_ctx.top_available = skip_y > 0
-                            && fdc.slice_table[(mb_addr - mb_width) as usize]
-                                == fdc.current_slice;
                     }
+                    // Per-MB top availability (slice-boundary aware)
+                    fdc.neighbor_ctx.top_available = skip_y > 0
+                        && fdc.slice_table[(mb_addr - mb_width) as usize]
+                            == fdc.current_slice;
                     mb::decode_skip_mb(fdc, hdr, skip_x, skip_y, ref_pics);
                     mb_addr += 1;
                     mbs_decoded += 1;
@@ -551,6 +552,15 @@ impl H264Decoder {
                 }
             }
 
+            // Update per-MB neighbor availability (slice-boundary aware).
+            // top_available must be per-MB because the top row may span
+            // multiple slices (when first_mb is mid-row).
+            let mb_x = mb_addr % mb_width;
+            let mb_y = mb_addr / mb_width;
+            fdc.neighbor_ctx.top_available = mb_y > 0
+                && fdc.slice_table[(mb_addr - mb_width) as usize]
+                    == fdc.current_slice;
+
             // Decode coded MB (existing path)
             mb::decode_macroblock(
                 fdc,
@@ -558,8 +568,8 @@ impl H264Decoder {
                 hdr,
                 sps,
                 pps,
-                mb_addr % mb_width,
-                mb_addr / mb_width,
+                mb_x,
+                mb_y,
                 ref_pics,
             )?;
             mb_addr += 1;
