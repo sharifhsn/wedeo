@@ -832,7 +832,12 @@ pub fn decode_mb_cavlc(
 
     // 3. Intra prediction modes
     #[cfg(feature = "tracing-detail")]
-    trace!(bits_after_mb_type = br.consumed(), mb_x, mb_y = _mb_y, "intra4x4 modes start");
+    trace!(
+        bits_after_mb_type = br.consumed(),
+        mb_x,
+        mb_y = _mb_y,
+        "intra4x4 modes start"
+    );
     if mb.is_intra4x4 {
         // Parse and resolve intra4x4 prediction modes for each 4x4 block.
         //

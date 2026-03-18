@@ -453,8 +453,7 @@ pub fn decode_macroblock(
     // Check neighbor availability with slice boundary awareness.
     // H.264 spec: neighbors from different slices are unavailable.
     let cur_slice = ctx.current_slice;
-    let has_top = mb_y > 0
-        && ctx.slice_table[mb_idx - ctx.mb_width as usize] == cur_slice;
+    let has_top = mb_y > 0 && ctx.slice_table[mb_idx - ctx.mb_width as usize] == cur_slice;
     let has_left = mb_x > 0 && ctx.slice_table[mb_idx - 1] == cur_slice;
 
     trace!(
@@ -508,7 +507,17 @@ pub fn decode_macroblock(
         decode_intra16x16(ctx, &mut mb, mb_x, mb_y, qp, c_qp, has_top, has_left);
     } else if !mb.is_intra {
         // Inter macroblock (P or B)
-        decode_inter_mb(ctx, &mut mb, slice_hdr, mb_x, mb_y, qp, c_qp, ref_pics, ref_pics_l1);
+        decode_inter_mb(
+            ctx,
+            &mut mb,
+            slice_hdr,
+            mb_x,
+            mb_y,
+            qp,
+            c_qp,
+            ref_pics,
+            ref_pics_l1,
+        );
     }
 
     // 6. Update neighbor context
@@ -600,7 +609,15 @@ fn decode_inter_mb(
         0 => {
             // P_L0_16x16: one 16x16 partition
             let ref_idx = mb.ref_idx_l0[0].max(0) as usize;
-            let n = ctx.mv_ctx.get_neighbors_slice(mb_x, mb_y, 0, 0, 4, Some(&ctx.slice_table), ctx.current_slice);
+            let n = ctx.mv_ctx.get_neighbors_slice(
+                mb_x,
+                mb_y,
+                0,
+                0,
+                4,
+                Some(&ctx.slice_table),
+                ctx.current_slice,
+            );
             #[cfg(feature = "tracing-detail")]
             trace!(
                 mb_x, mb_y,
@@ -641,7 +658,15 @@ fn decode_inter_mb(
             for part in 0..2u32 {
                 let ref_idx = mb.ref_idx_l0[part as usize].max(0) as usize;
                 let blk_y = part * 2; // 0 for top, 2 for bottom
-                let n = ctx.mv_ctx.get_neighbors_slice(mb_x, mb_y, 0, blk_y, 4, Some(&ctx.slice_table), ctx.current_slice);
+                let n = ctx.mv_ctx.get_neighbors_slice(
+                    mb_x,
+                    mb_y,
+                    0,
+                    blk_y,
+                    4,
+                    Some(&ctx.slice_table),
+                    ctx.current_slice,
+                );
                 #[cfg(feature = "tracing-detail")]
                 trace!(mb_x, mb_y, part, ref_idx, blk_y,
                     mv_a = ?n.mv_a, ref_a = n.ref_a, a_avail = n.a_avail,
@@ -687,7 +712,15 @@ fn decode_inter_mb(
             for part in 0..2u32 {
                 let ref_idx = mb.ref_idx_l0[part as usize].max(0) as usize;
                 let blk_x = part * 2; // 0 for left, 2 for right
-                let n = ctx.mv_ctx.get_neighbors_slice(mb_x, mb_y, blk_x, 0, 2, Some(&ctx.slice_table), ctx.current_slice);
+                let n = ctx.mv_ctx.get_neighbors_slice(
+                    mb_x,
+                    mb_y,
+                    blk_x,
+                    0,
+                    2,
+                    Some(&ctx.slice_table),
+                    ctx.current_slice,
+                );
                 let mvp = mvpred::predict_mv_8x16(
                     n.mv_a,
                     n.mv_b,
@@ -735,7 +768,15 @@ fn decode_inter_mb(
                 match sub_type {
                     0 => {
                         // 8x8 sub-partition
-                        let n = ctx.mv_ctx.get_neighbors_slice(mb_x, mb_y, part_x, part_y, 2, Some(&ctx.slice_table), ctx.current_slice);
+                        let n = ctx.mv_ctx.get_neighbors_slice(
+                            mb_x,
+                            mb_y,
+                            part_x,
+                            part_y,
+                            2,
+                            Some(&ctx.slice_table),
+                            ctx.current_slice,
+                        );
                         #[cfg(feature = "tracing-detail")]
                         trace!(
                             mb_x, mb_y, i8x8, part_x, part_y,
@@ -793,7 +834,15 @@ fn decode_inter_mb(
                         // 8x4 sub-partition: two 8x4 blocks
                         for sub in 0..2u32 {
                             let sub_y = part_y + sub;
-                            let n = ctx.mv_ctx.get_neighbors_slice(mb_x, mb_y, part_x, sub_y, 2, Some(&ctx.slice_table), ctx.current_slice);
+                            let n = ctx.mv_ctx.get_neighbors_slice(
+                                mb_x,
+                                mb_y,
+                                part_x,
+                                sub_y,
+                                2,
+                                Some(&ctx.slice_table),
+                                ctx.current_slice,
+                            );
                             let mvp = mvpred::predict_mv(
                                 n.mv_a,
                                 n.mv_b,
@@ -846,7 +895,15 @@ fn decode_inter_mb(
                         // 4x8 sub-partition: two 4x8 blocks
                         for sub in 0..2u32 {
                             let sub_x = part_x + sub;
-                            let n = ctx.mv_ctx.get_neighbors_slice(mb_x, mb_y, sub_x, part_y, 1, Some(&ctx.slice_table), ctx.current_slice);
+                            let n = ctx.mv_ctx.get_neighbors_slice(
+                                mb_x,
+                                mb_y,
+                                sub_x,
+                                part_y,
+                                1,
+                                Some(&ctx.slice_table),
+                                ctx.current_slice,
+                            );
                             let mvp = mvpred::predict_mv(
                                 n.mv_a,
                                 n.mv_b,
@@ -900,7 +957,15 @@ fn decode_inter_mb(
                         for sub in 0..4u32 {
                             let sub_x = part_x + (sub % 2);
                             let sub_y = part_y + (sub / 2);
-                            let n = ctx.mv_ctx.get_neighbors_slice(mb_x, mb_y, sub_x, sub_y, 1, Some(&ctx.slice_table), ctx.current_slice);
+                            let n = ctx.mv_ctx.get_neighbors_slice(
+                                mb_x,
+                                mb_y,
+                                sub_x,
+                                sub_y,
+                                1,
+                                Some(&ctx.slice_table),
+                                ctx.current_slice,
+                            );
                             let mvp = mvpred::predict_mv(
                                 n.mv_a,
                                 n.mv_b,
@@ -1051,10 +1116,13 @@ fn apply_mc_partition(
         let ref_ptr = ref_pic.y.as_ptr();
         let cur_ptr = ctx.pic.y.as_ptr();
         let same_buf = std::ptr::eq(ref_ptr, cur_ptr);
-        let ref_row: Vec<u8> = (0..21).map(|i| {
-            let rx = (luma_ref_x as i32 - 2 + i as i32).clamp(0, ref_pic.width as i32 - 1) as usize;
-            ref_pic.y[ry * stride + rx]
-        }).collect();
+        let ref_row: Vec<u8> = (0..21)
+            .map(|i| {
+                let rx =
+                    (luma_ref_x as i32 - 2 + i as i32).clamp(0, ref_pic.width as i32 - 1) as usize;
+                ref_pic.y[ry * stride + rx]
+            })
+            .collect();
         trace!(mb_x, mb_y, luma_ref_x, luma_ref_y, luma_dx, luma_dy,
                ref_ptr = ?ref_ptr, cur_ptr = ?cur_ptr, same_buf,
                ref_pic_width = ref_pic.width, ref_pic_height = ref_pic.height,
@@ -1150,7 +1218,15 @@ pub fn decode_skip_mb(
         }
     } else {
         // Compute skip MV from neighbors
-        let n = ctx.mv_ctx.get_neighbors_slice(mb_x, mb_y, 0, 0, 4, Some(&ctx.slice_table), ctx.current_slice);
+        let n = ctx.mv_ctx.get_neighbors_slice(
+            mb_x,
+            mb_y,
+            0,
+            0,
+            4,
+            Some(&ctx.slice_table),
+            ctx.current_slice,
+        );
         #[cfg(feature = "tracing-detail")]
         trace!(
             mb_x, mb_y,
@@ -1230,8 +1306,19 @@ pub fn decode_b_skip_mb(
         if use_l0 && use_l1 {
             // Bidirectional MC
             apply_mc_bi_partition(
-                ctx, ref_pics, ref_pics_l1, mb_x, mb_y, 0, 0, 16, 16,
-                mv_l0, ref_l0, mv_l1, ref_l1,
+                ctx,
+                ref_pics,
+                ref_pics_l1,
+                mb_x,
+                mb_y,
+                0,
+                0,
+                16,
+                16,
+                mv_l0,
+                ref_l0,
+                mv_l1,
+                ref_l1,
             );
         } else if use_l0 {
             let ref_pic = ref_pics[(ref_l0 as usize).min(ref_pics.len() - 1)];
@@ -1309,8 +1396,19 @@ fn decode_b_inter_mb(
 
         if use_l0 && use_l1 {
             apply_mc_bi_partition(
-                ctx, ref_pics, ref_pics_l1, mb_x, mb_y, 0, 0, 16, 16,
-                mv_l0, ref_l0, mv_l1, ref_l1,
+                ctx,
+                ref_pics,
+                ref_pics_l1,
+                mb_x,
+                mb_y,
+                0,
+                0,
+                16,
+                16,
+                mv_l0,
+                ref_l0,
+                mv_l1,
+                ref_l1,
             );
         } else if use_l0 {
             let ref_pic = ref_pics[(ref_l0 as usize).min(ref_pics.len() - 1)];
@@ -1334,14 +1432,22 @@ fn decode_b_inter_mb(
         for part in 0..part_count {
             let uses_l0 = mb.b_list_flags[part][0];
             let uses_l1 = mb.b_list_flags[part][1];
-            let ref_l0 = if uses_l0 { mb.ref_idx_l0[part].max(0) } else { -1 };
-            let ref_l1 = if uses_l1 { mb.ref_idx_l1[part].max(0) } else { -1 };
+            let ref_l0 = if uses_l0 {
+                mb.ref_idx_l0[part].max(0)
+            } else {
+                -1
+            };
+            let ref_l1 = if uses_l1 {
+                mb.ref_idx_l1[part].max(0)
+            } else {
+                -1
+            };
 
             // Compute partition geometry
             let (blk_x, blk_y, pw, ph) = match part_size {
                 0 => (0u32, 0u32, 16usize, 16usize), // 16x16
-                1 => (0, part as u32 * 2, 16, 8),     // 16x8
-                2 => (part as u32 * 2, 0, 8, 16),     // 8x16
+                1 => (0, part as u32 * 2, 16, 8),    // 16x8
+                2 => (part as u32 * 2, 0, 8, 16),    // 8x16
                 _ => (0, 0, 16, 16),
             };
 
@@ -1350,21 +1456,44 @@ fn decode_b_inter_mb(
             // Compute L0 MV
             let mv_l0 = if uses_l0 {
                 let n = ctx.mv_ctx.get_neighbors_slice(
-                    mb_x, mb_y, blk_x, blk_y, part_width_4x4,
-                    Some(&ctx.slice_table), ctx.current_slice,
+                    mb_x,
+                    mb_y,
+                    blk_x,
+                    blk_y,
+                    part_width_4x4,
+                    Some(&ctx.slice_table),
+                    ctx.current_slice,
                 );
                 let mvp = match part_size {
                     1 => mvpred::predict_mv_16x8(
-                        n.mv_a, n.mv_b, n.mv_c, n.ref_a, n.ref_b, n.ref_c,
-                        ref_l0, n.a_avail, n.b_avail, n.c_avail, part == 0,
+                        n.mv_a,
+                        n.mv_b,
+                        n.mv_c,
+                        n.ref_a,
+                        n.ref_b,
+                        n.ref_c,
+                        ref_l0,
+                        n.a_avail,
+                        n.b_avail,
+                        n.c_avail,
+                        part == 0,
                     ),
                     2 => mvpred::predict_mv_8x16(
-                        n.mv_a, n.mv_b, n.mv_c, n.ref_a, n.ref_b, n.ref_c,
-                        ref_l0, n.a_avail, n.b_avail, n.c_avail, part == 0,
+                        n.mv_a,
+                        n.mv_b,
+                        n.mv_c,
+                        n.ref_a,
+                        n.ref_b,
+                        n.ref_c,
+                        ref_l0,
+                        n.a_avail,
+                        n.b_avail,
+                        n.c_avail,
+                        part == 0,
                     ),
                     _ => mvpred::predict_mv(
-                        n.mv_a, n.mv_b, n.mv_c, n.ref_a, n.ref_b, n.ref_c,
-                        ref_l0, n.a_avail, n.b_avail, n.c_avail,
+                        n.mv_a, n.mv_b, n.mv_c, n.ref_a, n.ref_b, n.ref_c, ref_l0, n.a_avail,
+                        n.b_avail, n.c_avail,
                     ),
                 };
                 [
@@ -1379,7 +1508,8 @@ fn decode_b_inter_mb(
             let blk_h_4x4 = (ph / 4) as u32;
             for by in blk_y..blk_y + blk_h_4x4 {
                 for bx in blk_x..blk_x + part_width_4x4 {
-                    ctx.mv_ctx.set(mb_x, mb_y, (bx + by * 4) as usize, mv_l0, ref_l0);
+                    ctx.mv_ctx
+                        .set(mb_x, mb_y, (bx + by * 4) as usize, mv_l0, ref_l0);
                 }
             }
 
@@ -1388,21 +1518,44 @@ fn decode_b_inter_mb(
             // sufficient for BA3_SVA_C where B-frames don't reference each other.)
             let mv_l1 = if uses_l1 {
                 let n = ctx.mv_ctx.get_neighbors_slice(
-                    mb_x, mb_y, blk_x, blk_y, part_width_4x4,
-                    Some(&ctx.slice_table), ctx.current_slice,
+                    mb_x,
+                    mb_y,
+                    blk_x,
+                    blk_y,
+                    part_width_4x4,
+                    Some(&ctx.slice_table),
+                    ctx.current_slice,
                 );
                 let mvp = match part_size {
                     1 => mvpred::predict_mv_16x8(
-                        n.mv_a, n.mv_b, n.mv_c, n.ref_a, n.ref_b, n.ref_c,
-                        ref_l1, n.a_avail, n.b_avail, n.c_avail, part == 0,
+                        n.mv_a,
+                        n.mv_b,
+                        n.mv_c,
+                        n.ref_a,
+                        n.ref_b,
+                        n.ref_c,
+                        ref_l1,
+                        n.a_avail,
+                        n.b_avail,
+                        n.c_avail,
+                        part == 0,
                     ),
                     2 => mvpred::predict_mv_8x16(
-                        n.mv_a, n.mv_b, n.mv_c, n.ref_a, n.ref_b, n.ref_c,
-                        ref_l1, n.a_avail, n.b_avail, n.c_avail, part == 0,
+                        n.mv_a,
+                        n.mv_b,
+                        n.mv_c,
+                        n.ref_a,
+                        n.ref_b,
+                        n.ref_c,
+                        ref_l1,
+                        n.a_avail,
+                        n.b_avail,
+                        n.c_avail,
+                        part == 0,
                     ),
                     _ => mvpred::predict_mv(
-                        n.mv_a, n.mv_b, n.mv_c, n.ref_a, n.ref_b, n.ref_c,
-                        ref_l1, n.a_avail, n.b_avail, n.c_avail,
+                        n.mv_a, n.mv_b, n.mv_c, n.ref_a, n.ref_b, n.ref_c, ref_l1, n.a_avail,
+                        n.b_avail, n.c_avail,
                     ),
                 };
                 [
@@ -1416,7 +1569,8 @@ fn decode_b_inter_mb(
             // Store L1 MV context
             for by in blk_y..blk_y + blk_h_4x4 {
                 for bx in blk_x..blk_x + part_width_4x4 {
-                    ctx.mv_ctx.set_l1(mb_x, mb_y, (bx + by * 4) as usize, mv_l1, ref_l1);
+                    ctx.mv_ctx
+                        .set_l1(mb_x, mb_y, (bx + by * 4) as usize, mv_l1, ref_l1);
                 }
             }
 
@@ -1426,9 +1580,19 @@ fn decode_b_inter_mb(
 
             if uses_l0 && uses_l1 && !ref_pics.is_empty() && !ref_pics_l1.is_empty() {
                 apply_mc_bi_partition(
-                    ctx, ref_pics, ref_pics_l1, mb_x, mb_y,
-                    px_x, px_y, pw, ph,
-                    mv_l0, ref_l0, mv_l1, ref_l1,
+                    ctx,
+                    ref_pics,
+                    ref_pics_l1,
+                    mb_x,
+                    mb_y,
+                    px_x,
+                    px_y,
+                    pw,
+                    ph,
+                    mv_l0,
+                    ref_l0,
+                    mv_l1,
+                    ref_l1,
                 );
             } else if uses_l0 && !ref_pics.is_empty() {
                 let ref_pic = ref_pics[(ref_l0 as usize).min(ref_pics.len() - 1)];
@@ -1488,7 +1652,13 @@ fn pred_spatial_direct_16x16(
 ) -> ([i16; 2], i8, [i16; 2], i8) {
     // Get neighbor info for L0
     let n = ctx.mv_ctx.get_neighbors_slice(
-        mb_x, mb_y, 0, 0, 4, Some(&ctx.slice_table), ctx.current_slice,
+        mb_x,
+        mb_y,
+        0,
+        0,
+        4,
+        Some(&ctx.slice_table),
+        ctx.current_slice,
     );
 
     // For each list: ref = min(ref_a, ref_b, ref_c) treating negative as unavailable
@@ -1498,15 +1668,17 @@ fn pred_spatial_direct_16x16(
     let ref_c_u = if n.c_avail { n.ref_c as u8 } else { u8::MAX };
 
     let min_ref_u = ref_a_u.min(ref_b_u).min(ref_c_u);
-    let ref_l0 = if min_ref_u == u8::MAX { -1i8 } else { min_ref_u as i8 };
+    let ref_l0 = if min_ref_u == u8::MAX {
+        -1i8
+    } else {
+        min_ref_u as i8
+    };
 
     // Compute MV for L0 using median prediction with the computed ref
     let mv_l0 = if ref_l0 >= 0 {
         mvpred::predict_mv(
-            n.mv_a, n.mv_b, n.mv_c,
-            n.ref_a, n.ref_b, n.ref_c,
-            ref_l0,
-            n.a_avail, n.b_avail, n.c_avail,
+            n.mv_a, n.mv_b, n.mv_c, n.ref_a, n.ref_b, n.ref_c, ref_l0, n.a_avail, n.b_avail,
+            n.c_avail,
         )
     } else {
         [0, 0]
@@ -1551,7 +1723,17 @@ fn apply_mc_bi_partition(
     let ref_l1 = ref_pics_l1[(ref_idx_l1.max(0) as usize).min(ref_pics_l1.len() - 1)];
 
     // MC L0 into destination
-    apply_mc_partition(ctx, ref_l0, mb_x, mb_y, px_offset_x, px_offset_y, block_w, block_h, mv_l0);
+    apply_mc_partition(
+        ctx,
+        ref_l0,
+        mb_x,
+        mb_y,
+        px_offset_x,
+        px_offset_y,
+        block_w,
+        block_h,
+        mv_l0,
+    );
 
     // MC L1 into temp buffers, then average with destination
     let dst_x = (mb_x * 16 + px_offset_x) as i32;
@@ -1567,16 +1749,29 @@ fn apply_mc_bi_partition(
 
     let mut tmp_y = vec![0u8; block_w * block_h];
     mc::mc_luma(
-        &mut tmp_y, block_w, &ref_l1.y, ref_l1.y_stride,
-        l1_ref_x, l1_ref_y, l1_dx, l1_dy,
-        block_w, block_h, ref_l1.width, ref_l1.height,
+        &mut tmp_y,
+        block_w,
+        &ref_l1.y,
+        ref_l1.y_stride,
+        l1_ref_x,
+        l1_ref_y,
+        l1_dx,
+        l1_dy,
+        block_w,
+        block_h,
+        ref_l1.width,
+        ref_l1.height,
     );
 
     // Average luma
     let luma_offset = dst_y as usize * ctx.pic.y_stride + dst_x as usize;
     mc::avg_pixels_inplace(
-        &mut ctx.pic.y[luma_offset..], ctx.pic.y_stride,
-        &tmp_y, block_w, block_w, block_h,
+        &mut ctx.pic.y[luma_offset..],
+        ctx.pic.y_stride,
+        &tmp_y,
+        block_w,
+        block_w,
+        block_h,
     );
 
     // Chroma L1
@@ -1595,25 +1790,51 @@ fn apply_mc_bi_partition(
 
     let mut tmp_u = vec![0u8; chroma_w * chroma_h];
     mc::mc_chroma(
-        &mut tmp_u, chroma_w, &ref_l1.u, ref_l1.uv_stride,
-        chroma_ref_x, chroma_ref_y, chroma_dx, chroma_dy,
-        chroma_w, chroma_h, ref_l1.width / 2, ref_l1.height / 2,
+        &mut tmp_u,
+        chroma_w,
+        &ref_l1.u,
+        ref_l1.uv_stride,
+        chroma_ref_x,
+        chroma_ref_y,
+        chroma_dx,
+        chroma_dy,
+        chroma_w,
+        chroma_h,
+        ref_l1.width / 2,
+        ref_l1.height / 2,
     );
     let chroma_offset = chroma_dst_y as usize * ctx.pic.uv_stride + chroma_dst_x as usize;
     mc::avg_pixels_inplace(
-        &mut ctx.pic.u[chroma_offset..], ctx.pic.uv_stride,
-        &tmp_u, chroma_w, chroma_w, chroma_h,
+        &mut ctx.pic.u[chroma_offset..],
+        ctx.pic.uv_stride,
+        &tmp_u,
+        chroma_w,
+        chroma_w,
+        chroma_h,
     );
 
     let mut tmp_v = vec![0u8; chroma_w * chroma_h];
     mc::mc_chroma(
-        &mut tmp_v, chroma_w, &ref_l1.v, ref_l1.uv_stride,
-        chroma_ref_x, chroma_ref_y, chroma_dx, chroma_dy,
-        chroma_w, chroma_h, ref_l1.width / 2, ref_l1.height / 2,
+        &mut tmp_v,
+        chroma_w,
+        &ref_l1.v,
+        ref_l1.uv_stride,
+        chroma_ref_x,
+        chroma_ref_y,
+        chroma_dx,
+        chroma_dy,
+        chroma_w,
+        chroma_h,
+        ref_l1.width / 2,
+        ref_l1.height / 2,
     );
     mc::avg_pixels_inplace(
-        &mut ctx.pic.v[chroma_offset..], ctx.pic.uv_stride,
-        &tmp_v, chroma_w, chroma_w, chroma_h,
+        &mut ctx.pic.v[chroma_offset..],
+        ctx.pic.uv_stride,
+        &tmp_v,
+        chroma_w,
+        chroma_w,
+        chroma_h,
     );
 }
 

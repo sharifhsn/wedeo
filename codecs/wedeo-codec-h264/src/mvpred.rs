@@ -409,9 +409,7 @@ impl MvContext {
             (true, false)
         };
 
-        if c_is_past
-            && let Some(result) = self.try_get_neighbor(mb_x, mb_y, cr_x, cr_y)
-        {
+        if c_is_past && let Some(result) = self.try_get_neighbor(mb_x, mb_y, cr_x, cr_y) {
             // If C is within the current MB and ref_idx=-1, the target 4x4 block
             // has not been decoded yet (e.g., sub 3 when processing sub 2 of a
             // P_8x8 MB).  FFmpeg marks these positions PART_NOT_AVAILABLE and

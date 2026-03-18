@@ -6,11 +6,11 @@
 //
 // Reference: FFmpeg libavcodec/h264dec.c, h264_slice.c
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
-use tracing::{debug, warn};
 #[cfg(feature = "tracing-detail")]
 use tracing::trace;
+use tracing::{debug, warn};
 use wedeo_codec::bitstream::{BitRead, BitReadBE, get_ue_golomb};
 use wedeo_codec::decoder::{CodecParameters, Decoder, DecoderDescriptor};
 use wedeo_codec::descriptor::{CodecCapabilities, CodecDescriptor, CodecProperties};
@@ -87,6 +87,19 @@ pub struct H264Decoder {
     current_poc: i32,
     /// nal_ref_idc of the current picture (non-zero = reference).
     current_nal_ref_idc: u8,
+    /// True once a B-slice has been seen (enables POC reordering).
+    has_b_frames: bool,
+    /// Output frame counter for sequential PTS assignment during reordering.
+    output_frame_counter: i64,
+    /// Pending frames awaiting POC-ordered output (keyed by POC).
+    /// For B-frame streams, frames are buffered here and flushed in POC
+    /// order when a reference frame completes. For I+P-only streams,
+    /// this is unused.
+    pending_output: BTreeMap<i32, Frame>,
+    /// Delayed frame buffer for one-frame output delay.
+    /// Holds the most recently decoded frame until the next frame arrives,
+    /// allowing B-frame detection before any output escapes to the caller.
+    delayed_frame: Option<(i32, Frame)>, // (poc, frame)
 }
 
 impl H264Decoder {
@@ -123,6 +136,10 @@ impl H264Decoder {
             prev_poc_lsb: 0,
             current_poc: 0,
             current_nal_ref_idc: 0,
+            has_b_frames: false,
+            output_frame_counter: 0,
+            pending_output: BTreeMap::new(),
+            delayed_frame: None,
         };
 
         // Parse avcC extradata if present (MP4/NALFF format).
@@ -217,7 +234,13 @@ impl H264Decoder {
     /// For IDR: POC = 0, reset prev_poc_msb/lsb.
     /// For non-IDR: compute poc_msb from wrap-around detection of poc_lsb,
     /// then poc = poc_msb + pic_order_cnt_lsb.
-    fn compute_poc_type0(&mut self, sps: &Sps, hdr: &SliceHeader, is_idr: bool, _nal_ref_idc: u8) -> i32 {
+    fn compute_poc_type0(
+        &mut self,
+        sps: &Sps,
+        hdr: &SliceHeader,
+        is_idr: bool,
+        _nal_ref_idc: u8,
+    ) -> i32 {
         if is_idr {
             self.prev_poc_msb = 0;
             self.prev_poc_lsb = 0;
@@ -320,9 +343,19 @@ impl H264Decoder {
                     self.current_frame_num_h264 = hdr.frame_num;
                     self.current_nal_ref_idc = nalu.nal_ref_idc;
 
+                    // Detect B-frames for output reordering
+                    if hdr.slice_type.is_b() && !self.has_b_frames {
+                        self.has_b_frames = true;
+                        // Move any delayed frame into pending_output for reordering
+                        if let Some((poc, f)) = self.delayed_frame.take() {
+                            self.pending_output.insert(poc, f);
+                        }
+                    }
+
                     // Compute spec-compliant POC (type 0)
                     if sps.poc_type == 0 {
-                        self.current_poc = self.compute_poc_type0(&sps, &hdr, is_idr, nalu.nal_ref_idc);
+                        self.current_poc =
+                            self.compute_poc_type0(&sps, &hdr, is_idr, nalu.nal_ref_idc);
                     } else {
                         // POC type 1/2 not yet implemented; fall back to decode order
                         self.current_poc = self.frame_num as i32 * 2;
@@ -331,7 +364,8 @@ impl H264Decoder {
                     // Build reference lists
                     if hdr.slice_type.is_p() {
                         let max_frame_num = 1u32 << sps.log2_max_frame_num;
-                        self.ref_list_l0 = refs::build_ref_list_p(&self.dpb, &hdr, hdr.frame_num, max_frame_num);
+                        self.ref_list_l0 =
+                            refs::build_ref_list_p(&self.dpb, &hdr, hdr.frame_num, max_frame_num);
                         self.ref_list_l1.clear();
                     } else if hdr.slice_type.is_b() {
                         let (l0, l1) = refs::build_ref_list_b(&self.dpb, &hdr, self.current_poc);
@@ -370,11 +404,15 @@ impl H264Decoder {
                             if let Some(e) = self.dpb.get(dpb_idx) {
                                 let s = e.pic.y_stride;
                                 // Sample pixels at y=128, x=155-165
-                                let row128: Vec<u8> = (155..166usize).map(|x| {
-                                    if 128 < e.pic.height as usize && x < e.pic.width as usize {
-                                        e.pic.y[128 * s + x]
-                                    } else { 0 }
-                                }).collect();
+                                let row128: Vec<u8> = (155..166usize)
+                                    .map(|x| {
+                                        if 128 < e.pic.height as usize && x < e.pic.width as usize {
+                                            e.pic.y[128 * s + x]
+                                        } else {
+                                            0
+                                        }
+                                    })
+                                    .collect();
                                 trace!(
                                     frame_num = self.frame_num,
                                     dpb_idx,
@@ -437,13 +475,54 @@ impl H264Decoder {
         if let (Some(mut fdc), Some(last_hdr)) =
             (self.current_fdc.take(), self.current_last_hdr.as_ref())
         {
-            let frame = self.fdc_to_frame(&mut fdc, last_hdr, self.current_pts);
+            // Set initial PTS to POC for reordering. Sequential PTS is
+            // assigned later when flushing from pending_output.
+            let frame = self.fdc_to_frame(&mut fdc, last_hdr, self.current_poc as i64);
             debug!(
                 frame_num = self.frame_num,
-                pts = self.current_pts,
+                poc = self.current_poc,
+                has_b = self.has_b_frames,
                 "frame complete"
             );
-            self.output_queue.push_back(frame);
+
+            if self.has_b_frames {
+                // B-frame stream: buffer in pending_output for POC-ordered output.
+                self.pending_output.insert(self.current_poc, frame);
+
+                // When a reference frame completes, flush all pending with POC < current.
+                if self.current_nal_ref_idc > 0 {
+                    let current_poc = self.current_poc;
+                    let to_flush: Vec<i32> = self
+                        .pending_output
+                        .keys()
+                        .copied()
+                        .filter(|&poc| poc < current_poc)
+                        .collect();
+                    for poc in to_flush {
+                        if let Some(mut f) = self.pending_output.remove(&poc) {
+                            f.pts = self.output_frame_counter;
+                            self.output_frame_counter += 1;
+                            self.output_queue.push_back(f);
+                        }
+                    }
+                }
+            } else {
+                // I+P-only (or B-frames not yet detected): use 1-frame delay.
+                // Push the previously delayed frame to output, hold current.
+                if let Some((_prev_poc, mut prev_frame)) = self.delayed_frame.take() {
+                    prev_frame.pts = self.output_frame_counter;
+                    self.output_frame_counter += 1;
+                    self.output_queue.push_back(prev_frame);
+                }
+                self.delayed_frame = Some((self.current_poc, frame));
+            }
+
+            // Non-reference pictures (nal_ref_idc == 0, typically B-frames)
+            // don't need to be stored in the DPB.
+            if self.current_nal_ref_idc == 0 {
+                self.frame_num += 1;
+                return;
+            }
 
             // Store decoded picture in DPB for reference
             let mb_width = fdc.mb_width;
@@ -616,16 +695,14 @@ impl H264Decoder {
             if mb_x == 0 {
                 fdc.neighbor_ctx.new_row();
                 // Top is available only if it exists AND is in the same slice.
-                fdc.neighbor_ctx.top_available = mb_y > 0
-                    && fdc.slice_table[(mb_addr - mb_width) as usize]
-                        == fdc.current_slice;
+                fdc.neighbor_ctx.top_available =
+                    mb_y > 0 && fdc.slice_table[(mb_addr - mb_width) as usize] == fdc.current_slice;
             } else if mb_addr == first_mb {
                 // First MB of a continuation slice that doesn't start at
                 // column 0: the left neighbor is from the previous slice.
                 fdc.neighbor_ctx.left_available = false;
-                fdc.neighbor_ctx.top_available = mb_y > 0
-                    && fdc.slice_table[(mb_addr - mb_width) as usize]
-                        == fdc.current_slice;
+                fdc.neighbor_ctx.top_available =
+                    mb_y > 0 && fdc.slice_table[(mb_addr - mb_width) as usize] == fdc.current_slice;
             }
 
             if is_inter_slice {
@@ -658,8 +735,7 @@ impl H264Decoder {
                     }
                     // Per-MB top availability (slice-boundary aware)
                     fdc.neighbor_ctx.top_available = skip_y > 0
-                        && fdc.slice_table[(mb_addr - mb_width) as usize]
-                            == fdc.current_slice;
+                        && fdc.slice_table[(mb_addr - mb_width) as usize] == fdc.current_slice;
                     if hdr.slice_type.is_b() {
                         mb::decode_b_skip_mb(fdc, hdr, skip_x, skip_y, ref_pics, ref_pics_l1);
                     } else {
@@ -687,8 +763,7 @@ impl H264Decoder {
                 if mb_x == 0 && mb_addr != first_mb {
                     fdc.neighbor_ctx.new_row();
                     fdc.neighbor_ctx.top_available = mb_y > 0
-                        && fdc.slice_table[(mb_addr - mb_width) as usize]
-                            == fdc.current_slice;
+                        && fdc.slice_table[(mb_addr - mb_width) as usize] == fdc.current_slice;
                 }
             } else {
                 // Intra slice: no skip run, but guard against reading past end.
@@ -702,9 +777,8 @@ impl H264Decoder {
             // multiple slices (when first_mb is mid-row).
             let mb_x = mb_addr % mb_width;
             let mb_y = mb_addr / mb_width;
-            fdc.neighbor_ctx.top_available = mb_y > 0
-                && fdc.slice_table[(mb_addr - mb_width) as usize]
-                    == fdc.current_slice;
+            fdc.neighbor_ctx.top_available =
+                mb_y > 0 && fdc.slice_table[(mb_addr - mb_width) as usize] == fdc.current_slice;
 
             // Decode coded MB (existing path)
             mb::decode_macroblock(
@@ -895,6 +969,29 @@ impl Decoder for H264Decoder {
                 // Drain mode: no more packets will be sent.
                 // Flush any in-progress frame.
                 self.finish_current_frame();
+
+                // Flush delayed frame into pending (for B-frame streams)
+                // or directly to output (for I+P streams)
+                if let Some((poc, f)) = self.delayed_frame.take() {
+                    if self.has_b_frames {
+                        self.pending_output.insert(poc, f);
+                    } else {
+                        let mut f = f;
+                        f.pts = self.output_frame_counter;
+                        self.output_frame_counter += 1;
+                        self.output_queue.push_back(f);
+                    }
+                }
+                // Flush all remaining pending frames in POC order
+                let remaining: Vec<i32> = self.pending_output.keys().copied().collect();
+                for poc in remaining {
+                    if let Some(mut f) = self.pending_output.remove(&poc) {
+                        f.pts = self.output_frame_counter;
+                        self.output_frame_counter += 1;
+                        self.output_queue.push_back(f);
+                    }
+                }
+
                 self.draining = true;
                 Ok(())
             }
@@ -925,6 +1022,10 @@ impl Decoder for H264Decoder {
         self.prev_poc_lsb = 0;
         self.current_poc = 0;
         self.current_nal_ref_idc = 0;
+        self.has_b_frames = false;
+        self.output_frame_counter = 0;
+        self.pending_output.clear();
+        self.delayed_frame = None;
         // SPS/PPS are retained across flush (matching FFmpeg behavior).
     }
 
