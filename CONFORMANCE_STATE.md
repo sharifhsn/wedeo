@@ -1,51 +1,59 @@
 # H.264 Conformance State (2026-03-19)
 
-**Status: 43/57 progressive CAVLC BITEXACT**
+**Status: 43/57 progressive CAVLC BITEXACT** (unchanged across 2 sessions)
 
-## This session's investigation (no new BITEXACT passes)
+## Commits this session
+```
+36e52c4 fix(h264): pre-mark current picture as ShortTerm before MMCO ops
+939f15f docs: update conformance state with B_8x8 MV prediction investigation
+```
 
-### Fix applied
-- **MMCO pre-mark** (`refs.rs`): Pre-mark current picture as ShortTerm before applying MMCO ops. FFmpeg does this in h264_refs.c. Needed for MMCO op 3 (ShortTermToLongTerm) to find the current pic by PicNum when it's still RefStatus::Unused. No current test exercises this path, but it matches FFmpeg's behavior.
+## Dead ends explored (DO NOT REPEAT)
 
-### Root causes identified
+### MR3 frame_num gap fill (5 attempts, all failed)
+- POC-only fix (local variable in compute_frame_num_offset): 284→242
+- Gap fill eviction-only (no non-existing refs): no effect
+- Gap fill with empty buffer non-existing refs: output truncated to 41 frames
+- Gap fill with zeroed buffer refs + prev_fn update: 284→258
+- Gap fill without prev_fn update: 284→278 (gap fires repeatedly)
+- Gate on `gaps_in_frame_num_allowed` prevents sp1/sp2 regressions ✓
+- **Root issue unclear**: gap fill evicts MMCO-managed refs the encoder expects to survive. Need FFmpeg DPB dump at frame 283 WITH gap fill to compare.
 
-1. **MR3 (284/300) — frame_num gap handling**: POC type 2 with gaps_in_frame_num_allowed. The stream has frame_num gaps (69→1 and 242→0). FFmpeg fills these gaps by advancing `prev_frame_num` through each gap (wrapping at max_frame_num=256), then checks for offset wraps. Without gap fill, wedeo detects TWO wraps (offset=512) instead of FFmpeg's one (offset=256). However, the POC error doesn't directly cause pixel diffs for this P-only stream. The 16 failing frames at the end are likely caused by wrong DPB FrameNumWrap values due to the same gap-handling issue. **Full fix requires implementing frame_num gap handling with DPB operations** (creating non-existing reference pictures), not just POC adjustments.
+### CVBS3 B_8x8 block_width fix (1 attempt, caused regressions)
+- Changed `sw` from 2 to 1 for 8x8 sub-partitions: 43→41 BITEXACT
+- FFmpeg's `pred_motion(part_width)` and wedeo's `get_neighbors_slice(sw)` have different neighbor selection mechanics — NOT directly comparable
 
-2. **CVBS3/CVSE3/CVSEFDFT3 remaining B-frame diffs**: All diffs are in **B_8x8 MBs**, but the actual differing sub-partitions are **non-direct types** (B_L0, B_L1, B_Bi), NOT B_Direct. For CVBS3 frame 7 MB(8,2), block [2] is B_L0_8x8 (sub_type=1), while block [0] is B_Direct and produces CORRECT pixels. The diff is a **cascade from MV prediction**: the MV predictor for B_L0 uses neighbor context that may be wrong. Attempted fix (changing `sw` to match FFmpeg's `block_width=1`) caused regressions — FFmpeg's pred_motion and wedeo's get_neighbors_slice have different neighbor selection mechanics.
+## What IS known about remaining files
 
-3. **MR4 (135/300) — DPB state matches but output differs**: POC type 0. DPB state at the first failing frame (output 12) MATCHES FFmpeg. The issue involves mixed pixel and ordering diffs (90 unique CRCs per decoder). Complex MMCO with both ST and LT management. May involve POC computation differences or ref_pic_list_modification.
+### MR3 (284/300)
+- POC type 2, gaps_in_frame_num_allowed=1
+- 16 PIXEL diffs at end (not ordering), all P-frames
+- FFmpeg DPB at frame 283: fn=[203,204,205,206] (recent, sequential)
+- Wedeo DPB at frame 283: fn=[67,217,218,221,225] (old MMCO-preserved refs)
+- The DPB divergence is the root cause but fixing it is non-trivial
 
-4. **CVWP5 (7/90) — multi-ref weighted prediction**: Multi-PPS stream where PPS 0 changes weighted_pred_flag between frames. The weight parsing and application code appears correct (frames matching = single-ref weighted pred works). Diffs start at frame 2 which has 4 active refs with mixed weight flags (some refs luma-only, some chroma-only, some none). No CAVLC desync errors. Further investigation needed.
+### CVBS3/CVSE3/CVSEFDFT3 (245/224/163 match)
+- Diffs are in **B_L0/B_L1/B_Bi sub-partitions** within B_8x8 MBs, NOT B_Direct
+- B_Direct blocks produce correct pixels
+- Diff is cascade from MV prediction: wrong neighbor context
+- CVBS3 frame 7 MB(8,2): block[0]=B_Direct(correct), block[2]=B_L0(WRONG, max_diff=17)
+- Sub-types at MB(8,2): [0, 2, 1, 11] = [B_Direct, B_L1, B_L0, B_Bi_4x4]
 
-## Remaining 14 DIFF files
+### Other files (unchanged from previous investigation)
+- MR4 (135/300): POC type 0, DPB matches FFmpeg but mixed pixel+ordering diffs
+- MR5 (52/300): Complex MMCO + POC type 1
+- CVWP2/3 (29/90): Output ordering + weighted bipred
+- CVWP5 (7/90): Multi-ref mixed weight flags
+- HCMP1 (33/250): Hierarchical B-frames
+- CVFC1 (19/50): Multi-slice, fails at frame 17
+- cvmp_mot_frm0_full_B (27/30): 3 B-frames, B_8x8 sub-partitions
+- FM1_BT_B, FM1_FT_E: FMO (out of scope)
 
-### Near-pass
-- **MR3** (284/300): frame_num gap handling (POC type 2), 16 diffs at end
-- **cvmp_mot_frm0_full_B** (27/30): 3 B-frames, B_8x8 with B_Direct sub-partitions
+## Priority for next session
 
-### B-frame temporal direct (B_8x8 sub-partitions)
-- **CVBS3** (245/300), **CVSE3** (224/278), **CVSEFDFT3** (163/200): All diffs in B_8x8 MBs
-
-### Weighted prediction
-- **CVWP2** (29/90), **CVWP3** (29/90): Output ordering + weighted bipred
-- **CVWP5** (7/90): Multi-ref mixed weight flags, POC type 2
-
-### Multi-slice / cascading
-- **HCMP1** (33/250): Hierarchical B-frames
-- **CVFC1** (19/50): Multi-slice, fails starting frame 17
-
-### Complex MMCO
-- **MR4** (135/300): POC type 0, DPB matches but output differs
-- **MR5** (52/300): Complex MMCO + POC type 1
-
-### Out of scope
-- **FM1_BT_B**, **FM1_FT_E**: FMO (num_slice_groups > 1)
-
-## Priority next steps
-
-1. **Frame_num gap handling** (MR3, potentially MR4/MR5): Implement FFmpeg's gap fill loop (h264_slice.c:1506-1522) including non-existing reference picture creation and DPB sliding window operations during gaps.
-2. **B_Direct_8x8 temporal direct** (CVBS3/CVSE3/CVSEFDFT3/cvmp_mot): Use lldb on FFmpeg to extract colocated MV and ref_idx at a specific differing MB, then compare with wedeo's values to find the exact divergence.
-3. **CVWP2/CVWP3 output ordering** — negative POC before IDR.
+1. **STOP investigating MR3** — 5 failed attempts, needs fundamentally different approach
+2. **Extract empirical MV prediction values** from BOTH decoders for CVBS3 frame 7 MB(8,2) partition 2 (B_L0). Compare MVP neighbors (A, B, C), MVD, and final MV to find exact divergence point.
+3. Consider simpler targets: cvmp_mot_frm0_full_B (27/30, only 3 wrong frames)
 
 ## Verify command
 ```bash
