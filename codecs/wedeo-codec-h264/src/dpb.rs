@@ -115,34 +115,27 @@ impl Dpb {
         self.entries.get_mut(idx).and_then(|e| e.as_mut())
     }
 
-    /// Get the number of short-term references.
-    pub fn num_short_term(&self) -> usize {
+    /// Count DPB entries whose status satisfies the given predicate.
+    fn count_by_status(&self, predicate: impl Fn(RefStatus) -> bool) -> usize {
         self.entries
             .iter()
-            .filter(|e| matches!(e, Some(entry) if entry.status == RefStatus::ShortTerm))
+            .filter(|e| matches!(e, Some(entry) if predicate(entry.status)))
             .count()
+    }
+
+    /// Get the number of short-term references.
+    pub fn num_short_term(&self) -> usize {
+        self.count_by_status(|s| s == RefStatus::ShortTerm)
     }
 
     /// Get the number of long-term references.
     pub fn num_long_term(&self) -> usize {
-        self.entries
-            .iter()
-            .filter(|e| matches!(e, Some(entry) if entry.status == RefStatus::LongTerm))
-            .count()
+        self.count_by_status(|s| s == RefStatus::LongTerm)
     }
 
     /// Get the total number of reference pictures (short-term + long-term).
     pub fn num_refs(&self) -> usize {
-        self.entries
-            .iter()
-            .filter(|e| {
-                matches!(
-                    e,
-                    Some(entry) if entry.status == RefStatus::ShortTerm
-                                   || entry.status == RefStatus::LongTerm
-                )
-            })
-            .count()
+        self.count_by_status(|s| s == RefStatus::ShortTerm || s == RefStatus::LongTerm)
     }
 
     /// Remove the oldest short-term reference (smallest frame_num).
@@ -238,20 +231,21 @@ impl Dpb {
         }
     }
 
+    /// Find the first DPB entry matching the given predicate, returning its index.
+    fn find_by(&self, predicate: impl Fn(&DpbEntry) -> bool) -> Option<usize> {
+        self.entries
+            .iter()
+            .position(|e| matches!(e, Some(entry) if predicate(entry)))
+    }
+
     /// Find a short-term reference by frame_num.
     pub fn find_short_term(&self, frame_num: u32) -> Option<usize> {
-        self.entries.iter().position(|e| {
-            matches!(e, Some(entry) if entry.status == RefStatus::ShortTerm
-                                       && entry.frame_num == frame_num)
-        })
+        self.find_by(|e| e.status == RefStatus::ShortTerm && e.frame_num == frame_num)
     }
 
     /// Find a long-term reference by long_term_frame_idx.
     pub fn find_long_term(&self, lt_idx: u32) -> Option<usize> {
-        self.entries.iter().position(|e| {
-            matches!(e, Some(entry) if entry.status == RefStatus::LongTerm
-                                       && entry.long_term_frame_idx == lt_idx)
-        })
+        self.find_by(|e| e.status == RefStatus::LongTerm && e.long_term_frame_idx == lt_idx)
     }
 
     /// Returns true if the DPB is full (no free slots).
