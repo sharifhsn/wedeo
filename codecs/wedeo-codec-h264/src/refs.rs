@@ -14,6 +14,24 @@ use crate::slice::{MmcoOp, RefPicListModification, SliceHeader};
 // Reference list construction
 // ---------------------------------------------------------------------------
 
+/// Collect long-term DPB references sorted by long_term_frame_idx ascending.
+///
+/// Returns a Vec of DPB indices in display order (lowest index first).
+fn collect_long_term_refs(dpb: &Dpb) -> Vec<usize> {
+    let mut long_term: Vec<(usize, u32)> = dpb
+        .entries
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| {
+            e.as_ref()
+                .filter(|entry| entry.status == RefStatus::LongTerm)
+                .map(|entry| (i, entry.long_term_frame_idx))
+        })
+        .collect();
+    long_term.sort_by_key(|&(_, lt_idx)| lt_idx);
+    long_term.into_iter().map(|(idx, _)| idx).collect()
+}
+
 /// Build reference list 0 for a P-slice (Baseline profile, frame-only).
 ///
 /// Short-term references are sorted by pic_num descending (most recent
@@ -59,24 +77,14 @@ pub fn build_ref_list_p(
     // Sort by pic_num descending (most recent first).
     short_term.sort_by_key(|&(_, p)| std::cmp::Reverse(p));
 
-    // Collect long-term references
-    let mut long_term: Vec<(usize, u32)> = Vec::new();
-    for (i, entry) in dpb.entries.iter().enumerate() {
-        if let Some(e) = entry
-            && e.status == RefStatus::LongTerm
-        {
-            long_term.push((i, e.long_term_frame_idx));
-        }
-    }
-
-    // Sort by long_term_frame_idx ascending
-    long_term.sort_by_key(|&(_, lt_idx)| lt_idx);
+    // Collect long-term references sorted by long_term_frame_idx ascending
+    let lt_indices = collect_long_term_refs(dpb);
 
     // Build initial list: short-term first, then long-term
     let mut list: Vec<usize> = short_term
         .iter()
         .map(|&(idx, _)| idx)
-        .chain(long_term.iter().map(|&(idx, _)| idx))
+        .chain(lt_indices)
         .collect();
 
     // Apply ref_pic_list_modification commands if present
@@ -140,16 +148,7 @@ pub fn build_ref_list_b(
     st_after.sort_by_key(|&(_, poc)| poc);
 
     // Collect long-term references sorted by long_term_frame_idx ascending
-    let mut long_term: Vec<(usize, u32)> = Vec::new();
-    for (i, entry) in dpb.entries.iter().enumerate() {
-        if let Some(e) = entry
-            && e.status == RefStatus::LongTerm
-        {
-            long_term.push((i, e.long_term_frame_idx));
-        }
-    }
-    long_term.sort_by_key(|&(_, lt_idx)| lt_idx);
-    let lt_indices: Vec<usize> = long_term.iter().map(|&(idx, _)| idx).collect();
+    let lt_indices = collect_long_term_refs(dpb);
 
     // Build L0: before + after + long-term
     let mut list0: Vec<usize> = st_before
