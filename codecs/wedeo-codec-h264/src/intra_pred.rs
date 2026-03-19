@@ -96,24 +96,12 @@ pub fn predict_4x4(
 
 /// Mode 0: Vertical -- each row copies top[0..3].
 fn pred_4x4_vertical(dst: &mut [u8], stride: usize, top: &[u8]) {
-    for y in 0..4 {
-        let row = y * stride;
-        dst[row] = top[0];
-        dst[row + 1] = top[1];
-        dst[row + 2] = top[2];
-        dst[row + 3] = top[3];
-    }
+    fill_vertical::<4>(dst, stride, top);
 }
 
 /// Mode 1: Horizontal -- each row is filled with left[y].
 fn pred_4x4_horizontal(dst: &mut [u8], stride: usize, left: &[u8]) {
-    for (y, &val) in left[..4].iter().enumerate() {
-        let row = y * stride;
-        dst[row] = val;
-        dst[row + 1] = val;
-        dst[row + 2] = val;
-        dst[row + 3] = val;
-    }
+    fill_horizontal::<4>(dst, stride, left);
 }
 
 /// Mode 2: DC -- average of available neighbors, or 128 if none available.
@@ -359,6 +347,28 @@ fn pred_4x4_horizontal_up(dst: &mut [u8], stride: usize, left: &[u8]) {
 }
 
 // ============================================================================
+// Shared fill helpers
+// ============================================================================
+
+/// Fill an N×N block by repeating `top[0..N]` into every row (vertical pred).
+#[inline]
+fn fill_vertical<const N: usize>(dst: &mut [u8], stride: usize, top: &[u8]) {
+    for y in 0..N {
+        let row = y * stride;
+        dst[row..row + N].copy_from_slice(&top[..N]);
+    }
+}
+
+/// Fill an N×N block so that row y is entirely `left[y]` (horizontal pred).
+#[inline]
+fn fill_horizontal<const N: usize>(dst: &mut [u8], stride: usize, left: &[u8]) {
+    for (y, &val) in left[..N].iter().enumerate() {
+        let row = y * stride;
+        dst[row..row + N].fill(val);
+    }
+}
+
+// ============================================================================
 // Intra 16x16 prediction (4 modes)
 // ============================================================================
 
@@ -391,20 +401,12 @@ pub fn predict_16x16(
 
 /// Mode 0: Vertical -- each row copies top[0..15].
 fn pred_16x16_vertical(dst: &mut [u8], stride: usize, top: &[u8]) {
-    for y in 0..16 {
-        let row = y * stride;
-        dst[row..row + 16].copy_from_slice(&top[..16]);
-    }
+    fill_vertical::<16>(dst, stride, top);
 }
 
 /// Mode 1: Horizontal -- each row filled with left[y].
 fn pred_16x16_horizontal(dst: &mut [u8], stride: usize, left: &[u8]) {
-    for (y, &val) in left[..16].iter().enumerate() {
-        let row = y * stride;
-        for x in 0..16 {
-            dst[row + x] = val;
-        }
-    }
+    fill_horizontal::<16>(dst, stride, left);
 }
 
 /// Mode 2: DC -- average of available top + left samples.
@@ -524,20 +526,12 @@ pub fn predict_chroma_8x8(
 
 /// Chroma Mode 2: Vertical -- each row copies top[0..7].
 fn pred_chroma_8x8_vertical(dst: &mut [u8], stride: usize, top: &[u8]) {
-    for y in 0..8 {
-        let row = y * stride;
-        dst[row..row + 8].copy_from_slice(&top[..8]);
-    }
+    fill_vertical::<8>(dst, stride, top);
 }
 
 /// Chroma Mode 1: Horizontal -- each row filled with left[y].
 fn pred_chroma_8x8_horizontal(dst: &mut [u8], stride: usize, left: &[u8]) {
-    for (y, &val) in left[..8].iter().enumerate() {
-        let row = y * stride;
-        for x in 0..8 {
-            dst[row + x] = val;
-        }
-    }
+    fill_horizontal::<8>(dst, stride, left);
 }
 
 /// Chroma Mode 0: DC -- splits the 8x8 block into 4 quadrants (4x4 each).
