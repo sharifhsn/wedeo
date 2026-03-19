@@ -212,6 +212,251 @@ fn copy_block(
 }
 
 // ---------------------------------------------------------------------------
+// Quarter-pel luma helper functions
+// ---------------------------------------------------------------------------
+
+/// Group B helper: compute h_lowpass, then average with a full-pel column
+/// extracted at column offset `full_pel_col_offset` within the extracted block.
+///
+/// `full_pel_col_offset` is 2 for (1,0) and 3 for (3,0).
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn qpel_h_avg(
+    dst: &mut [u8],
+    dst_stride: usize,
+    ref_y: &[u8],
+    ref_stride: usize,
+    ref_x: i32,
+    ref_y_pos: i32,
+    block_w: usize,
+    block_h: usize,
+    pw: i32,
+    ph: i32,
+    full_pel_col_offset: usize,
+) {
+    let src_w = block_w + 5;
+    let src_h = block_h;
+    let mut src = vec![0i32; src_w * src_h];
+    extract_ref_block(&mut src, ref_y, ref_stride, ref_x - 2, ref_y_pos, src_w, src_h, pw, ph);
+
+    let mut half_h = vec![0u8; block_w * block_h];
+    h_lowpass(&mut half_h, block_w, &src, src_w, block_w, block_h);
+
+    let mut full_pel = vec![0u8; block_w * block_h];
+    for j in 0..block_h {
+        for i in 0..block_w {
+            full_pel[j * block_w + i] = src[j * src_w + i + full_pel_col_offset] as u8;
+        }
+    }
+    avg_pixels(dst, dst_stride, &full_pel, block_w, &half_h, block_w, block_w, block_h);
+}
+
+/// Group B helper: compute v_lowpass, then average with a full-pel row
+/// extracted at row offset `full_pel_row_offset` within the extracted block.
+///
+/// `full_pel_row_offset` is 2 for (0,1) and 3 for (0,3).
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn qpel_v_avg(
+    dst: &mut [u8],
+    dst_stride: usize,
+    ref_y: &[u8],
+    ref_stride: usize,
+    ref_x: i32,
+    ref_y_pos: i32,
+    block_w: usize,
+    block_h: usize,
+    pw: i32,
+    ph: i32,
+    full_pel_row_offset: usize,
+) {
+    let src_w = block_w;
+    let src_h = block_h + 5;
+    let mut src = vec![0i32; src_w * src_h];
+    extract_ref_block(&mut src, ref_y, ref_stride, ref_x, ref_y_pos - 2, src_w, src_h, pw, ph);
+
+    let mut half_v = vec![0u8; block_w * block_h];
+    v_lowpass(&mut half_v, block_w, &src, src_w, block_w, block_h);
+
+    let mut full_pel = vec![0u8; block_w * block_h];
+    for j in 0..block_h {
+        for i in 0..block_w {
+            full_pel[j * block_w + i] = src[(j + full_pel_row_offset) * src_w + i] as u8;
+        }
+    }
+    avg_pixels(dst, dst_stride, &full_pel, block_w, &half_v, block_w, block_w, block_h);
+}
+
+/// Group C helper: diagonal quarter-pel = avg(h_lowpass, v_lowpass).
+///
+/// `h_row_delta` is the vertical offset added to `ref_y_pos` for the
+/// horizontal half-pel extraction (0 for top-adjacent, +1 for below).
+/// `v_col_delta` is the horizontal offset added to `ref_x` for the
+/// vertical half-pel extraction (0 for current col, +1 for right).
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn qpel_diagonal(
+    dst: &mut [u8],
+    dst_stride: usize,
+    ref_y: &[u8],
+    ref_stride: usize,
+    ref_x: i32,
+    ref_y_pos: i32,
+    block_w: usize,
+    block_h: usize,
+    pw: i32,
+    ph: i32,
+    h_row_delta: i32,
+    v_col_delta: i32,
+) {
+    let src_h_w = block_w + 5;
+    let src_h_h = block_h;
+    let mut src_h_buf = vec![0i32; src_h_w * src_h_h];
+    extract_ref_block(
+        &mut src_h_buf,
+        ref_y,
+        ref_stride,
+        ref_x - 2,
+        ref_y_pos + h_row_delta,
+        src_h_w,
+        src_h_h,
+        pw,
+        ph,
+    );
+    let mut half_h = vec![0u8; block_w * block_h];
+    h_lowpass(&mut half_h, block_w, &src_h_buf, src_h_w, block_w, block_h);
+
+    let src_v_w = block_w;
+    let src_v_h = block_h + 5;
+    let mut src_v_buf = vec![0i32; src_v_w * src_v_h];
+    extract_ref_block(
+        &mut src_v_buf,
+        ref_y,
+        ref_stride,
+        ref_x + v_col_delta,
+        ref_y_pos - 2,
+        src_v_w,
+        src_v_h,
+        pw,
+        ph,
+    );
+    let mut half_v = vec![0u8; block_w * block_h];
+    v_lowpass(&mut half_v, block_w, &src_v_buf, src_v_w, block_w, block_h);
+
+    avg_pixels(dst, dst_stride, &half_h, block_w, &half_v, block_w, block_w, block_h);
+}
+
+/// Group D helper: h_lowpass (at row `ref_y_pos + h_row_delta`) + hv_lowpass, averaged.
+///
+/// Used for (2,1) with `h_row_delta=0` and (2,3) with `h_row_delta=1`.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn qpel_mixed_h_hv(
+    dst: &mut [u8],
+    dst_stride: usize,
+    ref_y: &[u8],
+    ref_stride: usize,
+    ref_x: i32,
+    ref_y_pos: i32,
+    block_w: usize,
+    block_h: usize,
+    pw: i32,
+    ph: i32,
+    h_row_delta: i32,
+) {
+    let src_h_w = block_w + 5;
+    let src_h_h = block_h;
+    let mut src_h_buf = vec![0i32; src_h_w * src_h_h];
+    extract_ref_block(
+        &mut src_h_buf,
+        ref_y,
+        ref_stride,
+        ref_x - 2,
+        ref_y_pos + h_row_delta,
+        src_h_w,
+        src_h_h,
+        pw,
+        ph,
+    );
+    let mut half_h = vec![0u8; block_w * block_h];
+    h_lowpass(&mut half_h, block_w, &src_h_buf, src_h_w, block_w, block_h);
+
+    let src_hv_w = block_w + 5;
+    let src_hv_h = block_h + 5;
+    let mut src_hv_buf = vec![0i32; src_hv_w * src_hv_h];
+    extract_ref_block(
+        &mut src_hv_buf,
+        ref_y,
+        ref_stride,
+        ref_x - 2,
+        ref_y_pos - 2,
+        src_hv_w,
+        src_hv_h,
+        pw,
+        ph,
+    );
+    let mut half_hv = vec![0u8; block_w * block_h];
+    hv_lowpass(&mut half_hv, block_w, &src_hv_buf, src_hv_w, block_w, block_h);
+
+    avg_pixels(dst, dst_stride, &half_h, block_w, &half_hv, block_w, block_w, block_h);
+}
+
+/// Group D helper: v_lowpass (at col `ref_x + v_col_delta`) + hv_lowpass, averaged.
+///
+/// Used for (1,2) with `v_col_delta=0` and (3,2) with `v_col_delta=1`.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn qpel_mixed_v_hv(
+    dst: &mut [u8],
+    dst_stride: usize,
+    ref_y: &[u8],
+    ref_stride: usize,
+    ref_x: i32,
+    ref_y_pos: i32,
+    block_w: usize,
+    block_h: usize,
+    pw: i32,
+    ph: i32,
+    v_col_delta: i32,
+) {
+    let src_v_w = block_w;
+    let src_v_h = block_h + 5;
+    let mut src_v_buf = vec![0i32; src_v_w * src_v_h];
+    extract_ref_block(
+        &mut src_v_buf,
+        ref_y,
+        ref_stride,
+        ref_x + v_col_delta,
+        ref_y_pos - 2,
+        src_v_w,
+        src_v_h,
+        pw,
+        ph,
+    );
+    let mut half_v = vec![0u8; block_w * block_h];
+    v_lowpass(&mut half_v, block_w, &src_v_buf, src_v_w, block_w, block_h);
+
+    let src_hv_w = block_w + 5;
+    let src_hv_h = block_h + 5;
+    let mut src_hv_buf = vec![0i32; src_hv_w * src_hv_h];
+    extract_ref_block(
+        &mut src_hv_buf,
+        ref_y,
+        ref_stride,
+        ref_x - 2,
+        ref_y_pos - 2,
+        src_hv_w,
+        src_hv_h,
+        pw,
+        ph,
+    );
+    let mut half_hv = vec![0u8; block_w * block_h];
+    hv_lowpass(&mut half_hv, block_w, &src_hv_buf, src_hv_w, block_w, block_h);
+
+    avg_pixels(dst, dst_stride, &half_v, block_w, &half_hv, block_w, block_w, block_h);
+}
+
+// ---------------------------------------------------------------------------
 // Luma motion compensation (quarter-pel precision)
 // ---------------------------------------------------------------------------
 
@@ -347,525 +592,98 @@ pub fn mc_luma(
         // ------------------------------------------------------------------
         // (1,0): quarter-pel = avg(G, b) — avg of full-pel and horizontal half
         // ------------------------------------------------------------------
-        (1, 0) => {
-            let src_w = block_w + 5;
-            let src_h = block_h;
-            let mut src = vec![0i32; src_w * src_h];
-            extract_ref_block(
-                &mut src,
-                ref_y,
-                ref_stride,
-                ref_x - 2,
-                ref_y_pos,
-                src_w,
-                src_h,
-                pw,
-                ph,
-            );
-
-            let mut half_h = vec![0u8; block_w * block_h];
-            h_lowpass(&mut half_h, block_w, &src, src_w, block_w, block_h);
-
-            // Full-pel samples start at offset 2 in the extracted block.
-            let mut full_pel = vec![0u8; block_w * block_h];
-            for j in 0..block_h {
-                for i in 0..block_w {
-                    full_pel[j * block_w + i] = src[j * src_w + i + 2] as u8;
-                }
-            }
-            avg_pixels(
-                dst, dst_stride, &full_pel, block_w, &half_h, block_w, block_w, block_h,
-            );
-        }
+        (1, 0) => qpel_h_avg(
+            dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos,
+            block_w, block_h, pw, ph, 2,
+        ),
 
         // ------------------------------------------------------------------
         // (3,0): quarter-pel = avg(G+1, b) — avg of full-pel+1 and horizontal half
         // ------------------------------------------------------------------
-        (3, 0) => {
-            let src_w = block_w + 5;
-            let src_h = block_h;
-            let mut src = vec![0i32; src_w * src_h];
-            extract_ref_block(
-                &mut src,
-                ref_y,
-                ref_stride,
-                ref_x - 2,
-                ref_y_pos,
-                src_w,
-                src_h,
-                pw,
-                ph,
-            );
-
-            let mut half_h = vec![0u8; block_w * block_h];
-            h_lowpass(&mut half_h, block_w, &src, src_w, block_w, block_h);
-
-            // Full-pel samples one position to the right (offset 3).
-            let mut full_pel = vec![0u8; block_w * block_h];
-            for j in 0..block_h {
-                for i in 0..block_w {
-                    full_pel[j * block_w + i] = src[j * src_w + i + 3] as u8;
-                }
-            }
-            avg_pixels(
-                dst, dst_stride, &full_pel, block_w, &half_h, block_w, block_w, block_h,
-            );
-        }
+        (3, 0) => qpel_h_avg(
+            dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos,
+            block_w, block_h, pw, ph, 3,
+        ),
 
         // ------------------------------------------------------------------
         // (0,1): quarter-pel = avg(G, h) — avg of full-pel and vertical half
         // ------------------------------------------------------------------
-        (0, 1) => {
-            let src_w = block_w;
-            let src_h = block_h + 5;
-            let mut src = vec![0i32; src_w * src_h];
-            extract_ref_block(
-                &mut src,
-                ref_y,
-                ref_stride,
-                ref_x,
-                ref_y_pos - 2,
-                src_w,
-                src_h,
-                pw,
-                ph,
-            );
-
-            let mut half_v = vec![0u8; block_w * block_h];
-            v_lowpass(&mut half_v, block_w, &src, src_w, block_w, block_h);
-
-            // Full-pel samples start at row offset 2.
-            let mut full_pel = vec![0u8; block_w * block_h];
-            for j in 0..block_h {
-                for i in 0..block_w {
-                    full_pel[j * block_w + i] = src[(j + 2) * src_w + i] as u8;
-                }
-            }
-            avg_pixels(
-                dst, dst_stride, &full_pel, block_w, &half_v, block_w, block_w, block_h,
-            );
-        }
+        (0, 1) => qpel_v_avg(
+            dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos,
+            block_w, block_h, pw, ph, 2,
+        ),
 
         // ------------------------------------------------------------------
         // (0,3): quarter-pel = avg(G_below, h) — avg of full-pel+1row and vertical half
         // ------------------------------------------------------------------
-        (0, 3) => {
-            let src_w = block_w;
-            let src_h = block_h + 5;
-            let mut src = vec![0i32; src_w * src_h];
-            extract_ref_block(
-                &mut src,
-                ref_y,
-                ref_stride,
-                ref_x,
-                ref_y_pos - 2,
-                src_w,
-                src_h,
-                pw,
-                ph,
-            );
-
-            let mut half_v = vec![0u8; block_w * block_h];
-            v_lowpass(&mut half_v, block_w, &src, src_w, block_w, block_h);
-
-            // Full-pel samples one row below (offset 3).
-            let mut full_pel = vec![0u8; block_w * block_h];
-            for j in 0..block_h {
-                for i in 0..block_w {
-                    full_pel[j * block_w + i] = src[(j + 3) * src_w + i] as u8;
-                }
-            }
-            avg_pixels(
-                dst, dst_stride, &full_pel, block_w, &half_v, block_w, block_w, block_h,
-            );
-        }
+        (0, 3) => qpel_v_avg(
+            dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos,
+            block_w, block_h, pw, ph, 3,
+        ),
 
         // ------------------------------------------------------------------
         // (1,1): avg(halfH, halfV) — diagonal quarter-pel "e"
         // ------------------------------------------------------------------
-        (1, 1) => {
-            // Horizontal half-pel at current row.
-            let src_h_w = block_w + 5;
-            let src_h_h = block_h;
-            let mut src_h_buf = vec![0i32; src_h_w * src_h_h];
-            extract_ref_block(
-                &mut src_h_buf,
-                ref_y,
-                ref_stride,
-                ref_x - 2,
-                ref_y_pos,
-                src_h_w,
-                src_h_h,
-                pw,
-                ph,
-            );
-            let mut half_h = vec![0u8; block_w * block_h];
-            h_lowpass(&mut half_h, block_w, &src_h_buf, src_h_w, block_w, block_h);
-
-            // Vertical half-pel at current column.
-            let src_v_w = block_w;
-            let src_v_h = block_h + 5;
-            let mut src_v_buf = vec![0i32; src_v_w * src_v_h];
-            extract_ref_block(
-                &mut src_v_buf,
-                ref_y,
-                ref_stride,
-                ref_x,
-                ref_y_pos - 2,
-                src_v_w,
-                src_v_h,
-                pw,
-                ph,
-            );
-            let mut half_v = vec![0u8; block_w * block_h];
-            v_lowpass(&mut half_v, block_w, &src_v_buf, src_v_w, block_w, block_h);
-
-            avg_pixels(
-                dst, dst_stride, &half_h, block_w, &half_v, block_w, block_w, block_h,
-            );
-        }
+        (1, 1) => qpel_diagonal(
+            dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos,
+            block_w, block_h, pw, ph, 0, 0,
+        ),
 
         // ------------------------------------------------------------------
         // (3,1): avg(halfH, halfV_right) — "g" position
         // ------------------------------------------------------------------
-        (3, 1) => {
-            let src_h_w = block_w + 5;
-            let src_h_h = block_h;
-            let mut src_h_buf = vec![0i32; src_h_w * src_h_h];
-            extract_ref_block(
-                &mut src_h_buf,
-                ref_y,
-                ref_stride,
-                ref_x - 2,
-                ref_y_pos,
-                src_h_w,
-                src_h_h,
-                pw,
-                ph,
-            );
-            let mut half_h = vec![0u8; block_w * block_h];
-            h_lowpass(&mut half_h, block_w, &src_h_buf, src_h_w, block_w, block_h);
-
-            // Vertical half-pel at column + 1.
-            let src_v_w = block_w;
-            let src_v_h = block_h + 5;
-            let mut src_v_buf = vec![0i32; src_v_w * src_v_h];
-            extract_ref_block(
-                &mut src_v_buf,
-                ref_y,
-                ref_stride,
-                ref_x + 1,
-                ref_y_pos - 2,
-                src_v_w,
-                src_v_h,
-                pw,
-                ph,
-            );
-            let mut half_v = vec![0u8; block_w * block_h];
-            v_lowpass(&mut half_v, block_w, &src_v_buf, src_v_w, block_w, block_h);
-
-            avg_pixels(
-                dst, dst_stride, &half_h, block_w, &half_v, block_w, block_w, block_h,
-            );
-        }
+        (3, 1) => qpel_diagonal(
+            dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos,
+            block_w, block_h, pw, ph, 0, 1,
+        ),
 
         // ------------------------------------------------------------------
         // (1,3): avg(halfH_below, halfV) — "m" position
         // ------------------------------------------------------------------
-        (1, 3) => {
-            // Horizontal half-pel at row + 1.
-            let src_h_w = block_w + 5;
-            let src_h_h = block_h;
-            let mut src_h_buf = vec![0i32; src_h_w * src_h_h];
-            extract_ref_block(
-                &mut src_h_buf,
-                ref_y,
-                ref_stride,
-                ref_x - 2,
-                ref_y_pos + 1,
-                src_h_w,
-                src_h_h,
-                pw,
-                ph,
-            );
-            let mut half_h = vec![0u8; block_w * block_h];
-            h_lowpass(&mut half_h, block_w, &src_h_buf, src_h_w, block_w, block_h);
-
-            // Vertical half-pel at current column.
-            let src_v_w = block_w;
-            let src_v_h = block_h + 5;
-            let mut src_v_buf = vec![0i32; src_v_w * src_v_h];
-            extract_ref_block(
-                &mut src_v_buf,
-                ref_y,
-                ref_stride,
-                ref_x,
-                ref_y_pos - 2,
-                src_v_w,
-                src_v_h,
-                pw,
-                ph,
-            );
-            let mut half_v = vec![0u8; block_w * block_h];
-            v_lowpass(&mut half_v, block_w, &src_v_buf, src_v_w, block_w, block_h);
-
-            avg_pixels(
-                dst, dst_stride, &half_h, block_w, &half_v, block_w, block_w, block_h,
-            );
-        }
+        (1, 3) => qpel_diagonal(
+            dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos,
+            block_w, block_h, pw, ph, 1, 0,
+        ),
 
         // ------------------------------------------------------------------
         // (3,3): avg(halfH_below, halfV_right) — "o" position
         // ------------------------------------------------------------------
-        (3, 3) => {
-            // Horizontal half-pel at row + 1.
-            let src_h_w = block_w + 5;
-            let src_h_h = block_h;
-            let mut src_h_buf = vec![0i32; src_h_w * src_h_h];
-            extract_ref_block(
-                &mut src_h_buf,
-                ref_y,
-                ref_stride,
-                ref_x - 2,
-                ref_y_pos + 1,
-                src_h_w,
-                src_h_h,
-                pw,
-                ph,
-            );
-            let mut half_h = vec![0u8; block_w * block_h];
-            h_lowpass(&mut half_h, block_w, &src_h_buf, src_h_w, block_w, block_h);
-
-            // Vertical half-pel at column + 1.
-            let src_v_w = block_w;
-            let src_v_h = block_h + 5;
-            let mut src_v_buf = vec![0i32; src_v_w * src_v_h];
-            extract_ref_block(
-                &mut src_v_buf,
-                ref_y,
-                ref_stride,
-                ref_x + 1,
-                ref_y_pos - 2,
-                src_v_w,
-                src_v_h,
-                pw,
-                ph,
-            );
-            let mut half_v = vec![0u8; block_w * block_h];
-            v_lowpass(&mut half_v, block_w, &src_v_buf, src_v_w, block_w, block_h);
-
-            avg_pixels(
-                dst, dst_stride, &half_h, block_w, &half_v, block_w, block_w, block_h,
-            );
-        }
+        (3, 3) => qpel_diagonal(
+            dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos,
+            block_w, block_h, pw, ph, 1, 1,
+        ),
 
         // ------------------------------------------------------------------
         // (2,1): avg(halfH, halfHV) — "f" position
         // ------------------------------------------------------------------
-        (2, 1) => {
-            // Horizontal half-pel.
-            let src_h_w = block_w + 5;
-            let src_h_h = block_h;
-            let mut src_h_buf = vec![0i32; src_h_w * src_h_h];
-            extract_ref_block(
-                &mut src_h_buf,
-                ref_y,
-                ref_stride,
-                ref_x - 2,
-                ref_y_pos,
-                src_h_w,
-                src_h_h,
-                pw,
-                ph,
-            );
-            let mut half_h = vec![0u8; block_w * block_h];
-            h_lowpass(&mut half_h, block_w, &src_h_buf, src_h_w, block_w, block_h);
-
-            // 2D half-pel.
-            let src_hv_w = block_w + 5;
-            let src_hv_h = block_h + 5;
-            let mut src_hv_buf = vec![0i32; src_hv_w * src_hv_h];
-            extract_ref_block(
-                &mut src_hv_buf,
-                ref_y,
-                ref_stride,
-                ref_x - 2,
-                ref_y_pos - 2,
-                src_hv_w,
-                src_hv_h,
-                pw,
-                ph,
-            );
-            let mut half_hv = vec![0u8; block_w * block_h];
-            hv_lowpass(
-                &mut half_hv,
-                block_w,
-                &src_hv_buf,
-                src_hv_w,
-                block_w,
-                block_h,
-            );
-
-            avg_pixels(
-                dst, dst_stride, &half_h, block_w, &half_hv, block_w, block_w, block_h,
-            );
-        }
+        (2, 1) => qpel_mixed_h_hv(
+            dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos,
+            block_w, block_h, pw, ph, 0,
+        ),
 
         // ------------------------------------------------------------------
         // (2,3): avg(halfH_below, halfHV) — "n" position
         // ------------------------------------------------------------------
-        (2, 3) => {
-            // Horizontal half-pel at row + 1.
-            let src_h_w = block_w + 5;
-            let src_h_h = block_h;
-            let mut src_h_buf = vec![0i32; src_h_w * src_h_h];
-            extract_ref_block(
-                &mut src_h_buf,
-                ref_y,
-                ref_stride,
-                ref_x - 2,
-                ref_y_pos + 1,
-                src_h_w,
-                src_h_h,
-                pw,
-                ph,
-            );
-            let mut half_h = vec![0u8; block_w * block_h];
-            h_lowpass(&mut half_h, block_w, &src_h_buf, src_h_w, block_w, block_h);
-
-            // 2D half-pel.
-            let src_hv_w = block_w + 5;
-            let src_hv_h = block_h + 5;
-            let mut src_hv_buf = vec![0i32; src_hv_w * src_hv_h];
-            extract_ref_block(
-                &mut src_hv_buf,
-                ref_y,
-                ref_stride,
-                ref_x - 2,
-                ref_y_pos - 2,
-                src_hv_w,
-                src_hv_h,
-                pw,
-                ph,
-            );
-            let mut half_hv = vec![0u8; block_w * block_h];
-            hv_lowpass(
-                &mut half_hv,
-                block_w,
-                &src_hv_buf,
-                src_hv_w,
-                block_w,
-                block_h,
-            );
-
-            avg_pixels(
-                dst, dst_stride, &half_h, block_w, &half_hv, block_w, block_w, block_h,
-            );
-        }
+        (2, 3) => qpel_mixed_h_hv(
+            dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos,
+            block_w, block_h, pw, ph, 1,
+        ),
 
         // ------------------------------------------------------------------
         // (1,2): avg(halfV, halfHV) — "i" position
         // ------------------------------------------------------------------
-        (1, 2) => {
-            // Vertical half-pel.
-            let src_v_w = block_w;
-            let src_v_h = block_h + 5;
-            let mut src_v_buf = vec![0i32; src_v_w * src_v_h];
-            extract_ref_block(
-                &mut src_v_buf,
-                ref_y,
-                ref_stride,
-                ref_x,
-                ref_y_pos - 2,
-                src_v_w,
-                src_v_h,
-                pw,
-                ph,
-            );
-            let mut half_v = vec![0u8; block_w * block_h];
-            v_lowpass(&mut half_v, block_w, &src_v_buf, src_v_w, block_w, block_h);
-
-            // 2D half-pel.
-            let src_hv_w = block_w + 5;
-            let src_hv_h = block_h + 5;
-            let mut src_hv_buf = vec![0i32; src_hv_w * src_hv_h];
-            extract_ref_block(
-                &mut src_hv_buf,
-                ref_y,
-                ref_stride,
-                ref_x - 2,
-                ref_y_pos - 2,
-                src_hv_w,
-                src_hv_h,
-                pw,
-                ph,
-            );
-            let mut half_hv = vec![0u8; block_w * block_h];
-            hv_lowpass(
-                &mut half_hv,
-                block_w,
-                &src_hv_buf,
-                src_hv_w,
-                block_w,
-                block_h,
-            );
-
-            avg_pixels(
-                dst, dst_stride, &half_v, block_w, &half_hv, block_w, block_w, block_h,
-            );
-        }
+        (1, 2) => qpel_mixed_v_hv(
+            dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos,
+            block_w, block_h, pw, ph, 0,
+        ),
 
         // ------------------------------------------------------------------
         // (3,2): avg(halfV_right, halfHV) — "k" position
         // ------------------------------------------------------------------
-        (3, 2) => {
-            // Vertical half-pel at column + 1.
-            let src_v_w = block_w;
-            let src_v_h = block_h + 5;
-            let mut src_v_buf = vec![0i32; src_v_w * src_v_h];
-            extract_ref_block(
-                &mut src_v_buf,
-                ref_y,
-                ref_stride,
-                ref_x + 1,
-                ref_y_pos - 2,
-                src_v_w,
-                src_v_h,
-                pw,
-                ph,
-            );
-            let mut half_v = vec![0u8; block_w * block_h];
-            v_lowpass(&mut half_v, block_w, &src_v_buf, src_v_w, block_w, block_h);
-
-            // 2D half-pel.
-            let src_hv_w = block_w + 5;
-            let src_hv_h = block_h + 5;
-            let mut src_hv_buf = vec![0i32; src_hv_w * src_hv_h];
-            extract_ref_block(
-                &mut src_hv_buf,
-                ref_y,
-                ref_stride,
-                ref_x - 2,
-                ref_y_pos - 2,
-                src_hv_w,
-                src_hv_h,
-                pw,
-                ph,
-            );
-            let mut half_hv = vec![0u8; block_w * block_h];
-            hv_lowpass(
-                &mut half_hv,
-                block_w,
-                &src_hv_buf,
-                src_hv_w,
-                block_w,
-                block_h,
-            );
-
-            avg_pixels(
-                dst, dst_stride, &half_v, block_w, &half_hv, block_w, block_w, block_h,
-            );
-        }
+        (3, 2) => qpel_mixed_v_hv(
+            dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos,
+            block_w, block_h, pw, ph, 1,
+        ),
 
         _ => unreachable!("dx and dy must be in 0..4, got ({}, {})", dx, dy),
     }
