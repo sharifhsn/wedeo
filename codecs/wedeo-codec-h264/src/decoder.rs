@@ -97,10 +97,13 @@ pub struct H264Decoder {
     /// Starts at `num_reorder_frames` from VUI, or 0 if not signalled.
     /// Dynamically increased when B-frames or out-of-order POCs are detected.
     reorder_depth: usize,
-    /// POC of the previously decoded frame, for POC gap detection.
-    /// Used to detect interleaved decode order (POC gap > 2) and increase
-    /// reorder_depth before the first output escapes.
-    prev_decode_poc: Option<i32>,
+    /// True if VUI bitstream_restriction is present (num_reorder_frames >= 0).
+    /// When set, reorder_depth is NOT dynamically increased beyond the VUI value
+    /// (matching FFmpeg h264_slice.c:1328 `!sps->bitstream_restriction_flag`).
+    has_bitstream_restriction: bool,
+    /// Sorted ascending history of recent POCs for out-of-order detection
+    /// (matching FFmpeg's `last_pocs` array in h264_slice.c).
+    last_pocs: [i64; 16],
     /// Crop offsets in pixels from the active SPS.
     crop_left: u32,
     crop_top: u32,
@@ -150,7 +153,8 @@ impl H264Decoder {
             prev_frame_num_offset: 0,
             prev_frame_num_h264: 0,
             reorder_depth: 0,
-            prev_decode_poc: None,
+            has_bitstream_restriction: false,
+            last_pocs: [i64::MIN; 16],
             crop_left: 0,
             crop_top: 0,
             output_frame_counter: 0,
@@ -364,7 +368,8 @@ impl H264Decoder {
         // Pre-set reorder_depth from VUI num_reorder_frames (matching FFmpeg
         // h264_slice.c:1304-1306). This ensures the reorder buffer is active
         // before the first B-frame arrives.
-        if sps.num_reorder_frames > 0 {
+        if sps.num_reorder_frames >= 0 {
+            self.has_bitstream_restriction = true;
             let nr = sps.num_reorder_frames as usize;
             if nr > self.reorder_depth {
                 self.reorder_depth = nr;
@@ -613,19 +618,48 @@ impl H264Decoder {
                 "frame complete"
             );
 
-            // Dynamically increase reorder depth when POC gap > 2 between
-            // consecutive decoded frames is detected (matching FFmpeg
-            // h264_slice.c:1318-1331). Must happen BEFORE the output
-            // decision so the buffer can accumulate enough frames.
-            // IDR resets POC to 0 — don't let that trigger a false gap.
-            if !self.current_is_idr
-                && let Some(prev) = self.prev_decode_poc
-                && (self.current_poc as i64 - prev as i64).unsigned_abs() > 2
-                && self.reorder_depth < 1
-            {
-                self.reorder_depth = 1;
+            // IDR resets the POC sequence. Clear last_pocs so the gap
+            // detection doesn't falsely trigger from the old sequence.
+            if self.current_is_idr {
+                self.last_pocs = [i64::MIN; 16];
             }
-            self.prev_decode_poc = Some(self.current_poc);
+
+            // Dynamically compute reorder depth using FFmpeg's last_pocs
+            // algorithm (h264_slice.c:1309-1332). Insert current POC into
+            // the sorted ascending last_pocs array and derive out_of_order
+            // from the insertion position. The algorithm shifts values left
+            // as it scans, then places cur_poc at the insertion point.
+            let cur_poc = self.current_poc as i64;
+            let mut insert_pos = 0usize;
+            for i in 0..=16 {
+                if i == 16 || cur_poc < self.last_pocs[i] {
+                    if i > 0 {
+                        self.last_pocs[i - 1] = cur_poc;
+                    }
+                    insert_pos = i;
+                    break;
+                } else if i > 0 {
+                    self.last_pocs[i - 1] = self.last_pocs[i];
+                }
+            }
+
+            let mut out_of_order = 16 - insert_pos;
+
+            // Also increase for B-frames or POC gap > 2
+            if last_hdr.slice_type.is_b()
+                || (self.last_pocs[14] > i64::MIN && (self.last_pocs[15] - self.last_pocs[14]) > 2)
+            {
+                out_of_order = out_of_order.max(1);
+            }
+
+            // If all entries are smaller than current (out_of_order == 16),
+            // it means POC went backwards (e.g., IDR). Reset last_pocs.
+            if out_of_order == 16 {
+                self.last_pocs = [i64::MIN; 16];
+                self.last_pocs[0] = cur_poc;
+            } else if out_of_order > self.reorder_depth && !self.has_bitstream_restriction {
+                self.reorder_depth = out_of_order;
+            }
 
             // Add current frame to the delayed_pics buffer.
             self.delayed_pics.push((self.current_poc, frame));
@@ -1187,7 +1221,8 @@ impl Decoder for H264Decoder {
         self.current_poc = 0;
         self.current_nal_ref_idc = 0;
         self.reorder_depth = 0;
-        self.prev_decode_poc = None;
+        self.has_bitstream_restriction = false;
+        self.last_pocs = [i64::MIN; 16];
         self.output_frame_counter = 0;
         self.delayed_pics.clear();
         // SPS/PPS are retained across flush (matching FFmpeg behavior).
