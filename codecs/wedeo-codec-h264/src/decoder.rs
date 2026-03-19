@@ -6,7 +6,7 @@
 //
 // Reference: FFmpeg libavcodec/h264dec.c, h264_slice.c
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 
 #[cfg(feature = "tracing-detail")]
 use tracing::trace;
@@ -93,22 +93,23 @@ pub struct H264Decoder {
     prev_frame_num_offset: i32,
     /// POC type 1/2 state: previous frame_num (H.264 level).
     prev_frame_num_h264: u32,
-    /// True once a B-slice has been seen (enables POC reordering).
-    has_b_frames: bool,
+    /// Reorder buffer depth (matching FFmpeg's `has_b_frames`).
+    /// Starts at `num_reorder_frames` from VUI, or 0 if not signalled.
+    /// Dynamically increased when B-frames or out-of-order POCs are detected.
+    reorder_depth: usize,
+    /// POC of the previously decoded frame, for POC gap detection.
+    /// Used to detect interleaved decode order (POC gap > 2) and increase
+    /// reorder_depth before the first output escapes.
+    prev_decode_poc: Option<i32>,
     /// Crop offsets in pixels from the active SPS.
     crop_left: u32,
     crop_top: u32,
     /// Output frame counter for sequential PTS assignment during reordering.
     output_frame_counter: i64,
-    /// Pending frames awaiting POC-ordered output (keyed by POC).
-    /// For B-frame streams, frames are buffered here and flushed in POC
-    /// order when a reference frame completes. For I+P-only streams,
-    /// this is unused.
-    pending_output: BTreeMap<i32, Frame>,
-    /// Delayed frame buffer for one-frame output delay.
-    /// Holds the most recently decoded frame until the next frame arrives,
-    /// allowing B-frame detection before any output escapes to the caller.
-    delayed_frame: Option<(i32, Frame)>, // (poc, frame)
+    /// Delayed picture buffer for POC-ordered output (matching FFmpeg's
+    /// `delayed_pic`). Frames are inserted here and the minimum-POC frame
+    /// is output when `delayed_pics.len() > reorder_depth`.
+    delayed_pics: Vec<(i32, Frame)>, // (poc, frame)
 }
 
 impl H264Decoder {
@@ -148,12 +149,12 @@ impl H264Decoder {
             frame_num_offset: 0,
             prev_frame_num_offset: 0,
             prev_frame_num_h264: 0,
-            has_b_frames: false,
+            reorder_depth: 0,
+            prev_decode_poc: None,
             crop_left: 0,
             crop_top: 0,
             output_frame_counter: 0,
-            pending_output: BTreeMap::new(),
-            delayed_frame: None,
+            delayed_pics: Vec::new(),
         };
 
         // Parse avcC extradata if present (MP4/NALFF format).
@@ -359,6 +360,16 @@ impl H264Decoder {
         }
         self.crop_left = sps.crop_left;
         self.crop_top = sps.crop_top;
+
+        // Pre-set reorder_depth from VUI num_reorder_frames (matching FFmpeg
+        // h264_slice.c:1304-1306). This ensures the reorder buffer is active
+        // before the first B-frame arrives.
+        if sps.num_reorder_frames > 0 {
+            let nr = sps.num_reorder_frames as usize;
+            if nr > self.reorder_depth {
+                self.reorder_depth = nr;
+            }
+        }
     }
 
     /// Process a single NAL unit.
@@ -428,13 +439,10 @@ impl H264Decoder {
                     self.current_frame_num_h264 = hdr.frame_num;
                     self.current_nal_ref_idc = nalu.nal_ref_idc;
 
-                    // Detect B-frames for output reordering
-                    if hdr.slice_type.is_b() && !self.has_b_frames {
-                        self.has_b_frames = true;
-                        // Move any delayed frame into pending_output for reordering
-                        if let Some((poc, f)) = self.delayed_frame.take() {
-                            self.pending_output.insert(poc, f);
-                        }
+                    // Dynamic reorder depth increase (matching FFmpeg
+                    // h264_slice.c:1328-1331). B-frames need at least depth 1.
+                    if hdr.slice_type.is_b() && self.reorder_depth < 1 {
+                        self.reorder_depth = 1;
                     }
 
                     // Compute spec-compliant POC
@@ -465,7 +473,12 @@ impl H264Decoder {
                         );
                     } else if hdr.slice_type.is_b() {
                         let max_frame_num_b = 1u32 << sps.log2_max_frame_num;
-                        let (l0, l1) = refs::build_ref_list_b(&self.dpb, &hdr, self.current_poc, max_frame_num_b);
+                        let (l0, l1) = refs::build_ref_list_b(
+                            &self.dpb,
+                            &hdr,
+                            self.current_poc,
+                            max_frame_num_b,
+                        );
                         debug!(
                             poc = self.current_poc,
                             l0_len = l0.len(),
@@ -591,45 +604,47 @@ impl H264Decoder {
             (self.current_fdc.take(), self.current_last_hdr.as_ref())
         {
             // Set initial PTS to POC for reordering. Sequential PTS is
-            // assigned later when flushing from pending_output.
+            // assigned later when flushing from delayed_pics.
             let frame = self.fdc_to_frame(&mut fdc, last_hdr, self.current_poc as i64);
             debug!(
                 frame_num = self.frame_num,
                 poc = self.current_poc,
-                has_b = self.has_b_frames,
+                reorder_depth = self.reorder_depth,
                 "frame complete"
             );
 
-            if self.has_b_frames {
-                // B-frame stream: buffer in pending_output for POC-ordered output.
-                self.pending_output.insert(self.current_poc, frame);
+            // Dynamically increase reorder depth when POC gap > 2 between
+            // consecutive decoded frames is detected (matching FFmpeg
+            // h264_slice.c:1318-1331). Must happen BEFORE the output
+            // decision so the buffer can accumulate enough frames.
+            // IDR resets POC to 0 — don't let that trigger a false gap.
+            if !self.current_is_idr
+                && let Some(prev) = self.prev_decode_poc
+                && (self.current_poc as i64 - prev as i64).unsigned_abs() > 2
+                && self.reorder_depth < 1
+            {
+                self.reorder_depth = 1;
+            }
+            self.prev_decode_poc = Some(self.current_poc);
 
-                // When a reference frame completes, flush all pending with POC < current.
-                if self.current_nal_ref_idc > 0 {
-                    let current_poc = self.current_poc;
-                    let to_flush: Vec<i32> = self
-                        .pending_output
-                        .keys()
-                        .copied()
-                        .filter(|&poc| poc < current_poc)
-                        .collect();
-                    for poc in to_flush {
-                        if let Some(mut f) = self.pending_output.remove(&poc) {
-                            f.pts = self.output_frame_counter;
-                            self.output_frame_counter += 1;
-                            self.output_queue.push_back(f);
-                        }
-                    }
-                }
-            } else {
-                // I+P-only (or B-frames not yet detected): use 1-frame delay.
-                // Push the previously delayed frame to output, hold current.
-                if let Some((_prev_poc, mut prev_frame)) = self.delayed_frame.take() {
-                    prev_frame.pts = self.output_frame_counter;
-                    self.output_frame_counter += 1;
-                    self.output_queue.push_back(prev_frame);
-                }
-                self.delayed_frame = Some((self.current_poc, frame));
+            // Add current frame to the delayed_pics buffer.
+            self.delayed_pics.push((self.current_poc, frame));
+
+            // Output frames when buffer exceeds reorder_depth (matching
+            // FFmpeg h264_slice.c:1359-1369). Output the minimum-POC frame.
+            while self.delayed_pics.len() > self.reorder_depth {
+                // Find the index of the minimum POC entry
+                let min_idx = self
+                    .delayed_pics
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, (poc, _))| *poc)
+                    .map(|(i, _)| i)
+                    .unwrap();
+                let (_, mut f) = self.delayed_pics.remove(min_idx);
+                f.pts = self.output_frame_counter;
+                self.output_frame_counter += 1;
+                self.output_queue.push_back(f);
             }
 
             // Non-reference pictures (nal_ref_idc == 0, typically B-frames)
@@ -743,9 +758,8 @@ impl H264Decoder {
                     .entries
                     .iter()
                     .filter_map(|e| {
-                        e.as_ref().and_then(|e| {
-                            (e.status == RefStatus::ShortTerm).then_some(e.frame_num)
-                        })
+                        e.as_ref()
+                            .and_then(|e| (e.status == RefStatus::ShortTerm).then_some(e.frame_num))
                     })
                     .collect();
                 let lt_fns: Vec<u32> = self
@@ -1134,26 +1148,12 @@ impl Decoder for H264Decoder {
                 // Flush any in-progress frame.
                 self.finish_current_frame();
 
-                // Flush delayed frame into pending (for B-frame streams)
-                // or directly to output (for I+P streams)
-                if let Some((poc, f)) = self.delayed_frame.take() {
-                    if self.has_b_frames {
-                        self.pending_output.insert(poc, f);
-                    } else {
-                        let mut f = f;
-                        f.pts = self.output_frame_counter;
-                        self.output_frame_counter += 1;
-                        self.output_queue.push_back(f);
-                    }
-                }
-                // Flush all remaining pending frames in POC order
-                let remaining: Vec<i32> = self.pending_output.keys().copied().collect();
-                for poc in remaining {
-                    if let Some(mut f) = self.pending_output.remove(&poc) {
-                        f.pts = self.output_frame_counter;
-                        self.output_frame_counter += 1;
-                        self.output_queue.push_back(f);
-                    }
+                // Flush all remaining delayed_pics in POC order
+                self.delayed_pics.sort_by_key(|(poc, _)| *poc);
+                for (_, mut f) in self.delayed_pics.drain(..) {
+                    f.pts = self.output_frame_counter;
+                    self.output_frame_counter += 1;
+                    self.output_queue.push_back(f);
                 }
 
                 self.draining = true;
@@ -1186,10 +1186,10 @@ impl Decoder for H264Decoder {
         self.prev_poc_lsb = 0;
         self.current_poc = 0;
         self.current_nal_ref_idc = 0;
-        self.has_b_frames = false;
+        self.reorder_depth = 0;
+        self.prev_decode_poc = None;
         self.output_frame_counter = 0;
-        self.pending_output.clear();
-        self.delayed_frame = None;
+        self.delayed_pics.clear();
         // SPS/PPS are retained across flush (matching FFmpeg behavior).
     }
 

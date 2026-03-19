@@ -134,6 +134,11 @@ pub struct Sps {
     pub fixed_frame_rate: bool,
     pub sar: Rational,
 
+    // VUI bitstream restriction
+    /// Number of frames that need reordering (from VUI bitstream_restriction).
+    /// -1 means not signalled (infer from profile/level).
+    pub num_reorder_frames: i32,
+
     // VUI video signal type
     pub video_signal_type_present: bool,
     pub video_format: u8,
@@ -192,6 +197,7 @@ impl Default for Sps {
             time_scale: 0,
             fixed_frame_rate: false,
             sar: Rational::new(0, 1),
+            num_reorder_frames: -1,
             video_signal_type_present: false,
             video_format: 5, // "Unspecified" per H.264 spec
             video_full_range_flag: false,
@@ -501,7 +507,7 @@ fn parse_vui(br: &mut BitReadBE<'_>, sps: &mut Sps) -> Result<()> {
 
     let _pic_struct_present = br.get_bit();
 
-    // bitstream_restriction -- parse but don't store (not needed for basic decode)
+    // bitstream_restriction
     let bitstream_restriction = br.get_bit();
     if bitstream_restriction {
         let _motion_vectors_over_pic_boundaries = br.get_bit();
@@ -509,8 +515,9 @@ fn parse_vui(br: &mut BitReadBE<'_>, sps: &mut Sps) -> Result<()> {
         let _max_bits_per_mb_denom = get_ue_golomb(br)?;
         let _log2_max_mv_length_horizontal = get_ue_golomb(br)?;
         let _log2_max_mv_length_vertical = get_ue_golomb(br)?;
-        let _num_reorder_frames = get_ue_golomb(br)?;
+        let num_reorder_frames = get_ue_golomb(br)?;
         let _max_dec_frame_buffering = get_ue_golomb(br)?;
+        sps.num_reorder_frames = num_reorder_frames.min(16) as i32;
     }
 
     Ok(())
