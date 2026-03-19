@@ -547,6 +547,7 @@ mod tests {
             ref_info: vec![-1i8; 16],
             mb_intra: vec![false; 1],
             needs_output: false,
+            ref_poc_l0: Vec::new(),
         }
     }
 

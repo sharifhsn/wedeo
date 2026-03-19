@@ -107,6 +107,15 @@ pub struct FrameDecodeContext {
     pub constrained_intra_pred: bool,
     /// SPS direct_8x8_inference_flag: when false, spatial direct uses 4x4 col blocks.
     pub direct_8x8_inference_flag: bool,
+    /// POC of colocated frame (L1[0]), for temporal direct mode.
+    pub col_poc: i32,
+    /// L0 ref POCs stored from the colocated frame, for temporal direct mode.
+    /// Maps col_ref[blk] → ref_poc_l0[col_ref[blk]] → POC.
+    pub col_ref_poc_l0: Vec<i32>,
+    /// Current frame's L0 ref POCs (for temporal direct dist_scale_factor).
+    pub cur_l0_ref_poc: Vec<i32>,
+    /// Current picture POC (for temporal direct dist_scale_factor).
+    pub cur_poc: i32,
 }
 
 impl FrameDecodeContext {
@@ -150,6 +159,10 @@ impl FrameDecodeContext {
             col_mb_intra: Vec::new(),
             constrained_intra_pred: pps.constrained_intra_pred,
             direct_8x8_inference_flag: sps.direct_8x8_inference_flag,
+            col_poc: 0,
+            col_ref_poc_l0: Vec::new(),
+            cur_l0_ref_poc: Vec::new(),
+            cur_poc: 0,
         }
     }
 }
@@ -644,7 +657,17 @@ fn decode_inter_mb(
 ) {
     // Dispatch B-frame inter MBs to dedicated handler
     if slice_hdr.slice_type.is_b() {
-        decode_b_inter_mb(ctx, mb, mb_x, mb_y, qp, chroma_qp, ref_pics, ref_pics_l1);
+        decode_b_inter_mb(
+            ctx,
+            mb,
+            slice_hdr,
+            mb_x,
+            mb_y,
+            qp,
+            chroma_qp,
+            ref_pics,
+            ref_pics_l1,
+        );
         return;
     }
 
@@ -1406,13 +1429,13 @@ pub fn decode_skip_mb(
     let _ = slice_hdr; // reserved for future use (e.g. weighted prediction)
 }
 
-/// Decode a B_Skip macroblock (spatial direct prediction, no residual).
+/// Decode a B_Skip macroblock (direct prediction, no residual).
 ///
-/// B_Skip uses spatial direct prediction for both L0 and L1 MVs,
-/// then averages the two MC predictions. No residual data is present.
+/// B_Skip uses direct prediction (spatial or temporal based on slice header)
+/// for both L0 and L1 MVs, then averages the two MC predictions.
 pub fn decode_b_skip_mb(
     ctx: &mut FrameDecodeContext,
-    _slice_hdr: &SliceHeader,
+    slice_hdr: &SliceHeader,
     mb_x: u32,
     mb_y: u32,
     ref_pics: &[&PictureBuffer],
@@ -1425,8 +1448,12 @@ pub fn decode_b_skip_mb(
             ctx.mv_ctx.set_l1(mb_x, mb_y, blk, [0, 0], 0);
         }
     } else {
-        // Compute spatial direct MVs per 4x4 block
-        let direct = pred_spatial_direct(ctx, mb_x, mb_y);
+        // Compute direct MVs per 4x4 block
+        let direct = if slice_hdr.direct_spatial_mv_pred_flag {
+            pred_spatial_direct(ctx, mb_x, mb_y)
+        } else {
+            pred_temporal_direct(ctx, mb_x, mb_y)
+        };
 
         for (i4, &(mv_l0, ref_l0, mv_l1, ref_l1)) in direct.iter().enumerate() {
             let bx = (i4 % 4) as u32;
@@ -1514,6 +1541,7 @@ pub fn decode_b_skip_mb(
 fn decode_b_inter_mb(
     ctx: &mut FrameDecodeContext,
     mb: &mut MacroblockCavlc,
+    slice_hdr: &SliceHeader,
     mb_x: u32,
     mb_y: u32,
     qp: u8,
@@ -1532,8 +1560,12 @@ fn decode_b_inter_mb(
     }
 
     if mb.is_direct {
-        // B_Direct_16x16: spatial direct prediction
-        let direct = pred_spatial_direct(ctx, mb_x, mb_y);
+        // B_Direct_16x16: dispatch based on direct_spatial_mv_pred_flag
+        let direct = if slice_hdr.direct_spatial_mv_pred_flag {
+            pred_spatial_direct(ctx, mb_x, mb_y)
+        } else {
+            pred_temporal_direct(ctx, mb_x, mb_y)
+        };
 
         // Apply MC per 4x4 block. Adjacent blocks with identical MVs could be
         // coalesced into larger partitions, but for correctness (especially
@@ -1575,7 +1607,7 @@ fn decode_b_inter_mb(
         }
     } else if mb.mb_type == 22 {
         // B_8x8: per-8x8-partition decode with sub_mb_type
-        decode_b_8x8_mb(ctx, mb, mb_x, mb_y, ref_pics, ref_pics_l1);
+        decode_b_8x8_mb(ctx, mb, slice_hdr, mb_x, mb_y, ref_pics, ref_pics_l1);
     } else {
         // Non-direct B-frame partitions (16x16, 16x8, 8x16)
         let part_size = mb.b_part_size;
@@ -1771,6 +1803,7 @@ fn decode_b_inter_mb(
 fn decode_b_8x8_mb(
     ctx: &mut FrameDecodeContext,
     mb: &mut MacroblockCavlc,
+    slice_hdr: &SliceHeader,
     mb_x: u32,
     mb_y: u32,
     ref_pics: &[&PictureBuffer],
@@ -1785,7 +1818,11 @@ fn decode_b_8x8_mb(
     // Neighbor computation is MB-level so results are valid for all partitions.
     let has_direct = mb.sub_mb_type.contains(&0);
     let direct = if has_direct {
-        Some(pred_spatial_direct(ctx, mb_x, mb_y))
+        Some(if slice_hdr.direct_spatial_mv_pred_flag {
+            pred_spatial_direct(ctx, mb_x, mb_y)
+        } else {
+            pred_temporal_direct(ctx, mb_x, mb_y)
+        })
     } else {
         None
     };
@@ -2155,6 +2192,130 @@ fn pred_spatial_direct(
                     }
                 }
             }
+        }
+    }
+
+    results
+}
+
+/// Temporal direct prediction for a B-frame macroblock.
+///
+/// Derives L0 and L1 MVs by scaling the colocated MB's MV from L1[0].
+/// Formula: L0_MV = (scale * col_mv + 128) >> 8
+///          L1_MV = L0_MV - col_mv
+/// where scale = 256 * (cur_poc - l0_ref_poc) / (col_poc - col_ref_poc)
+///
+/// Returns per-4x4 block results matching pred_spatial_direct's format.
+///
+/// Reference: FFmpeg h264_direct.c:pred_temp_direct_motion (lines 486-718)
+fn pred_temporal_direct(
+    ctx: &FrameDecodeContext,
+    mb_x: u32,
+    mb_y: u32,
+) -> [([i16; 2], i8, [i16; 2], i8); 16] {
+    let mb_idx = (mb_y * ctx.mb_width + mb_x) as usize;
+    let col_is_intra = ctx.col_mb_intra.get(mb_idx).copied().unwrap_or(true);
+    let blk_base = mb_idx * 16;
+
+    let mut results = [([0i16; 2], 0i8, [0i16; 2], 0i8); 16];
+
+    // For intra colocated, all MVs are zero with ref_idx 0
+    if col_is_intra || ctx.col_ref.is_empty() {
+        return results;
+    }
+
+    // Precompute dist_scale_factor for each L0 ref
+    // scale = clip(256 * td / tb, -1024, 1023) where
+    //   tb = clip(cur_poc - l0_ref_poc, -128, 127)
+    //   td = clip(col_poc - col_ref_poc, -128, 127)
+    let compute_scale = |l0_ref_poc: i32, col_ref_poc_val: i32| -> i32 {
+        let tb = (ctx.cur_poc - l0_ref_poc).clamp(-128, 127);
+        let td = (ctx.col_poc - col_ref_poc_val).clamp(-128, 127);
+        if td == 0 {
+            return 256;
+        }
+        let tx = (16384 + (td.abs() >> 1)) / td;
+        ((tb * tx + 32) >> 6).clamp(-1024, 1023)
+    };
+
+    if ctx.direct_8x8_inference_flag {
+        // Per-8x8 block
+        const CORNERS: [usize; 4] = [0, 2, 8, 10];
+        const FILL: [[usize; 4]; 4] =
+            [[0, 1, 4, 5], [2, 3, 6, 7], [8, 9, 12, 13], [10, 11, 14, 15]];
+
+        for i8x8 in 0..4 {
+            let col_blk = blk_base + CORNERS[i8x8];
+            let col_ref_idx = ctx.col_ref.get(col_blk).copied().unwrap_or(-1);
+            if col_ref_idx < 0 {
+                // Intra sub-block: zero MV, ref 0
+                for &blk in &FILL[i8x8] {
+                    results[blk] = ([0, 0], 0, [0, 0], 0);
+                }
+                continue;
+            }
+
+            // Get colocated ref's POC
+            let col_ref_poc_val = ctx
+                .col_ref_poc_l0
+                .get(col_ref_idx as usize)
+                .copied()
+                .unwrap_or(ctx.col_poc);
+
+            // Map to current L0: find L0 ref with matching POC
+            let l0_ref = ctx
+                .cur_l0_ref_poc
+                .iter()
+                .position(|&poc| poc == col_ref_poc_val)
+                .unwrap_or(0);
+
+            let l0_ref_poc = ctx.cur_l0_ref_poc.get(l0_ref).copied().unwrap_or(0);
+            let scale = compute_scale(l0_ref_poc, col_ref_poc_val);
+
+            let col_mv = ctx.col_mv.get(col_blk).copied().unwrap_or([0, 0]);
+            let mv_l0 = [
+                ((scale * col_mv[0] as i32 + 128) >> 8) as i16,
+                ((scale * col_mv[1] as i32 + 128) >> 8) as i16,
+            ];
+            let mv_l1 = [mv_l0[0] - col_mv[0], mv_l0[1] - col_mv[1]];
+
+            for &blk in &FILL[i8x8] {
+                results[blk] = (mv_l0, l0_ref as i8, mv_l1, 0);
+            }
+        }
+    } else {
+        // Per-4x4 block
+        for (blk, result) in results.iter_mut().enumerate() {
+            let col_blk = blk_base + blk;
+            let col_ref_idx = ctx.col_ref.get(col_blk).copied().unwrap_or(-1);
+            if col_ref_idx < 0 {
+                *result = ([0, 0], 0, [0, 0], 0);
+                continue;
+            }
+
+            let col_ref_poc_val = ctx
+                .col_ref_poc_l0
+                .get(col_ref_idx as usize)
+                .copied()
+                .unwrap_or(ctx.col_poc);
+
+            let l0_ref = ctx
+                .cur_l0_ref_poc
+                .iter()
+                .position(|&poc| poc == col_ref_poc_val)
+                .unwrap_or(0);
+
+            let l0_ref_poc = ctx.cur_l0_ref_poc.get(l0_ref).copied().unwrap_or(0);
+            let scale = compute_scale(l0_ref_poc, col_ref_poc_val);
+
+            let col_mv = ctx.col_mv.get(col_blk).copied().unwrap_or([0, 0]);
+            let mv_l0 = [
+                ((scale * col_mv[0] as i32 + 128) >> 8) as i16,
+                ((scale * col_mv[1] as i32 + 128) >> 8) as i16,
+            ];
+            let mv_l1 = [mv_l0[0] - col_mv[0], mv_l0[1] - col_mv[1]];
+
+            *result = (mv_l0, l0_ref as i8, mv_l1, 0);
         }
     }
 

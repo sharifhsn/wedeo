@@ -521,14 +521,22 @@ impl H264Decoder {
                         .filter_map(|&dpb_idx| self.dpb.get(dpb_idx).map(|e| &e.pic))
                         .collect();
 
-                    // Populate colocated info from L1[0] for spatial direct mode
+                    // Populate colocated info from L1[0] for direct mode
                     if hdr.slice_type.is_b() && !self.ref_list_l1.is_empty() {
                         let l1_0_dpb_idx = self.ref_list_l1[0];
                         if let Some(entry) = self.dpb.get(l1_0_dpb_idx) {
                             fdc.col_mv = entry.mv_info.clone();
                             fdc.col_ref = entry.ref_info.clone();
                             fdc.col_mb_intra = entry.mb_intra.clone();
+                            fdc.col_poc = entry.poc;
+                            fdc.col_ref_poc_l0 = entry.ref_poc_l0.clone();
                         }
+                        fdc.cur_poc = self.current_poc;
+                        fdc.cur_l0_ref_poc = self
+                            .ref_list_l0
+                            .iter()
+                            .filter_map(|&i| self.dpb.get(i).map(|e| e.poc))
+                            .collect();
                     }
 
                     #[cfg(feature = "tracing-detail")]
@@ -729,6 +737,13 @@ impl H264Decoder {
 
             let mb_intra: Vec<bool> = fdc.mb_info.iter().map(|info| info.is_intra).collect();
 
+            // Store L0 ref POCs for temporal direct mode mapping.
+            let ref_poc_l0: Vec<i32> = self
+                .ref_list_l0
+                .iter()
+                .filter_map(|&dpb_idx| self.dpb.get(dpb_idx).map(|e| e.poc))
+                .collect();
+
             let entry = DpbEntry {
                 pic: fdc.pic,
                 poc: self.current_poc,
@@ -739,6 +754,7 @@ impl H264Decoder {
                 ref_info,
                 mb_intra,
                 needs_output: false,
+                ref_poc_l0,
             };
 
             // Try to store in DPB; if full, remove oldest first

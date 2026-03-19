@@ -45,8 +45,13 @@ pub struct DpbEntry {
     pub mv_info: Vec<[i16; 2]>,
     /// Per-4x4-block reference indices (16 entries per MB, row-major).
     pub ref_info: Vec<i8>,
+    /// Per-MB intra flag (true if the MB was decoded as intra).
+    pub mb_intra: Vec<bool>,
     /// Whether this picture is needed for output (not yet displayed).
     pub needs_output: bool,
+    /// POCs of L0 references used during this frame's decode.
+    /// Used for temporal direct mode to map colocated ref_idx → POC.
+    pub ref_poc_l0: Vec<i32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -313,7 +318,9 @@ mod tests {
             long_term_frame_idx: 0,
             mv_info: vec![[0i16; 2]; 16],
             ref_info: vec![-1i8; 16],
+            mb_intra: vec![false; 1],
             needs_output: true,
+            ref_poc_l0: Vec::new(),
         }
     }
 
