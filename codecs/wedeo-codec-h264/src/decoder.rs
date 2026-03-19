@@ -664,21 +664,26 @@ impl H264Decoder {
             // Add current frame to the delayed_pics buffer.
             self.delayed_pics.push((self.current_poc, frame));
 
-            // Output frames when buffer exceeds reorder_depth (matching
-            // FFmpeg h264_slice.c:1359-1369). Output the minimum-POC frame.
-            while self.delayed_pics.len() > self.reorder_depth {
-                // Find the index of the minimum POC entry
-                let min_idx = self
-                    .delayed_pics
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, (poc, _))| *poc)
-                    .map(|(i, _)| i)
-                    .unwrap();
-                let (_, mut f) = self.delayed_pics.remove(min_idx);
-                f.pts = self.output_frame_counter;
-                self.output_frame_counter += 1;
-                self.output_queue.push_back(f);
+            // Output frames when buffer exceeds reorder_depth AND the
+            // current frame is in order (matching FFmpeg h264_slice.c:
+            // 1359-1369, specifically the `!out_of_order` check at 1364).
+            // When out_of_order > 0, the buffer is still accumulating and
+            // outputting now would produce incorrect display order.
+            if out_of_order == 0 {
+                while self.delayed_pics.len() > self.reorder_depth {
+                    // Find the index of the minimum POC entry
+                    let min_idx = self
+                        .delayed_pics
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, (poc, _))| *poc)
+                        .map(|(i, _)| i)
+                        .unwrap();
+                    let (_, mut f) = self.delayed_pics.remove(min_idx);
+                    f.pts = self.output_frame_counter;
+                    self.output_frame_counter += 1;
+                    self.output_queue.push_back(f);
+                }
             }
 
             // Non-reference pictures (nal_ref_idc == 0, typically B-frames)
