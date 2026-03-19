@@ -398,20 +398,27 @@ def main():
         print("No conformance files found", file=sys.stderr)
         sys.exit(1)
 
-    # Load cached results for --only-failing mode
+    # Load cached results for --only-failing mode.
+    # Cache is invalidated if the wedeo binary is newer than the cache file.
     cache_path = Path(args.cache) if args.cache else Path(".conformance-cache.json")
     cached_pass: set[str] = set()
     if args.only_failing and cache_path.exists():
         try:
-            cached = json.loads(cache_path.read_text())
-            cached_pass = {
-                r["filename"] for r in cached if r.get("status") == "BITEXACT"
-            }
-            print(f"Loaded {len(cached_pass)} cached BITEXACT results, "
-                  f"re-testing {len(files) - len(cached_pass & {f.name for f in files})} files",
-                  file=sys.stderr)
+            binary_mtime = Path(wedeo_bin).stat().st_mtime
+            cache_mtime = cache_path.stat().st_mtime
+            if binary_mtime > cache_mtime:
+                print("Cache invalidated (wedeo binary is newer)", file=sys.stderr)
+            else:
+                cached = json.loads(cache_path.read_text())
+                cached_pass = {
+                    r["filename"] for r in cached if r.get("status") == "BITEXACT"
+                }
+                skip_count = len(cached_pass & {f.name for f in files})
+                print(f"Loaded {len(cached_pass)} cached BITEXACT, "
+                      f"re-testing {len(files) - skip_count} files",
+                      file=sys.stderr)
         except Exception:
-            pass  # ignore corrupt cache
+            pass  # ignore corrupt cache or missing binary
 
     print(f"Testing {len(files)} files...", file=sys.stderr)
 

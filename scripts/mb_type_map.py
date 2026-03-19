@@ -101,26 +101,36 @@ def extract_mb_types(
     )
     trace = strip_ansi(result.stderr.decode("utf-8", errors="replace"))
 
-    # Find the target frame boundaries in the trace
-    frame_idx = -1
+    # Collect MBs per frame, delimited by "frame complete" lines.
+    # Multi-slice frames have multiple "slice start" but only one
+    # "frame complete", so this correctly groups them.
     current_type = "?"
     mb_width = 0
     mb_height = 0
-    in_target = False
-    mbs = []
+    mbs: list[tuple[int, int, str]] = []
+    frames: list[tuple[str, list[tuple[int, int, str]]]] = []
+    current_mbs: list[tuple[int, int, str]] = []
+    # Track mb_width from SPS for SKIP position computation
+    sps_mb_width = 0
 
     for line in trace.splitlines():
         if "slice start" in line:
-            frame_idx += 1
             m = re.search(r"slice_type=(\w+)", line)
             if m:
                 current_type = m.group(1)
-            if frame_idx == target_frame:
-                in_target = True
-            elif frame_idx > target_frame:
+
+        elif "SPS parsed" in line:
+            m = re.search(r"width=(\d+)", line)
+            if m:
+                sps_mb_width = int(m.group(1)) // 16
+
+        elif "frame complete" in line:
+            frames.append((current_type, list(current_mbs)))
+            current_mbs = []
+            if len(frames) > target_frame:
                 break
 
-        elif "decoded MB" in line and in_target:
+        elif "decoded MB" in line:
             m_x = re.search(r"mb_x=(\d+)", line)
             m_y = re.search(r"mb_y=(\d+)", line)
             m_type = re.search(r"mb_type=(\d+)", line)
@@ -130,23 +140,30 @@ def extract_mb_types(
                 y = int(m_y.group(1))
                 raw = int(m_type.group(1))
                 is_pcm = m_pcm is not None
-                if is_pcm:
-                    abbrev = "PCM"
-                else:
-                    abbrev = mb_type_abbrev(raw, current_type)
-                mbs.append((x, y, abbrev))
-                mb_width = max(mb_width, x + 1)
-                mb_height = max(mb_height, y + 1)
+                abbrev = "PCM" if is_pcm else mb_type_abbrev(raw, current_type)
+                current_mbs.append((x, y, abbrev))
 
-        elif "MB type parsed" in line and in_target:
-            # CAVLC trace: captures mb_type before decode_macroblock
-            m_pcm = re.search(r"is_pcm=true", line)
-            m_i4 = re.search(r"is_intra4x4=true", line)
-            m_i16 = re.search(r"is_intra16x16=true", line)
-            # Use these to disambiguate when "decoded MB" doesn't fire (skip MBs)
+        elif "mb_skip_run" in line and sps_mb_width > 0:
+            # Parse skip runs to show SKIP MBs in the grid.
+            # Trace format: mb_addr=N mb_skip_run=M
+            m_addr = re.search(r"mb_addr=(\d+)", line)
+            m_run = re.search(r"mb_skip_run=(\d+)", line)
+            if m_addr and m_run:
+                addr = int(m_addr.group(1))
+                run = int(m_run.group(1))
+                skip_label = "SKIP" if current_type in ("P", "SP") else "BSKP"
+                for i in range(run):
+                    sx = (addr + i) % sps_mb_width
+                    sy = (addr + i) // sps_mb_width
+                    current_mbs.append((sx, sy, skip_label))
 
-    if not mbs and not in_target:
-        print(f"Frame {target_frame} not found (only {frame_idx + 1} frames decoded)",
+    if target_frame < len(frames):
+        current_type, mbs = frames[target_frame]
+        for x, y, _ in mbs:
+            mb_width = max(mb_width, x + 1)
+            mb_height = max(mb_height, y + 1)
+    else:
+        print(f"Frame {target_frame} not found (only {len(frames)} frames decoded)",
               file=sys.stderr)
 
     return mb_width, mb_height, current_type, mbs

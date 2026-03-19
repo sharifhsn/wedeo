@@ -21,6 +21,7 @@ Requires:
 """
 
 import argparse
+import os
 import re
 import subprocess
 import sys
@@ -28,9 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ffmpeg_debug import (
-    find_ffmpeg_binary,
     find_wedeo_binary,
-    run_lldb,
     strip_ansi,
 )
 
@@ -74,12 +73,11 @@ class DpbState:
 def extract_wedeo_dpb(input_path: str, max_frames: int = 0) -> list[DpbState]:
     """Extract per-frame DPB state from wedeo via tracing."""
     wedeo_bin = find_wedeo_binary(prefer_debug=True, features=["tracing"])
-    env = {
+    full_env = {
+        **os.environ,
         "RUST_LOG": "wedeo_codec_h264::decoder=debug,wedeo_codec_h264::refs=debug",
         "WEDEO_NO_DEBLOCK": "1",
     }
-    import os
-    full_env = {**os.environ, **env}
     result = subprocess.run(
         [str(wedeo_bin), input_path],
         capture_output=True, env=full_env, timeout=120,
@@ -92,8 +90,9 @@ def extract_wedeo_dpb(input_path: str, max_frames: int = 0) -> list[DpbState]:
     current_poc = 0
     current_type = "?"
 
-    # Parse "slice start" / "frame complete" / "DPB state" lines
-    pending_refs: list[DpbRef] = []
+    # Parsing: "frame complete" fires BEFORE the DPB store + "DPB state" log
+    # (for the same frame). So we append the state on "frame complete" with
+    # empty refs, then update the LAST state when "DPB state" arrives.
     for line in trace.splitlines():
         if "slice start" in line:
             m_type = re.search(r"slice_type=(\w+)", line)
@@ -102,27 +101,6 @@ def extract_wedeo_dpb(input_path: str, max_frames: int = 0) -> list[DpbState]:
                 current_type = m_type.group(1)
             if m_fn:
                 current_frame_num = int(m_fn.group(1))
-
-        elif "DPB state" in line:
-            # Parse: st_frame_nums=[0, 1, 2] lt_indices=[3]
-            pending_refs = []
-            m_st = re.search(r"st_frame_nums=\[([^\]]*)\]", line)
-            if m_st and m_st.group(1).strip():
-                for fn_str in m_st.group(1).split(","):
-                    fn_str = fn_str.strip()
-                    if fn_str:
-                        pending_refs.append(DpbRef(
-                            frame_num=int(fn_str), poc=-1, status="ST",
-                        ))
-            m_lt = re.search(r"lt_indices=\[([^\]]*)\]", line)
-            if m_lt and m_lt.group(1).strip():
-                for idx_str in m_lt.group(1).split(","):
-                    idx_str = idx_str.strip()
-                    if idx_str:
-                        pending_refs.append(DpbRef(
-                            frame_num=-1, poc=-1, status="LT",
-                            lt_idx=int(idx_str),
-                        ))
 
         elif "frame complete" in line:
             decode_idx += 1
@@ -135,132 +113,38 @@ def extract_wedeo_dpb(input_path: str, max_frames: int = 0) -> list[DpbState]:
                 frame_num=current_frame_num,
                 poc=current_poc,
                 slice_type=current_type,
-                refs=list(pending_refs),
-            ))
-            pending_refs = []
-
-            if max_frames and decode_idx + 1 >= max_frames:
-                break
-
-    return states
-
-
-def extract_wedeo_dpb_detail(input_path: str, max_frames: int = 0) -> list[DpbState]:
-    """Extract per-frame DPB state from wedeo via detailed tracing.
-
-    Uses tracing-detail feature for full DPB dump. Falls back to
-    basic tracing if tracing-detail is not available.
-    """
-    wedeo_bin = find_wedeo_binary(
-        prefer_debug=True, features=["tracing", "tracing-detail"]
-    )
-    import os
-    env = {
-        **os.environ,
-        "RUST_LOG": (
-            "wedeo_codec_h264::decoder=trace,"
-            "wedeo_codec_h264::refs=trace"
-        ),
-        "WEDEO_NO_DEBLOCK": "1",
-    }
-    result = subprocess.run(
-        [str(wedeo_bin), input_path],
-        capture_output=True, env=env, timeout=120,
-    )
-    trace = strip_ansi(result.stderr.decode("utf-8", errors="replace"))
-
-    states = []
-    decode_idx = -1
-    current_frame_num = 0
-    current_poc = 0
-    current_type = "?"
-
-    for line in trace.splitlines():
-        if "slice start" in line:
-            m = re.search(r"slice_type=(\w+)", line)
-            if m:
-                current_type = m.group(1)
-            m = re.search(r"frame_num=(\d+)", line)
-            if m:
-                current_frame_num = int(m.group(1))
-
-        elif "frame complete" in line:
-            decode_idx += 1
-            m = re.search(r"poc=(-?\d+)", line)
-            if m:
-                current_poc = int(m.group(1))
-
-            states.append(DpbState(
-                decode_idx=decode_idx,
-                frame_num=current_frame_num,
-                poc=current_poc,
-                slice_type=current_type,
                 refs=[],
             ))
 
             if max_frames and decode_idx + 1 >= max_frames:
                 break
 
-        elif "DPB stored entry" in line:
-            # Parse individual DPB entries from tracing-detail
-            m_fn = re.search(r"h264_frame_num=(\d+)", line)
-            m_poc = re.search(r"poc=(-?\d+)", line)
-            m_st = re.search(r"status=(ShortTerm|LongTerm|Unused)", line)
-            if m_fn and m_poc and m_st and states:
-                status = "ST" if m_st.group(1) == "ShortTerm" else (
-                    "LT" if m_st.group(1) == "LongTerm" else "U"
-                )
-                if status != "U":
-                    states[-1].refs.append(DpbRef(
-                        frame_num=int(m_fn.group(1)),
-                        poc=int(m_poc.group(1)),
-                        status=status,
-                    ))
+        elif "DPB state" in line and states:
+            # Update the LAST state (same frame — DPB state logged after
+            # "frame complete" but before the next frame's "slice start").
+            refs = []
+            m_st = re.search(r"st_frame_nums=\[([^\]]*)\]", line)
+            if m_st and m_st.group(1).strip():
+                for fn_str in m_st.group(1).split(","):
+                    fn_str = fn_str.strip()
+                    if fn_str:
+                        refs.append(DpbRef(
+                            frame_num=int(fn_str), poc=-1, status="ST",
+                        ))
+            m_lt = re.search(r"lt_indices=\[([^\]]*)\]", line)
+            if m_lt and m_lt.group(1).strip():
+                for idx_str in m_lt.group(1).split(","):
+                    idx_str = idx_str.strip()
+                    if idx_str:
+                        refs.append(DpbRef(
+                            frame_num=-1, poc=-1, status="LT",
+                            lt_idx=int(idx_str),
+                        ))
+            states[-1].refs = refs
 
     return states
 
 
-# ---------------------------------------------------------------------------
-# FFmpeg DPB extraction (via lldb)
-# ---------------------------------------------------------------------------
-
-def extract_ffmpeg_dpb_at_frame(
-    input_path: str, frame_idx: int,
-) -> DpbState | None:
-    """Extract FFmpeg DPB state at a specific frame via lldb.
-
-    Breaks at ff_h264_execute_ref_pic_marking and reads short_ref/long_ref arrays.
-    """
-    ffmpeg_bin = find_ffmpeg_binary()
-
-    # We break at the start of ref pic marking for the target frame.
-    # Each call to ff_h264_execute_ref_pic_marking corresponds to one reference frame.
-    ignore_count = frame_idx  # skip this many breakpoint hits
-
-    lldb_commands = f"""
-breakpoint set -n ff_h264_execute_ref_pic_marking
-breakpoint modify 1 -i {ignore_count}
-run -bitexact -i {input_path} -f null -
-
-# Read short_ref array
-expr h->short_ref_count
-expr (int)h->short_ref[0]->frame_num
-expr (int)h->short_ref[0]->poc
-expr h->long_ref_count
-
-# Read current frame info
-expr sl->slice_type_nos
-expr sl->mb_y
-expr h->poc.frame_num
-
-quit
-"""
-    try:
-        result = run_lldb(str(ffmpeg_bin), lldb_commands, timeout=30)
-        # Parse results - this is fragile and depends on lldb output format
-        return None  # TODO: parse lldb output
-    except Exception:
-        return None
 
 
 # ---------------------------------------------------------------------------
@@ -326,8 +210,6 @@ def main():
                         help="Max frames to decode (0=all)")
     parser.add_argument("--all", action="store_true",
                         help="Show DPB for all frames")
-    parser.add_argument("--detail", action="store_true",
-                        help="Use tracing-detail for full DPB dump")
     args = parser.parse_args()
 
     input_path = args.input
@@ -338,10 +220,7 @@ def main():
     print(f"Extracting wedeo DPB state for {Path(input_path).name}...",
           file=sys.stderr)
 
-    if args.detail:
-        states = extract_wedeo_dpb_detail(input_path, args.max_frames)
-    else:
-        states = extract_wedeo_dpb(input_path, args.max_frames)
+    states = extract_wedeo_dpb(input_path, args.max_frames)
 
     print(f"Decoded {len(states)} frames\n")
     compare_dpb_states(states, args.frame, args.all)

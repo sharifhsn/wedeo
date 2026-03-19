@@ -29,9 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ffmpeg_debug import (
-    find_ffmpeg_binary,
     find_wedeo_binary,
-    run_lldb,
     strip_ansi,
 )
 
@@ -87,23 +85,22 @@ def extract_wedeo_reflists(
     trace = strip_ansi(result.stderr.decode("utf-8", errors="replace"))
 
     slices = []
-    decode_idx = -1
+    frame_idx = -1  # count frames via "frame complete", not "slice start"
     current_fn = 0
     current_type = "?"
     current_poc = 0
 
     for line in trace.splitlines():
         if "slice start" in line:
-            decode_idx += 1
             m = re.search(r"slice_type=(\w+)", line)
             if m:
                 current_type = m.group(1)
             m = re.search(r"frame_num=(\d+)", line)
             if m:
                 current_fn = int(m.group(1))
-            m = re.search(r"is_idr=(true|false)", line)
 
         elif "frame complete" in line:
+            frame_idx += 1
             m = re.search(r"poc=(-?\d+)", line)
             if m:
                 current_poc = int(m.group(1))
@@ -116,8 +113,10 @@ def extract_wedeo_reflists(
             if m_poc:
                 current_poc = int(m_poc.group(1))
 
+            # frame_idx+1 because "B-frame ref lists" fires before
+            # "frame complete" for this frame
             slices.append(SliceRefInfo(
-                decode_idx=decode_idx,
+                decode_idx=frame_idx + 1,
                 frame_num=current_fn,
                 poc=current_poc,
                 slice_type=current_type,
@@ -128,8 +127,10 @@ def extract_wedeo_reflists(
             if max_frames and len(slices) >= max_frames:
                 break
 
-        # For P-frames, we don't currently log ref lists.
-        # TODO: Add ref list logging for P-frames in decoder.rs
+        # NOTE: P-frame ref lists are not currently logged by the decoder.
+        # To debug P-frame ref issues (HCBP1/HCBP2), add a debug!() in
+        # decoder.rs where build_ref_list_p is called, similar to the
+        # existing "B-frame ref lists" log.
 
     return slices
 
@@ -147,58 +148,7 @@ def _parse_poc_list(line: str, field: str) -> list[int]:
 
 
 # ---------------------------------------------------------------------------
-# FFmpeg extraction (via lldb)
-# ---------------------------------------------------------------------------
-
-def extract_ffmpeg_reflist_at_frame(
-    input_path: str, frame_idx: int,
-) -> SliceRefInfo | None:
-    """Extract FFmpeg ref list at a specific frame via lldb.
-
-    Breaks at ff_h264_build_ref_list and reads ref_list[0] and ref_list[1].
-    """
-    ffmpeg_bin = find_ffmpeg_binary()
-
-    lldb_script = f"""
-breakpoint set -n ff_h264_fill_mbaff_ref_list
-breakpoint modify 1 -i {frame_idx}
-run -bitexact -i {input_path} -f null -
-
-# Read ref counts
-expr sl->ref_count[0]
-expr sl->ref_count[1]
-
-# Read L0 refs (frame_num and poc for first 4)
-expr sl->ref_list[0][0].parent->poc
-expr sl->ref_list[0][0].parent->frame_num
-expr sl->ref_list[0][1].parent->poc
-expr sl->ref_list[0][1].parent->frame_num
-expr sl->ref_list[0][2].parent->poc
-expr sl->ref_list[0][2].parent->frame_num
-expr sl->ref_list[0][3].parent->poc
-expr sl->ref_list[0][3].parent->frame_num
-
-# Read L1 refs (first 2)
-expr sl->ref_list[1][0].parent->poc
-expr sl->ref_list[1][0].parent->frame_num
-expr sl->ref_list[1][1].parent->poc
-expr sl->ref_list[1][1].parent->frame_num
-
-quit
-"""
-
-    try:
-        raw = run_lldb(str(ffmpeg_bin), lldb_script, timeout=30)
-        # Parsing lldb output is fragile; return None for now if parsing fails
-        print(f"FFmpeg lldb raw output:\n{raw}", file=sys.stderr)
-        return None
-    except Exception as e:
-        print(f"FFmpeg lldb failed: {e}", file=sys.stderr)
-        return None
-
-
-# ---------------------------------------------------------------------------
-# Comparison
+# Display
 # ---------------------------------------------------------------------------
 
 def format_reflist(infos: list[SliceRefInfo], target_frame: int | None) -> None:
@@ -233,8 +183,6 @@ def main():
                         help="Show ref lists at specific frame")
     parser.add_argument("--max-frames", type=int, default=50,
                         help="Max frames to analyze (0=all)")
-    parser.add_argument("--ffmpeg", action="store_true",
-                        help="Also extract from FFmpeg via lldb")
     args = parser.parse_args()
 
     input_path = args.input
@@ -248,14 +196,6 @@ def main():
 
     print(f"\nWedeo ref lists ({len(wedeo_info)} B-slices):")
     format_reflist(wedeo_info, args.frame)
-
-    if args.ffmpeg and args.frame is not None:
-        print(f"\nExtracting FFmpeg ref list at frame {args.frame}...",
-              file=sys.stderr)
-        ffmpeg_info = extract_ffmpeg_reflist_at_frame(input_path, args.frame)
-        if ffmpeg_info:
-            print(f"\nFFmpeg ref list at frame {args.frame}:")
-            format_reflist([ffmpeg_info], args.frame)
 
 
 if __name__ == "__main__":
