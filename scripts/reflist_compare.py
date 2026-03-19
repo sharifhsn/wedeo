@@ -127,10 +127,28 @@ def extract_wedeo_reflists(
             if max_frames and len(slices) >= max_frames:
                 break
 
-        # NOTE: P-frame ref lists are not currently logged by the decoder.
-        # To debug P-frame ref issues (HCBP1/HCBP2), add a debug!() in
-        # decoder.rs where build_ref_list_p is called, similar to the
-        # existing "B-frame ref lists" log.
+        elif "P-frame ref list" in line:
+            # Parse: l0_frame_nums=[Some(7), Some(6), Some(5)]
+            m_fns = re.search(r"l0_frame_nums=\[([^\]]*)\]", line)
+            l0_fns = []
+            if m_fns:
+                for item in re.finditer(r"Some\((\d+)\)", m_fns.group(1)):
+                    l0_fns.append(int(item.group(1)))
+            m_poc = re.search(r"poc=(-?\d+)", line)
+            if m_poc:
+                current_poc = int(m_poc.group(1))
+
+            slices.append(SliceRefInfo(
+                decode_idx=frame_idx + 1,
+                frame_num=current_fn,
+                poc=current_poc,
+                slice_type=current_type,
+                l0=[RefListEntry(frame_num=fn) for fn in l0_fns],
+                l1=[],
+            ))
+
+            if max_frames and len(slices) >= max_frames:
+                break
 
     return slices
 
