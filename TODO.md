@@ -17,7 +17,7 @@
 - [x] **Pixel format conversion** — wedeo-scale now wraps dcv-color-primitives for I420/NV12↔RGB24/BGR24/RGBA/BGRA conversions. Converter struct with metadata preservation. 11 unit tests.
 
 ### Video codecs (native Rust, no existing crate covers these)
-- [~] **H.264 Baseline decoder** — 16/17 BITEXACT + BA1_FT_C now 299/299 frames + B-frame infrastructure. See `H264.md` for detailed status. Remaining:
+- [~] **H.264 decoder** — 39/57 progressive CAVLC conformance BITEXACT, all 17 Baseline pass. See `H264.md` for detailed status.
   - [x] Wire P-frame inter prediction (mb_skip_run + P_SKIP + coded P-MB types 0-4)
   - [x] Fix demuxer access unit grouping (SPS/AUD/first_mb_in_slice boundaries)
   - [x] Write FATE integration tests (4 bitexact + 4 frame count regression tests)
@@ -36,12 +36,22 @@
   - [x] Fix BA1_FT_C luma — MV neighbor C/D slice check for all blk_y values
   - [x] Fix chroma V ±1 rounding — CHROMA_QP_TABLE had transcription error at index 36 (extra 33)
   - [x] Fix deblocking filter diffs — TC0_TABLE had transcription error at QP 26 (missing [1,1,1] entry)
-  - [~] Implement B-frame decode — infrastructure complete (POC, ref lists, CAVLC, MC, reorder), I/P frames in BA3_SVA_C BITEXACT, B-frame pixels diverge (MV prediction needs refinement)
-  - [ ] Fix B-frame MV prediction — L1 neighbor context, spatial direct col_zero_flag
-  - [ ] Pass remaining Baseline FATE conformance tests (BA3_SVA_C B-frames: 17/33 match)
+  - [x] Implement B-frame decode — spatial direct prediction, bi-directional MC, DPB reordering
+  - [x] Fix B-frame deblocking — L1 data in MbDeblockInfo, two-permutation BS check, canonical picture IDs
+  - [x] Implement I_PCM macroblock decode — byte-align + read 384 raw bytes, QP tracking fix
+  - [x] Implement pred_weight_table parsing — consume weight bits for weighted P/B slices
+  - [x] Implement direct_8x8_inference_flag=0 — per-4x4 col_zero_flag in spatial direct
+  - [x] Fix ref_pic_list_modification wrap — modular arithmetic mod MaxFrameNum
+  - [x] Fix frame crop offset — apply SPS crop_left/crop_top in frame output
+  - [x] Fix sliding window FrameNumWrap — evict smallest FrameNumWrap, not smallest raw frame_num
+  - [ ] Implement weighted prediction application — weights parsed, need MC application
+  - [ ] Debug MMCO complex sequences — MR4/MR5 diverge at frame 17 (Op 1+3+4+6 interactions)
+  - [ ] Debug HCBP1/HCBP2 15-ref DPB — 17/250 match, sliding window not improving
+  - [ ] Fix FMO (Flexible Macroblock Ordering) — FM1_FT_E has num_slice_groups>1
+- [ ] **AV1 decoder via rav1d** — wrap Prossimo's rav1d (pure Rust AV1 decoder, port of dav1d) behind wedeo traits, similar to how symphonia is wrapped. Create `adapters/wedeo-rav1d/` with `Decoder` impl. Needs: new `CodecId::Av1` variant, AV1 OBU probe in demuxer, frame type mapping. rav1d handles all decode internally; wedeo just needs the trait bridge and pixel format conversion. Consider using a git worktree (`feat/rav1d-integration`) since it touches workspace Cargo.toml.
+- [ ] **Video player with audio** — extend `bins/wedeo-play/` with audio playback (currently video-only via minifb). Needs: audio output backend (cpal or rodio crate), A/V sync (PTS-based with audio clock as master), demuxer that handles both audio+video streams (MP4/MKV via symphonia). Consider using a git worktree (`feat/video-player-audio`) since it may need new Frame fields in wedeo-core.
 - [ ] **VP9 decoder** — second priority for WebM support. Reference: `FFmpeg/libavcodec/vp9*.c`.
 - [ ] **HEVC decoder** — similar to H.264 but more complex (CTU/CTB structure).
-- [ ] **AV1 decoder** — check if Prossimo's rav1d (pure Rust AV1 decoder) is available as a crate. If so, wrap it like symphonia. If not, write from scratch.
 
 ### Video muxers
 - [ ] **MP4/MOV muxer** — needed for any useful video output. No existing pure-Rust MP4 muxer crate.

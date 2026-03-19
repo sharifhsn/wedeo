@@ -137,39 +137,47 @@ new codecs and formats.
 
 ### H.264 video decoder (native Rust, in progress)
 
-First native video codec. Decodes H.264 Baseline profile I+P frames to YUV420p.
-See `H264.md` for detailed architecture, module map, and known issues.
+First native video codec. Decodes H.264 I+P+B frames to YUV420p.
+See `H264.md` for detailed architecture, module map, and conformance parity report.
 
-**Decoder** (`codecs/wedeo-codec-h264/`, ~15,400 lines):
+**Decoder** (`codecs/wedeo-codec-h264/`, ~16,200 lines):
 - NAL parsing (Annex B + NALFF/avcC), SPS/PPS, slice header with MMCO
-- CAVLC entropy decoding (all VLC tables, level/run decode, mb_type parsing)
+- CAVLC entropy decoding (all VLC tables, level/run decode, mb_type parsing, I_PCM raw bytes)
 - 17 intra prediction modes (9 Intra4x4 + 4 Intra16x16 + 4 chroma)
 - 4x4/8x8 integer IDCT, luma/chroma DC Hadamard transforms (i32 precision)
 - Flat dequantization (spec-equivalent, avoids i16 overflow in FFmpeg's precomputed tables)
-- In-loop deblocking filter (boundary strength, strong/normal filtering, luma+chroma)
-- Quarter-pel luma MC (6-tap FIR), eighth-pel chroma bilinear
-- MV prediction (median, P_SKIP, 16x8/8x16/8x8 sub-partitions), reference list construction with frame_num wrap-around, MMCO, sliding window DPB
-- Cross-MB intra4x4 prediction mode tracking (top/left neighbor modes)
-- Multi-slice frame support, avcC extradata parsing
+- In-loop deblocking filter (boundary strength with B-frame two-permutation check, strong/normal filtering, luma+chroma)
+- Quarter-pel luma MC (6-tap FIR), eighth-pel chroma bilinear, bi-directional MC
+- MV prediction (median, P_SKIP, B_SKIP spatial direct with per-4x4 col_zero_flag, 16x8/8x16/8x8 sub-partitions)
+- Reference list construction (L0+L1), frame_num wrap-around, MMCO, sliding window DPB with FrameNumWrap
+- Pred weight table parsing (luma/chroma weight+offset per ref)
+- DPB output reordering (POC type 0/1/2), cross-MB intra4x4 prediction mode tracking
+- Multi-slice frame support, avcC extradata parsing, SPS frame crop offsets
 
 **Demuxer** (`formats/wedeo-format-h264/`, ~480 lines):
 - Annex B start code scanning, SPS-based probe (score 100)
 - Access unit grouping (AUD, SPS, first_mb_in_slice boundaries)
 - File extensions: .264, .h264, .h26l, .avc
 
-**FATE Baseline conformance: 15/17 tests bitexact** (2026-03-18):
+**FATE conformance: 39/57 progressive CAVLC tests bitexact, all 17/17 Baseline** (2026-03-19):
 
-| Test | Resolution | Types | Status |
-|------|-----------|-------|--------|
-| BA1_Sony_D, SVA_BA1_B, SVA_NL1_B | 176x144 | I+P | **BITEXACT** |
-| BAMQ1_JVC_C | 176x144 | I | **BITEXACT** (per-MB QP) |
-| BA_MW_D, BANM_MW_D, AUD_MW_E | 176x144 | I+P | **BITEXACT** |
-| BA2_Sony_F | 176x144 | I+P | **BITEXACT** (300 frames) |
-| BAMQ2_JVC_C, SVA_BA2_D, SVA_NL2_E | 176x144 | I+P | **BITEXACT** |
-| BASQP1_Sony_C | 176x144 | I | **BITEXACT** (QP=0, multi-slice) |
-| SVA_Base_B, SVA_FM1_E, SVA_CL1_E | 176x144 | I+P | **BITEXACT** (multi-slice) |
-| BA1_FT_C | 352x288 | I+P | 260/299 frames match, late multi-slice diff |
-| BA3_SVA_C | 176x144 | I+P+B | B-frames not implemented |
+| Test | Status | Notes |
+|------|--------|-------|
+| All 17 Baseline (BA*, SVA*, AUD*, BAMQ*, BANM*, BASQP*) | **BITEXACT** | I+P+B, multi-slice, per-MB QP |
+| NL1/NL2/NL3, NLMQ1/NLMQ2 (Main/CAVLC) | **BITEXACT** | Including B-frames |
+| MR1_MW_A, MR2_MW_A, MR2_TANDBERG_E, MR1_BT_A | **BITEXACT** | Multi-reference, POC type 1 |
+| MIDR_MW_D, MPS_MW_A, NRF_MW_E | **BITEXACT** | IDR, multi-PPS, non-ref frames |
+| CVPCMNL1, CVPCMNL2 | **BITEXACT** | I_PCM macroblocks |
+| FM2_SVA_B, FM2_SVA_C | **BITEXACT** | Both decoders produce 0 frames |
+| CVFC1 | 19/50 | Frame crop offset applied, remaining multi-slice diffs |
+| CVWP1/CVWP5 | 8/90, 7/90 | Weight table parsed, application not yet implemented |
+| CVWP2/CVWP3 | 29/90 | direct_8x8_inference=0 + weighted pred |
+| HCBP1/HCBP2 | 17/250 | 15-ref DPB issue, sliding window not helping |
+| MR3_TANDBERG_B | 284/300 | POC type 2, 16 frames differ at end |
+| MR4_TANDBERG_C, MR5_TANDBERG_C | 17/300 | Complex MMCO sequences |
+| SL1_SVA_B, cvmp_mot_frm0_full_B | 17/33, 27/30 | direct_8x8_inference=0 |
+| FM1_FT_E | 119/305 | FMO (num_slice_groups>1) |
+| MR6-9_BT_B, FI1_Sony_E | Gap | Interlaced (PAFF) / CABAC |
 
 ### FFmpeg audio parity via symphonia
 
@@ -236,7 +244,7 @@ symphonia wrappers (priority 50) when both exist (e.g., WAV/PCM always uses nati
 - **Error**: No error context (where/why), no codec-specific error codes.
 
 ### In progress
-- **H.264 Baseline decoder** — I-frame decode pipeline works end-to-end, P-frame inter prediction implemented but not wired. See `H264.md`.
+- **H.264 decoder** — I+P+B frame decode with deblocking, 25/37 progressive CAVLC conformance files BITEXACT (all 17 Baseline). Remaining bugs: constrained intra, POC type 1/2, MMCO with >2 refs. See `H264.md`.
 
 ### Not yet started
 - Video codecs (HEVC, VP9, AV1, etc.) — native Rust implementations, no existing crate covers these
