@@ -268,60 +268,28 @@ fn gather_top_left_luma(
     }
 }
 
-/// Gather top 16 pixels for 16x16 luma prediction.
-fn gather_top_16(pic: &PictureBuffer, mb_x: u32, mb_y: u32) -> [u8; 16] {
-    let mut top = [128u8; 16];
-    if mb_y > 0 {
-        let px = (mb_x * 16) as usize;
-        let py = (mb_y * 16) as usize;
-        let row_above = (py - 1) * pic.y_stride + px;
-        top.copy_from_slice(&pic.y[row_above..row_above + 16]);
-    }
-    top
-}
-
-/// Gather left 16 pixels for 16x16 luma prediction.
-fn gather_left_16(pic: &PictureBuffer, mb_x: u32, mb_y: u32) -> [u8; 16] {
-    let mut left = [128u8; 16];
-    if mb_x > 0 {
-        let px = (mb_x * 16) as usize;
-        let py = (mb_y * 16) as usize;
-        for (i, l) in left.iter_mut().enumerate() {
-            *l = pic.y[(py + i) * pic.y_stride + px - 1];
-        }
-    }
-    left
-}
-
-/// Gather top-left pixel for 16x16 luma prediction.
-fn gather_top_left_16(pic: &PictureBuffer, mb_x: u32, mb_y: u32) -> u8 {
-    if mb_x > 0 && mb_y > 0 {
-        let px = (mb_x * 16) as usize;
-        let py = (mb_y * 16) as usize;
-        pic.y[(py - 1) * pic.y_stride + px - 1]
-    } else {
-        128
-    }
-}
-
-/// Gather top 8 pixels for chroma 8x8 prediction.
-fn gather_top_chroma(plane: &[u8], stride: usize, mb_x: u32, mb_y: u32) -> [u8; 8] {
-    let mut top = [128u8; 8];
-    if mb_y > 0 {
-        let px = (mb_x * 8) as usize;
-        let py = (mb_y * 8) as usize;
+/// Gather N pixels from the row above `(px, py)`.
+///
+/// Used for top-neighbor gathering in 16x16 luma and 8x8 chroma prediction.
+/// Returns `[128; N]` if `py == 0`.
+#[inline]
+fn gather_top<const N: usize>(plane: &[u8], stride: usize, px: usize, py: usize) -> [u8; N] {
+    let mut top = [128u8; N];
+    if py > 0 {
         let row_above = (py - 1) * stride + px;
-        top.copy_from_slice(&plane[row_above..row_above + 8]);
+        top.copy_from_slice(&plane[row_above..row_above + N]);
     }
     top
 }
 
-/// Gather left 8 pixels for chroma 8x8 prediction.
-fn gather_left_chroma(plane: &[u8], stride: usize, mb_x: u32, mb_y: u32) -> [u8; 8] {
-    let mut left = [128u8; 8];
-    if mb_x > 0 {
-        let px = (mb_x * 8) as usize;
-        let py = (mb_y * 8) as usize;
+/// Gather N pixels from the column left of `(px, py)`.
+///
+/// Used for left-neighbor gathering in 16x16 luma and 8x8 chroma prediction.
+/// Returns `[128; N]` if `px == 0`.
+#[inline]
+fn gather_left<const N: usize>(plane: &[u8], stride: usize, px: usize, py: usize) -> [u8; N] {
+    let mut left = [128u8; N];
+    if px > 0 {
         for (i, l) in left.iter_mut().enumerate() {
             *l = plane[(py + i) * stride + px - 1];
         }
@@ -329,11 +297,13 @@ fn gather_left_chroma(plane: &[u8], stride: usize, mb_x: u32, mb_y: u32) -> [u8;
     left
 }
 
-/// Gather top-left pixel for chroma prediction.
-fn gather_top_left_chroma(plane: &[u8], stride: usize, mb_x: u32, mb_y: u32) -> u8 {
-    if mb_x > 0 && mb_y > 0 {
-        let px = (mb_x * 8) as usize;
-        let py = (mb_y * 8) as usize;
+/// Gather the top-left corner pixel at `(px-1, py-1)`.
+///
+/// Used in 16x16 luma and 8x8 chroma prediction.
+/// Returns `128` if `px == 0` or `py == 0`.
+#[inline]
+fn gather_top_left(plane: &[u8], stride: usize, px: usize, py: usize) -> u8 {
+    if px > 0 && py > 0 {
         plane[(py - 1) * stride + px - 1]
     } else {
         128
@@ -369,13 +339,11 @@ fn decode_chroma(
         };
 
         // Gather neighbors for chroma prediction
-        let top = gather_top_chroma(plane_data, stride, mb_x, mb_y);
-        let left = gather_left_chroma(plane_data, stride, mb_x, mb_y);
-        let top_left = gather_top_left_chroma(plane_data, stride, mb_x, mb_y);
-
-        // Apply chroma prediction
         let px = (mb_x * 8) as usize;
         let py = (mb_y * 8) as usize;
+        let top: [u8; 8] = gather_top(plane_data, stride, px, py);
+        let left: [u8; 8] = gather_left(plane_data, stride, px, py);
+        let top_left = gather_top_left(plane_data, stride, px, py);
         let offset = py * stride + px;
         intra_pred::predict_chroma_8x8(
             &mut plane_data[offset..],
@@ -2862,12 +2830,11 @@ fn decode_intra16x16(
     has_left: bool,
 ) {
     // Apply 16x16 intra prediction
-    let top = gather_top_16(&ctx.pic, mb_x, mb_y);
-    let left = gather_left_16(&ctx.pic, mb_x, mb_y);
-    let top_left = gather_top_left_16(&ctx.pic, mb_x, mb_y);
-
     let px = (mb_x * 16) as usize;
     let py = (mb_y * 16) as usize;
+    let top: [u8; 16] = gather_top(&ctx.pic.y, ctx.pic.y_stride, px, py);
+    let left: [u8; 16] = gather_left(&ctx.pic.y, ctx.pic.y_stride, px, py);
+    let top_left = gather_top_left(&ctx.pic.y, ctx.pic.y_stride, px, py);
     let offset = py * ctx.pic.y_stride + px;
     intra_pred::predict_16x16(
         &mut ctx.pic.y[offset..],
