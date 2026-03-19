@@ -671,137 +671,55 @@ fn deblock_mb(
     let mb_idx = (mb_y * mb_width + mb_x) as usize;
     let cur_qp = mb_info[mb_idx].qp;
 
-    // --- Luma vertical edges ---
-    let luma_bs_v = compute_luma_bs(true, mb_info, mb_x, mb_y, mb_width);
-    for (edge, &bs_edge) in luma_bs_v.iter().enumerate() {
-        if bs_edge == [0, 0, 0, 0] {
-            continue;
+    // Process vertical (is_vertical=true) then horizontal (is_vertical=false) edges.
+    // Chroma uses the same bS as luma (derived by mapping the 4x4 luma grid to 4:2:0).
+    for is_vertical in [true, false] {
+        let luma_bs = compute_luma_bs(is_vertical, mb_info, mb_x, mb_y, mb_width);
+
+        // --- Luma edges ---
+        for (edge, &bs_edge) in luma_bs.iter().enumerate() {
+            if bs_edge == [0, 0, 0, 0] {
+                continue;
+            }
+            let qp = if edge == 0 {
+                let neighbor_qp = if is_vertical && mb_x > 0 {
+                    Some(mb_info[mb_idx - 1].qp)
+                } else if !is_vertical && mb_y > 0 {
+                    Some(mb_info[mb_idx - mb_width as usize].qp)
+                } else {
+                    None
+                };
+                neighbor_qp.map_or(cur_qp, |nq| avg_qp(cur_qp, nq))
+            } else {
+                cur_qp
+            };
+            filter_mb_edge_luma(is_vertical, pic, mb_x, mb_y, edge, bs_edge, qp, alpha_c0_offset, beta_offset);
         }
-        let qp = if edge == 0 && mb_x > 0 {
-            let left_qp = mb_info[mb_idx - 1].qp;
-            avg_qp(cur_qp, left_qp)
-        } else {
-            cur_qp
-        };
-        filter_mb_edge_luma(
-            true,
-            pic,
-            mb_x,
-            mb_y,
-            edge,
-            bs_edge,
-            qp,
-            alpha_c0_offset,
-            beta_offset,
-        );
-    }
 
-    // --- Luma horizontal edges ---
-    let luma_bs_h = compute_luma_bs(false, mb_info, mb_x, mb_y, mb_width);
-    for (edge, &bs_edge) in luma_bs_h.iter().enumerate() {
-        if bs_edge == [0, 0, 0, 0] {
-            continue;
+        // --- Chroma edges (4:2:0: 2 edges per direction) ---
+        let chroma_bs = derive_chroma_bs(&luma_bs);
+        for (edge, &bs_edge) in chroma_bs.iter().enumerate() {
+            if bs_edge == [0, 0, 0, 0] {
+                continue;
+            }
+            let chroma_qp_cur = chroma_qp(cur_qp);
+            let qp = if edge == 0 {
+                let neighbor_chroma_qp = if is_vertical && mb_x > 0 {
+                    Some(chroma_qp(mb_info[mb_idx - 1].qp))
+                } else if !is_vertical && mb_y > 0 {
+                    Some(chroma_qp(mb_info[mb_idx - mb_width as usize].qp))
+                } else {
+                    None
+                };
+                neighbor_chroma_qp.map_or(chroma_qp_cur, |nq| avg_qp(chroma_qp_cur, nq))
+            } else {
+                chroma_qp_cur
+            };
+
+            let uv_stride = pic.uv_stride;
+            filter_mb_edge_chroma(is_vertical, &mut pic.u, uv_stride, mb_x, mb_y, edge, bs_edge, qp, alpha_c0_offset, beta_offset);
+            filter_mb_edge_chroma(is_vertical, &mut pic.v, uv_stride, mb_x, mb_y, edge, bs_edge, qp, alpha_c0_offset, beta_offset);
         }
-        let qp = if edge == 0 && mb_y > 0 {
-            let above_qp = mb_info[mb_idx - mb_width as usize].qp;
-            avg_qp(cur_qp, above_qp)
-        } else {
-            cur_qp
-        };
-        filter_mb_edge_luma(
-            false,
-            pic,
-            mb_x,
-            mb_y,
-            edge,
-            bs_edge,
-            qp,
-            alpha_c0_offset,
-            beta_offset,
-        );
-    }
-
-    // --- Chroma vertical edges (4:2:0: 2 edges, 2 pairs each) ---
-    // Chroma uses the same bS as luma, derived by mapping from the 4x4 luma grid.
-    let chroma_bs_v = derive_chroma_bs(&luma_bs_v);
-    for (edge, &bs_edge) in chroma_bs_v.iter().enumerate() {
-        if bs_edge == [0, 0, 0, 0] {
-            continue;
-        }
-        let chroma_qp_cur = chroma_qp(cur_qp);
-        let qp = if edge == 0 && mb_x > 0 {
-            let left_chroma_qp = chroma_qp(mb_info[mb_idx - 1].qp);
-            avg_qp(chroma_qp_cur, left_chroma_qp)
-        } else {
-            chroma_qp_cur
-        };
-
-        let uv_stride = pic.uv_stride;
-        filter_mb_edge_chroma(
-            true,
-            &mut pic.u,
-            uv_stride,
-            mb_x,
-            mb_y,
-            edge,
-            bs_edge,
-            qp,
-            alpha_c0_offset,
-            beta_offset,
-        );
-        filter_mb_edge_chroma(
-            true,
-            &mut pic.v,
-            uv_stride,
-            mb_x,
-            mb_y,
-            edge,
-            bs_edge,
-            qp,
-            alpha_c0_offset,
-            beta_offset,
-        );
-    }
-
-    // --- Chroma horizontal edges ---
-    let chroma_bs_h = derive_chroma_bs(&luma_bs_h);
-    for (edge, &bs_edge) in chroma_bs_h.iter().enumerate() {
-        if bs_edge == [0, 0, 0, 0] {
-            continue;
-        }
-        let chroma_qp_cur = chroma_qp(cur_qp);
-        let qp = if edge == 0 && mb_y > 0 {
-            let above_chroma_qp = chroma_qp(mb_info[mb_idx - mb_width as usize].qp);
-            avg_qp(chroma_qp_cur, above_chroma_qp)
-        } else {
-            chroma_qp_cur
-        };
-
-        let uv_stride = pic.uv_stride;
-        filter_mb_edge_chroma(
-            false,
-            &mut pic.u,
-            uv_stride,
-            mb_x,
-            mb_y,
-            edge,
-            bs_edge,
-            qp,
-            alpha_c0_offset,
-            beta_offset,
-        );
-        filter_mb_edge_chroma(
-            false,
-            &mut pic.v,
-            uv_stride,
-            mb_x,
-            mb_y,
-            edge,
-            bs_edge,
-            qp,
-            alpha_c0_offset,
-            beta_offset,
-        );
     }
 }
 
