@@ -703,6 +703,9 @@ fn decode_inter_mb(
 
             let ref_pic = ref_pics[ref_idx.min(ref_pics.len() - 1)];
             apply_mc_partition(ctx, ref_pic, mb_x, mb_y, 0, 0, 16, 16, mv);
+            if slice_hdr.use_weight {
+                apply_weight_p(ctx, slice_hdr, mb_x, mb_y, 0, 0, 16, 16, ref_idx);
+            }
 
             // Fill MV context for all 16 4x4 blocks
             for blk in 0..16 {
@@ -753,6 +756,9 @@ fn decode_inter_mb(
 
                 let ref_pic = ref_pics[ref_idx.min(ref_pics.len() - 1)];
                 apply_mc_partition(ctx, ref_pic, mb_x, mb_y, 0, blk_y * 4, 16, 8, mv);
+                if slice_hdr.use_weight {
+                    apply_weight_p(ctx, slice_hdr, mb_x, mb_y, 0, blk_y * 4, 16, 8, ref_idx);
+                }
 
                 // Fill MV context for the 8 4x4 blocks in this partition
                 for by in blk_y..blk_y + 2 {
@@ -797,6 +803,9 @@ fn decode_inter_mb(
 
                 let ref_pic = ref_pics[ref_idx.min(ref_pics.len() - 1)];
                 apply_mc_partition(ctx, ref_pic, mb_x, mb_y, blk_x * 4, 0, 8, 16, mv);
+                if slice_hdr.use_weight {
+                    apply_weight_p(ctx, slice_hdr, mb_x, mb_y, blk_x * 4, 0, 8, 16, ref_idx);
+                }
 
                 // Fill MV context for the 8 4x4 blocks in this partition
                 for by in 0..4u32 {
@@ -873,6 +882,19 @@ fn decode_inter_mb(
                             8,
                             mv,
                         );
+                        if slice_hdr.use_weight {
+                            apply_weight_p(
+                                ctx,
+                                slice_hdr,
+                                mb_x,
+                                mb_y,
+                                part_x * 4,
+                                part_y * 4,
+                                8,
+                                8,
+                                ref_idx,
+                            );
+                        }
 
                         for by in part_y..part_y + 2 {
                             for bx in part_x..part_x + 2 {
@@ -935,6 +957,19 @@ fn decode_inter_mb(
                                 4,
                                 mv,
                             );
+                            if slice_hdr.use_weight {
+                                apply_weight_p(
+                                    ctx,
+                                    slice_hdr,
+                                    mb_x,
+                                    mb_y,
+                                    part_x * 4,
+                                    sub_y * 4,
+                                    8,
+                                    4,
+                                    ref_idx,
+                                );
+                            }
 
                             for bx in part_x..part_x + 2 {
                                 ctx.mv_ctx.set(
@@ -996,6 +1031,19 @@ fn decode_inter_mb(
                                 8,
                                 mv,
                             );
+                            if slice_hdr.use_weight {
+                                apply_weight_p(
+                                    ctx,
+                                    slice_hdr,
+                                    mb_x,
+                                    mb_y,
+                                    sub_x * 4,
+                                    part_y * 4,
+                                    4,
+                                    8,
+                                    ref_idx,
+                                );
+                            }
 
                             for by in part_y..part_y + 2 {
                                 ctx.mv_ctx.set(
@@ -1052,6 +1100,19 @@ fn decode_inter_mb(
                                 4,
                                 mv,
                             );
+                            if slice_hdr.use_weight {
+                                apply_weight_p(
+                                    ctx,
+                                    slice_hdr,
+                                    mb_x,
+                                    mb_y,
+                                    sub_x * 4,
+                                    sub_y * 4,
+                                    4,
+                                    4,
+                                    ref_idx,
+                                );
+                            }
 
                             ctx.mv_ctx.set(
                                 mb_x,
@@ -1299,6 +1360,9 @@ pub fn decode_skip_mb(
 
         // Apply motion compensation from ref_pics[0]
         apply_mc_partition(ctx, ref_pics[0], mb_x, mb_y, 0, 0, 16, 16, mv);
+        if slice_hdr.use_weight {
+            apply_weight_p(ctx, slice_hdr, mb_x, mb_y, 0, 0, 16, 16, 0);
+        }
 
         // Fill MV context for all 16 4x4 blocks
         for blk in 0..16 {
@@ -1761,8 +1825,7 @@ fn decode_b_8x8_mb(
                         let ref_pic = ref_pics[(ref_l0 as usize).min(ref_pics.len() - 1)];
                         apply_mc_partition(ctx, ref_pic, mb_x, mb_y, px_x, px_y, 4, 4, mv_l0);
                     } else if use_l1 {
-                        let ref_pic =
-                            ref_pics_l1[(ref_l1 as usize).min(ref_pics_l1.len() - 1)];
+                        let ref_pic = ref_pics_l1[(ref_l1 as usize).min(ref_pics_l1.len() - 1)];
                         apply_mc_partition(ctx, ref_pic, mb_x, mb_y, px_x, px_y, 4, 4, mv_l1);
                     }
 
@@ -2040,12 +2103,8 @@ fn pred_spatial_direct(
             // MV_CORNERS: bottom-right 4x4 of each 8x8 (for MV)
             const MV_CORNERS: [usize; 4] = [0, 3, 12, 15];
             // 4x4 indices within each 8x8 in raster order
-            const BLOCK_8X8_TO_4X4: [[usize; 4]; 4] = [
-                [0, 1, 4, 5],
-                [2, 3, 6, 7],
-                [8, 9, 12, 13],
-                [10, 11, 14, 15],
-            ];
+            const BLOCK_8X8_TO_4X4: [[usize; 4]; 4] =
+                [[0, 1, 4, 5], [2, 3, 6, 7], [8, 9, 12, 13], [10, 11, 14, 15]];
 
             for i8 in 0..4 {
                 let col_ref0 = ctx
@@ -2079,18 +2138,10 @@ fn pred_spatial_direct(
             // Per-4x4: each 4x4 block gets its own colocated check
             // Reference: FFmpeg h264_direct.c lines 460-477 (IS_SUB_8X8 else branch)
             for (i4, result) in results.iter_mut().enumerate() {
-                let col_ref0 = ctx
-                    .col_ref
-                    .get(blk_base + i4)
-                    .copied()
-                    .unwrap_or(-1);
+                let col_ref0 = ctx.col_ref.get(blk_base + i4).copied().unwrap_or(-1);
 
                 if col_ref0 == 0 {
-                    let col_mv0 = ctx
-                        .col_mv
-                        .get(blk_base + i4)
-                        .copied()
-                        .unwrap_or([0, 0]);
+                    let col_mv0 = ctx.col_mv.get(blk_base + i4).copied().unwrap_or([0, 0]);
                     if col_mv0[0].abs() <= 1 && col_mv0[1].abs() <= 1 {
                         let mut a = mv[0];
                         let mut b = mv[1];
@@ -2108,6 +2159,108 @@ fn pred_spatial_direct(
     }
 
     results
+}
+
+/// Apply weighted prediction for a P-slice partition (luma + chroma).
+#[allow(clippy::too_many_arguments)]
+fn apply_weight_p(
+    ctx: &mut FrameDecodeContext,
+    hdr: &SliceHeader,
+    mb_x: u32,
+    mb_y: u32,
+    px_x: u32,
+    px_y: u32,
+    pw: usize,
+    ph: usize,
+    ref_idx: usize,
+) {
+    let lx = (mb_x * 16 + px_x) as usize;
+    let ly = (mb_y * 16 + px_y) as usize;
+
+    // Luma
+    if ref_idx < hdr.luma_weight_l0.len() {
+        let (w, o) = hdr.luma_weight_l0[ref_idx];
+        apply_weight_uni(
+            &mut ctx.pic.y,
+            ctx.pic.y_stride,
+            lx,
+            ly,
+            pw,
+            ph,
+            hdr.luma_log2_weight_denom,
+            w,
+            o,
+        );
+    }
+
+    // Chroma
+    if hdr.use_weight_chroma && ref_idx < hdr.chroma_weight_l0.len() {
+        let cx = lx / 2;
+        let cy = ly / 2;
+        let cw = pw / 2;
+        let ch = ph / 2;
+        let cw_entry = hdr.chroma_weight_l0[ref_idx];
+        // Cb
+        apply_weight_uni(
+            &mut ctx.pic.u,
+            ctx.pic.uv_stride,
+            cx,
+            cy,
+            cw,
+            ch,
+            hdr.chroma_log2_weight_denom,
+            cw_entry[0].0,
+            cw_entry[0].1,
+        );
+        // Cr
+        apply_weight_uni(
+            &mut ctx.pic.v,
+            ctx.pic.uv_stride,
+            cx,
+            cy,
+            cw,
+            ch,
+            hdr.chroma_log2_weight_denom,
+            cw_entry[1].0,
+            cw_entry[1].1,
+        );
+    }
+}
+
+/// Apply uni-directional weighted prediction to pixels already written by MC.
+///
+/// For each pixel: `clip((pixel * weight + offset_scaled) >> log2_denom)`
+/// where `offset_scaled = offset << log2_denom` (with rounding for denom > 0).
+///
+/// Reference: FFmpeg h264dsp_template.c:30-61
+#[allow(clippy::too_many_arguments)]
+fn apply_weight_uni(
+    buf: &mut [u8],
+    stride: usize,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    log2_denom: u32,
+    weight: i32,
+    offset: i32,
+) {
+    // For 8-bit: offset_scaled = offset; if log2_denom > 0, add rounding
+    let offset_scaled = if log2_denom > 0 {
+        (offset << log2_denom) + (1 << (log2_denom - 1))
+    } else {
+        offset
+    };
+    for row in 0..h {
+        let base = (y + row) * stride + x;
+        for col in 0..w {
+            let idx = base + col;
+            if idx < buf.len() {
+                let val = (buf[idx] as i32 * weight + offset_scaled) >> log2_denom;
+                buf[idx] = val.clamp(0, 255) as u8;
+            }
+        }
+    }
 }
 
 /// Apply bidirectional motion compensation: MC from both L0 and L1, then average.
