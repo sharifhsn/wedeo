@@ -457,6 +457,12 @@ impl H264Decoder {
                         self.ref_list_l0 =
                             refs::build_ref_list_p(&self.dpb, &hdr, hdr.frame_num, max_frame_num);
                         self.ref_list_l1.clear();
+                        debug!(
+                            poc = self.current_poc,
+                            l0_len = self.ref_list_l0.len(),
+                            l0_frame_nums = ?self.ref_list_l0.iter().map(|&i| self.dpb.get(i).map(|e| e.frame_num)).collect::<Vec<_>>(),
+                            "P-frame ref list"
+                        );
                     } else if hdr.slice_type.is_b() {
                         let max_frame_num_b = 1u32 << sps.log2_max_frame_num;
                         let (l0, l1) = refs::build_ref_list_b(&self.dpb, &hdr, self.current_poc, max_frame_num_b);
