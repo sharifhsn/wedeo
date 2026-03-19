@@ -360,6 +360,56 @@ fn fill_block<const N: usize>(dst: &mut [u8], stride: usize, val: u8) {
     }
 }
 
+/// Plane prediction for an N×N block (luma 16x16 or chroma 8x8).
+///
+/// The gradient multiplier, bias and shift differ between block sizes and
+/// are supplied as const parameters so the compiler can fold them away:
+///
+/// | N  | GRAD_MULT | GRAD_ADD | GRAD_SHIFT |
+/// |----|-----------|----------|------------|
+/// | 16 |     5     |    32    |      6     |
+/// |  8 |    17     |    16    |      5     |
+///
+/// All other constants (pivot = N/2-1, extra_mult = N/2, coef = N/2-1)
+/// are derived from N at compile time.
+#[inline]
+fn plane_pred<const N: usize, const GRAD_MULT: i32, const GRAD_ADD: i32, const GRAD_SHIFT: i32>(
+    dst: &mut [u8],
+    stride: usize,
+    top: &[u8],
+    left: &[u8],
+    top_left: u8,
+) {
+    let pivot = (N / 2 - 1) as i32;
+    let extra_mult = (N / 2) as i32;
+    let last = N - 1;
+
+    let mut h_val: i32 = 0;
+    for x in 1..=pivot {
+        h_val += x * (top[last / 2 + x as usize] as i32 - top[last / 2 - x as usize] as i32);
+    }
+    h_val += extra_mult * (top[last] as i32 - top_left as i32);
+
+    let mut v_val: i32 = 0;
+    for y in 1..=pivot {
+        v_val += y * (left[last / 2 + y as usize] as i32 - left[last / 2 - y as usize] as i32);
+    }
+    v_val += extra_mult * (left[last] as i32 - top_left as i32);
+
+    let b = (GRAD_MULT * h_val + GRAD_ADD) >> GRAD_SHIFT;
+    let c = (GRAD_MULT * v_val + GRAD_ADD) >> GRAD_SHIFT;
+    let a = 16 * (left[last] as i32 + top[last] as i32 + 1) - pivot * (b + c);
+
+    for j in 0..N {
+        let mut acc = a + c * j as i32;
+        let row = j * stride;
+        for i in 0..N {
+            dst[row + i] = clip(acc >> 5);
+            acc += b;
+        }
+    }
+}
+
 /// Fill an N×N block by repeating `top[0..N]` into every row (vertical pred).
 #[inline]
 fn fill_vertical<const N: usize>(dst: &mut [u8], stride: usize, top: &[u8]) {
@@ -441,36 +491,7 @@ fn pred_16x16_dc(
 /// c = (5*V + 32) >> 6
 /// pred[y][x] = clip((a + b*x + c*y) >> 5, 0, 255)
 fn pred_16x16_plane(dst: &mut [u8], stride: usize, top: &[u8], left: &[u8], top_left: u8) {
-    // Compute H gradient.
-    // For x=1..7: top[7+x] - top[7-x]
-    // For x=8:    top[15]   - top_left
-    let mut h_val: i32 = 0;
-    for x in 1..=7i32 {
-        h_val += x * (top[7 + x as usize] as i32 - top[7 - x as usize] as i32);
-    }
-    h_val += 8 * (top[15] as i32 - top_left as i32);
-
-    // Compute V gradient.
-    // For y=1..7: left[7+y] - left[7-y]
-    // For y=8:    left[15]  - top_left
-    let mut v_val: i32 = 0;
-    for y in 1..=7i32 {
-        v_val += y * (left[7 + y as usize] as i32 - left[7 - y as usize] as i32);
-    }
-    v_val += 8 * (left[15] as i32 - top_left as i32);
-
-    let b = (5 * h_val + 32) >> 6;
-    let c = (5 * v_val + 32) >> 6;
-    let a = 16 * (left[15] as i32 + top[15] as i32 + 1) - 7 * (b + c);
-
-    for j in 0..16 {
-        let mut acc = a + c * j as i32;
-        let row = j * stride;
-        for i in 0..16 {
-            dst[row + i] = clip(acc >> 5);
-            acc += b;
-        }
-    }
+    plane_pred::<16, 5, 32, 6>(dst, stride, top, left, top_left);
 }
 
 // ============================================================================
@@ -633,36 +654,7 @@ fn fill_quadrants(
 /// c = (17*V + 16) >> 5
 /// pred[y][x] = clip((a + b*x + c*y) >> 5, 0, 255)
 fn pred_chroma_8x8_plane(dst: &mut [u8], stride: usize, top: &[u8], left: &[u8], top_left: u8) {
-    // Compute H gradient.
-    // For x=1..3: top[3+x] - top[3-x]
-    // For x=4:    top[7]   - top_left
-    let mut h_val: i32 = 0;
-    for x in 1..=3i32 {
-        h_val += x * (top[3 + x as usize] as i32 - top[3 - x as usize] as i32);
-    }
-    h_val += 4 * (top[7] as i32 - top_left as i32);
-
-    // Compute V gradient.
-    // For y=1..3: left[3+y] - left[3-y]
-    // For y=4:    left[7]   - top_left
-    let mut v_val: i32 = 0;
-    for y in 1..=3i32 {
-        v_val += y * (left[3 + y as usize] as i32 - left[3 - y as usize] as i32);
-    }
-    v_val += 4 * (left[7] as i32 - top_left as i32);
-
-    let b = (17 * h_val + 16) >> 5;
-    let c = (17 * v_val + 16) >> 5;
-    let a = 16 * (left[7] as i32 + top[7] as i32 + 1) - 3 * (b + c);
-
-    for j in 0..8 {
-        let mut acc = a + c * j as i32;
-        let row = j * stride;
-        for i in 0..8 {
-            dst[row + i] = clip(acc >> 5);
-            acc += b;
-        }
-    }
+    plane_pred::<8, 17, 16, 5>(dst, stride, top, left, top_left);
 }
 
 // ============================================================================
