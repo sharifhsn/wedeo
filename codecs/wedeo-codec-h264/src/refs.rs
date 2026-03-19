@@ -410,6 +410,18 @@ fn apply_mmco(
 ) {
     let mut current_marked = false;
 
+    // Pre-mark the current picture as ShortTerm before running MMCO ops.
+    // FFmpeg does this in h264_refs.c by setting reference = PICT_FRAME
+    // before calling execute_ref_pic_marking. This is needed because
+    // MMCO op 3 (ShortTermToLongTerm) uses find_short_term to locate
+    // the current pic by PicNum — it won't find it if still Unused.
+    if let Some(idx) = current_dpb_idx
+        && let Some(entry) = dpb.get_mut(idx)
+        && entry.status == RefStatus::Unused
+    {
+        entry.status = RefStatus::ShortTerm;
+    }
+
     for op in ops {
         match op {
             MmcoOp::End => break,
