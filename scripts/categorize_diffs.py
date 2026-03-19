@@ -23,16 +23,23 @@ WEDEO_BIN = "./target/release/wedeo-framecrc"
 
 
 def get_framecrc(cmd):
-    """Run a command and extract (pts, crc) pairs from framecrc output."""
+    """Run a command and extract (line_index, crc) pairs from framecrc output.
+
+    Framecrc format: stream_index, dts, pts, duration, size, crc
+    We extract the CRC (last field) and use line index for ordering.
+    """
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        result = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, timeout=30,
+        )
         lines = []
         for line in result.stdout.splitlines():
             if line.startswith("0,"):
                 parts = line.split(",")
-                pts = parts[1].strip()
-                crc = parts[-1].strip()
-                lines.append((pts, crc))
+                if len(parts) >= 6:
+                    crc = parts[-1].strip()
+                    lines.append((len(lines), crc))
         return lines
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return []
@@ -122,11 +129,19 @@ def main():
         sys.exit(1)
 
     # Get list of DIFF files from conformance report
-    result = subprocess.run(
-        ["python3", "scripts/conformance_report.py",
-         "--cavlc-only", "--progressive-only", "--only-failing"],
-        capture_output=True, text=True, timeout=300
-    )
+    try:
+        result = subprocess.run(
+            ["python3", "scripts/conformance_report.py",
+             "--cavlc-only", "--progressive-only", "--only-failing"],
+            capture_output=True, text=True, timeout=300
+        )
+        if result.returncode != 0:
+            print(f"Error running conformance_report.py: {result.stderr[:200]}",
+                  file=sys.stderr)
+            sys.exit(1)
+    except subprocess.TimeoutExpired:
+        print("Error: conformance_report.py timed out", file=sys.stderr)
+        sys.exit(1)
 
     diff_files = []
     in_diff = False

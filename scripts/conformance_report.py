@@ -32,7 +32,7 @@ import os
 import re
 import subprocess
 import sys
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from ffmpeg_debug import find_wedeo_binary
