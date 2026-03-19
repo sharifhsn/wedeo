@@ -154,6 +154,27 @@ impl FrameDecodeContext {
 // Deblock info helper
 // ---------------------------------------------------------------------------
 
+/// Finalize a skip/direct MB: update slice table, neighbor context, and deblock info.
+///
+/// Called at the end of `decode_skip_mb` and `decode_b_skip_mb` after MC is applied.
+/// Skip MBs have no residual and no intra prediction, so non_zero_count is all zeros.
+/// Inter MBs make neighbors unavailable under constrained_intra_pred.
+#[inline]
+fn finalize_skip_mb(ctx: &mut FrameDecodeContext, mb_x: u32, mb_y: u32) {
+    let mb_idx = (mb_y * ctx.mb_width + mb_x) as usize;
+    ctx.slice_table[mb_idx] = ctx.current_slice;
+    let nz = [0u8; 24];
+    let modes = if ctx.constrained_intra_pred {
+        [-1i8; 16] // unavailable for constrained intra prediction
+    } else {
+        [2i8; 16] // DC_PRED for inter MBs
+    };
+    ctx.neighbor_ctx.update_after_mb(mb_x, &nz, &modes);
+    ctx.neighbor_ctx.left_available = true;
+    let qp = ctx.qp;
+    store_deblock_info(ctx, mb_idx, false, qp, [0; 24]);
+}
+
 /// Store `MbDeblockInfo` for the deblocking filter after decoding a macroblock.
 ///
 /// Copies the current MV and ref_idx from `mv_ctx` into `mb_info[mb_idx]`.
@@ -1350,22 +1371,8 @@ pub fn decode_skip_mb(
         }
     }
 
-    // Record slice ownership and update neighbor context.
-    let mb_idx = (mb_y * ctx.mb_width + mb_x) as usize;
-    ctx.slice_table[mb_idx] = ctx.current_slice;
-    let nz = [0u8; 24];
-    // Skip MBs are inter: use -1 (unavailable) when constrained_intra_pred
-    let modes = if ctx.constrained_intra_pred {
-        [-1i8; 16]
-    } else {
-        [2i8; 16]
-    };
-    ctx.neighbor_ctx.update_after_mb(mb_x, &nz, &modes);
-    ctx.neighbor_ctx.left_available = true;
-
-    // Store deblocking info (P_SKIP: only L0, list_count=1)
-    let qp = ctx.qp;
-    store_deblock_info(ctx, mb_idx, false, qp, [0; 24]);
+    // Record slice ownership, update neighbor context, and store deblock info.
+    finalize_skip_mb(ctx, mb_x, mb_y);
 
     let _ = slice_hdr; // reserved for future use (e.g. weighted prediction)
 }
@@ -1434,22 +1441,8 @@ pub fn decode_b_skip_mb(
         }
     }
 
-    // Record slice ownership and update neighbor context
-    let mb_idx = (mb_y * ctx.mb_width + mb_x) as usize;
-    ctx.slice_table[mb_idx] = ctx.current_slice;
-    let nz = [0u8; 24];
-    // B_Skip MBs are inter: use -1 (unavailable) when constrained_intra_pred
-    let modes = if ctx.constrained_intra_pred {
-        [-1i8; 16]
-    } else {
-        [2i8; 16]
-    };
-    ctx.neighbor_ctx.update_after_mb(mb_x, &nz, &modes);
-    ctx.neighbor_ctx.left_available = true;
-
-    // Store deblocking info (B_SKIP)
-    let qp = ctx.qp;
-    store_deblock_info(ctx, mb_idx, false, qp, [0; 24]);
+    // Record slice ownership, update neighbor context, and store deblock info.
+    finalize_skip_mb(ctx, mb_x, mb_y);
 }
 
 /// Decode a B-frame inter macroblock.
@@ -2611,10 +2604,9 @@ fn fill_mb_gray(ctx: &mut FrameDecodeContext, mb_x: u32, mb_y: u32) {
     let chroma_x = (mb_x * 8) as usize;
     let chroma_y = (mb_y * 8) as usize;
     for y in 0..8 {
-        let u_offset = (chroma_y + y) * ctx.pic.uv_stride + chroma_x;
-        ctx.pic.u[u_offset..u_offset + 8].fill(128);
-        let v_offset = (chroma_y + y) * ctx.pic.uv_stride + chroma_x;
-        ctx.pic.v[v_offset..v_offset + 8].fill(128);
+        let uv_offset = (chroma_y + y) * ctx.pic.uv_stride + chroma_x;
+        ctx.pic.u[uv_offset..uv_offset + 8].fill(128);
+        ctx.pic.v[uv_offset..uv_offset + 8].fill(128);
     }
 }
 
