@@ -1509,6 +1509,7 @@ mod tests {
                 non_zero_count: [0; 24],
                 ref_idx: [0; 16],
                 mv: [[0, 0]; 16],
+                ..Default::default()
             },
             MbDeblockInfo {
                 is_intra: true,
@@ -1516,6 +1517,7 @@ mod tests {
                 non_zero_count: [0; 24],
                 ref_idx: [0; 16],
                 mv: [[0, 0]; 16],
+                ..Default::default()
             },
         ];
 
@@ -1568,6 +1570,7 @@ mod tests {
                 non_zero_count: [0; 24],
                 ref_idx: [0; 16],
                 mv: [[0, 0]; 16],
+                ..Default::default()
             },
             MbDeblockInfo {
                 is_intra: true,
@@ -1575,6 +1578,7 @@ mod tests {
                 non_zero_count: [0; 24],
                 ref_idx: [0; 16],
                 mv: [[0, 0]; 16],
+                ..Default::default()
             },
         ];
 

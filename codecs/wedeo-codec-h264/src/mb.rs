@@ -606,11 +606,13 @@ pub fn decode_macroblock(
     let mb_idx_base = mb_idx * 16;
     let mut deblock_mv = [[0i16; 2]; 16];
     let mut deblock_mv_l1 = [[0i16; 2]; 16];
+    let mut deblock_ref_idx = [-1i8; 16];
     let mut deblock_pic_id = [-1i64; 16];
     let mut deblock_pic_id_l1 = [-1i64; 16];
     if !mb.is_intra && mb_idx_base + 16 <= ctx.mv_ctx.mv.len() {
         deblock_mv.copy_from_slice(&ctx.mv_ctx.mv[mb_idx_base..mb_idx_base + 16]);
         deblock_mv_l1.copy_from_slice(&ctx.mv_ctx.mv_l1[mb_idx_base..mb_idx_base + 16]);
+        deblock_ref_idx.copy_from_slice(&ctx.mv_ctx.ref_idx[mb_idx_base..mb_idx_base + 16]);
         // Map raw ref_idx to canonical picture IDs (pointer identity)
         for blk in 0..16 {
             let r0 = ctx.mv_ctx.ref_idx[mb_idx_base + blk];
@@ -624,6 +626,7 @@ pub fn decode_macroblock(
         is_intra: mb.is_intra,
         qp,
         non_zero_count: mb.non_zero_count,
+        ref_idx: deblock_ref_idx,
         ref_pic_id: deblock_pic_id,
         mv: deblock_mv,
         ref_pic_id_l1: deblock_pic_id_l1,
@@ -1510,11 +1513,13 @@ pub fn decode_b_skip_mb(
     let mb_idx_base = mb_idx * 16;
     let mut deblock_mv = [[0i16; 2]; 16];
     let mut deblock_mv_l1 = [[0i16; 2]; 16];
+    let mut deblock_ref_idx = [-1i8; 16];
     let mut deblock_pic_id = [-1i64; 16];
     let mut deblock_pic_id_l1 = [-1i64; 16];
     if mb_idx_base + 16 <= ctx.mv_ctx.mv.len() {
         deblock_mv.copy_from_slice(&ctx.mv_ctx.mv[mb_idx_base..mb_idx_base + 16]);
         deblock_mv_l1.copy_from_slice(&ctx.mv_ctx.mv_l1[mb_idx_base..mb_idx_base + 16]);
+        deblock_ref_idx.copy_from_slice(&ctx.mv_ctx.ref_idx[mb_idx_base..mb_idx_base + 16]);
         for blk in 0..16 {
             let r0 = ctx.mv_ctx.ref_idx[mb_idx_base + blk];
             deblock_pic_id[blk] = ref_pic_id_from_list(r0, ref_pics);
@@ -1526,6 +1531,7 @@ pub fn decode_b_skip_mb(
         is_intra: false,
         qp: ctx.qp,
         non_zero_count: [0; 24],
+        ref_idx: deblock_ref_idx,
         ref_pic_id: deblock_pic_id,
         mv: deblock_mv,
         ref_pic_id_l1: deblock_pic_id_l1,
