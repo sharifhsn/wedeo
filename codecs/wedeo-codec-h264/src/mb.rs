@@ -151,6 +151,38 @@ impl FrameDecodeContext {
 }
 
 // ---------------------------------------------------------------------------
+// Deblock info helper
+// ---------------------------------------------------------------------------
+
+/// Store `MbDeblockInfo` for the deblocking filter after decoding a macroblock.
+///
+/// Copies the current MV and ref_idx from `mv_ctx` into `mb_info[mb_idx]`.
+/// Called from `decode_macroblock`, `decode_skip_mb`, and `decode_b_skip_mb`.
+#[inline]
+fn store_deblock_info(
+    ctx: &mut FrameDecodeContext,
+    mb_idx: usize,
+    is_intra: bool,
+    qp: u8,
+    non_zero_count: [u8; 24],
+) {
+    let mb_idx_base = mb_idx * 16;
+    let mut deblock_mv = [[0i16; 2]; 16];
+    let mut deblock_ref_idx = [-1i8; 16];
+    if !is_intra && mb_idx_base + 16 <= ctx.mv_ctx.mv.len() {
+        deblock_mv.copy_from_slice(&ctx.mv_ctx.mv[mb_idx_base..mb_idx_base + 16]);
+        deblock_ref_idx.copy_from_slice(&ctx.mv_ctx.ref_idx[mb_idx_base..mb_idx_base + 16]);
+    }
+    ctx.mb_info[mb_idx] = MbDeblockInfo {
+        is_intra,
+        qp,
+        non_zero_count,
+        ref_idx: deblock_ref_idx,
+        mv: deblock_mv,
+    };
+}
+
+// ---------------------------------------------------------------------------
 // Pixel access helpers
 // ---------------------------------------------------------------------------
 
@@ -586,20 +618,7 @@ pub fn decode_macroblock(
     ctx.neighbor_ctx.left_available = true;
 
     // 7. Store MbDeblockInfo for the deblocking filter
-    let mb_idx_base = mb_idx * 16;
-    let mut deblock_mv = [[0i16; 2]; 16];
-    let mut deblock_ref_idx = [-1i8; 16];
-    if !mb.is_intra && mb_idx_base + 16 <= ctx.mv_ctx.mv.len() {
-        deblock_mv.copy_from_slice(&ctx.mv_ctx.mv[mb_idx_base..mb_idx_base + 16]);
-        deblock_ref_idx.copy_from_slice(&ctx.mv_ctx.ref_idx[mb_idx_base..mb_idx_base + 16]);
-    }
-    ctx.mb_info[mb_idx] = MbDeblockInfo {
-        is_intra: mb.is_intra,
-        qp,
-        non_zero_count: mb.non_zero_count,
-        ref_idx: deblock_ref_idx,
-        mv: deblock_mv,
-    };
+    store_deblock_info(ctx, mb_idx, mb.is_intra, qp, mb.non_zero_count);
 
     Ok(())
 }
@@ -1377,20 +1396,8 @@ pub fn decode_skip_mb(
     ctx.neighbor_ctx.left_available = true;
 
     // Store deblocking info (P_SKIP: only L0, list_count=1)
-    let mb_idx_base = mb_idx * 16;
-    let mut deblock_mv = [[0i16; 2]; 16];
-    let mut deblock_ref_idx = [-1i8; 16];
-    if mb_idx_base + 16 <= ctx.mv_ctx.mv.len() {
-        deblock_mv.copy_from_slice(&ctx.mv_ctx.mv[mb_idx_base..mb_idx_base + 16]);
-        deblock_ref_idx.copy_from_slice(&ctx.mv_ctx.ref_idx[mb_idx_base..mb_idx_base + 16]);
-    }
-    ctx.mb_info[mb_idx] = MbDeblockInfo {
-        is_intra: false,
-        qp: ctx.qp,
-        non_zero_count: [0; 24],
-        ref_idx: deblock_ref_idx,
-        mv: deblock_mv,
-    };
+    let qp = ctx.qp;
+    store_deblock_info(ctx, mb_idx, false, qp, [0; 24]);
 
     let _ = slice_hdr; // reserved for future use (e.g. weighted prediction)
 }
@@ -1473,20 +1480,8 @@ pub fn decode_b_skip_mb(
     ctx.neighbor_ctx.left_available = true;
 
     // Store deblocking info (B_SKIP)
-    let mb_idx_base = mb_idx * 16;
-    let mut deblock_mv = [[0i16; 2]; 16];
-    let mut deblock_ref_idx = [-1i8; 16];
-    if mb_idx_base + 16 <= ctx.mv_ctx.mv.len() {
-        deblock_mv.copy_from_slice(&ctx.mv_ctx.mv[mb_idx_base..mb_idx_base + 16]);
-        deblock_ref_idx.copy_from_slice(&ctx.mv_ctx.ref_idx[mb_idx_base..mb_idx_base + 16]);
-    }
-    ctx.mb_info[mb_idx] = MbDeblockInfo {
-        is_intra: false,
-        qp: ctx.qp,
-        non_zero_count: [0; 24],
-        ref_idx: deblock_ref_idx,
-        mv: deblock_mv,
-    };
+    let qp = ctx.qp;
+    store_deblock_info(ctx, mb_idx, false, qp, [0; 24]);
 }
 
 /// Decode a B-frame inter macroblock.
