@@ -1478,6 +1478,7 @@ pub fn decode_b_skip_mb(
                     ref_l0,
                     mv_l1,
                     ref_l1,
+                    slice_hdr,
                 );
             } else if use_l0 {
                 let ref_pic = ref_pics[(ref_l0 as usize).min(ref_pics.len() - 1)];
@@ -1593,6 +1594,7 @@ fn decode_b_inter_mb(
                     ref_l0,
                     mv_l1,
                     ref_l1,
+                    slice_hdr,
                 );
             } else if use_l0 {
                 let ref_pic = ref_pics[(ref_l0 as usize).min(ref_pics.len() - 1)];
@@ -1776,6 +1778,7 @@ fn decode_b_inter_mb(
                     ref_l0,
                     mv_l1,
                     ref_l1,
+                    slice_hdr,
                 );
             } else if uses_l0 && !ref_pics.is_empty() {
                 let ref_pic = ref_pics[(ref_l0 as usize).min(ref_pics.len() - 1)];
@@ -1857,6 +1860,7 @@ fn decode_b_8x8_mb(
                             ref_l0,
                             mv_l1,
                             ref_l1,
+                            slice_hdr,
                         );
                     } else if use_l0 {
                         let ref_pic = ref_pics[(ref_l0 as usize).min(ref_pics.len() - 1)];
@@ -2006,6 +2010,7 @@ fn decode_b_8x8_mb(
                         ref_l0,
                         mv_l1,
                         ref_l1,
+                        slice_hdr,
                     );
                 } else if uses_l0 && !ref_pics.is_empty() {
                     let ref_pic = ref_pics[(ref_l0 as usize).min(ref_pics.len() - 1)];
@@ -2435,8 +2440,15 @@ fn apply_weight_uni(
 
 /// Apply bidirectional motion compensation: MC from both L0 and L1, then average.
 ///
-/// This handles the unweighted case (weighted_bipred_idc == 0):
-/// result[i] = (L0[i] + L1[i] + 1) >> 1
+/// Bi-directional MC with optional weighted prediction.
+///
+/// Unweighted (weighted_bipred_idc == 0):
+///   result[i] = (L0[i] + L1[i] + 1) >> 1
+///
+/// Explicit weighted (weighted_bipred_idc == 1):
+///   result[i] = clip((L0[i]*w0 + L1[i]*w1 + offset) >> (denom+1))
+///
+/// Reference: FFmpeg h264dsp_template.c:63-92, h264_mb.c:406-456
 #[allow(clippy::too_many_arguments)]
 fn apply_mc_bi_partition(
     ctx: &mut FrameDecodeContext,
@@ -2452,6 +2464,7 @@ fn apply_mc_bi_partition(
     ref_idx_l0: i8,
     mv_l1: [i16; 2],
     ref_idx_l1: i8,
+    slice_hdr: &SliceHeader,
 ) {
     let ref_l0 = ref_pics[(ref_idx_l0.max(0) as usize).min(ref_pics.len() - 1)];
     let ref_l1 = ref_pics_l1[(ref_idx_l1.max(0) as usize).min(ref_pics_l1.len() - 1)];
@@ -2497,16 +2510,40 @@ fn apply_mc_bi_partition(
         ref_l1.height,
     );
 
-    // Average luma
+    // Average or weighted-average luma
     let luma_offset = dst_y as usize * ctx.pic.y_stride + dst_x as usize;
-    mc::avg_pixels_inplace(
-        &mut ctx.pic.y[luma_offset..],
-        ctx.pic.y_stride,
-        &tmp_y,
-        block_w,
-        block_w,
-        block_h,
-    );
+    let l0_idx = ref_idx_l0.max(0) as usize;
+    let l1_idx = ref_idx_l1.max(0) as usize;
+
+    if slice_hdr.use_weight
+        && l0_idx < slice_hdr.luma_weight_l0.len()
+        && l1_idx < slice_hdr.luma_weight_l1.len()
+    {
+        let (w0, o0) = slice_hdr.luma_weight_l0[l0_idx];
+        let (w1, o1) = slice_hdr.luma_weight_l1[l1_idx];
+        let denom = slice_hdr.luma_log2_weight_denom;
+        biweight_pixels(
+            &mut ctx.pic.y[luma_offset..],
+            ctx.pic.y_stride,
+            &tmp_y,
+            block_w,
+            block_w,
+            block_h,
+            denom,
+            w0,
+            w1,
+            o0 + o1,
+        );
+    } else {
+        mc::avg_pixels_inplace(
+            &mut ctx.pic.y[luma_offset..],
+            ctx.pic.y_stride,
+            &tmp_y,
+            block_w,
+            block_w,
+            block_h,
+        );
+    }
 
     // Chroma L1
     let chroma_w = block_w / 2;
@@ -2537,15 +2574,7 @@ fn apply_mc_bi_partition(
         ref_l1.width / 2,
         ref_l1.height / 2,
     );
-    let chroma_offset = chroma_dst_y as usize * ctx.pic.uv_stride + chroma_dst_x as usize;
-    mc::avg_pixels_inplace(
-        &mut ctx.pic.u[chroma_offset..],
-        ctx.pic.uv_stride,
-        &tmp_u,
-        chroma_w,
-        chroma_w,
-        chroma_h,
-    );
+    let chroma_off = chroma_dst_y as usize * ctx.pic.uv_stride + chroma_dst_x as usize;
 
     let mut tmp_v = vec![0u8; chroma_w * chroma_h];
     mc::mc_chroma(
@@ -2562,14 +2591,91 @@ fn apply_mc_bi_partition(
         ref_l1.width / 2,
         ref_l1.height / 2,
     );
-    mc::avg_pixels_inplace(
-        &mut ctx.pic.v[chroma_offset..],
-        ctx.pic.uv_stride,
-        &tmp_v,
-        chroma_w,
-        chroma_w,
-        chroma_h,
-    );
+
+    if slice_hdr.use_weight_chroma
+        && l0_idx < slice_hdr.chroma_weight_l0.len()
+        && l1_idx < slice_hdr.chroma_weight_l1.len()
+    {
+        let cw0 = slice_hdr.chroma_weight_l0[l0_idx];
+        let cw1 = slice_hdr.chroma_weight_l1[l1_idx];
+        let denom = slice_hdr.chroma_log2_weight_denom;
+        // Cb
+        biweight_pixels(
+            &mut ctx.pic.u[chroma_off..],
+            ctx.pic.uv_stride,
+            &tmp_u,
+            chroma_w,
+            chroma_w,
+            chroma_h,
+            denom,
+            cw0[0].0,
+            cw1[0].0,
+            cw0[0].1 + cw1[0].1,
+        );
+        // Cr
+        biweight_pixels(
+            &mut ctx.pic.v[chroma_off..],
+            ctx.pic.uv_stride,
+            &tmp_v,
+            chroma_w,
+            chroma_w,
+            chroma_h,
+            denom,
+            cw0[1].0,
+            cw1[1].0,
+            cw0[1].1 + cw1[1].1,
+        );
+    } else {
+        mc::avg_pixels_inplace(
+            &mut ctx.pic.u[chroma_off..],
+            ctx.pic.uv_stride,
+            &tmp_u,
+            chroma_w,
+            chroma_w,
+            chroma_h,
+        );
+        mc::avg_pixels_inplace(
+            &mut ctx.pic.v[chroma_off..],
+            ctx.pic.uv_stride,
+            &tmp_v,
+            chroma_w,
+            chroma_w,
+            chroma_h,
+        );
+    }
+}
+
+/// Apply weighted bi-prediction to pixels.
+///
+/// FFmpeg formula: clip((dst * w0 + src * w1 + offset) >> (denom + 1))
+/// where offset = ((o0 + o1 + 1) | 1) << denom
+///
+/// Reference: FFmpeg h264dsp_template.c:63-92
+#[allow(clippy::too_many_arguments)]
+fn biweight_pixels(
+    dst: &mut [u8],
+    dst_stride: usize,
+    src: &[u8],
+    src_stride: usize,
+    w: usize,
+    h: usize,
+    log2_denom: u32,
+    weight0: i32,
+    weight1: i32,
+    offset_sum: i32,
+) {
+    let offset = ((offset_sum + 1) | 1) << log2_denom;
+    let shift = log2_denom + 1;
+    for row in 0..h {
+        let d_off = row * dst_stride;
+        let s_off = row * src_stride;
+        for col in 0..w {
+            let val =
+                (dst[d_off + col] as i32 * weight0 + src[s_off + col] as i32 * weight1 + offset)
+                    >> shift;
+            dst[d_off + col] = val.clamp(0, 255) as u8;
+        }
+    }
 }
 
 /// Fill a macroblock with gray (128) for all planes.
