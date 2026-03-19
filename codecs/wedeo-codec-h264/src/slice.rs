@@ -169,6 +169,22 @@ pub struct SliceHeader {
     pub sp_for_switch_flag: bool,
     pub slice_qs_delta: i32,
 
+    // --- Weighted prediction ---
+    pub luma_log2_weight_denom: u32,
+    pub chroma_log2_weight_denom: u32,
+    /// Per-ref luma weight/offset: [ref_idx] = (weight, offset). List 0.
+    pub luma_weight_l0: Vec<(i32, i32)>,
+    /// Per-ref chroma weight/offset: [ref_idx][plane] = (weight, offset). List 0.
+    pub chroma_weight_l0: Vec<[(i32, i32); 2]>,
+    /// Per-ref luma weight/offset for list 1 (B-slices).
+    pub luma_weight_l1: Vec<(i32, i32)>,
+    /// Per-ref chroma weight/offset for list 1.
+    pub chroma_weight_l1: Vec<[(i32, i32); 2]>,
+    /// True if any non-default luma weight is present.
+    pub use_weight: bool,
+    /// True if any non-default chroma weight is present.
+    pub use_weight_chroma: bool,
+
     // --- Deblocking ---
     pub disable_deblocking_filter_idc: u32,
     pub slice_alpha_c0_offset: i32,
@@ -209,6 +225,14 @@ impl Default for SliceHeader {
             slice_qp: 0,
             sp_for_switch_flag: false,
             slice_qs_delta: 0,
+            luma_log2_weight_denom: 0,
+            chroma_log2_weight_denom: 0,
+            luma_weight_l0: Vec::new(),
+            chroma_weight_l0: Vec::new(),
+            luma_weight_l1: Vec::new(),
+            chroma_weight_l1: Vec::new(),
+            use_weight: false,
+            use_weight_chroma: false,
             disable_deblocking_filter_idc: 0,
             slice_alpha_c0_offset: 0,
             slice_beta_offset: 0,
@@ -336,6 +360,86 @@ fn parse_dec_ref_pic_marking(
         adaptive,
         mmco_ops,
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Pred weight table parsing
+// ---------------------------------------------------------------------------
+
+/// Parse pred_weight_table() from the slice header.
+///
+/// Reference: ITU-T H.264 Section 7.3.3.2, FFmpeg h264_parse.c:30-120.
+fn parse_pred_weight_table(
+    br: &mut BitReadBE<'_>,
+    hdr: &mut SliceHeader,
+    chroma_format_idc: u8,
+) -> Result<()> {
+    hdr.luma_log2_weight_denom = get_ue_golomb(br)?;
+    if hdr.luma_log2_weight_denom > 7 {
+        return Err(Error::InvalidData);
+    }
+    let luma_def = 1i32 << hdr.luma_log2_weight_denom;
+
+    if chroma_format_idc != 0 {
+        hdr.chroma_log2_weight_denom = get_ue_golomb(br)?;
+        if hdr.chroma_log2_weight_denom > 7 {
+            return Err(Error::InvalidData);
+        }
+    }
+    let chroma_def = 1i32 << hdr.chroma_log2_weight_denom;
+
+    let num_lists = if hdr.slice_type.is_b() { 2 } else { 1 };
+    let ref_counts = [hdr.num_ref_idx_l0_active, hdr.num_ref_idx_l1_active];
+
+    for (list, &ref_count_u32) in ref_counts.iter().enumerate().take(num_lists) {
+        let ref_count = ref_count_u32 as usize;
+        let mut luma_weights = Vec::with_capacity(ref_count);
+        let mut chroma_weights = Vec::with_capacity(ref_count);
+
+        for _i in 0..ref_count {
+            let luma_weight_flag = br.get_bit();
+            if luma_weight_flag {
+                let w = get_se_golomb(br)?;
+                let o = get_se_golomb(br)?;
+                if w != luma_def || o != 0 {
+                    hdr.use_weight = true;
+                }
+                luma_weights.push((w, o));
+            } else {
+                luma_weights.push((luma_def, 0));
+            }
+
+            if chroma_format_idc != 0 {
+                let chroma_weight_flag = br.get_bit();
+                if chroma_weight_flag {
+                    let mut cw = [(chroma_def, 0i32); 2];
+                    for item in &mut cw {
+                        let w = get_se_golomb(br)?;
+                        let o = get_se_golomb(br)?;
+                        if w != chroma_def || o != 0 {
+                            hdr.use_weight_chroma = true;
+                        }
+                        *item = (w, o);
+                    }
+                    chroma_weights.push(cw);
+                } else {
+                    chroma_weights.push([(chroma_def, 0); 2]);
+                }
+            } else {
+                chroma_weights.push([(chroma_def, 0); 2]);
+            }
+        }
+
+        if list == 0 {
+            hdr.luma_weight_l0 = luma_weights;
+            hdr.chroma_weight_l0 = chroma_weights;
+        } else {
+            hdr.luma_weight_l1 = luma_weights;
+            hdr.chroma_weight_l1 = chroma_weights;
+        }
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -475,11 +579,12 @@ pub fn parse_slice_header(
         }
     }
 
-    // 13. Weighted prediction (skip for now — just skip the bits)
-    // pred_weight_table() would be parsed here for weighted P/B slices.
-    // For the skeleton, we skip this entirely since it requires knowing
-    // the chroma format and ref counts to determine how many bits to read.
-    // TODO: implement pred_weight_table parsing
+    // 13. Weighted prediction
+    if (pps.weighted_pred_flag && hdr.slice_type.is_p())
+        || (pps.weighted_bipred_idc == 1 && hdr.slice_type.is_b())
+    {
+        parse_pred_weight_table(&mut br, &mut hdr, sps.chroma_format_idc)?;
+    }
 
     // 14. Dec ref pic marking
     if nal_ref_idc != 0 {
