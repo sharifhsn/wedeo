@@ -22,23 +22,6 @@ use crate::sps::Sps;
 use crate::tables::CHROMA_QP_TABLE;
 
 // ---------------------------------------------------------------------------
-// Deblocking helper
-// ---------------------------------------------------------------------------
-
-/// Map a raw ref_idx to a canonical picture ID using the reference picture list.
-/// Returns the picture buffer's pointer address as i64, or -1 if unused.
-/// This ensures cross-list comparisons (L0 vs L1) correctly identify same-picture.
-fn ref_pic_id_from_list(ref_idx: i8, ref_pics: &[&PictureBuffer]) -> i64 {
-    if ref_idx < 0 {
-        return -1;
-    }
-    match ref_pics.get(ref_idx as usize) {
-        Some(pic) => *pic as *const PictureBuffer as i64,
-        None => -1,
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Block scanning order
 // ---------------------------------------------------------------------------
 
@@ -605,33 +588,17 @@ pub fn decode_macroblock(
     // 7. Store MbDeblockInfo for the deblocking filter
     let mb_idx_base = mb_idx * 16;
     let mut deblock_mv = [[0i16; 2]; 16];
-    let mut deblock_mv_l1 = [[0i16; 2]; 16];
     let mut deblock_ref_idx = [-1i8; 16];
-    let mut deblock_pic_id = [-1i64; 16];
-    let mut deblock_pic_id_l1 = [-1i64; 16];
     if !mb.is_intra && mb_idx_base + 16 <= ctx.mv_ctx.mv.len() {
         deblock_mv.copy_from_slice(&ctx.mv_ctx.mv[mb_idx_base..mb_idx_base + 16]);
-        deblock_mv_l1.copy_from_slice(&ctx.mv_ctx.mv_l1[mb_idx_base..mb_idx_base + 16]);
         deblock_ref_idx.copy_from_slice(&ctx.mv_ctx.ref_idx[mb_idx_base..mb_idx_base + 16]);
-        // Map raw ref_idx to canonical picture IDs (pointer identity)
-        for blk in 0..16 {
-            let r0 = ctx.mv_ctx.ref_idx[mb_idx_base + blk];
-            deblock_pic_id[blk] = ref_pic_id_from_list(r0, ref_pics);
-            let r1 = ctx.mv_ctx.ref_idx_l1[mb_idx_base + blk];
-            deblock_pic_id_l1[blk] = ref_pic_id_from_list(r1, ref_pics_l1);
-        }
     }
-    let list_count = if slice_hdr.slice_type.is_b() { 2 } else { 1 };
     ctx.mb_info[mb_idx] = MbDeblockInfo {
         is_intra: mb.is_intra,
         qp,
         non_zero_count: mb.non_zero_count,
         ref_idx: deblock_ref_idx,
-        ref_pic_id: deblock_pic_id,
         mv: deblock_mv,
-        ref_pic_id_l1: deblock_pic_id_l1,
-        mv_l1: deblock_mv_l1,
-        list_count,
     };
 
     Ok(())
@@ -1412,21 +1379,17 @@ pub fn decode_skip_mb(
     // Store deblocking info (P_SKIP: only L0, list_count=1)
     let mb_idx_base = mb_idx * 16;
     let mut deblock_mv = [[0i16; 2]; 16];
-    let mut deblock_pic_id = [-1i64; 16];
+    let mut deblock_ref_idx = [-1i8; 16];
     if mb_idx_base + 16 <= ctx.mv_ctx.mv.len() {
         deblock_mv.copy_from_slice(&ctx.mv_ctx.mv[mb_idx_base..mb_idx_base + 16]);
-        for (blk, pic_id) in deblock_pic_id.iter_mut().enumerate() {
-            let r0 = ctx.mv_ctx.ref_idx[mb_idx_base + blk];
-            *pic_id = ref_pic_id_from_list(r0, ref_pics);
-        }
+        deblock_ref_idx.copy_from_slice(&ctx.mv_ctx.ref_idx[mb_idx_base..mb_idx_base + 16]);
     }
     ctx.mb_info[mb_idx] = MbDeblockInfo {
         is_intra: false,
         qp: ctx.qp,
         non_zero_count: [0; 24],
-        ref_pic_id: deblock_pic_id,
+        ref_idx: deblock_ref_idx,
         mv: deblock_mv,
-        ..Default::default()
     };
 
     let _ = slice_hdr; // reserved for future use (e.g. weighted prediction)
@@ -1509,34 +1472,20 @@ pub fn decode_b_skip_mb(
     ctx.neighbor_ctx.update_after_mb(mb_x, &nz, &modes);
     ctx.neighbor_ctx.left_available = true;
 
-    // Store deblocking info (B_SKIP: always list_count=2)
+    // Store deblocking info (B_SKIP)
     let mb_idx_base = mb_idx * 16;
     let mut deblock_mv = [[0i16; 2]; 16];
-    let mut deblock_mv_l1 = [[0i16; 2]; 16];
     let mut deblock_ref_idx = [-1i8; 16];
-    let mut deblock_pic_id = [-1i64; 16];
-    let mut deblock_pic_id_l1 = [-1i64; 16];
     if mb_idx_base + 16 <= ctx.mv_ctx.mv.len() {
         deblock_mv.copy_from_slice(&ctx.mv_ctx.mv[mb_idx_base..mb_idx_base + 16]);
-        deblock_mv_l1.copy_from_slice(&ctx.mv_ctx.mv_l1[mb_idx_base..mb_idx_base + 16]);
         deblock_ref_idx.copy_from_slice(&ctx.mv_ctx.ref_idx[mb_idx_base..mb_idx_base + 16]);
-        for blk in 0..16 {
-            let r0 = ctx.mv_ctx.ref_idx[mb_idx_base + blk];
-            deblock_pic_id[blk] = ref_pic_id_from_list(r0, ref_pics);
-            let r1 = ctx.mv_ctx.ref_idx_l1[mb_idx_base + blk];
-            deblock_pic_id_l1[blk] = ref_pic_id_from_list(r1, ref_pics_l1);
-        }
     }
     ctx.mb_info[mb_idx] = MbDeblockInfo {
         is_intra: false,
         qp: ctx.qp,
         non_zero_count: [0; 24],
         ref_idx: deblock_ref_idx,
-        ref_pic_id: deblock_pic_id,
         mv: deblock_mv,
-        ref_pic_id_l1: deblock_pic_id_l1,
-        mv_l1: deblock_mv_l1,
-        list_count: 2,
     };
 }
 

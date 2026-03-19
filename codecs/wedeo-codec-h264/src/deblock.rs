@@ -105,14 +105,6 @@ pub struct MbDeblockInfo {
     pub ref_idx: [i8; 16],
     /// Motion vectors per 4x4 block (list 0) [x, y].
     pub mv: [[i16; 2]; 16],
-    /// Canonical reference picture ID per 4x4 block (list 0).
-    pub ref_pic_id: [i64; 16],
-    /// Canonical reference picture ID per 4x4 block (list 1, for B-slices).
-    pub ref_pic_id_l1: [i64; 16],
-    /// Motion vectors per 4x4 block (list 1, for B-slices) [x, y].
-    pub mv_l1: [[i16; 2]; 16],
-    /// Number of reference lists (1 for P-slices, 2 for B-slices).
-    pub list_count: u8,
 }
 
 impl Default for MbDeblockInfo {
@@ -123,10 +115,6 @@ impl Default for MbDeblockInfo {
             non_zero_count: [0; 24],
             ref_idx: [-1; 16],
             mv: [[0; 2]; 16],
-            ref_pic_id: [-1; 16],
-            ref_pic_id_l1: [-1; 16],
-            mv_l1: [[0; 2]; 16],
-            list_count: 1,
         }
     }
 }
@@ -1453,7 +1441,6 @@ mod tests {
             non_zero_count: [0; 24],
             ref_idx: [0; 16],
             mv: [[0, 0]; 16],
-            ..Default::default()
         }];
 
         deblock_frame(&mut pic, &mb_info, 0, 0, 0);
@@ -1475,7 +1462,6 @@ mod tests {
             non_zero_count: [1; 24],
             ref_idx: [0; 16],
             mv: [[0, 0]; 16],
-            ..Default::default()
         }];
 
         let y_before = pic.y.clone();
@@ -1509,7 +1495,6 @@ mod tests {
                 non_zero_count: [0; 24],
                 ref_idx: [0; 16],
                 mv: [[0, 0]; 16],
-                ..Default::default()
             },
             MbDeblockInfo {
                 is_intra: true,
@@ -1517,7 +1502,6 @@ mod tests {
                 non_zero_count: [0; 24],
                 ref_idx: [0; 16],
                 mv: [[0, 0]; 16],
-                ..Default::default()
             },
         ];
 
@@ -1570,7 +1554,6 @@ mod tests {
                 non_zero_count: [0; 24],
                 ref_idx: [0; 16],
                 mv: [[0, 0]; 16],
-                ..Default::default()
             },
             MbDeblockInfo {
                 is_intra: true,
@@ -1578,7 +1561,6 @@ mod tests {
                 non_zero_count: [0; 24],
                 ref_idx: [0; 16],
                 mv: [[0, 0]; 16],
-                ..Default::default()
             },
         ];
 
