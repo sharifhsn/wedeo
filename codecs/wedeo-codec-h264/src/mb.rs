@@ -726,7 +726,7 @@ fn decode_inter_mb(
 
             let ref_pic = ref_pics[ref_idx.min(ref_pics.len() - 1)];
             apply_mc_partition(ctx, ref_pic, mb_x, mb_y, 0, 0, 16, 16, mv);
-            if slice_hdr.use_weight {
+            if slice_hdr.use_weight || slice_hdr.use_weight_chroma {
                 apply_weight_p(ctx, slice_hdr, mb_x, mb_y, 0, 0, 16, 16, ref_idx);
             }
 
@@ -779,7 +779,7 @@ fn decode_inter_mb(
 
                 let ref_pic = ref_pics[ref_idx.min(ref_pics.len() - 1)];
                 apply_mc_partition(ctx, ref_pic, mb_x, mb_y, 0, blk_y * 4, 16, 8, mv);
-                if slice_hdr.use_weight {
+                if slice_hdr.use_weight || slice_hdr.use_weight_chroma {
                     apply_weight_p(ctx, slice_hdr, mb_x, mb_y, 0, blk_y * 4, 16, 8, ref_idx);
                 }
 
@@ -826,7 +826,7 @@ fn decode_inter_mb(
 
                 let ref_pic = ref_pics[ref_idx.min(ref_pics.len() - 1)];
                 apply_mc_partition(ctx, ref_pic, mb_x, mb_y, blk_x * 4, 0, 8, 16, mv);
-                if slice_hdr.use_weight {
+                if slice_hdr.use_weight || slice_hdr.use_weight_chroma {
                     apply_weight_p(ctx, slice_hdr, mb_x, mb_y, blk_x * 4, 0, 8, 16, ref_idx);
                 }
 
@@ -905,7 +905,7 @@ fn decode_inter_mb(
                             8,
                             mv,
                         );
-                        if slice_hdr.use_weight {
+                        if slice_hdr.use_weight || slice_hdr.use_weight_chroma {
                             apply_weight_p(
                                 ctx,
                                 slice_hdr,
@@ -980,7 +980,7 @@ fn decode_inter_mb(
                                 4,
                                 mv,
                             );
-                            if slice_hdr.use_weight {
+                            if slice_hdr.use_weight || slice_hdr.use_weight_chroma {
                                 apply_weight_p(
                                     ctx,
                                     slice_hdr,
@@ -1054,7 +1054,7 @@ fn decode_inter_mb(
                                 8,
                                 mv,
                             );
-                            if slice_hdr.use_weight {
+                            if slice_hdr.use_weight || slice_hdr.use_weight_chroma {
                                 apply_weight_p(
                                     ctx,
                                     slice_hdr,
@@ -1123,7 +1123,7 @@ fn decode_inter_mb(
                                 4,
                                 mv,
                             );
-                            if slice_hdr.use_weight {
+                            if slice_hdr.use_weight || slice_hdr.use_weight_chroma {
                                 apply_weight_p(
                                     ctx,
                                     slice_hdr,
@@ -1383,7 +1383,7 @@ pub fn decode_skip_mb(
 
         // Apply motion compensation from ref_pics[0]
         apply_mc_partition(ctx, ref_pics[0], mb_x, mb_y, 0, 0, 16, 16, mv);
-        if slice_hdr.use_weight {
+        if slice_hdr.use_weight || slice_hdr.use_weight_chroma {
             apply_weight_p(ctx, slice_hdr, mb_x, mb_y, 0, 0, 16, 16, 0);
         }
 
@@ -2239,14 +2239,19 @@ fn pred_temporal_direct(
     };
 
     if ctx.direct_8x8_inference_flag {
-        // Per-8x8 block
-        const CORNERS: [usize; 4] = [0, 2, 8, 10];
+        // Per-8x8 block: ref uses 8x8 grid positions (top-left of each 8x8),
+        // MV uses FFmpeg's x8*3 + y8*3*4 positions matching h264_direct.c
+        const REF_POS: [usize; 4] = [0, 2, 8, 10];
+        const MV_POS: [usize; 4] = [0, 3, 12, 15];
         const FILL: [[usize; 4]; 4] =
             [[0, 1, 4, 5], [2, 3, 6, 7], [8, 9, 12, 13], [10, 11, 14, 15]];
 
         for i8x8 in 0..4 {
-            let col_blk = blk_base + CORNERS[i8x8];
-            let col_ref_idx = ctx.col_ref.get(col_blk).copied().unwrap_or(-1);
+            let col_ref_idx = ctx
+                .col_ref
+                .get(blk_base + REF_POS[i8x8])
+                .copied()
+                .unwrap_or(-1);
             if col_ref_idx < 0 {
                 // Intra sub-block: zero MV, ref 0
                 for &blk in &FILL[i8x8] {
@@ -2272,7 +2277,11 @@ fn pred_temporal_direct(
             let l0_ref_poc = ctx.cur_l0_ref_poc.get(l0_ref).copied().unwrap_or(0);
             let scale = compute_scale(l0_ref_poc, col_ref_poc_val);
 
-            let col_mv = ctx.col_mv.get(col_blk).copied().unwrap_or([0, 0]);
+            let col_mv = ctx
+                .col_mv
+                .get(blk_base + MV_POS[i8x8])
+                .copied()
+                .unwrap_or([0, 0]);
             let mv_l0 = [
                 ((scale * col_mv[0] as i32 + 128) >> 8) as i16,
                 ((scale * col_mv[1] as i32 + 128) >> 8) as i16,
@@ -2338,8 +2347,8 @@ fn apply_weight_p(
     let lx = (mb_x * 16 + px_x) as usize;
     let ly = (mb_y * 16 + px_y) as usize;
 
-    // Luma
-    if ref_idx < hdr.luma_weight_l0.len() {
+    // Luma (skip when only chroma weights are active)
+    if hdr.use_weight && ref_idx < hdr.luma_weight_l0.len() {
         let (w, o) = hdr.luma_weight_l0[ref_idx];
         apply_weight_uni(
             &mut ctx.pic.y,
