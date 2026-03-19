@@ -95,6 +95,9 @@ pub struct H264Decoder {
     prev_frame_num_h264: u32,
     /// True once a B-slice has been seen (enables POC reordering).
     has_b_frames: bool,
+    /// Crop offsets in pixels from the active SPS.
+    crop_left: u32,
+    crop_top: u32,
     /// Output frame counter for sequential PTS assignment during reordering.
     output_frame_counter: i64,
     /// Pending frames awaiting POC-ordered output (keyed by POC).
@@ -146,6 +149,8 @@ impl H264Decoder {
             prev_frame_num_offset: 0,
             prev_frame_num_h264: 0,
             has_b_frames: false,
+            crop_left: 0,
+            crop_top: 0,
             output_frame_counter: 0,
             pending_output: BTreeMap::new(),
             delayed_frame: None,
@@ -352,6 +357,8 @@ impl H264Decoder {
             self.width = w;
             self.height = h;
         }
+        self.crop_left = sps.crop_left;
+        self.crop_top = sps.crop_top;
     }
 
     /// Process a single NAL unit.
@@ -941,29 +948,33 @@ impl H264Decoder {
             );
         }
 
-        // Convert PictureBuffer to Frame.
+        // Convert PictureBuffer to Frame, applying SPS crop offsets.
         let width = self.width as usize;
         let height = self.height as usize;
         let chroma_width = width / 2;
         let chroma_height = height / 2;
+        let crop_x = self.crop_left as usize;
+        let crop_y = self.crop_top as usize;
+        let chroma_crop_x = crop_x / 2;
+        let chroma_crop_y = crop_y / 2;
 
         let mut y_data = Vec::with_capacity(width * height);
         for row in 0..height {
-            let src_start = row * fdc.pic.y_stride;
+            let src_start = (crop_y + row) * fdc.pic.y_stride + crop_x;
             y_data.extend_from_slice(&fdc.pic.y[src_start..src_start + width]);
         }
         let y_buf = Buffer::from_slice(&y_data);
 
         let mut u_data = Vec::with_capacity(chroma_width * chroma_height);
         for row in 0..chroma_height {
-            let src_start = row * fdc.pic.uv_stride;
+            let src_start = (chroma_crop_y + row) * fdc.pic.uv_stride + chroma_crop_x;
             u_data.extend_from_slice(&fdc.pic.u[src_start..src_start + chroma_width]);
         }
         let u_buf = Buffer::from_slice(&u_data);
 
         let mut v_data = Vec::with_capacity(chroma_width * chroma_height);
         for row in 0..chroma_height {
-            let src_start = row * fdc.pic.uv_stride;
+            let src_start = (chroma_crop_y + row) * fdc.pic.uv_stride + chroma_crop_x;
             v_data.extend_from_slice(&fdc.pic.v[src_start..src_start + chroma_width]);
         }
         let v_buf = Buffer::from_slice(&v_data);
