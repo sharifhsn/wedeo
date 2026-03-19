@@ -406,15 +406,17 @@ fn filter_strong_chroma(
 }
 
 // ---------------------------------------------------------------------------
-// Edge filtering functions — luma vertical
+// Edge filtering functions — luma (vertical and horizontal)
 // ---------------------------------------------------------------------------
 
-/// Filter a vertical luma edge (4 pixel pairs tall).
+/// Filter a luma edge (vertical or horizontal), spanning 4 pixel pairs.
 ///
+/// `is_vertical`: true = vertical edge (filter across columns), false = horizontal (filter across rows).
 /// `edge`: 0 = MB boundary, 1..3 = internal edges.
 /// `bs`: boundary strength for each of the 4 pixel pairs along the edge.
 #[allow(clippy::too_many_arguments)] // edge filtering requires position, bS, QP, and offsets
-fn filter_mb_edge_luma_v(
+fn filter_mb_edge_luma(
+    is_vertical: bool,
     pic: &mut PictureBuffer,
     mb_x: u32,
     mb_y: u32,
@@ -429,9 +431,13 @@ fn filter_mb_edge_luma_v(
         return;
     }
 
-    let x_base = mb_x as usize * 16 + edge * 4;
-    let y_base = mb_y as usize * 16;
     let stride = pic.y_stride;
+    // For vertical edges the fixed coordinate is x; for horizontal it is y.
+    let (x_base, y_base) = if is_vertical {
+        (mb_x as usize * 16 + edge * 4, mb_y as usize * 16)
+    } else {
+        (mb_x as usize * 16, mb_y as usize * 16 + edge * 4)
+    };
 
     for i in 0..4u8 {
         let cur_bs = bs[i as usize];
@@ -440,113 +446,45 @@ fn filter_mb_edge_luma_v(
         }
 
         for d in 0..4usize {
-            let y = y_base + i as usize * 4 + d;
-            let x = x_base;
-            let off = y * stride + x;
+            // Walk along the edge: for vertical, y varies; for horizontal, x varies.
+            let off = if is_vertical {
+                (y_base + i as usize * 4 + d) * stride + x_base
+            } else {
+                y_base * stride + x_base + i as usize * 4 + d
+            };
 
-            let p0 = pic.y[off - 1] as i32;
-            let p1 = pic.y[off - 2] as i32;
-            let p2 = pic.y[off - 3] as i32;
+            // Step size across the edge boundary.
+            let step = if is_vertical { 1 } else { stride };
+
+            let p0 = pic.y[off - step] as i32;
+            let p1 = pic.y[off - 2 * step] as i32;
+            let p2 = pic.y[off - 3 * step] as i32;
             let q0 = pic.y[off] as i32;
-            let q1 = pic.y[off + 1] as i32;
-            let q2 = pic.y[off + 2] as i32;
+            let q1 = pic.y[off + step] as i32;
+            let q2 = pic.y[off + 2 * step] as i32;
 
             if cur_bs < 4 {
                 let tc0 = get_tc0(qp, alpha_offset, cur_bs);
                 if let Some((new_p0, new_p1, new_q0, new_q1)) =
                     filter_normal_luma(p0, p1, p2, q0, q1, q2, alpha, beta, tc0)
                 {
-                    pic.y[off - 1] = new_p0;
-                    pic.y[off - 2] = new_p1;
+                    pic.y[off - step] = new_p0;
+                    pic.y[off - 2 * step] = new_p1;
                     pic.y[off] = new_q0;
-                    pic.y[off + 1] = new_q1;
+                    pic.y[off + step] = new_q1;
                 }
             } else {
-                let p3 = pic.y[off - 4] as i32;
-                let q3 = pic.y[off + 3] as i32;
+                let p3 = pic.y[off - 4 * step] as i32;
+                let q3 = pic.y[off + 3 * step] as i32;
                 if let Some((new_p0, new_p1, new_p2, new_q0, new_q1, new_q2)) =
                     filter_strong_luma(p0, p1, p2, p3, q0, q1, q2, q3, alpha, beta)
                 {
-                    pic.y[off - 1] = new_p0;
-                    pic.y[off - 2] = new_p1;
-                    pic.y[off - 3] = new_p2;
+                    pic.y[off - step] = new_p0;
+                    pic.y[off - 2 * step] = new_p1;
+                    pic.y[off - 3 * step] = new_p2;
                     pic.y[off] = new_q0;
-                    pic.y[off + 1] = new_q1;
-                    pic.y[off + 2] = new_q2;
-                }
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Edge filtering functions — luma horizontal
-// ---------------------------------------------------------------------------
-
-/// Filter a horizontal luma edge (4 pixel pairs wide).
-///
-/// `edge`: 0 = MB boundary, 1..3 = internal edges.
-/// `bs`: boundary strength for each of the 4 pixel pairs along the edge.
-#[allow(clippy::too_many_arguments)] // edge filtering requires position, bS, QP, and offsets
-fn filter_mb_edge_luma_h(
-    pic: &mut PictureBuffer,
-    mb_x: u32,
-    mb_y: u32,
-    edge: usize,
-    bs: [u8; 4],
-    qp: u8,
-    alpha_offset: i32,
-    beta_offset: i32,
-) {
-    let (alpha, beta) = get_thresholds(qp, alpha_offset, beta_offset);
-    if alpha == 0 || beta == 0 {
-        return;
-    }
-
-    let x_base = mb_x as usize * 16;
-    let y_base = mb_y as usize * 16 + edge * 4;
-    let stride = pic.y_stride;
-
-    for i in 0..4u8 {
-        let cur_bs = bs[i as usize];
-        if cur_bs == 0 {
-            continue;
-        }
-
-        for d in 0..4usize {
-            let x = x_base + i as usize * 4 + d;
-            let y = y_base;
-            let off = y * stride + x;
-
-            let p0 = pic.y[off - stride] as i32;
-            let p1 = pic.y[off - 2 * stride] as i32;
-            let p2 = pic.y[off - 3 * stride] as i32;
-            let q0 = pic.y[off] as i32;
-            let q1 = pic.y[off + stride] as i32;
-            let q2 = pic.y[off + 2 * stride] as i32;
-
-            if cur_bs < 4 {
-                let tc0 = get_tc0(qp, alpha_offset, cur_bs);
-                if let Some((new_p0, new_p1, new_q0, new_q1)) =
-                    filter_normal_luma(p0, p1, p2, q0, q1, q2, alpha, beta, tc0)
-                {
-                    pic.y[off - stride] = new_p0;
-                    pic.y[off - 2 * stride] = new_p1;
-                    pic.y[off] = new_q0;
-                    pic.y[off + stride] = new_q1;
-                }
-            } else {
-                let p3 = pic.y[off - 4 * stride] as i32;
-                let q3 = pic.y[off + 3 * stride] as i32;
-                if let Some((new_p0, new_p1, new_p2, new_q0, new_q1, new_q2)) =
-                    filter_strong_luma(p0, p1, p2, p3, q0, q1, q2, q3, alpha, beta)
-                {
-                    pic.y[off - stride] = new_p0;
-                    pic.y[off - 2 * stride] = new_p1;
-                    pic.y[off - 3 * stride] = new_p2;
-                    pic.y[off] = new_q0;
-                    pic.y[off + stride] = new_q1;
-                    pic.y[off + 2 * stride] = new_q2;
+                    pic.y[off + step] = new_q1;
+                    pic.y[off + 2 * step] = new_q2;
                 }
             }
         }
@@ -793,7 +731,8 @@ fn deblock_mb(
         } else {
             cur_qp
         };
-        filter_mb_edge_luma_v(
+        filter_mb_edge_luma(
+            true,
             pic,
             mb_x,
             mb_y,
@@ -817,7 +756,8 @@ fn deblock_mb(
         } else {
             cur_qp
         };
-        filter_mb_edge_luma_h(
+        filter_mb_edge_luma(
+            false,
             pic,
             mb_x,
             mb_y,
