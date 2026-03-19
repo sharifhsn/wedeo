@@ -22,6 +22,23 @@ use crate::sps::Sps;
 use crate::tables::CHROMA_QP_TABLE;
 
 // ---------------------------------------------------------------------------
+// Deblocking helper
+// ---------------------------------------------------------------------------
+
+/// Map a raw ref_idx to a canonical picture ID using the reference picture list.
+/// Returns the picture buffer's pointer address as i64, or -1 if unused.
+/// This ensures cross-list comparisons (L0 vs L1) correctly identify same-picture.
+fn ref_pic_id_from_list(ref_idx: i8, ref_pics: &[&PictureBuffer]) -> i64 {
+    if ref_idx < 0 {
+        return -1;
+    }
+    match ref_pics.get(ref_idx as usize) {
+        Some(pic) => *pic as *const PictureBuffer as i64,
+        None => -1,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Block scanning order
 // ---------------------------------------------------------------------------
 
@@ -80,11 +97,19 @@ pub struct FrameDecodeContext {
     pub slice_table: Vec<u16>,
     /// Current slice number (incremented per slice within a frame).
     pub current_slice: u16,
+    /// Colocated L0 motion vectors from L1[0] reference frame (for spatial direct).
+    pub col_mv: Vec<[i16; 2]>,
+    /// Colocated L0 reference indices from L1[0] reference frame.
+    pub col_ref: Vec<i8>,
+    /// Per-MB intra flag from L1[0] reference frame.
+    pub col_mb_intra: Vec<bool>,
+    /// PPS constrained_intra_pred flag: inter neighbor pixels unavailable for intra prediction.
+    pub constrained_intra_pred: bool,
 }
 
 impl FrameDecodeContext {
     /// Create a new frame decode context for the given SPS and PPS.
-    pub fn new(sps: &Sps, _pps: &Pps) -> Self {
+    pub fn new(sps: &Sps, pps: &Pps) -> Self {
         let mb_width = sps.mb_width;
         let mb_height = sps.mb_height;
         let width = mb_width * 16;
@@ -118,6 +143,10 @@ impl FrameDecodeContext {
             mv_ctx: MvContext::new(mb_width, mb_height),
             slice_table: vec![u16::MAX; total_mbs],
             current_slice: 0,
+            col_mv: Vec::new(),
+            col_ref: Vec::new(),
+            col_mb_intra: Vec::new(),
+            constrained_intra_pred: pps.constrained_intra_pred,
         }
     }
 }
@@ -437,14 +466,12 @@ pub fn decode_macroblock(
     )?;
 
     // 2. Update QP with mb_qp_delta
-    if mb.mb_qp_delta != 0 || mb.is_pcm {
-        if mb.is_pcm {
-            ctx.qp = 0;
-        } else {
-            ctx.qp = ((ctx.qp as i32 + mb.mb_qp_delta).rem_euclid(52)) as u8;
-        }
+    // I_PCM: QP=0 for deblocking table, but running QP stays unchanged
+    // (FFmpeg h264_cavlc.c: sl->qscale is NOT modified for I_PCM).
+    if mb.mb_qp_delta != 0 {
+        ctx.qp = ((ctx.qp as i32 + mb.mb_qp_delta).rem_euclid(52)) as u8;
     }
-    let qp = ctx.qp;
+    let qp = if mb.is_pcm { 0 } else { ctx.qp };
 
     // Compute chroma QP
     let chroma_qp_idx = (qp as i32 + pps.chroma_qp_index_offset[0]).clamp(0, 51) as usize;
@@ -453,8 +480,19 @@ pub fn decode_macroblock(
     // Check neighbor availability with slice boundary awareness.
     // H.264 spec: neighbors from different slices are unavailable.
     let cur_slice = ctx.current_slice;
-    let has_top = mb_y > 0 && ctx.slice_table[mb_idx - ctx.mb_width as usize] == cur_slice;
-    let has_left = mb_x > 0 && ctx.slice_table[mb_idx - 1] == cur_slice;
+    let mut has_top = mb_y > 0 && ctx.slice_table[mb_idx - ctx.mb_width as usize] == cur_slice;
+    let mut has_left = mb_x > 0 && ctx.slice_table[mb_idx - 1] == cur_slice;
+
+    // Constrained intra prediction: inter neighbor pixels are unavailable
+    // for intra prediction (H.264 spec, FFmpeg h264_mvpred.h:598).
+    if ctx.constrained_intra_pred && (mb.is_intra4x4 || mb.is_intra16x16 || mb.is_pcm) {
+        if has_top && !ctx.mb_info[mb_idx - ctx.mb_width as usize].is_intra {
+            has_top = false;
+        }
+        if has_left && !ctx.mb_info[mb_idx - 1].is_intra {
+            has_left = false;
+        }
+    }
 
     trace!(
         mb_x,
@@ -538,6 +576,8 @@ pub fn decode_macroblock(
             *mode = mb.intra4x4_pred_mode[i] as i8;
         }
         modes
+    } else if ctx.constrained_intra_pred && !mb.is_intra {
+        [-1i8; 16] // unavailable for constrained intra prediction
     } else {
         [2i8; 16] // DC_PRED for I_16x16, I_PCM, and inter MBs
     };
@@ -548,18 +588,31 @@ pub fn decode_macroblock(
 
     // 7. Store MbDeblockInfo for the deblocking filter
     let mb_idx_base = mb_idx * 16;
-    let mut deblock_ref = [-1i8; 16];
     let mut deblock_mv = [[0i16; 2]; 16];
+    let mut deblock_mv_l1 = [[0i16; 2]; 16];
+    let mut deblock_pic_id = [-1i64; 16];
+    let mut deblock_pic_id_l1 = [-1i64; 16];
     if !mb.is_intra && mb_idx_base + 16 <= ctx.mv_ctx.mv.len() {
-        deblock_ref.copy_from_slice(&ctx.mv_ctx.ref_idx[mb_idx_base..mb_idx_base + 16]);
         deblock_mv.copy_from_slice(&ctx.mv_ctx.mv[mb_idx_base..mb_idx_base + 16]);
+        deblock_mv_l1.copy_from_slice(&ctx.mv_ctx.mv_l1[mb_idx_base..mb_idx_base + 16]);
+        // Map raw ref_idx to canonical picture IDs (pointer identity)
+        for blk in 0..16 {
+            let r0 = ctx.mv_ctx.ref_idx[mb_idx_base + blk];
+            deblock_pic_id[blk] = ref_pic_id_from_list(r0, ref_pics);
+            let r1 = ctx.mv_ctx.ref_idx_l1[mb_idx_base + blk];
+            deblock_pic_id_l1[blk] = ref_pic_id_from_list(r1, ref_pics_l1);
+        }
     }
+    let list_count = if slice_hdr.slice_type.is_b() { 2 } else { 1 };
     ctx.mb_info[mb_idx] = MbDeblockInfo {
         is_intra: mb.is_intra,
         qp,
         non_zero_count: mb.non_zero_count,
-        ref_idx: deblock_ref,
+        ref_pic_id: deblock_pic_id,
         mv: deblock_mv,
+        ref_pic_id_l1: deblock_pic_id_l1,
+        mv_l1: deblock_mv_l1,
+        list_count,
     };
 
     Ok(())
@@ -1254,24 +1307,33 @@ pub fn decode_skip_mb(
     let mb_idx = (mb_y * ctx.mb_width + mb_x) as usize;
     ctx.slice_table[mb_idx] = ctx.current_slice;
     let nz = [0u8; 24];
-    let modes = [2i8; 16]; // DC_PRED for inter MBs
+    // Skip MBs are inter: use -1 (unavailable) when constrained_intra_pred
+    let modes = if ctx.constrained_intra_pred {
+        [-1i8; 16]
+    } else {
+        [2i8; 16]
+    };
     ctx.neighbor_ctx.update_after_mb(mb_x, &nz, &modes);
     ctx.neighbor_ctx.left_available = true;
 
-    // Store deblocking info
+    // Store deblocking info (P_SKIP: only L0, list_count=1)
     let mb_idx_base = mb_idx * 16;
-    let mut deblock_ref = [-1i8; 16];
     let mut deblock_mv = [[0i16; 2]; 16];
+    let mut deblock_pic_id = [-1i64; 16];
     if mb_idx_base + 16 <= ctx.mv_ctx.mv.len() {
-        deblock_ref.copy_from_slice(&ctx.mv_ctx.ref_idx[mb_idx_base..mb_idx_base + 16]);
         deblock_mv.copy_from_slice(&ctx.mv_ctx.mv[mb_idx_base..mb_idx_base + 16]);
+        for (blk, pic_id) in deblock_pic_id.iter_mut().enumerate() {
+            let r0 = ctx.mv_ctx.ref_idx[mb_idx_base + blk];
+            *pic_id = ref_pic_id_from_list(r0, ref_pics);
+        }
     }
     ctx.mb_info[mb_idx] = MbDeblockInfo {
         is_intra: false,
         qp: ctx.qp,
         non_zero_count: [0; 24],
-        ref_idx: deblock_ref,
+        ref_pic_id: deblock_pic_id,
         mv: deblock_mv,
+        ..Default::default()
     };
 
     let _ = slice_hdr; // reserved for future use (e.g. weighted prediction)
@@ -1296,43 +1358,51 @@ pub fn decode_b_skip_mb(
             ctx.mv_ctx.set_l1(mb_x, mb_y, blk, [0, 0], 0);
         }
     } else {
-        // Compute spatial direct MVs
-        let (mv_l0, ref_l0, mv_l1, ref_l1) =
-            pred_spatial_direct_16x16(ctx, mb_x, mb_y, ref_pics, ref_pics_l1);
+        // Compute spatial direct MVs per 8x8 block
+        let direct = pred_spatial_direct(ctx, mb_x, mb_y);
+        // 8x8 partition offsets in 4x4-block units and pixel units
+        const PART_8X8: [(u32, u32); 4] = [(0, 0), (2, 0), (0, 2), (2, 2)];
 
-        let use_l0 = ref_l0 >= 0;
-        let use_l1 = ref_l1 >= 0;
+        for (i8, &(bx, by)) in PART_8X8.iter().enumerate() {
+            let (mv_l0, ref_l0, mv_l1, ref_l1) = direct[i8];
+            let use_l0 = ref_l0 >= 0;
+            let use_l1 = ref_l1 >= 0;
+            let px_x = bx * 4;
+            let px_y = by * 4;
 
-        if use_l0 && use_l1 {
-            // Bidirectional MC
-            apply_mc_bi_partition(
-                ctx,
-                ref_pics,
-                ref_pics_l1,
-                mb_x,
-                mb_y,
-                0,
-                0,
-                16,
-                16,
-                mv_l0,
-                ref_l0,
-                mv_l1,
-                ref_l1,
-            );
-        } else if use_l0 {
-            let ref_pic = ref_pics[(ref_l0 as usize).min(ref_pics.len() - 1)];
-            apply_mc_partition(ctx, ref_pic, mb_x, mb_y, 0, 0, 16, 16, mv_l0);
-        } else if use_l1 {
-            let ref_pic = ref_pics_l1[(ref_l1 as usize).min(ref_pics_l1.len() - 1)];
-            apply_mc_partition(ctx, ref_pic, mb_x, mb_y, 0, 0, 16, 16, mv_l1);
-        } else {
-            fill_mb_gray(ctx, mb_x, mb_y);
-        }
+            if use_l0 && use_l1 {
+                apply_mc_bi_partition(
+                    ctx,
+                    ref_pics,
+                    ref_pics_l1,
+                    mb_x,
+                    mb_y,
+                    px_x,
+                    px_y,
+                    8,
+                    8,
+                    mv_l0,
+                    ref_l0,
+                    mv_l1,
+                    ref_l1,
+                );
+            } else if use_l0 {
+                let ref_pic = ref_pics[(ref_l0 as usize).min(ref_pics.len() - 1)];
+                apply_mc_partition(ctx, ref_pic, mb_x, mb_y, px_x, px_y, 8, 8, mv_l0);
+            } else if use_l1 {
+                let ref_pic = ref_pics_l1[(ref_l1 as usize).min(ref_pics_l1.len() - 1)];
+                apply_mc_partition(ctx, ref_pic, mb_x, mb_y, px_x, px_y, 8, 8, mv_l1);
+            }
 
-        for blk in 0..16 {
-            ctx.mv_ctx.set(mb_x, mb_y, blk, mv_l0, ref_l0);
-            ctx.mv_ctx.set_l1(mb_x, mb_y, blk, mv_l1, ref_l1);
+            // Store MV context for this 8x8 block
+            for dy in by..by + 2 {
+                for dx in bx..bx + 2 {
+                    ctx.mv_ctx
+                        .set(mb_x, mb_y, (dx + dy * 4) as usize, mv_l0, ref_l0);
+                    ctx.mv_ctx
+                        .set_l1(mb_x, mb_y, (dx + dy * 4) as usize, mv_l1, ref_l1);
+                }
+            }
         }
     }
 
@@ -1340,24 +1410,40 @@ pub fn decode_b_skip_mb(
     let mb_idx = (mb_y * ctx.mb_width + mb_x) as usize;
     ctx.slice_table[mb_idx] = ctx.current_slice;
     let nz = [0u8; 24];
-    let modes = [2i8; 16];
+    // B_Skip MBs are inter: use -1 (unavailable) when constrained_intra_pred
+    let modes = if ctx.constrained_intra_pred {
+        [-1i8; 16]
+    } else {
+        [2i8; 16]
+    };
     ctx.neighbor_ctx.update_after_mb(mb_x, &nz, &modes);
     ctx.neighbor_ctx.left_available = true;
 
-    // Store deblocking info
+    // Store deblocking info (B_SKIP: always list_count=2)
     let mb_idx_base = mb_idx * 16;
-    let mut deblock_ref = [-1i8; 16];
     let mut deblock_mv = [[0i16; 2]; 16];
+    let mut deblock_mv_l1 = [[0i16; 2]; 16];
+    let mut deblock_pic_id = [-1i64; 16];
+    let mut deblock_pic_id_l1 = [-1i64; 16];
     if mb_idx_base + 16 <= ctx.mv_ctx.mv.len() {
-        deblock_ref.copy_from_slice(&ctx.mv_ctx.ref_idx[mb_idx_base..mb_idx_base + 16]);
         deblock_mv.copy_from_slice(&ctx.mv_ctx.mv[mb_idx_base..mb_idx_base + 16]);
+        deblock_mv_l1.copy_from_slice(&ctx.mv_ctx.mv_l1[mb_idx_base..mb_idx_base + 16]);
+        for blk in 0..16 {
+            let r0 = ctx.mv_ctx.ref_idx[mb_idx_base + blk];
+            deblock_pic_id[blk] = ref_pic_id_from_list(r0, ref_pics);
+            let r1 = ctx.mv_ctx.ref_idx_l1[mb_idx_base + blk];
+            deblock_pic_id_l1[blk] = ref_pic_id_from_list(r1, ref_pics_l1);
+        }
     }
     ctx.mb_info[mb_idx] = MbDeblockInfo {
         is_intra: false,
         qp: ctx.qp,
         non_zero_count: [0; 24],
-        ref_idx: deblock_ref,
+        ref_pic_id: deblock_pic_id,
         mv: deblock_mv,
+        ref_pic_id_l1: deblock_pic_id_l1,
+        mv_l1: deblock_mv_l1,
+        list_count: 2,
     };
 }
 
@@ -1387,45 +1473,55 @@ fn decode_b_inter_mb(
     }
 
     if mb.is_direct {
-        // B_Direct_16x16: spatial direct prediction
-        let (mv_l0, ref_l0, mv_l1, ref_l1) =
-            pred_spatial_direct_16x16(ctx, mb_x, mb_y, ref_pics, ref_pics_l1);
+        // B_Direct_16x16: spatial direct prediction per 8x8 block
+        let direct = pred_spatial_direct(ctx, mb_x, mb_y);
+        const PART_8X8: [(u32, u32); 4] = [(0, 0), (2, 0), (0, 2), (2, 2)];
 
-        let use_l0 = ref_l0 >= 0 && !ref_pics.is_empty();
-        let use_l1 = ref_l1 >= 0 && !ref_pics_l1.is_empty();
+        for (i8, &(bx, by)) in PART_8X8.iter().enumerate() {
+            let (mv_l0, ref_l0, mv_l1, ref_l1) = direct[i8];
+            let use_l0 = ref_l0 >= 0 && !ref_pics.is_empty();
+            let use_l1 = ref_l1 >= 0 && !ref_pics_l1.is_empty();
+            let px_x = bx * 4;
+            let px_y = by * 4;
 
-        if use_l0 && use_l1 {
-            apply_mc_bi_partition(
-                ctx,
-                ref_pics,
-                ref_pics_l1,
-                mb_x,
-                mb_y,
-                0,
-                0,
-                16,
-                16,
-                mv_l0,
-                ref_l0,
-                mv_l1,
-                ref_l1,
-            );
-        } else if use_l0 {
-            let ref_pic = ref_pics[(ref_l0 as usize).min(ref_pics.len() - 1)];
-            apply_mc_partition(ctx, ref_pic, mb_x, mb_y, 0, 0, 16, 16, mv_l0);
-        } else if use_l1 {
-            let ref_pic = ref_pics_l1[(ref_l1 as usize).min(ref_pics_l1.len() - 1)];
-            apply_mc_partition(ctx, ref_pic, mb_x, mb_y, 0, 0, 16, 16, mv_l1);
-        } else {
-            fill_mb_gray(ctx, mb_x, mb_y);
+            if use_l0 && use_l1 {
+                apply_mc_bi_partition(
+                    ctx,
+                    ref_pics,
+                    ref_pics_l1,
+                    mb_x,
+                    mb_y,
+                    px_x,
+                    px_y,
+                    8,
+                    8,
+                    mv_l0,
+                    ref_l0,
+                    mv_l1,
+                    ref_l1,
+                );
+            } else if use_l0 {
+                let ref_pic = ref_pics[(ref_l0 as usize).min(ref_pics.len() - 1)];
+                apply_mc_partition(ctx, ref_pic, mb_x, mb_y, px_x, px_y, 8, 8, mv_l0);
+            } else if use_l1 {
+                let ref_pic = ref_pics_l1[(ref_l1 as usize).min(ref_pics_l1.len() - 1)];
+                apply_mc_partition(ctx, ref_pic, mb_x, mb_y, px_x, px_y, 8, 8, mv_l1);
+            }
+
+            for dy in by..by + 2 {
+                for dx in bx..bx + 2 {
+                    ctx.mv_ctx
+                        .set(mb_x, mb_y, (dx + dy * 4) as usize, mv_l0, ref_l0);
+                    ctx.mv_ctx
+                        .set_l1(mb_x, mb_y, (dx + dy * 4) as usize, mv_l1, ref_l1);
+                }
+            }
         }
-
-        for blk in 0..16 {
-            ctx.mv_ctx.set(mb_x, mb_y, blk, mv_l0, ref_l0);
-            ctx.mv_ctx.set_l1(mb_x, mb_y, blk, mv_l1, ref_l1);
-        }
+    } else if mb.mb_type == 22 {
+        // B_8x8: per-8x8-partition decode with sub_mb_type
+        decode_b_8x8_mb(ctx, mb, mb_x, mb_y, ref_pics, ref_pics_l1);
     } else {
-        // Non-direct B-frame partitions
+        // Non-direct B-frame partitions (16x16, 16x8, 8x16)
         let part_size = mb.b_part_size;
         let part_count = mb.partition_count.min(2) as usize;
 
@@ -1607,6 +1703,232 @@ fn decode_b_inter_mb(
     add_b_residual(ctx, mb, mb_x, mb_y, qp, chroma_qp);
 }
 
+/// Decode a B_8x8 macroblock: each 8x8 partition has its own sub_mb_type.
+///
+/// Sub-partition types: B_Direct_8x8 (0) uses spatial direct prediction;
+/// B_L0_8x8 (1), B_L1_8x8 (2), B_Bi_8x8 (3) use explicit MC;
+/// Sub-types 4-12 have smaller sub-partitions (8x4, 4x8, 4x4) but are
+/// handled as 8x8 with the first sub-partition's MV for simplicity.
+///
+/// Reference: FFmpeg h264_mb.c hl_decode_mb_predict_luma B_8x8 path
+#[allow(clippy::too_many_arguments)]
+fn decode_b_8x8_mb(
+    ctx: &mut FrameDecodeContext,
+    mb: &mut MacroblockCavlc,
+    mb_x: u32,
+    mb_y: u32,
+    ref_pics: &[&PictureBuffer],
+    ref_pics_l1: &[&PictureBuffer],
+) {
+    use crate::tables::B_SUB_MB_TYPE_INFO;
+
+    // 8x8 partition layout: [0]=(0,0), [1]=(2,0), [2]=(0,2), [3]=(2,2) in 4x4-block units
+    const PART_XY: [(u32, u32); 4] = [(0, 0), (2, 0), (0, 2), (2, 2)];
+
+    // Pre-compute spatial direct for all 4 8x8 blocks (needed if any sub_mb_type==0).
+    // Neighbor computation is MB-level so results are valid for all partitions.
+    let has_direct = mb.sub_mb_type.contains(&0);
+    let direct = if has_direct {
+        Some(pred_spatial_direct(ctx, mb_x, mb_y))
+    } else {
+        None
+    };
+
+    for (part, &(blk_x, blk_y)) in PART_XY.iter().enumerate() {
+        let sub_type = mb.sub_mb_type[part];
+
+        if sub_type == 0 {
+            // B_Direct_8x8: use per-8x8 spatial direct result
+            let (mv_l0, ref_l0, mv_l1, ref_l1) = direct.unwrap()[part];
+
+            let use_l0 = ref_l0 >= 0 && !ref_pics.is_empty();
+            let use_l1 = ref_l1 >= 0 && !ref_pics_l1.is_empty();
+
+            let px_x = blk_x * 4;
+            let px_y = blk_y * 4;
+
+            if use_l0 && use_l1 {
+                apply_mc_bi_partition(
+                    ctx,
+                    ref_pics,
+                    ref_pics_l1,
+                    mb_x,
+                    mb_y,
+                    px_x,
+                    px_y,
+                    8,
+                    8,
+                    mv_l0,
+                    ref_l0,
+                    mv_l1,
+                    ref_l1,
+                );
+            } else if use_l0 {
+                let ref_pic = ref_pics[(ref_l0 as usize).min(ref_pics.len() - 1)];
+                apply_mc_partition(ctx, ref_pic, mb_x, mb_y, px_x, px_y, 8, 8, mv_l0);
+            } else if use_l1 {
+                let ref_pic = ref_pics_l1[(ref_l1 as usize).min(ref_pics_l1.len() - 1)];
+                apply_mc_partition(ctx, ref_pic, mb_x, mb_y, px_x, px_y, 8, 8, mv_l1);
+            }
+
+            // Store MV context for the 8x8 block
+            for by in blk_y..blk_y + 2 {
+                for bx in blk_x..blk_x + 2 {
+                    ctx.mv_ctx
+                        .set(mb_x, mb_y, (bx + by * 4) as usize, mv_l0, ref_l0);
+                    ctx.mv_ctx
+                        .set_l1(mb_x, mb_y, (bx + by * 4) as usize, mv_l1, ref_l1);
+                }
+            }
+        } else {
+            // Non-direct 8x8 sub-partition with per-sub-partition MC.
+            // Sub-partition layout: 0→8x8, 1→8x4, 2→4x8, 3→4x4
+            let info = &B_SUB_MB_TYPE_INFO[sub_type as usize];
+            let sub_count = info.0 as usize;
+            let part_size = info.1;
+            let uses_l0 = info.2;
+            let uses_l1 = info.3;
+            let ref_l0 = if uses_l0 {
+                mb.ref_idx_l0[part].max(0)
+            } else {
+                -1
+            };
+            let ref_l1 = if uses_l1 {
+                mb.ref_idx_l1[part].max(0)
+            } else {
+                -1
+            };
+
+            // Sub-partition geometry: (dx, dy, w, h) in 4x4-block units
+            let sub_parts: &[(u32, u32, u32, u32)] = match part_size {
+                1 => &[(0, 0, 2, 1), (0, 1, 2, 1)], // 8x4
+                2 => &[(0, 0, 1, 2), (1, 0, 1, 2)], // 4x8
+                3 => &[(0, 0, 1, 1), (1, 0, 1, 1), (0, 1, 1, 1), (1, 1, 1, 1)], // 4x4
+                _ => &[(0, 0, 2, 2)],               // 8x8
+            };
+
+            for (j, &(sdx, sdy, sw, sh)) in sub_parts.iter().enumerate().take(sub_count) {
+                let sub_blk_x = blk_x + sdx;
+                let sub_blk_y = blk_y + sdy;
+                let pw = (sw * 4) as usize;
+                let ph = (sh * 4) as usize;
+                let mvd_idx = part * 4 + j;
+
+                // Compute L0 MV
+                let mv_l0 = if uses_l0 {
+                    let n = ctx.mv_ctx.get_neighbors_slice(
+                        mb_x,
+                        mb_y,
+                        sub_blk_x,
+                        sub_blk_y,
+                        sw,
+                        Some(&ctx.slice_table),
+                        ctx.current_slice,
+                    );
+                    let mvp = mvpred::predict_mv(
+                        n.mv_a, n.mv_b, n.mv_c, n.ref_a, n.ref_b, n.ref_c, ref_l0, n.a_avail,
+                        n.b_avail, n.c_avail,
+                    );
+                    [
+                        mvp[0].wrapping_add(mb.mvd_l0[mvd_idx][0]),
+                        mvp[1].wrapping_add(mb.mvd_l0[mvd_idx][1]),
+                    ]
+                } else {
+                    [0, 0]
+                };
+
+                // Store L0 context
+                for by in sub_blk_y..sub_blk_y + sh {
+                    for bx in sub_blk_x..sub_blk_x + sw {
+                        ctx.mv_ctx
+                            .set(mb_x, mb_y, (bx + by * 4) as usize, mv_l0, ref_l0);
+                    }
+                }
+
+                // Compute L1 MV
+                let mv_l1 = if uses_l1 {
+                    let n = ctx.mv_ctx.get_neighbors_list(
+                        mb_x,
+                        mb_y,
+                        sub_blk_x,
+                        sub_blk_y,
+                        sw,
+                        Some(&ctx.slice_table),
+                        ctx.current_slice,
+                        1,
+                    );
+                    let mvp = mvpred::predict_mv(
+                        n.mv_a, n.mv_b, n.mv_c, n.ref_a, n.ref_b, n.ref_c, ref_l1, n.a_avail,
+                        n.b_avail, n.c_avail,
+                    );
+                    [
+                        mvp[0].wrapping_add(mb.mvd_l1[mvd_idx][0]),
+                        mvp[1].wrapping_add(mb.mvd_l1[mvd_idx][1]),
+                    ]
+                } else {
+                    [0, 0]
+                };
+
+                // Store L1 context
+                for by in sub_blk_y..sub_blk_y + sh {
+                    for bx in sub_blk_x..sub_blk_x + sw {
+                        ctx.mv_ctx
+                            .set_l1(mb_x, mb_y, (bx + by * 4) as usize, mv_l1, ref_l1);
+                    }
+                }
+
+                trace!(
+                    mb_x,
+                    mb_y,
+                    part,
+                    j,
+                    sub_type,
+                    sub_blk_x,
+                    sub_blk_y,
+                    mv_l0_x = mv_l0[0],
+                    mv_l0_y = mv_l0[1],
+                    ref_l0,
+                    mv_l1_x = mv_l1[0],
+                    mv_l1_y = mv_l1[1],
+                    ref_l1,
+                    mvd_l0_x = mb.mvd_l0[mvd_idx][0],
+                    mvd_l0_y = mb.mvd_l0[mvd_idx][1],
+                    mvd_l1_x = mb.mvd_l1[mvd_idx][0],
+                    mvd_l1_y = mb.mvd_l1[mvd_idx][1],
+                    "B_8x8 sub-partition MV"
+                );
+
+                // Apply MC at sub-partition size
+                let px_x = sub_blk_x * 4;
+                let px_y = sub_blk_y * 4;
+                if uses_l0 && uses_l1 && !ref_pics.is_empty() && !ref_pics_l1.is_empty() {
+                    apply_mc_bi_partition(
+                        ctx,
+                        ref_pics,
+                        ref_pics_l1,
+                        mb_x,
+                        mb_y,
+                        px_x,
+                        px_y,
+                        pw,
+                        ph,
+                        mv_l0,
+                        ref_l0,
+                        mv_l1,
+                        ref_l1,
+                    );
+                } else if uses_l0 && !ref_pics.is_empty() {
+                    let ref_pic = ref_pics[(ref_l0 as usize).min(ref_pics.len() - 1)];
+                    apply_mc_partition(ctx, ref_pic, mb_x, mb_y, px_x, px_y, pw, ph, mv_l0);
+                } else if uses_l1 && !ref_pics_l1.is_empty() {
+                    let ref_pic = ref_pics_l1[(ref_l1 as usize).min(ref_pics_l1.len() - 1)];
+                    apply_mc_partition(ctx, ref_pic, mb_x, mb_y, px_x, px_y, pw, ph, mv_l1);
+                }
+            }
+        }
+    }
+}
+
 /// Add residual coefficients on top of B-frame MC prediction.
 #[allow(clippy::too_many_arguments)]
 fn add_b_residual(
@@ -1636,66 +1958,125 @@ fn add_b_residual(
     decode_chroma_inter(ctx, mb, mb_x, mb_y, chroma_qp);
 }
 
-/// Spatial direct prediction for a 16x16 B-frame macroblock.
+/// Spatial direct prediction for a B-frame macroblock, returning per-8x8-block results.
 ///
 /// Derives L0 and L1 MVs from neighbors per H.264 spec 8.4.1.2.3.
-/// Returns (mv_l0, ref_l0, mv_l1, ref_l1).
+/// Returns 4 tuples (mv_l0, ref_l0, mv_l1, ref_l1), one per 8x8 partition:
+/// [0]=top-left, [1]=top-right, [2]=bottom-left, [3]=bottom-right.
 ///
-/// Reference: FFmpeg h264_direct.c:pred_spatial_direct_motion
-fn pred_spatial_direct_16x16(
+/// The col_zero_flag optimization is applied per-8x8-block, checking the
+/// colocated reference frame's L0 ref_idx and MV at the corner of each 8x8.
+///
+/// Reference: FFmpeg h264_direct.c:pred_spatial_direct_motion (lines 199-484)
+fn pred_spatial_direct(
     ctx: &FrameDecodeContext,
     mb_x: u32,
     mb_y: u32,
-    _ref_pics: &[&PictureBuffer],
-    _ref_pics_l1: &[&PictureBuffer],
-) -> ([i16; 2], i8, [i16; 2], i8) {
-    // Get neighbor info for L0
-    let n = ctx.mv_ctx.get_neighbors_slice(
-        mb_x,
-        mb_y,
-        0,
-        0,
-        4,
-        Some(&ctx.slice_table),
-        ctx.current_slice,
-    );
+) -> [([i16; 2], i8, [i16; 2], i8); 4] {
+    let mut ref_idx = [-1i8; 2];
+    let mut mv = [[0i16; 2]; 2];
 
-    // For each list: ref = min(ref_a, ref_b, ref_c) treating negative as unavailable
-    // Use unsigned comparison: treat -1 as u8::MAX so it loses in min()
-    let ref_a_u = if n.a_avail { n.ref_a as u8 } else { u8::MAX };
-    let ref_b_u = if n.b_avail { n.ref_b as u8 } else { u8::MAX };
-    let ref_c_u = if n.c_avail { n.ref_c as u8 } else { u8::MAX };
+    // For each list: ref = min(left_ref, top_ref, topright_ref) using unsigned comparison.
+    // If ref >= 0, compute MV via median prediction matching the selected ref.
+    // Reference: FFmpeg h264_direct.c lines 224-267
+    for list in 0..2u8 {
+        let n = ctx.mv_ctx.get_neighbors_list(
+            mb_x,
+            mb_y,
+            0,
+            0,
+            4,
+            Some(&ctx.slice_table),
+            ctx.current_slice,
+            list,
+        );
 
-    let min_ref_u = ref_a_u.min(ref_b_u).min(ref_c_u);
-    let ref_l0 = if min_ref_u == u8::MAX {
-        -1i8
-    } else {
-        min_ref_u as i8
-    };
+        let ref_a_u = if n.a_avail { n.ref_a as u8 } else { u8::MAX };
+        let ref_b_u = if n.b_avail { n.ref_b as u8 } else { u8::MAX };
+        let ref_c_u = if n.c_avail { n.ref_c as u8 } else { u8::MAX };
 
-    // Compute MV for L0 using median prediction with the computed ref
-    let mv_l0 = if ref_l0 >= 0 {
-        mvpred::predict_mv(
-            n.mv_a, n.mv_b, n.mv_c, n.ref_a, n.ref_b, n.ref_c, ref_l0, n.a_avail, n.b_avail,
-            n.c_avail,
-        )
-    } else {
-        [0, 0]
-    };
+        let min_ref_u = ref_a_u.min(ref_b_u).min(ref_c_u);
+        let r = if min_ref_u == u8::MAX {
+            -1i8
+        } else {
+            min_ref_u as i8
+        };
+        ref_idx[list as usize] = r;
 
-    // For L1: same logic. In the common case where all neighbors are from L0 only
-    // (P-frames in the DPB), L1 ref will be -1. We use L1 MV context if available.
-    // For simplicity in the first pass: ref_l1=0, mv_l1 = median from L0 neighbors.
-    // This works for BA3_SVA_C where B-frames reference the surrounding I/P frames.
-    let ref_l1 = 0i8;
-    let mv_l1 = [0i16, 0];
-
-    // Handle the case where both refs are negative
-    if ref_l0 < 0 && ref_l1 < 0 {
-        return ([0, 0], 0, [0, 0], 0);
+        if r >= 0 {
+            mv[list as usize] = mvpred::predict_mv(
+                n.mv_a, n.mv_b, n.mv_c, n.ref_a, n.ref_b, n.ref_c, r, n.a_avail, n.b_avail,
+                n.c_avail,
+            );
+        }
+        // else: mv stays [0, 0], ref stays -1
     }
 
-    (mv_l0, ref_l0, mv_l1, ref_l1)
+    // If both refs negative, set both to 0 (use both lists with zero MV).
+    // Reference: FFmpeg h264_direct.c lines 268-273
+    if ref_idx[0] < 0 && ref_idx[1] < 0 {
+        ref_idx[0] = 0;
+        ref_idx[1] = 0;
+    }
+
+    let base = (mv[0], ref_idx[0], mv[1], ref_idx[1]);
+
+    // Fast path: if both MVs are zero, skip col_zero_flag check.
+    // Reference: FFmpeg h264_direct.c lines 275-284
+    if mv[0] == [0, 0] && mv[1] == [0, 0] {
+        return [base; 4];
+    }
+
+    // Per-8x8-block col_zero_flag optimization.
+    // Check the colocated block in the L1[0] reference frame per 8x8 partition.
+    // If colocated ref_idx=0 and |mv| <= 1, suppress the spatial MV for lists
+    // where ref == 0.
+    // Reference: FFmpeg h264_direct.c lines 424-477 (per-8x8 path)
+    let mb_idx = (mb_y * ctx.mb_width + mb_x) as usize;
+    let col_is_intra = ctx.col_mb_intra.get(mb_idx).copied().unwrap_or(true);
+
+    let mut results = [base; 4];
+
+    if !col_is_intra && !ctx.col_ref.is_empty() {
+        let blk_base = mb_idx * 16;
+        // Raster indices for ref at corner of each 8x8 block (one ref per 8x8):
+        // FFmpeg: l1ref0[i8] where i8=0..3, stored per-8x8
+        // Wedeo: per-4x4, use top-left corner of each 8x8
+        const REF_CORNERS: [usize; 4] = [0, 2, 8, 10];
+        // Raster indices for MV at corner of each 8x8 (direct_8x8_inference_flag=1):
+        // FFmpeg: l1mv[x8*3 + y8*3*b4_stride] → bottom-right 4x4 of each 8x8
+        // In raster order: (0,0)=0, (3,0)=3, (0,3)=12, (3,3)=15
+        const MV_CORNERS: [usize; 4] = [0, 3, 12, 15];
+
+        for i8 in 0..4 {
+            let col_ref0 = ctx
+                .col_ref
+                .get(blk_base + REF_CORNERS[i8])
+                .copied()
+                .unwrap_or(-1);
+
+            if col_ref0 == 0 {
+                let col_mv0 = ctx
+                    .col_mv
+                    .get(blk_base + MV_CORNERS[i8])
+                    .copied()
+                    .unwrap_or([0, 0]);
+                if col_mv0[0].abs() <= 1 && col_mv0[1].abs() <= 1 {
+                    let mut a = mv[0];
+                    let mut b = mv[1];
+                    if ref_idx[0] == 0 {
+                        a = [0, 0];
+                    }
+                    if ref_idx[1] == 0 {
+                        b = [0, 0];
+                    }
+                    results[i8] = (a, ref_idx[0], b, ref_idx[1]);
+                }
+            }
+        }
+    }
+
+    results
 }
 
 /// Apply bidirectional motion compensation: MC from both L0 and L1, then average.
@@ -1970,8 +2351,15 @@ fn decode_intra4x4(
             if blk_x < 3 {
                 true
             } else {
-                // blk_x == 3: top-right is from the MB to the right
-                mb_x + 1 < ctx.mb_width
+                // blk_x == 3: top-right is from the MB to the upper-right
+                let tr_available = mb_x + 1 < ctx.mb_width;
+                if tr_available && ctx.constrained_intra_pred {
+                    // Upper-right MB must be intra for constrained intra pred
+                    let tr_idx = ((mb_y - 1) * ctx.mb_width + mb_x + 1) as usize;
+                    ctx.mb_info[tr_idx].is_intra
+                } else {
+                    tr_available
+                }
             }
         } else {
             false
