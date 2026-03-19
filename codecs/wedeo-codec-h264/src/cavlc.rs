@@ -105,12 +105,7 @@ impl NeighborContext {
             None
         };
 
-        match (left, top) {
-            (Some(a), Some(b)) => (a + b + 1) >> 1,
-            (Some(a), None) => a,
-            (None, Some(b)) => b,
-            (None, None) => 0,
-        }
+        merge_nc(left, top)
     }
 
     /// Compute nC for a chroma 4x4 block.
@@ -142,12 +137,7 @@ impl NeighborContext {
             None
         };
 
-        match (left, top) {
-            (Some(a), Some(b)) => (a + b + 1) >> 1,
-            (Some(a), None) => a,
-            (None, Some(b)) => b,
-            (None, None) => 0,
-        }
+        merge_nc(left, top)
     }
 
     /// Update the context after decoding a macroblock.
@@ -207,6 +197,20 @@ impl NeighborContext {
     }
 }
 
+/// Merge left and top nC neighbor values into a single nC prediction.
+///
+/// H.264 spec 9.2.1: nC = (left + top + 1) >> 1 if both available,
+/// otherwise whichever is available, or 0 if neither.
+#[inline]
+fn merge_nc(left: Option<i32>, top: Option<i32>) -> i32 {
+    match (left, top) {
+        (Some(a), Some(b)) => (a + b + 1) >> 1,
+        (Some(a), None) => a,
+        (None, Some(b)) => b,
+        (None, None) => 0,
+    }
+}
+
 /// Compute nC from already-decoded non_zero_count values within the current MB
 /// and from the neighbor context for edge blocks.
 ///
@@ -244,12 +248,7 @@ pub fn compute_nc(
             None
         };
 
-        match (left, top) {
-            (Some(a), Some(b)) => (a + b + 1) >> 1,
-            (Some(a), None) => a,
-            (None, Some(b)) => b,
-            (None, None) => 0,
-        }
+        merge_nc(left, top)
     } else if block_idx < 20 {
         // Chroma Cb
         let cb_idx = block_idx - 16; // 0..3
@@ -273,12 +272,7 @@ pub fn compute_nc(
             None
         };
 
-        match (left, top) {
-            (Some(a), Some(b)) => (a + b + 1) >> 1,
-            (Some(a), None) => a,
-            (None, Some(b)) => b,
-            (None, None) => 0,
-        }
+        merge_nc(left, top)
     } else {
         // Chroma Cr
         let cr_idx = block_idx - 20; // 0..3
@@ -302,12 +296,7 @@ pub fn compute_nc(
             None
         };
 
-        match (left, top) {
-            (Some(a), Some(b)) => (a + b + 1) >> 1,
-            (Some(a), None) => a,
-            (None, Some(b)) => b,
-            (None, None) => 0,
-        }
+        merge_nc(left, top)
     }
 }
 
@@ -846,21 +835,14 @@ pub fn decode_mb_cavlc(
             }
         }
 
-        // Read 64 Cb samples (8x8)
-        for y in 0..8u32 {
-            for x in 0..8u32 {
-                let blk = ((y / 4) * 2 + (x / 4)) as usize;
-                let sub = ((y % 4) * 4 + (x % 4)) as usize;
-                mb.chroma_ac[0][blk][sub] = br.get_bits_32(8) as i16;
-            }
-        }
-
-        // Read 64 Cr samples (8x8)
-        for y in 0..8u32 {
-            for x in 0..8u32 {
-                let blk = ((y / 4) * 2 + (x / 4)) as usize;
-                let sub = ((y % 4) * 4 + (x % 4)) as usize;
-                mb.chroma_ac[1][blk][sub] = br.get_bits_32(8) as i16;
+        // Read 64 Cb then 64 Cr samples (8x8 each)
+        for plane_idx in 0..2usize {
+            for y in 0..8u32 {
+                for x in 0..8u32 {
+                    let blk = ((y / 4) * 2 + (x / 4)) as usize;
+                    let sub = ((y % 4) * 4 + (x % 4)) as usize;
+                    mb.chroma_ac[plane_idx][blk][sub] = br.get_bits_32(8) as i16;
+                }
             }
         }
 
@@ -964,17 +946,8 @@ pub fn decode_mb_cavlc(
                 mb.mvd_l0[0][0] = get_se_golomb(br)? as i16;
                 mb.mvd_l0[0][1] = get_se_golomb(br)? as i16;
             }
-            1 => {
-                // P_L0_L0_16x8: two ref_idx, two mvd
-                mb.ref_idx_l0[0] = read_ref_idx(br, num_ref_idx_l0_active)? as i8;
-                mb.ref_idx_l0[1] = read_ref_idx(br, num_ref_idx_l0_active)? as i8;
-                mb.mvd_l0[0][0] = get_se_golomb(br)? as i16;
-                mb.mvd_l0[0][1] = get_se_golomb(br)? as i16;
-                mb.mvd_l0[1][0] = get_se_golomb(br)? as i16;
-                mb.mvd_l0[1][1] = get_se_golomb(br)? as i16;
-            }
-            2 => {
-                // P_L0_L0_8x16: two ref_idx, two mvd
+            1 | 2 => {
+                // P_L0_L0_16x8 / P_L0_L0_8x16: two ref_idx, two mvd
                 mb.ref_idx_l0[0] = read_ref_idx(br, num_ref_idx_l0_active)? as i8;
                 mb.ref_idx_l0[1] = read_ref_idx(br, num_ref_idx_l0_active)? as i8;
                 mb.mvd_l0[0][0] = get_se_golomb(br)? as i16;
