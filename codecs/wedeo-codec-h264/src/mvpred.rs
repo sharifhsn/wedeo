@@ -306,6 +306,17 @@ impl MvContext {
         (self.mv_l1[idx], self.ref_idx_l1[idx])
     }
 
+    /// Get the MV and ref_idx for a 4x4 block from list `list` (0 = L0, 1 = L1).
+    #[inline(always)]
+    fn get_for_list(&self, mb_x: u32, mb_y: u32, blk_idx: usize, list: u8) -> ([i16; 2], i8) {
+        let idx = self.linear_idx(mb_x, mb_y, blk_idx);
+        if list == 0 {
+            (self.mv[idx], self.ref_idx[idx])
+        } else {
+            (self.mv_l1[idx], self.ref_idx_l1[idx])
+        }
+    }
+
     /// Set the MV and ref_idx for a 4x4 block (list 0).
     pub fn set(&mut self, mb_x: u32, mb_y: u32, blk_idx: usize, mv: [i16; 2], ref_idx: i8) {
         let idx = self.linear_idx(mb_x, mb_y, blk_idx);
@@ -453,6 +464,18 @@ impl MvContext {
         blk_x: u32,
         blk_y: u32,
     ) -> Option<([i16; 2], i8)> {
+        self.try_get_neighbor_list(mb_x, mb_y, blk_x, blk_y, 0)
+    }
+
+    /// Like `try_get_neighbor` but reads from the given list (0 = L0, 1 = L1).
+    fn try_get_neighbor_list(
+        &self,
+        mb_x: u32,
+        mb_y: u32,
+        blk_x: u32,
+        blk_y: u32,
+        list: u8,
+    ) -> Option<([i16; 2], i8)> {
         // Use signed arithmetic to handle wrapping (negative) block coordinates
         let abs_blk_x = mb_x as i32 * 4 + blk_x as i32;
         let abs_blk_y = mb_y as i32 * 4 + blk_y as i32;
@@ -474,7 +497,7 @@ impl MvContext {
         let target_blk_y = abs_blk_y % 4;
         let blk_idx = (target_blk_x + target_blk_y * 4) as usize;
 
-        Some(self.get(target_mb_x, target_mb_y, blk_idx))
+        Some(self.get_for_list(target_mb_x, target_mb_y, blk_idx, list))
     }
 
     /// Get neighbors A, B, C for a partition starting at 4x4 block (blk_x, blk_y)
@@ -489,7 +512,7 @@ impl MvContext {
         blk_y: u32,
         part_width: u32,
     ) -> NeighborInfo {
-        self.get_neighbors_slice(mb_x, mb_y, blk_x, blk_y, part_width, None, 0)
+        self.get_neighbors_impl(mb_x, mb_y, blk_x, blk_y, part_width, None, 0, 0)
     }
 
     /// Get neighbors for a specific list (0 = L0, 1 = L1).
@@ -506,158 +529,16 @@ impl MvContext {
         current_slice: u16,
         list: u8,
     ) -> NeighborInfo {
-        if list == 0 {
-            self.get_neighbors_slice(
-                mb_x,
-                mb_y,
-                blk_x,
-                blk_y,
-                part_width,
-                slice_table,
-                current_slice,
-            )
-        } else {
-            // For L1, we need to read from L1 MV/ref arrays.
-            // Create a temporary "view" by reading L1 data.
-            self.get_neighbors_l1_impl(
-                mb_x,
-                mb_y,
-                blk_x,
-                blk_y,
-                part_width,
-                slice_table,
-                current_slice,
-            )
-        }
-    }
-
-    /// Internal L1 neighbor lookup — same logic as get_neighbors_slice but reads L1 arrays.
-    #[allow(clippy::too_many_arguments)]
-    fn get_neighbors_l1_impl(
-        &self,
-        mb_x: u32,
-        mb_y: u32,
-        blk_x: u32,
-        blk_y: u32,
-        part_width: u32,
-        slice_table: Option<&[u16]>,
-        current_slice: u16,
-    ) -> NeighborInfo {
-        let same_slice = |nb_mb_x: u32, nb_mb_y: u32| -> bool {
-            match slice_table {
-                None => true,
-                Some(st) => {
-                    let idx = (nb_mb_y * self.mb_width + nb_mb_x) as usize;
-                    idx < st.len() && st[idx] == current_slice
-                }
-            }
-        };
-
-        // Helper to read from L1 arrays
-        let get_l1 = |mb_x: u32, mb_y: u32, blk_idx: usize| -> ([i16; 2], i8) {
-            let idx = self.linear_idx(mb_x, mb_y, blk_idx);
-            (self.mv_l1[idx], self.ref_idx_l1[idx])
-        };
-
-        // Neighbor A (left) — L1
-        let (mv_a, ref_a, a_avail) = if blk_x > 0 {
-            let blk_idx = ((blk_x - 1) + blk_y * 4) as usize;
-            let (mv, r) = get_l1(mb_x, mb_y, blk_idx);
-            (mv, r, true)
-        } else if mb_x > 0 && same_slice(mb_x - 1, mb_y) {
-            let blk_idx = (3 + blk_y * 4) as usize;
-            let (mv, r) = get_l1(mb_x - 1, mb_y, blk_idx);
-            (mv, r, true)
-        } else {
-            ([0, 0], -1, false)
-        };
-
-        // Neighbor B (top) — L1
-        let (mv_b, ref_b, b_avail) = if blk_y > 0 {
-            let blk_idx = (blk_x + (blk_y - 1) * 4) as usize;
-            let (mv, r) = get_l1(mb_x, mb_y, blk_idx);
-            (mv, r, true)
-        } else if mb_y > 0 && same_slice(mb_x, mb_y - 1) {
-            let blk_idx = (blk_x + 3 * 4) as usize;
-            let (mv, r) = get_l1(mb_x, mb_y - 1, blk_idx);
-            (mv, r, true)
-        } else {
-            ([0, 0], -1, false)
-        };
-
-        // Neighbor C (top-right / top-left fallback) — L1
-        // Simplified: reuse the L0 neighbor_c logic but read from L1
-        let (mv_c, ref_c, c_avail) = {
-            let cr_x = blk_x + part_width;
-            let cr_y = blk_y.wrapping_sub(1);
-            let abs_cr_x = mb_x as i32 * 4 + cr_x as i32;
-            let abs_cr_y = mb_y as i32 * 4 + cr_y as i32;
-
-            let c_ok = if abs_cr_x >= 0
-                && abs_cr_y >= 0
-                && abs_cr_x < self.mb_width as i32 * 4
-                && abs_cr_y < self.mb_height as i32 * 4
-            {
-                let c_mb_x = abs_cr_x as u32 / 4;
-                let c_mb_y = abs_cr_y as u32 / 4;
-                let is_past = c_mb_y < mb_y || (c_mb_y == mb_y && c_mb_x <= mb_x);
-                is_past && (slice_table.is_none() || same_slice(c_mb_x, c_mb_y))
-            } else {
-                false
-            };
-
-            if c_ok {
-                let target_mb_x = abs_cr_x as u32 / 4;
-                let target_mb_y = abs_cr_y as u32 / 4;
-                let target_blk_x = abs_cr_x as u32 % 4;
-                let target_blk_y = abs_cr_y as u32 % 4;
-                let blk_idx = (target_blk_x + target_blk_y * 4) as usize;
-                let (mv, r) = get_l1(target_mb_x, target_mb_y, blk_idx);
-                (mv, r, true)
-            } else {
-                // Fallback to D (top-left)
-                let dl_x = blk_x.wrapping_sub(1);
-                let dl_y = blk_y.wrapping_sub(1);
-                let abs_dl_x = mb_x as i32 * 4 + dl_x as i32;
-                let abs_dl_y = mb_y as i32 * 4 + dl_y as i32;
-
-                let d_ok = if abs_dl_x >= 0
-                    && abs_dl_y >= 0
-                    && abs_dl_x < self.mb_width as i32 * 4
-                    && abs_dl_y < self.mb_height as i32 * 4
-                {
-                    let d_mb_x = abs_dl_x as u32 / 4;
-                    let d_mb_y = abs_dl_y as u32 / 4;
-                    slice_table.is_none() || same_slice(d_mb_x, d_mb_y)
-                } else {
-                    false
-                };
-
-                if d_ok {
-                    let target_mb_x = abs_dl_x as u32 / 4;
-                    let target_mb_y = abs_dl_y as u32 / 4;
-                    let target_blk_x = abs_dl_x as u32 % 4;
-                    let target_blk_y = abs_dl_y as u32 % 4;
-                    let blk_idx = (target_blk_x + target_blk_y * 4) as usize;
-                    let (mv, r) = get_l1(target_mb_x, target_mb_y, blk_idx);
-                    (mv, r, true)
-                } else {
-                    ([0, 0], -1, false)
-                }
-            }
-        };
-
-        NeighborInfo {
-            mv_a,
-            ref_a,
-            a_avail,
-            mv_b,
-            ref_b,
-            b_avail,
-            mv_c,
-            ref_c,
-            c_avail,
-        }
+        self.get_neighbors_impl(
+            mb_x,
+            mb_y,
+            blk_x,
+            blk_y,
+            part_width,
+            slice_table,
+            current_slice,
+            list,
+        )
     }
 
     /// Like `get_neighbors` but with slice-boundary awareness.
@@ -673,7 +554,34 @@ impl MvContext {
         slice_table: Option<&[u16]>,
         current_slice: u16,
     ) -> NeighborInfo {
-        // Helper: check if a neighbor MB is in the same slice
+        self.get_neighbors_impl(
+            mb_x,
+            mb_y,
+            blk_x,
+            blk_y,
+            part_width,
+            slice_table,
+            current_slice,
+            0,
+        )
+    }
+
+    /// Unified neighbor lookup for both L0 and L1.
+    ///
+    /// `list` selects which MV/ref_idx arrays to read: 0 = L0, 1 = L1.
+    /// If `slice_table` is Some, neighbors from different slices are unavailable.
+    #[allow(clippy::too_many_arguments)]
+    fn get_neighbors_impl(
+        &self,
+        mb_x: u32,
+        mb_y: u32,
+        blk_x: u32,
+        blk_y: u32,
+        part_width: u32,
+        slice_table: Option<&[u16]>,
+        current_slice: u16,
+        list: u8,
+    ) -> NeighborInfo {
         let same_slice = |nb_mb_x: u32, nb_mb_y: u32| -> bool {
             match slice_table {
                 None => true,
@@ -685,49 +593,46 @@ impl MvContext {
         };
 
         // Neighbor A (left)
-        let (mv_a, ref_a, a_avail) = if blk_x > 0 {
-            // Within same MB — always available
-            match self.neighbor_a(mb_x, mb_y, blk_x, blk_y) {
-                Some((mv, r)) => (mv, r, true),
-                None => ([0, 0], -1, false),
+        let (mv_a, ref_a, a_avail) = {
+            let a_ok = blk_x > 0 || (mb_x > 0 && same_slice(mb_x - 1, mb_y));
+            if a_ok {
+                let (nb_mb_x, a_blk_x) = if blk_x > 0 {
+                    (mb_x, blk_x - 1)
+                } else {
+                    (mb_x - 1, 3)
+                };
+                let blk_idx = (a_blk_x + blk_y * 4) as usize;
+                let (mv, r) = self.get_for_list(nb_mb_x, mb_y, blk_idx, list);
+                (mv, r, true)
+            } else {
+                ([0, 0], -1, false)
             }
-        } else if mb_x > 0 && same_slice(mb_x - 1, mb_y) {
-            match self.neighbor_a(mb_x, mb_y, blk_x, blk_y) {
-                Some((mv, r)) => (mv, r, true),
-                None => ([0, 0], -1, false),
-            }
-        } else {
-            ([0, 0], -1, false)
         };
 
         // Neighbor B (top)
-        let (mv_b, ref_b, b_avail) = if blk_y > 0 {
-            // Within same MB
-            match self.neighbor_b(mb_x, mb_y, blk_x, blk_y) {
-                Some((mv, r)) => (mv, r, true),
-                None => ([0, 0], -1, false),
+        let (mv_b, ref_b, b_avail) = {
+            let b_ok = blk_y > 0 || (mb_y > 0 && same_slice(mb_x, mb_y - 1));
+            if b_ok {
+                let (nb_mb_y, b_blk_y) = if blk_y > 0 {
+                    (mb_y, blk_y - 1)
+                } else {
+                    (mb_y - 1, 3)
+                };
+                let blk_idx = (blk_x + b_blk_y * 4) as usize;
+                let (mv, r) = self.get_for_list(mb_x, nb_mb_y, blk_idx, list);
+                (mv, r, true)
+            } else {
+                ([0, 0], -1, false)
             }
-        } else if mb_y > 0 && same_slice(mb_x, mb_y - 1) {
-            match self.neighbor_b(mb_x, mb_y, blk_x, blk_y) {
-                Some((mv, r)) => (mv, r, true),
-                None => ([0, 0], -1, false),
-            }
-        } else {
-            ([0, 0], -1, false)
         };
 
         // Neighbor C (top-right, falling back to D=top-left)
-        // The neighbor_c method handles the complex availability logic
-        // within a MB. For cross-MB access, check slice boundary.
-        let (mv_c, ref_c, c_avail) = if slice_table.is_some() {
-            // Determine which MB the C/D result comes from and check slices.
-            // C candidate: (blk_x + part_width, blk_y - 1)
+        let (mv_c, ref_c, c_avail) = {
             let cr_x = blk_x + part_width;
             let cr_y = blk_y.wrapping_sub(1);
             let abs_cr_x = mb_x as i32 * 4 + cr_x as i32;
             let abs_cr_y = mb_y as i32 * 4 + cr_y as i32;
 
-            // Check C availability: must be in-bounds and in a decoded MB
             let c_mb_ok = if abs_cr_x >= 0
                 && abs_cr_y >= 0
                 && abs_cr_x < self.mb_width as i32 * 4
@@ -737,15 +642,55 @@ impl MvContext {
                 let c_mb_y = abs_cr_y as u32 / 4;
                 let is_same_mb = c_mb_x == mb_x && c_mb_y == mb_y;
                 let is_past = c_mb_y < mb_y || (c_mb_y == mb_y && c_mb_x <= mb_x);
-                is_same_mb || (is_past && same_slice(c_mb_x, c_mb_y))
+                is_same_mb || (is_past && (slice_table.is_none() || same_slice(c_mb_x, c_mb_y)))
             } else {
                 false
             };
 
             if c_mb_ok {
-                match self.neighbor_c(mb_x, mb_y, blk_x, blk_y, part_width) {
-                    Some((mv, r)) => (mv, r, true),
-                    None => ([0, 0], -1, false),
+                // Use the L0 neighbor_c method for same-MB availability (ref=-1 check),
+                // then re-read from the correct list if list=1.
+                if list == 0 {
+                    match self.neighbor_c(mb_x, mb_y, blk_x, blk_y, part_width) {
+                        Some((mv, r)) => (mv, r, true),
+                        None => ([0, 0], -1, false),
+                    }
+                } else {
+                    // For L1 we replicate neighbor_c's same-MB ref=-1 guard ourselves.
+                    let target_mb_x = abs_cr_x as u32 / 4;
+                    let target_mb_y = abs_cr_y as u32 / 4;
+                    let target_blk_x = abs_cr_x as u32 % 4;
+                    let target_blk_y = abs_cr_y as u32 % 4;
+                    let blk_idx = (target_blk_x + target_blk_y * 4) as usize;
+                    let is_same_mb = target_mb_x == mb_x && target_mb_y == mb_y;
+                    let (mv, r) = self.get_for_list(target_mb_x, target_mb_y, blk_idx, list);
+                    // Same-MB + ref=-1 means not yet decoded → fall through to D
+                    if is_same_mb && r < 0 {
+                        // Fall through to D (top-left)
+                        let dl_x = blk_x.wrapping_sub(1);
+                        let dl_y = blk_y.wrapping_sub(1);
+                        let abs_dl_x = mb_x as i32 * 4 + dl_x as i32;
+                        let abs_dl_y = mb_y as i32 * 4 + dl_y as i32;
+                        let d_ok = abs_dl_x >= 0
+                            && abs_dl_y >= 0
+                            && abs_dl_x < self.mb_width as i32 * 4
+                            && abs_dl_y < self.mb_height as i32 * 4
+                            && {
+                                let d_mb_x = abs_dl_x as u32 / 4;
+                                let d_mb_y = abs_dl_y as u32 / 4;
+                                slice_table.is_none() || same_slice(d_mb_x, d_mb_y)
+                            };
+                        if d_ok {
+                            match self.try_get_neighbor_list(mb_x, mb_y, dl_x, dl_y, list) {
+                                Some((mv, r)) => (mv, r, true),
+                                None => ([0, 0], -1, false),
+                            }
+                        } else {
+                            ([0, 0], -1, false)
+                        }
+                    } else {
+                        (mv, r, true)
+                    }
                 }
             } else {
                 // C not available — try D (top-left fallback)
@@ -762,24 +707,19 @@ impl MvContext {
                     let d_mb_x = abs_dl_x as u32 / 4;
                     let d_mb_y = abs_dl_y as u32 / 4;
                     let is_same_mb = d_mb_x == mb_x && d_mb_y == mb_y;
-                    is_same_mb || same_slice(d_mb_x, d_mb_y)
+                    is_same_mb || (slice_table.is_none() || same_slice(d_mb_x, d_mb_y))
                 } else {
                     false
                 };
 
                 if d_mb_ok {
-                    match self.try_get_neighbor(mb_x, mb_y, dl_x, dl_y) {
+                    match self.try_get_neighbor_list(mb_x, mb_y, dl_x, dl_y, list) {
                         Some((mv, r)) => (mv, r, true),
                         None => ([0, 0], -1, false),
                     }
                 } else {
                     ([0, 0], -1, false)
                 }
-            }
-        } else {
-            match self.neighbor_c(mb_x, mb_y, blk_x, blk_y, part_width) {
-                Some((mv, r)) => (mv, r, true),
-                None => ([0, 0], -1, false),
             }
         };
 
