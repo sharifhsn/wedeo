@@ -113,36 +113,8 @@ fn pred_4x4_dc(
     has_top: bool,
     has_left: bool,
 ) {
-    let dc: u8 = match (has_top, has_left) {
-        (true, true) => {
-            let sum = top[0] as u16
-                + top[1] as u16
-                + top[2] as u16
-                + top[3] as u16
-                + left[0] as u16
-                + left[1] as u16
-                + left[2] as u16
-                + left[3] as u16;
-            ((sum + 4) >> 3) as u8
-        }
-        (true, false) => {
-            let sum = top[0] as u16 + top[1] as u16 + top[2] as u16 + top[3] as u16;
-            ((sum + 2) >> 2) as u8
-        }
-        (false, true) => {
-            let sum = left[0] as u16 + left[1] as u16 + left[2] as u16 + left[3] as u16;
-            ((sum + 2) >> 2) as u8
-        }
-        (false, false) => 128,
-    };
-
-    for y in 0..4 {
-        let row = y * stride;
-        dst[row] = dc;
-        dst[row + 1] = dc;
-        dst[row + 2] = dc;
-        dst[row + 3] = dc;
-    }
+    let dc = compute_dc_value::<4>(has_top, has_left, top, left);
+    fill_block::<4>(dst, stride, dc);
 }
 
 /// Mode 3: Diagonal Down-Left.
@@ -347,8 +319,46 @@ fn pred_4x4_horizontal_up(dst: &mut [u8], stride: usize, left: &[u8]) {
 }
 
 // ============================================================================
-// Shared fill helpers
+// Shared helpers
 // ============================================================================
+
+/// Compute the DC value for an N×N intra block.
+///
+/// Averages the available top and/or left neighbors of length N.
+/// Falls back to 128 when neither is available.
+#[inline]
+fn compute_dc_value<const N: usize>(
+    has_top: bool,
+    has_left: bool,
+    top: &[u8],
+    left: &[u8],
+) -> u8 {
+    match (has_top, has_left) {
+        (true, true) => {
+            let sum: u32 = top[..N].iter().map(|&v| v as u32).sum::<u32>()
+                + left[..N].iter().map(|&v| v as u32).sum::<u32>();
+            ((sum + N as u32) >> (N.trailing_zeros() + 1)) as u8
+        }
+        (true, false) => {
+            let sum: u32 = top[..N].iter().map(|&v| v as u32).sum();
+            ((sum + (N as u32 / 2)) >> N.trailing_zeros()) as u8
+        }
+        (false, true) => {
+            let sum: u32 = left[..N].iter().map(|&v| v as u32).sum();
+            ((sum + (N as u32 / 2)) >> N.trailing_zeros()) as u8
+        }
+        (false, false) => 128,
+    }
+}
+
+/// Fill every cell of an N×N block with `val`.
+#[inline]
+fn fill_block<const N: usize>(dst: &mut [u8], stride: usize, val: u8) {
+    for y in 0..N {
+        let row = y * stride;
+        dst[row..row + N].fill(val);
+    }
+}
 
 /// Fill an N×N block by repeating `top[0..N]` into every row (vertical pred).
 #[inline]
@@ -418,38 +428,8 @@ fn pred_16x16_dc(
     has_top: bool,
     has_left: bool,
 ) {
-    let dc: u8 = match (has_top, has_left) {
-        (true, true) => {
-            let mut sum: u32 = 0;
-            for i in 0..16 {
-                sum += top[i] as u32;
-                sum += left[i] as u32;
-            }
-            ((sum + 16) >> 5) as u8
-        }
-        (true, false) => {
-            let mut sum: u32 = 0;
-            for &t in &top[..16] {
-                sum += t as u32;
-            }
-            ((sum + 8) >> 4) as u8
-        }
-        (false, true) => {
-            let mut sum: u32 = 0;
-            for &l in &left[..16] {
-                sum += l as u32;
-            }
-            ((sum + 8) >> 4) as u8
-        }
-        (false, false) => 128,
-    };
-
-    for y in 0..16 {
-        let row = y * stride;
-        for x in 0..16 {
-            dst[row + x] = dc;
-        }
-    }
+    let dc = compute_dc_value::<16>(has_top, has_left, top, left);
+    fill_block::<16>(dst, stride, dc);
 }
 
 /// Mode 3: Plane -- linear interpolation using H and V gradients.
