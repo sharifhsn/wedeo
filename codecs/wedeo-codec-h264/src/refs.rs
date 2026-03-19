@@ -336,17 +336,60 @@ pub fn mark_reference(
             current_dpb_idx,
         );
     } else {
-        sliding_window_mark(dpb, max_num_ref_frames, current_dpb_idx);
+        sliding_window_mark(
+            dpb,
+            max_num_ref_frames,
+            current_dpb_idx,
+            current_frame_num,
+            max_frame_num,
+        );
     }
 }
 
 /// Sliding window reference picture marking.
-fn sliding_window_mark(dpb: &mut Dpb, max_num_ref_frames: u32, current_dpb_idx: Option<usize>) {
+///
+/// Removes the short-term reference with the smallest FrameNumWrap value,
+/// where FrameNumWrap handles wrap-around relative to current_frame_num.
+fn sliding_window_mark(
+    dpb: &mut Dpb,
+    max_num_ref_frames: u32,
+    current_dpb_idx: Option<usize>,
+    current_frame_num: u32,
+    max_frame_num: u32,
+) {
     let num_st = dpb.num_short_term();
     let num_lt = dpb.num_long_term();
 
     if num_st > 0 && (num_st + num_lt) as u32 >= max_num_ref_frames.max(1) {
-        dpb.remove_oldest_short_term();
+        // Find the short-term ref with smallest FrameNumWrap.
+        // FrameNumWrap = frame_num - MaxFrameNum if frame_num > current_frame_num
+        //              = frame_num               otherwise
+        // This correctly handles wrap-around: after frame_num wraps from 15→0,
+        // the old frame_num=15 has FrameNumWrap=15-16=-1 (smaller).
+        let frame_num_wrap = |fn_: u32| -> i64 {
+            if fn_ > current_frame_num {
+                fn_ as i64 - max_frame_num as i64
+            } else {
+                fn_ as i64
+            }
+        };
+
+        let mut oldest_idx: Option<usize> = None;
+        let mut oldest_wrap = i64::MAX;
+        for (i, entry) in dpb.entries.iter().enumerate() {
+            if let Some(e) = entry
+                && e.status == RefStatus::ShortTerm
+            {
+                let wrap = frame_num_wrap(e.frame_num);
+                if wrap < oldest_wrap {
+                    oldest_wrap = wrap;
+                    oldest_idx = Some(i);
+                }
+            }
+        }
+        if let Some(idx) = oldest_idx {
+            dpb.mark_unused(idx);
+        }
     }
 
     if let Some(idx) = current_dpb_idx
