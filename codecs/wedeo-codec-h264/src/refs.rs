@@ -35,7 +35,7 @@ pub fn build_ref_list_p(
     dpb: &Dpb,
     slice_hdr: &SliceHeader,
     current_frame_num: u32,
-    max_frame_num: u32,
+    max_frame_num: u32, // also MaxPicNum for frame mode
 ) -> Vec<usize> {
     // Compute pic_num with wrap-around handling (H.264 spec 8.2.4.1).
     let pic_num = |fn_: u32| -> i64 {
@@ -87,6 +87,7 @@ pub fn build_ref_list_p(
             dpb,
             current_frame_num,
             slice_hdr.num_ref_idx_l0_active as usize,
+            max_frame_num,
         );
     }
 
@@ -116,6 +117,7 @@ pub fn build_ref_list_b(
     dpb: &Dpb,
     slice_hdr: &SliceHeader,
     current_poc: i32,
+    max_frame_num: u32,
 ) -> (Vec<usize>, Vec<usize>) {
     // Collect short-term references split by POC relative to current.
     let mut st_before: Vec<(usize, i32)> = Vec::new(); // POC <= current
@@ -172,16 +174,13 @@ pub fn build_ref_list_b(
 
     // Apply ref_pic_list_modification for L0
     if !slice_hdr.ref_pic_list_modification_l0.is_empty() {
-        // For B-slice list modification, we need the current frame_num
-        // but the modification commands use poc-based addressing.
-        // The existing apply_ref_pic_list_modification works for frame_num-based.
-        // For B-slices, modification_of_pic_nums_idc 0/1 still use frame_num.
         apply_ref_pic_list_modification(
             &mut list0,
             &slice_hdr.ref_pic_list_modification_l0,
             dpb,
             slice_hdr.frame_num,
             slice_hdr.num_ref_idx_l0_active as usize,
+            max_frame_num,
         );
     }
     // Apply ref_pic_list_modification for L1
@@ -192,6 +191,7 @@ pub fn build_ref_list_b(
             dpb,
             slice_hdr.frame_num,
             slice_hdr.num_ref_idx_l1_active as usize,
+            max_frame_num,
         );
     }
 
@@ -209,14 +209,19 @@ pub fn build_ref_list_b(
 }
 
 /// Apply ref_pic_list_modification() reordering commands to a reference list.
+///
+/// `max_pic_num` = MaxFrameNum for frame mode (2^log2_max_frame_num).
+/// Wrap-around uses `& (max_pic_num - 1)` per H.264 spec 8.2.4.3.1.
 fn apply_ref_pic_list_modification(
     list: &mut Vec<usize>,
     mods: &[RefPicListModification],
     dpb: &Dpb,
     current_frame_num: u32,
     max_ref_count: usize,
+    max_pic_num: u32,
 ) {
     let mut pred_pic_num = current_frame_num;
+    let mask = max_pic_num.wrapping_sub(1);
 
     for (index, modification) in mods.iter().enumerate() {
         match modification.idc {
@@ -227,6 +232,8 @@ fn apply_ref_pic_list_modification(
                 } else {
                     pred_pic_num = pred_pic_num.wrapping_add(abs_diff_pic_num);
                 }
+                // Wrap modulo MaxPicNum (= MaxFrameNum for frame mode)
+                pred_pic_num &= mask;
                 if let Some(dpb_idx) = dpb.find_short_term(pred_pic_num) {
                     reorder_list(list, dpb_idx, index, max_ref_count);
                 }
@@ -290,6 +297,7 @@ pub fn mark_reference(
     slice_hdr: &SliceHeader,
     is_idr: bool,
     current_frame_num: u32,
+    max_frame_num: u32,
     max_num_ref_frames: u32,
     current_dpb_idx: Option<usize>,
 ) {
@@ -320,7 +328,13 @@ pub fn mark_reference(
             }
         }
     } else if slice_hdr.adaptive_ref_pic_marking {
-        apply_mmco(dpb, &slice_hdr.mmco_ops, current_frame_num, current_dpb_idx);
+        apply_mmco(
+            dpb,
+            &slice_hdr.mmco_ops,
+            current_frame_num,
+            max_frame_num,
+            current_dpb_idx,
+        );
     } else {
         sliding_window_mark(dpb, max_num_ref_frames, current_dpb_idx);
     }
@@ -348,6 +362,7 @@ fn apply_mmco(
     dpb: &mut Dpb,
     ops: &[MmcoOp],
     current_frame_num: u32,
+    max_frame_num: u32,
     current_dpb_idx: Option<usize>,
 ) {
     let mut current_marked = false;
@@ -359,7 +374,8 @@ fn apply_mmco(
             MmcoOp::ShortTermUnused {
                 difference_of_pic_nums_minus1,
             } => {
-                let pic_num = current_frame_num.wrapping_sub(difference_of_pic_nums_minus1 + 1);
+                let pic_num = current_frame_num.wrapping_sub(difference_of_pic_nums_minus1 + 1)
+                    % max_frame_num;
                 if let Some(idx) = dpb.find_short_term(pic_num) {
                     dpb.mark_unused(idx);
                 }
@@ -375,7 +391,8 @@ fn apply_mmco(
                 difference_of_pic_nums_minus1,
                 long_term_frame_idx,
             } => {
-                let pic_num = current_frame_num.wrapping_sub(difference_of_pic_nums_minus1 + 1);
+                let pic_num = current_frame_num.wrapping_sub(difference_of_pic_nums_minus1 + 1)
+                    % max_frame_num;
                 if let Some(old_lt) = dpb.find_long_term(*long_term_frame_idx) {
                     dpb.mark_unused(old_lt);
                 }
@@ -485,6 +502,7 @@ mod tests {
             long_term_frame_idx: 0,
             mv_info: vec![[0i16; 2]; 16],
             ref_info: vec![-1i8; 16],
+            mb_intra: vec![false; 1],
             needs_output: false,
         }
     }
@@ -599,7 +617,7 @@ mod tests {
         };
 
         let new_idx = dpb.store(make_entry(12, 24, RefStatus::Unused)).unwrap();
-        mark_reference(&mut dpb, &hdr, false, 12, 4, Some(new_idx));
+        mark_reference(&mut dpb, &hdr, false, 12, 256, 4, Some(new_idx));
 
         assert!(dpb.find_short_term(2).is_none());
         assert!(dpb.find_short_term(12).is_some());
@@ -621,7 +639,7 @@ mod tests {
             ..Default::default()
         };
 
-        mark_reference(&mut dpb, &hdr, true, 0, 4, Some(new_idx));
+        mark_reference(&mut dpb, &hdr, true, 0, 256, 4, Some(new_idx));
 
         assert_eq!(dpb.num_refs(), 1);
         assert!(dpb.find_short_term(0).is_some());
@@ -640,7 +658,7 @@ mod tests {
             ..Default::default()
         };
 
-        mark_reference(&mut dpb, &hdr, true, 0, 4, Some(new_idx));
+        mark_reference(&mut dpb, &hdr, true, 0, 256, 4, Some(new_idx));
 
         let entry = dpb.get(new_idx).unwrap();
         assert_eq!(entry.status, RefStatus::LongTerm);
@@ -660,7 +678,7 @@ mod tests {
             MmcoOp::End,
         ];
 
-        apply_mmco(&mut dpb, &ops, 7, None);
+        apply_mmco(&mut dpb, &ops, 7, 256, None);
 
         assert!(dpb.find_short_term(5).is_none());
         assert!(dpb.find_short_term(3).is_some());
@@ -678,7 +696,7 @@ mod tests {
             MmcoOp::End,
         ];
 
-        apply_mmco(&mut dpb, &ops, 5, Some(idx));
+        apply_mmco(&mut dpb, &ops, 5, 256, Some(idx));
 
         let entry = dpb.get(idx).unwrap();
         assert_eq!(entry.status, RefStatus::LongTerm);
@@ -698,7 +716,7 @@ mod tests {
             MmcoOp::End,
         ];
 
-        apply_mmco(&mut dpb, &ops, 5, None);
+        apply_mmco(&mut dpb, &ops, 5, 256, None);
 
         assert!(dpb.find_short_term(3).is_none());
         let lt_idx = dpb.find_long_term(2).unwrap();
@@ -716,7 +734,7 @@ mod tests {
         let cur_idx = dpb.store(cur).unwrap();
 
         let ops = vec![MmcoOp::Reset, MmcoOp::End];
-        apply_mmco(&mut dpb, &ops, 3, Some(cur_idx));
+        apply_mmco(&mut dpb, &ops, 3, 256, Some(cur_idx));
 
         assert!(dpb.find_short_term(1).is_none());
         assert!(dpb.find_short_term(2).is_none());
@@ -748,7 +766,7 @@ mod tests {
             MmcoOp::End,
         ];
 
-        apply_mmco(&mut dpb, &ops, 5, None);
+        apply_mmco(&mut dpb, &ops, 5, 256, None);
 
         assert!(dpb.find_long_term(0).is_some());
         assert!(dpb.find_long_term(1).is_some());
@@ -770,7 +788,7 @@ mod tests {
             MmcoOp::End,
         ];
 
-        apply_mmco(&mut dpb, &ops, 5, None);
+        apply_mmco(&mut dpb, &ops, 5, 256, None);
 
         assert_eq!(dpb.num_long_term(), 0);
     }

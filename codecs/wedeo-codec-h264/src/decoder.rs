@@ -87,6 +87,12 @@ pub struct H264Decoder {
     current_poc: i32,
     /// nal_ref_idc of the current picture (non-zero = reference).
     current_nal_ref_idc: u8,
+    /// POC type 1/2 state: frame_num_offset for wrap detection.
+    frame_num_offset: i32,
+    /// POC type 1/2 state: previous frame_num_offset.
+    prev_frame_num_offset: i32,
+    /// POC type 1/2 state: previous frame_num (H.264 level).
+    prev_frame_num_h264: u32,
     /// True once a B-slice has been seen (enables POC reordering).
     has_b_frames: bool,
     /// Output frame counter for sequential PTS assignment during reordering.
@@ -136,6 +142,9 @@ impl H264Decoder {
             prev_poc_lsb: 0,
             current_poc: 0,
             current_nal_ref_idc: 0,
+            frame_num_offset: 0,
+            prev_frame_num_offset: 0,
+            prev_frame_num_h264: 0,
             has_b_frames: false,
             output_frame_counter: 0,
             pending_output: BTreeMap::new(),
@@ -266,6 +275,75 @@ impl H264Decoder {
         poc_msb + poc_lsb as i32
     }
 
+    /// Compute frame_num_offset, handling wrap when frame_num < prev_frame_num.
+    ///
+    /// Reference: FFmpeg h264_parse.c:287-289.
+    fn compute_frame_num_offset(&mut self, frame_num: u32, max_frame_num: u32, is_idr: bool) {
+        if is_idr {
+            self.prev_frame_num_offset = 0;
+            self.frame_num_offset = 0;
+        } else {
+            self.frame_num_offset = self.prev_frame_num_offset;
+            if frame_num < self.prev_frame_num_h264 {
+                self.frame_num_offset += max_frame_num as i32;
+            }
+        }
+    }
+
+    /// Compute POC for poc_type == 2.
+    ///
+    /// Reference: FFmpeg h264_parse.c:344-352.
+    fn compute_poc_type2(&self, frame_num: u32, nal_ref_idc: u8) -> i32 {
+        let mut poc = 2 * (self.frame_num_offset + frame_num as i32);
+        if nal_ref_idc == 0 {
+            poc -= 1;
+        }
+        poc
+    }
+
+    /// Compute POC for poc_type == 1.
+    ///
+    /// Reference: FFmpeg h264_parse.c:308-343.
+    fn compute_poc_type1(&self, sps: &Sps, hdr: &SliceHeader, nal_ref_idc: u8) -> i32 {
+        let abs_frame_num = if sps.num_ref_frames_in_poc_cycle != 0 {
+            let mut afn = self.frame_num_offset + hdr.frame_num as i32;
+            if nal_ref_idc == 0 && afn > 0 {
+                afn -= 1;
+            }
+            afn
+        } else {
+            0
+        };
+
+        let expectedpoc: i64 = if abs_frame_num > 0 {
+            let expected_delta_per_poc_cycle: i64 =
+                sps.offset_for_ref_frame.iter().map(|&v| v as i64).sum();
+            let poc_cycle_length = sps.num_ref_frames_in_poc_cycle as i32;
+            let poc_cycle_cnt = (abs_frame_num - 1) / poc_cycle_length;
+            let frame_num_in_poc_cycle = ((abs_frame_num - 1) % poc_cycle_length) as usize;
+
+            let mut ep = poc_cycle_cnt as i64 * expected_delta_per_poc_cycle;
+            for i in 0..=frame_num_in_poc_cycle {
+                ep += sps.offset_for_ref_frame[i] as i64;
+            }
+            if nal_ref_idc == 0 {
+                ep += sps.offset_for_non_ref_pic as i64;
+            }
+            ep
+        } else {
+            0
+        };
+
+        // field_poc[0] and field_poc[1], take min for frame POC
+        let field_poc_0 = expectedpoc + hdr.delta_pic_order_cnt[0] as i64;
+        let field_poc_1 = field_poc_0
+            + sps.offset_for_top_to_bottom_field as i64
+            + hdr.delta_pic_order_cnt[1] as i64;
+
+        // For frame mode, POC is min of both fields
+        (field_poc_0.min(field_poc_1)) as i32
+    }
+
     /// Update decoder dimensions from an SPS.
     fn apply_sps(&mut self, sps: &Sps) {
         let w = sps.width();
@@ -352,13 +430,18 @@ impl H264Decoder {
                         }
                     }
 
-                    // Compute spec-compliant POC (type 0)
+                    // Compute spec-compliant POC
+                    let max_frame_num = 1u32 << sps.log2_max_frame_num;
+                    self.compute_frame_num_offset(hdr.frame_num, max_frame_num, is_idr);
+
                     if sps.poc_type == 0 {
                         self.current_poc =
                             self.compute_poc_type0(&sps, &hdr, is_idr, nalu.nal_ref_idc);
+                    } else if sps.poc_type == 1 {
+                        self.current_poc = self.compute_poc_type1(&sps, &hdr, nalu.nal_ref_idc);
                     } else {
-                        // POC type 1/2 not yet implemented; fall back to decode order
-                        self.current_poc = self.frame_num as i32 * 2;
+                        // POC type 2
+                        self.current_poc = self.compute_poc_type2(hdr.frame_num, nalu.nal_ref_idc);
                     }
 
                     // Build reference lists
@@ -368,7 +451,8 @@ impl H264Decoder {
                             refs::build_ref_list_p(&self.dpb, &hdr, hdr.frame_num, max_frame_num);
                         self.ref_list_l1.clear();
                     } else if hdr.slice_type.is_b() {
-                        let (l0, l1) = refs::build_ref_list_b(&self.dpb, &hdr, self.current_poc);
+                        let max_frame_num_b = 1u32 << sps.log2_max_frame_num;
+                        let (l0, l1) = refs::build_ref_list_b(&self.dpb, &hdr, self.current_poc, max_frame_num_b);
                         debug!(
                             poc = self.current_poc,
                             l0_len = l0.len(),
@@ -405,6 +489,16 @@ impl H264Decoder {
                         .iter()
                         .filter_map(|&dpb_idx| self.dpb.get(dpb_idx).map(|e| &e.pic))
                         .collect();
+
+                    // Populate colocated info from L1[0] for spatial direct mode
+                    if hdr.slice_type.is_b() && !self.ref_list_l1.is_empty() {
+                        let l1_0_dpb_idx = self.ref_list_l1[0];
+                        if let Some(entry) = self.dpb.get(l1_0_dpb_idx) {
+                            fdc.col_mv = entry.mv_info.clone();
+                            fdc.col_ref = entry.ref_info.clone();
+                            fdc.col_mb_intra = entry.mb_intra.clone();
+                        }
+                    }
 
                     #[cfg(feature = "tracing-detail")]
                     if hdr.slice_type.is_p() || hdr.slice_type.is_b() {
@@ -566,6 +660,8 @@ impl H264Decoder {
                 );
             }
 
+            let mb_intra: Vec<bool> = fdc.mb_info.iter().map(|info| info.is_intra).collect();
+
             let entry = DpbEntry {
                 pic: fdc.pic,
                 poc: self.current_poc,
@@ -574,6 +670,7 @@ impl H264Decoder {
                 long_term_frame_idx: 0,
                 mv_info,
                 ref_info,
+                mb_intra,
                 needs_output: false,
             };
 
@@ -607,16 +704,20 @@ impl H264Decoder {
                     );
                 }
                 // Apply reference picture marking
-                let sps_max_refs = self
+                let (sps_max_refs, max_frame_num) = self
                     .sps_list
                     .iter()
-                    .find_map(|s| s.as_ref().map(|sps| sps.max_num_ref_frames))
-                    .unwrap_or(4);
+                    .find_map(|s| {
+                        s.as_ref()
+                            .map(|sps| (sps.max_num_ref_frames, 1u32 << sps.log2_max_frame_num))
+                    })
+                    .unwrap_or((4, 16));
                 refs::mark_reference(
                     &mut self.dpb,
                     last_hdr,
                     self.current_is_idr,
                     self.current_frame_num_h264,
+                    max_frame_num,
                     sps_max_refs,
                     Some(dpb_idx),
                 );
@@ -653,6 +754,11 @@ impl H264Decoder {
                 }
             }
 
+            // Update POC type 1/2 state: frame_num_offset persists across
+            // all frames (not just references).
+            self.prev_frame_num_offset = self.frame_num_offset;
+            self.prev_frame_num_h264 = self.current_frame_num_h264;
+
             self.frame_num += 1;
         }
     }
@@ -663,7 +769,7 @@ impl H264Decoder {
     /// `ref_pics_l1` contains the list 1 reference pictures (B-slices only).
     /// Returns the number of MBs decoded in this slice.
     #[allow(clippy::too_many_arguments)] // H.264 slice decode needs all parameters
-    #[cfg_attr(feature = "tracing-detail", tracing::instrument(skip_all, fields(first_mb = hdr.first_mb_in_slice, slice_type = ?hdr.slice_type)))]
+    #[cfg_attr(feature = "tracing-detail", tracing::instrument(skip_all, fields(poc = self.current_poc, first_mb = hdr.first_mb_in_slice, slice_type = ?hdr.slice_type)))]
     fn decode_slice_into(
         &self,
         rbsp: &[u8],
