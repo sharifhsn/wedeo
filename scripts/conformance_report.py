@@ -370,6 +370,10 @@ def main():
                         help="Only test CAVLC files (skip CABAC)")
     parser.add_argument("--progressive-only", action="store_true",
                         help="Only test progressive files (skip interlaced)")
+    parser.add_argument("--only-failing", action="store_true",
+                        help="Only test files that were DIFF/FAIL in a previous run (fast mode)")
+    parser.add_argument("--cache", default=None,
+                        help="Path to cache previous results (default: .conformance-cache.json)")
     args = parser.parse_args()
 
     conformance_dir = Path(args.dir)
@@ -394,6 +398,21 @@ def main():
         print("No conformance files found", file=sys.stderr)
         sys.exit(1)
 
+    # Load cached results for --only-failing mode
+    cache_path = Path(args.cache) if args.cache else Path(".conformance-cache.json")
+    cached_pass: set[str] = set()
+    if args.only_failing and cache_path.exists():
+        try:
+            cached = json.loads(cache_path.read_text())
+            cached_pass = {
+                r["filename"] for r in cached if r.get("status") == "BITEXACT"
+            }
+            print(f"Loaded {len(cached_pass)} cached BITEXACT results, "
+                  f"re-testing {len(files) - len(cached_pass & {f.name for f in files})} files",
+                  file=sys.stderr)
+        except Exception:
+            pass  # ignore corrupt cache
+
     print(f"Testing {len(files)} files...", file=sys.stderr)
 
     results = []
@@ -401,7 +420,15 @@ def main():
         print(f"  [{i+1}/{len(files)}] {input_path.name}...",
               end="", file=sys.stderr, flush=True)
 
-        # Detect features first (for filtering)
+        # Fast path: skip feature detection and comparison for cached BITEXACT
+        if args.only_failing and input_path.name in cached_pass:
+            results.append(ConformanceResult(
+                filename=input_path.name, status="BITEXACT",
+            ))
+            print(" BITEXACT (cached)", file=sys.stderr)
+            continue
+
+        # Detect features (for filtering and reporting)
         try:
             features = detect_features(input_path)
         except Exception:
@@ -453,6 +480,17 @@ def main():
         if args.failures:
             results = [r for r in results if r.status in ("DIFF", "FAIL")]
         print(format_text_report(results, args.features))
+
+    # Save cache for --only-failing mode
+    cache_data = [
+        {"filename": r.filename, "status": r.status,
+         "wedeo_frames": r.wedeo_frames, "matching_frames": r.matching_frames}
+        for r in results
+    ]
+    try:
+        cache_path.write_text(json.dumps(cache_data, indent=2))
+    except Exception:
+        pass  # don't fail on cache write errors
 
 
 if __name__ == "__main__":

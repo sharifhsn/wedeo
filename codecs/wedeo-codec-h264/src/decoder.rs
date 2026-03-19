@@ -730,6 +730,39 @@ impl H264Decoder {
                 );
             }
 
+            // Log DPB summary for debugging tools (dpb_compare.py)
+            {
+                let st_fns: Vec<u32> = self
+                    .dpb
+                    .entries
+                    .iter()
+                    .filter_map(|e| {
+                        e.as_ref().and_then(|e| {
+                            (e.status == RefStatus::ShortTerm).then_some(e.frame_num)
+                        })
+                    })
+                    .collect();
+                let lt_fns: Vec<u32> = self
+                    .dpb
+                    .entries
+                    .iter()
+                    .filter_map(|e| {
+                        e.as_ref().and_then(|e| {
+                            (e.status == RefStatus::LongTerm).then_some(e.long_term_frame_idx)
+                        })
+                    })
+                    .collect();
+                debug!(
+                    h264_fn = self.current_frame_num_h264,
+                    poc = self.current_poc,
+                    st_count = st_fns.len(),
+                    st_frame_nums = ?st_fns,
+                    lt_count = lt_fns.len(),
+                    lt_indices = ?lt_fns,
+                    "DPB state"
+                );
+            }
+
             // Update POC type 0 state for reference pictures only.
             // Non-reference pictures (nal_ref_idc == 0, e.g. B-frames)
             // do not update the POC state.
