@@ -492,15 +492,18 @@ fn filter_mb_edge_luma(
 }
 
 // ---------------------------------------------------------------------------
-// Edge filtering functions — chroma vertical
+// Edge filtering functions — chroma (vertical and horizontal)
 // ---------------------------------------------------------------------------
 
-/// Filter a vertical chroma edge.
+/// Filter a chroma edge (vertical or horizontal).
 ///
-/// For 4:2:0, chroma MBs are 8x8, with 2 edges (0 = MB boundary, 1 = internal).
-/// Each edge spans 4 pixel pairs (2 sub-blocks of 2 lines each).
+/// For 4:2:0, chroma MBs are 8x8 with 2 edges per direction
+/// (0 = MB boundary, 1 = internal). Each edge spans 4 pixel pairs
+/// (2 sub-blocks of 2 pixels each).
+/// `is_vertical`: true = vertical edge (step=1), false = horizontal (step=stride).
 #[allow(clippy::too_many_arguments)] // edge filtering requires plane, stride, position, bS, QP, and offsets
-fn filter_mb_edge_chroma_v(
+fn filter_mb_edge_chroma(
+    is_vertical: bool,
     plane: &mut [u8],
     stride: usize,
     mb_x: u32,
@@ -516,8 +519,12 @@ fn filter_mb_edge_chroma_v(
         return;
     }
 
-    let x_base = mb_x as usize * 8 + edge * 4;
-    let y_base = mb_y as usize * 8;
+    let (x_base, y_base) = if is_vertical {
+        (mb_x as usize * 8 + edge * 4, mb_y as usize * 8)
+    } else {
+        (mb_x as usize * 8, mb_y as usize * 8 + edge * 4)
+    };
+    let step = if is_vertical { 1 } else { stride };
 
     for i in 0..4u8 {
         let cur_bs = bs[i as usize];
@@ -526,84 +533,29 @@ fn filter_mb_edge_chroma_v(
         }
 
         for d in 0..2usize {
-            let y = y_base + i as usize * 2 + d;
-            let x = x_base;
-            let off = y * stride + x;
+            // Walk along the edge: for vertical, y varies; for horizontal, x varies.
+            let off = if is_vertical {
+                (y_base + i as usize * 2 + d) * stride + x_base
+            } else {
+                y_base * stride + x_base + i as usize * 2 + d
+            };
 
-            let p0 = plane[off - 1] as i32;
-            let p1 = plane[off - 2] as i32;
+            let p0 = plane[off - step] as i32;
+            let p1 = plane[off - 2 * step] as i32;
             let q0 = plane[off] as i32;
-            let q1 = plane[off + 1] as i32;
+            let q1 = plane[off + step] as i32;
 
             if cur_bs < 4 {
                 let tc = get_tc0(qp, alpha_offset, cur_bs) + 1;
                 if let Some((new_p0, new_q0)) =
                     filter_normal_chroma(p0, p1, q0, q1, alpha, beta, tc)
                 {
-                    plane[off - 1] = new_p0;
+                    plane[off - step] = new_p0;
                     plane[off] = new_q0;
                 }
             } else if let Some((new_p0, new_q0)) = filter_strong_chroma(p0, p1, q0, q1, alpha, beta)
             {
-                plane[off - 1] = new_p0;
-                plane[off] = new_q0;
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Edge filtering functions — chroma horizontal
-// ---------------------------------------------------------------------------
-
-/// Filter a horizontal chroma edge.
-#[allow(clippy::too_many_arguments)] // edge filtering requires plane, stride, position, bS, QP, and offsets
-fn filter_mb_edge_chroma_h(
-    plane: &mut [u8],
-    stride: usize,
-    mb_x: u32,
-    mb_y: u32,
-    edge: usize,
-    bs: [u8; 4],
-    qp: u8,
-    alpha_offset: i32,
-    beta_offset: i32,
-) {
-    let (alpha, beta) = get_thresholds(qp, alpha_offset, beta_offset);
-    if alpha == 0 || beta == 0 {
-        return;
-    }
-
-    let x_base = mb_x as usize * 8;
-    let y_base = mb_y as usize * 8 + edge * 4;
-
-    for i in 0..4u8 {
-        let cur_bs = bs[i as usize];
-        if cur_bs == 0 {
-            continue;
-        }
-
-        for d in 0..2usize {
-            let x = x_base + i as usize * 2 + d;
-            let y = y_base;
-            let off = y * stride + x;
-
-            let p0 = plane[off - stride] as i32;
-            let p1 = plane[off - 2 * stride] as i32;
-            let q0 = plane[off] as i32;
-            let q1 = plane[off + stride] as i32;
-
-            if cur_bs < 4 {
-                let tc = get_tc0(qp, alpha_offset, cur_bs) + 1;
-                if let Some((new_p0, new_q0)) =
-                    filter_normal_chroma(p0, p1, q0, q1, alpha, beta, tc)
-                {
-                    plane[off - stride] = new_p0;
-                    plane[off] = new_q0;
-                }
-            } else if let Some((new_p0, new_q0)) = filter_strong_chroma(p0, p1, q0, q1, alpha, beta)
-            {
-                plane[off - stride] = new_p0;
+                plane[off - step] = new_p0;
                 plane[off] = new_q0;
             }
         }
@@ -785,7 +737,8 @@ fn deblock_mb(
         };
 
         let uv_stride = pic.uv_stride;
-        filter_mb_edge_chroma_v(
+        filter_mb_edge_chroma(
+            true,
             &mut pic.u,
             uv_stride,
             mb_x,
@@ -796,7 +749,8 @@ fn deblock_mb(
             alpha_c0_offset,
             beta_offset,
         );
-        filter_mb_edge_chroma_v(
+        filter_mb_edge_chroma(
+            true,
             &mut pic.v,
             uv_stride,
             mb_x,
@@ -824,7 +778,8 @@ fn deblock_mb(
         };
 
         let uv_stride = pic.uv_stride;
-        filter_mb_edge_chroma_h(
+        filter_mb_edge_chroma(
+            false,
             &mut pic.u,
             uv_stride,
             mb_x,
@@ -835,7 +790,8 @@ fn deblock_mb(
             alpha_c0_offset,
             beta_offset,
         );
-        filter_mb_edge_chroma_h(
+        filter_mb_edge_chroma(
+            false,
             &mut pic.v,
             uv_stride,
             mb_x,
