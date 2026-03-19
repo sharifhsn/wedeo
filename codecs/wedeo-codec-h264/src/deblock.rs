@@ -676,10 +676,12 @@ fn filter_mb_edge_chroma_h(
 // Per-macroblock deblocking
 // ---------------------------------------------------------------------------
 
-/// Compute boundary strengths for all 4 luma vertical edges of a macroblock.
+/// Compute boundary strengths for all 4 luma edges of a macroblock.
 ///
+/// `is_vertical`: true = vertical edges (left neighbor), false = horizontal edges (above neighbor).
 /// Returns `bs[edge][pair]` — 4 edges, each with 4 pairs of bS values.
-fn compute_luma_bs_vertical(
+fn compute_luma_bs(
+    is_vertical: bool,
     mb_info: &[MbDeblockInfo],
     mb_x: u32,
     mb_y: u32,
@@ -692,97 +694,46 @@ fn compute_luma_bs_vertical(
     for (edge, bs_edge) in bs.iter_mut().enumerate() {
         let is_mb_edge = edge == 0;
 
-        // For edge 0, the P block is in the left macroblock
-        if is_mb_edge && mb_x == 0 {
+        // For edge 0, the P block is in the neighboring macroblock.
+        // Skip if there is no such neighbor.
+        if is_mb_edge && (if is_vertical { mb_x == 0 } else { mb_y == 0 }) {
             continue;
         }
 
         for (pair, bs_val) in bs_edge.iter_mut().enumerate() {
-            // Q block: column = edge, row = pair
-            let q_bx = edge;
-            let q_by = pair;
-            let q_idx = luma_block_idx(q_bx, q_by);
-            let q_intra = cur.is_intra;
-            let q_nnz = cur.non_zero_count[q_idx];
-            let q_ref = cur.ref_idx[q_idx];
-            let q_mv = cur.mv[q_idx];
-
-            // P block: one column to the left
-            let (p_intra, p_nnz, p_ref, p_mv) = if is_mb_edge {
-                // P is in the left macroblock, rightmost column
-                let left = &mb_info[mb_idx - 1];
-                let p_idx = luma_block_idx(3, q_by);
-                (
-                    left.is_intra,
-                    left.non_zero_count[p_idx],
-                    left.ref_idx[p_idx],
-                    left.mv[p_idx],
-                )
+            // For vertical edges: Q block at (col=edge, row=pair).
+            // For horizontal edges: Q block at (col=pair, row=edge).
+            let (q_bx, q_by) = if is_vertical {
+                (edge, pair)
             } else {
-                let p_idx = luma_block_idx(q_bx - 1, q_by);
-                (
-                    cur.is_intra,
-                    cur.non_zero_count[p_idx],
-                    cur.ref_idx[p_idx],
-                    cur.mv[p_idx],
-                )
+                (pair, edge)
             };
-
-            *bs_val = compute_bs(
-                is_mb_edge, p_intra, q_intra, p_nnz, q_nnz, p_ref, q_ref, p_mv, q_mv,
-            );
-        }
-    }
-
-    bs
-}
-
-/// Compute boundary strengths for all 4 luma horizontal edges of a macroblock.
-fn compute_luma_bs_horizontal(
-    mb_info: &[MbDeblockInfo],
-    mb_x: u32,
-    mb_y: u32,
-    mb_width: u32,
-) -> [[u8; 4]; 4] {
-    let mut bs = [[0u8; 4]; 4];
-    let mb_idx = (mb_y * mb_width + mb_x) as usize;
-    let cur = &mb_info[mb_idx];
-
-    for (edge, bs_edge) in bs.iter_mut().enumerate() {
-        let is_mb_edge = edge == 0;
-
-        if is_mb_edge && mb_y == 0 {
-            continue;
-        }
-
-        for (pair, bs_val) in bs_edge.iter_mut().enumerate() {
-            // Q block: column = pair, row = edge
-            let q_bx = pair;
-            let q_by = edge;
             let q_idx = luma_block_idx(q_bx, q_by);
             let q_intra = cur.is_intra;
             let q_nnz = cur.non_zero_count[q_idx];
             let q_ref = cur.ref_idx[q_idx];
             let q_mv = cur.mv[q_idx];
 
-            // P block: one row above
+            // P block: one step in the opposite direction.
             let (p_intra, p_nnz, p_ref, p_mv) = if is_mb_edge {
-                let above = &mb_info[mb_idx - mb_width as usize];
-                let p_idx = luma_block_idx(q_bx, 3);
-                (
-                    above.is_intra,
-                    above.non_zero_count[p_idx],
-                    above.ref_idx[p_idx],
-                    above.mv[p_idx],
-                )
+                if is_vertical {
+                    // P is in the left macroblock, rightmost column
+                    let left = &mb_info[mb_idx - 1];
+                    let p_idx = luma_block_idx(3, q_by);
+                    (left.is_intra, left.non_zero_count[p_idx], left.ref_idx[p_idx], left.mv[p_idx])
+                } else {
+                    // P is in the above macroblock, bottom row
+                    let above = &mb_info[mb_idx - mb_width as usize];
+                    let p_idx = luma_block_idx(q_bx, 3);
+                    (above.is_intra, above.non_zero_count[p_idx], above.ref_idx[p_idx], above.mv[p_idx])
+                }
             } else {
-                let p_idx = luma_block_idx(q_bx, q_by - 1);
-                (
-                    cur.is_intra,
-                    cur.non_zero_count[p_idx],
-                    cur.ref_idx[p_idx],
-                    cur.mv[p_idx],
-                )
+                let p_idx = if is_vertical {
+                    luma_block_idx(q_bx - 1, q_by)
+                } else {
+                    luma_block_idx(q_bx, q_by - 1)
+                };
+                (cur.is_intra, cur.non_zero_count[p_idx], cur.ref_idx[p_idx], cur.mv[p_idx])
             };
 
             *bs_val = compute_bs(
@@ -831,7 +782,7 @@ fn deblock_mb(
     let cur_qp = mb_info[mb_idx].qp;
 
     // --- Luma vertical edges ---
-    let luma_bs_v = compute_luma_bs_vertical(mb_info, mb_x, mb_y, mb_width);
+    let luma_bs_v = compute_luma_bs(true, mb_info, mb_x, mb_y, mb_width);
     for (edge, &bs_edge) in luma_bs_v.iter().enumerate() {
         if bs_edge == [0, 0, 0, 0] {
             continue;
@@ -855,7 +806,7 @@ fn deblock_mb(
     }
 
     // --- Luma horizontal edges ---
-    let luma_bs_h = compute_luma_bs_horizontal(mb_info, mb_x, mb_y, mb_width);
+    let luma_bs_h = compute_luma_bs(false, mb_info, mb_x, mb_y, mb_width);
     for (edge, &bs_edge) in luma_bs_h.iter().enumerate() {
         if bs_edge == [0, 0, 0, 0] {
             continue;
