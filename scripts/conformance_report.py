@@ -91,12 +91,6 @@ class H264Features:
                 gaps.append("PAFF (interlaced)")
         if self.constrained_intra_pred:
             gaps.append("constrained_intra_pred (bug: parsed but not enforced)")
-        if self.poc_type == 1:
-            gaps.append("POC type 1 (not implemented)")
-        if self.poc_type == 2:
-            gaps.append("POC type 2 (not implemented)")
-        if self.weighted_pred:
-            gaps.append("weighted prediction")
         if self.weighted_bipred_idc > 0:
             gaps.append(f"weighted bipred (idc={self.weighted_bipred_idc})")
         if self.num_slice_groups > 1:
