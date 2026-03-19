@@ -140,7 +140,7 @@ new codecs and formats.
 First native video codec. Decodes H.264 I+P+B frames to YUV420p.
 See `H264.md` for detailed architecture, module map, and conformance parity report.
 
-**Decoder** (`codecs/wedeo-codec-h264/`, ~16,200 lines):
+**Decoder** (`codecs/wedeo-codec-h264/`, ~17,000 lines):
 - NAL parsing (Annex B + NALFF/avcC), SPS/PPS, slice header with MMCO
 - CAVLC entropy decoding (all VLC tables, level/run decode, mb_type parsing, I_PCM raw bytes)
 - 17 intra prediction modes (9 Intra4x4 + 4 Intra16x16 + 4 chroma)
@@ -148,9 +148,12 @@ See `H264.md` for detailed architecture, module map, and conformance parity repo
 - Flat dequantization (spec-equivalent, avoids i16 overflow in FFmpeg's precomputed tables)
 - In-loop deblocking filter (boundary strength with B-frame two-permutation check, strong/normal filtering, luma+chroma)
 - Quarter-pel luma MC (6-tap FIR), eighth-pel chroma bilinear, bi-directional MC
-- MV prediction (median, P_SKIP, B_SKIP spatial direct with per-4x4 col_zero_flag, 16x8/8x16/8x8 sub-partitions)
+- P-slice weighted prediction (uni-directional, all partition types)
+- MV prediction (median, P_SKIP, B_SKIP spatial+temporal direct with per-4x4 col_zero_flag, 16x8/8x16/8x8 sub-partitions)
+- Temporal direct prediction (dist_scale_factor MV scaling from colocated L1[0])
 - Reference list construction (L0+L1), frame_num wrap-around, MMCO, sliding window DPB with FrameNumWrap
 - Pred weight table parsing (luma/chroma weight+offset per ref)
+- FFmpeg-style output reordering (delayed_pics buffer with last_pocs detection, VUI num_reorder_frames)
 - DPB output reordering (POC type 0/1/2), cross-MB intra4x4 prediction mode tracking
 - Multi-slice frame support, avcC extradata parsing, SPS frame crop offsets
 
@@ -159,7 +162,7 @@ See `H264.md` for detailed architecture, module map, and conformance parity repo
 - Access unit grouping (AUD, SPS, first_mb_in_slice boundaries)
 - File extensions: .264, .h264, .h26l, .avc
 
-**FATE conformance: 39/57 progressive CAVLC tests bitexact, all 17/17 Baseline** (2026-03-19):
+**FATE conformance: 42/57 progressive CAVLC tests bitexact, all 17/17 Baseline** (2026-03-19):
 
 | Test | Status | Notes |
 |------|--------|-------|
@@ -168,15 +171,19 @@ See `H264.md` for detailed architecture, module map, and conformance parity repo
 | MR1_MW_A, MR2_MW_A, MR2_TANDBERG_E, MR1_BT_A | **BITEXACT** | Multi-reference, POC type 1 |
 | MIDR_MW_D, MPS_MW_A, NRF_MW_E | **BITEXACT** | IDR, multi-PPS, non-ref frames |
 | CVPCMNL1, CVPCMNL2 | **BITEXACT** | I_PCM macroblocks |
+| HCBP1, HCBP2 | **BITEXACT** | 15-ref hierarchical, deep reorder buffer |
+| SL1_SVA_B | **BITEXACT** | Temporal direct + direct_8x8_inference=0 |
 | FM2_SVA_B, FM2_SVA_C | **BITEXACT** | Both decoders produce 0 frames |
-| CVFC1 | 19/50 | Frame crop offset applied, remaining multi-slice diffs |
-| CVWP1/CVWP5 | 8/90, 7/90 | Weight table parsed, application not yet implemented |
+| CVBS3/CVSE3/CVSEFDFT3 | 150/300, 137/278, 98/200 | Temporal direct works, P-frame MC diffs cascade |
+| CVWP1 | 19/90 | Chroma-only bug (luma matches, chroma diffs 100+) |
+| CVWP5 | 7/90 | Mixed pixel diffs |
 | CVWP2/CVWP3 | 29/90 | direct_8x8_inference=0 + weighted pred |
-| HCBP1/HCBP2 | 17/250 | 15-ref DPB issue, sliding window not helping |
+| CVFC1 | 19/50 | Frame crop + multi-slice diffs |
+| HCMP1 | 33/250 | 15-ref Main profile, pixel diffs |
 | MR3_TANDBERG_B | 284/300 | POC type 2, 16 frames differ at end |
-| MR4_TANDBERG_C, MR5_TANDBERG_C | 17/300 | Complex MMCO sequences |
-| SL1_SVA_B, cvmp_mot_frm0_full_B | 17/33, 27/30 | direct_8x8_inference=0 |
-| FM1_FT_E | 119/305 | FMO (num_slice_groups>1) |
+| MR4_TANDBERG_C, MR5_TANDBERG_C | 135/300, 52/300 | Complex MMCO sequences |
+| cvmp_mot_frm0_full_B | 27/30 | direct_8x8_inference=0 |
+| FM1_FT_E, FM1_BT_B | 119/305, 0/0 | FMO (out of scope) |
 | MR6-9_BT_B, FI1_Sony_E | Gap | Interlaced (PAFF) / CABAC |
 
 ### FFmpeg audio parity via symphonia
@@ -244,7 +251,7 @@ symphonia wrappers (priority 50) when both exist (e.g., WAV/PCM always uses nati
 - **Error**: No error context (where/why), no codec-specific error codes.
 
 ### In progress
-- **H.264 decoder** — I+P+B frame decode with deblocking, 25/37 progressive CAVLC conformance files BITEXACT (all 17 Baseline). Remaining bugs: constrained intra, POC type 1/2, MMCO with >2 refs. See `H264.md`.
+- **H.264 decoder** — I+P+B frame decode with deblocking, 42/57 progressive CAVLC conformance files BITEXACT (all 17 Baseline). Remaining: chroma-only bug (CVWP1), P-frame MC cascading diffs (CVBS3/CVSE3/CVSEFDFT3), complex MMCO (MR4/MR5). See `H264.md`.
 
 ### Not yet started
 - Video codecs (HEVC, VP9, AV1, etc.) — native Rust implementations, no existing crate covers these
