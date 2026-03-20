@@ -327,12 +327,7 @@ fn pred_4x4_horizontal_up(dst: &mut [u8], stride: usize, left: &[u8]) {
 /// Averages the available top and/or left neighbors of length N.
 /// Falls back to 128 when neither is available.
 #[inline]
-fn compute_dc_value<const N: usize>(
-    has_top: bool,
-    has_left: bool,
-    top: &[u8],
-    left: &[u8],
-) -> u8 {
+fn compute_dc_value<const N: usize>(has_top: bool, has_left: bool, top: &[u8], left: &[u8]) -> u8 {
     match (has_top, has_left) {
         (true, true) => {
             let sum: u32 = top[..N].iter().map(|&v| v as u32).sum::<u32>()

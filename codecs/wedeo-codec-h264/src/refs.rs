@@ -333,6 +333,7 @@ pub fn mark_reference(
             current_frame_num,
             max_frame_num,
             current_dpb_idx,
+            max_num_ref_frames,
         );
     } else {
         sliding_window_mark(
@@ -406,6 +407,7 @@ fn apply_mmco(
     current_frame_num: u32,
     max_frame_num: u32,
     current_dpb_idx: Option<usize>,
+    max_num_ref_frames: u32,
 ) {
     let mut current_marked = false;
 
@@ -503,7 +505,11 @@ fn apply_mmco(
             MmcoOp::CurrentToLongTerm {
                 long_term_frame_idx,
             } => {
-                if let Some(old_lt) = dpb.find_long_term(*long_term_frame_idx) {
+                // Remove any existing long-term ref at the target index
+                // (FFmpeg h264_refs.c:681-704).
+                if let Some(old_lt) = dpb.find_long_term(*long_term_frame_idx)
+                    && old_lt != current_dpb_idx.unwrap_or(usize::MAX)
+                {
                     dpb.mark_unused(old_lt);
                 }
                 if let Some(idx) = current_dpb_idx
@@ -523,6 +529,54 @@ fn apply_mmco(
         && entry.status == RefStatus::Unused
     {
         entry.status = RefStatus::ShortTerm;
+    }
+
+    // Post-MMCO DPB overflow check (FFmpeg h264_refs.c:764-788).
+    // If the DPB has more refs than max_num_ref_frames allows after MMCO,
+    // forcibly evict to bring it back in bounds.
+    let max_refs = max_num_ref_frames.max(1) as usize;
+    while dpb.num_short_term() + dpb.num_long_term() > max_refs {
+        if dpb.num_short_term() > 0 {
+            // Remove oldest short-term ref (smallest FrameNumWrap).
+            let frame_num_wrap = |fn_: u32| -> i64 {
+                if fn_ > current_frame_num {
+                    fn_ as i64 - max_frame_num as i64
+                } else {
+                    fn_ as i64
+                }
+            };
+            let mut oldest_idx: Option<usize> = None;
+            let mut oldest_wrap = i64::MAX;
+            for (i, entry) in dpb.entries.iter().enumerate() {
+                if let Some(e) = entry
+                    && e.status == RefStatus::ShortTerm
+                {
+                    let wrap = frame_num_wrap(e.frame_num);
+                    if wrap < oldest_wrap {
+                        oldest_wrap = wrap;
+                        oldest_idx = Some(i);
+                    }
+                }
+            }
+            if let Some(idx) = oldest_idx {
+                dpb.mark_unused(idx);
+            } else {
+                break;
+            }
+        } else {
+            // Only long-term refs remain — remove the first one found.
+            let lt_idx = dpb
+                .entries
+                .iter()
+                .enumerate()
+                .find(|(_, e)| e.as_ref().is_some_and(|e| e.status == RefStatus::LongTerm))
+                .map(|(i, _)| i);
+            if let Some(idx) = lt_idx {
+                dpb.mark_unused(idx);
+            } else {
+                break;
+            }
+        }
     }
 }
 
@@ -733,7 +787,7 @@ mod tests {
             MmcoOp::End,
         ];
 
-        apply_mmco(&mut dpb, &ops, 7, 256, None);
+        apply_mmco(&mut dpb, &ops, 7, 256, None, 16);
 
         assert!(dpb.find_short_term(5).is_none());
         assert!(dpb.find_short_term(3).is_some());
@@ -751,7 +805,7 @@ mod tests {
             MmcoOp::End,
         ];
 
-        apply_mmco(&mut dpb, &ops, 5, 256, Some(idx));
+        apply_mmco(&mut dpb, &ops, 5, 256, Some(idx), 16);
 
         let entry = dpb.get(idx).unwrap();
         assert_eq!(entry.status, RefStatus::LongTerm);
@@ -771,7 +825,7 @@ mod tests {
             MmcoOp::End,
         ];
 
-        apply_mmco(&mut dpb, &ops, 5, 256, None);
+        apply_mmco(&mut dpb, &ops, 5, 256, None, 16);
 
         assert!(dpb.find_short_term(3).is_none());
         let lt_idx = dpb.find_long_term(2).unwrap();
@@ -789,7 +843,7 @@ mod tests {
         let cur_idx = dpb.store(cur).unwrap();
 
         let ops = vec![MmcoOp::Reset, MmcoOp::End];
-        apply_mmco(&mut dpb, &ops, 3, 256, Some(cur_idx));
+        apply_mmco(&mut dpb, &ops, 3, 256, Some(cur_idx), 16);
 
         assert!(dpb.find_short_term(1).is_none());
         assert!(dpb.find_short_term(2).is_none());
@@ -821,7 +875,7 @@ mod tests {
             MmcoOp::End,
         ];
 
-        apply_mmco(&mut dpb, &ops, 5, 256, None);
+        apply_mmco(&mut dpb, &ops, 5, 256, None, 16);
 
         assert!(dpb.find_long_term(0).is_some());
         assert!(dpb.find_long_term(1).is_some());
@@ -843,7 +897,7 @@ mod tests {
             MmcoOp::End,
         ];
 
-        apply_mmco(&mut dpb, &ops, 5, 256, None);
+        apply_mmco(&mut dpb, &ops, 5, 256, None, 16);
 
         assert_eq!(dpb.num_long_term(), 0);
     }

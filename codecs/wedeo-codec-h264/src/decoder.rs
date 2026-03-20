@@ -521,6 +521,23 @@ impl H264Decoder {
                         .filter_map(|&dpb_idx| self.dpb.get(dpb_idx).map(|e| &e.pic))
                         .collect();
 
+                    // Set L0/L1 ref POCs for deblocking ref-identity comparison
+                    // and temporal direct dist_scale_factor.
+                    if hdr.slice_type.is_p() || hdr.slice_type.is_b() {
+                        fdc.cur_l0_ref_poc = self
+                            .ref_list_l0
+                            .iter()
+                            .filter_map(|&i| self.dpb.get(i).map(|e| e.poc))
+                            .collect();
+                    }
+                    if hdr.slice_type.is_b() {
+                        fdc.cur_l1_ref_poc = self
+                            .ref_list_l1
+                            .iter()
+                            .filter_map(|&i| self.dpb.get(i).map(|e| e.poc))
+                            .collect();
+                    }
+
                     // Populate colocated info from L1[0] for direct mode
                     if hdr.slice_type.is_b() && !self.ref_list_l1.is_empty() {
                         let l1_0_dpb_idx = self.ref_list_l1[0];
@@ -532,11 +549,11 @@ impl H264Decoder {
                             fdc.col_ref_poc_l0 = entry.ref_poc_l0.clone();
                         }
                         fdc.cur_poc = self.current_poc;
-                        fdc.cur_l0_ref_poc = self
-                            .ref_list_l0
-                            .iter()
-                            .filter_map(|&i| self.dpb.get(i).map(|e| e.poc))
-                            .collect();
+
+                        // Pre-compute implicit weights for weighted_bipred_idc=2
+                        if pps.weighted_bipred_idc == 2 {
+                            fdc.compute_implicit_weights();
+                        }
                     }
 
                     #[cfg(feature = "tracing-detail")]

@@ -97,8 +97,14 @@ pub struct FrameDecodeContext {
     pub col_ref_poc_l0: Vec<i32>,
     /// Current frame's L0 ref POCs (for temporal direct dist_scale_factor).
     pub cur_l0_ref_poc: Vec<i32>,
+    /// Current frame's L1 ref POCs (for implicit weighted bipred).
+    pub cur_l1_ref_poc: Vec<i32>,
     /// Current picture POC (for temporal direct dist_scale_factor).
     pub cur_poc: i32,
+    /// Pre-computed implicit weights for weighted_bipred_idc=2.
+    /// `implicit_weight[ref0][ref1]` = w0 weight for biweight formula.
+    /// w1 = 64 - w0, log2_denom = 5, offset = 0.
+    pub implicit_weight: Vec<Vec<i32>>,
 }
 
 impl FrameDecodeContext {
@@ -145,8 +151,50 @@ impl FrameDecodeContext {
             col_poc: 0,
             col_ref_poc_l0: Vec::new(),
             cur_l0_ref_poc: Vec::new(),
+            cur_l1_ref_poc: Vec::new(),
             cur_poc: 0,
+            implicit_weight: Vec::new(),
         }
+    }
+
+    /// Compute implicit weights for weighted_bipred_idc=2.
+    ///
+    /// For each (ref0, ref1) pair, computes w0 from POC distances:
+    ///   td = clip(-128, 127, POC[ref1] - POC[ref0])
+    ///   tb = clip(-128, 127, POC[current] - POC[ref0])
+    ///   dist_scale_factor = (tb * ((16384 + abs(td)/2) / td) + 32) >> 8
+    ///   w0 = 64 - dist_scale_factor  (if in range [-64, 128])
+    ///
+    /// Reference: FFmpeg h264_slice.c:688-747 implicit_weight_table()
+    pub fn compute_implicit_weights(&mut self) {
+        let cur_poc = self.cur_poc;
+        let ref_count0 = self.cur_l0_ref_poc.len();
+        let ref_count1 = self.cur_l1_ref_poc.len();
+
+        // Early exit: single ref on each list with symmetric POC → no weighting
+        if ref_count0 == 1
+            && ref_count1 == 1
+            && self.cur_l0_ref_poc[0] as i64 + self.cur_l1_ref_poc[0] as i64 == 2 * cur_poc as i64
+        {
+            self.implicit_weight = vec![vec![32; ref_count1]; ref_count0];
+            return;
+        }
+
+        let mut weights = vec![vec![32i32; ref_count1]; ref_count0];
+        for (r0, &poc0) in self.cur_l0_ref_poc.iter().enumerate() {
+            for (r1, &poc1) in self.cur_l1_ref_poc.iter().enumerate() {
+                let td = (poc1 - poc0).clamp(-128, 127);
+                if td != 0 {
+                    let tb = (cur_poc - poc0).clamp(-128, 127);
+                    let tx = (16384 + (td.abs() >> 1)) / td;
+                    let dist_scale_factor = (tb * tx + 32) >> 8;
+                    if (-64..=128).contains(&dist_scale_factor) {
+                        weights[r0][r1] = 64 - dist_scale_factor;
+                    }
+                }
+            }
+        }
+        self.implicit_weight = weights;
     }
 }
 
@@ -160,7 +208,7 @@ impl FrameDecodeContext {
 /// Skip MBs have no residual and no intra prediction, so non_zero_count is all zeros.
 /// Inter MBs make neighbors unavailable under constrained_intra_pred.
 #[inline]
-fn finalize_skip_mb(ctx: &mut FrameDecodeContext, mb_x: u32, mb_y: u32) {
+fn finalize_skip_mb(ctx: &mut FrameDecodeContext, mb_x: u32, mb_y: u32, is_b_slice: bool) {
     let mb_idx = (mb_y * ctx.mb_width + mb_x) as usize;
     ctx.slice_table[mb_idx] = ctx.current_slice;
     let nz = [0u8; 24];
@@ -172,34 +220,76 @@ fn finalize_skip_mb(ctx: &mut FrameDecodeContext, mb_x: u32, mb_y: u32) {
     ctx.neighbor_ctx.update_after_mb(mb_x, &nz, &modes);
     ctx.neighbor_ctx.left_available = true;
     let qp = ctx.qp;
-    store_deblock_info(ctx, mb_idx, false, qp, [0; 24]);
+    store_deblock_info(ctx, mb_idx, false, is_b_slice, qp, [0; 24]);
 }
 
 /// Store `MbDeblockInfo` for the deblocking filter after decoding a macroblock.
 ///
-/// Copies the current MV and ref_idx from `mv_ctx` into `mb_info[mb_idx]`.
+/// Copies the current MV and ref_idx from `mv_ctx` into `mb_info[mb_idx]`,
+/// converting list-relative ref_idx to picture POC for identity comparison.
 /// Called from `decode_macroblock`, `decode_skip_mb`, and `decode_b_skip_mb`.
+/// `is_b_slice`: true for B-slice MBs (copies L1 data for two-permutation BS check).
 #[inline]
 fn store_deblock_info(
     ctx: &mut FrameDecodeContext,
     mb_idx: usize,
     is_intra: bool,
+    is_b_slice: bool,
     qp: u8,
     non_zero_count: [u8; 24],
 ) {
     let mb_idx_base = mb_idx * 16;
     let mut deblock_mv = [[0i16; 2]; 16];
-    let mut deblock_ref_idx = [-1i8; 16];
+    let mut deblock_ref_poc = [i32::MIN; 16];
+    let mut deblock_mv_l1 = [[0i16; 2]; 16];
+    let mut deblock_ref_poc_l1 = [i32::MIN; 16];
     if !is_intra && mb_idx_base + 16 <= ctx.mv_ctx.mv.len() {
         deblock_mv.copy_from_slice(&ctx.mv_ctx.mv[mb_idx_base..mb_idx_base + 16]);
-        deblock_ref_idx.copy_from_slice(&ctx.mv_ctx.ref_idx[mb_idx_base..mb_idx_base + 16]);
+        // Convert ref_idx to picture identity for deblocking ref comparison.
+        // B-slices: use POC (needed for cross-list L0/L1 identity comparison).
+        // P-slices: use ref_idx directly (same list, ref_idx = identity;
+        // avoids depending on POC computation which may have bugs for POC type 1).
+        if is_b_slice {
+            for (blk, poc) in deblock_ref_poc.iter_mut().enumerate() {
+                let ri = ctx.mv_ctx.ref_idx[mb_idx_base + blk];
+                *poc = if ri >= 0 {
+                    ctx.cur_l0_ref_poc
+                        .get(ri as usize)
+                        .copied()
+                        .unwrap_or(i32::MIN)
+                } else {
+                    i32::MIN
+                };
+            }
+            deblock_mv_l1.copy_from_slice(&ctx.mv_ctx.mv_l1[mb_idx_base..mb_idx_base + 16]);
+            for (blk, poc) in deblock_ref_poc_l1.iter_mut().enumerate() {
+                let ri = ctx.mv_ctx.ref_idx_l1[mb_idx_base + blk];
+                *poc = if ri >= 0 {
+                    ctx.cur_l1_ref_poc
+                        .get(ri as usize)
+                        .copied()
+                        .unwrap_or(i32::MIN)
+                } else {
+                    i32::MIN
+                };
+            }
+        } else {
+            // P-slice: ref_idx identifies the picture (all blocks share the same L0 list)
+            for (blk, poc) in deblock_ref_poc.iter_mut().enumerate() {
+                let ri = ctx.mv_ctx.ref_idx[mb_idx_base + blk];
+                *poc = if ri >= 0 { ri as i32 } else { i32::MIN };
+            }
+        }
     }
     ctx.mb_info[mb_idx] = MbDeblockInfo {
         is_intra,
         qp,
+        list_count: if is_b_slice { 2 } else { 1 },
         non_zero_count,
-        ref_idx: deblock_ref_idx,
+        ref_poc: deblock_ref_poc,
         mv: deblock_mv,
+        ref_poc_l1: deblock_ref_poc_l1,
+        mv_l1: deblock_mv_l1,
     };
 }
 
@@ -607,7 +697,14 @@ pub fn decode_macroblock(
     ctx.neighbor_ctx.left_available = true;
 
     // 7. Store MbDeblockInfo for the deblocking filter
-    store_deblock_info(ctx, mb_idx, mb.is_intra, qp, mb.non_zero_count);
+    store_deblock_info(
+        ctx,
+        mb_idx,
+        mb.is_intra,
+        slice_hdr.slice_type.is_b(),
+        qp,
+        mb.non_zero_count,
+    );
 
     Ok(())
 }
@@ -1372,7 +1469,7 @@ pub fn decode_skip_mb(
     }
 
     // Record slice ownership, update neighbor context, and store deblock info.
-    finalize_skip_mb(ctx, mb_x, mb_y);
+    finalize_skip_mb(ctx, mb_x, mb_y, false);
 
     let _ = slice_hdr; // reserved for future use (e.g. weighted prediction)
 }
@@ -1431,9 +1528,37 @@ pub fn decode_b_skip_mb(
             } else if use_l0 {
                 let ref_pic = ref_pics[(ref_l0 as usize).min(ref_pics.len() - 1)];
                 apply_mc_partition(ctx, ref_pic, mb_x, mb_y, px_x, px_y, 4, 4, mv_l0);
+                if slice_hdr.use_weight || slice_hdr.use_weight_chroma {
+                    apply_weight_list(
+                        ctx,
+                        slice_hdr,
+                        mb_x,
+                        mb_y,
+                        px_x,
+                        px_y,
+                        4,
+                        4,
+                        ref_l0.max(0) as usize,
+                        0,
+                    );
+                }
             } else if use_l1 {
                 let ref_pic = ref_pics_l1[(ref_l1 as usize).min(ref_pics_l1.len() - 1)];
                 apply_mc_partition(ctx, ref_pic, mb_x, mb_y, px_x, px_y, 4, 4, mv_l1);
+                if slice_hdr.use_weight || slice_hdr.use_weight_chroma {
+                    apply_weight_list(
+                        ctx,
+                        slice_hdr,
+                        mb_x,
+                        mb_y,
+                        px_x,
+                        px_y,
+                        4,
+                        4,
+                        ref_l1.max(0) as usize,
+                        1,
+                    );
+                }
             }
 
             ctx.mv_ctx.set(mb_x, mb_y, i4, mv_l0, ref_l0);
@@ -1442,7 +1567,7 @@ pub fn decode_b_skip_mb(
     }
 
     // Record slice ownership, update neighbor context, and store deblock info.
-    finalize_skip_mb(ctx, mb_x, mb_y);
+    finalize_skip_mb(ctx, mb_x, mb_y, true);
 }
 
 /// Decode a B-frame inter macroblock.
@@ -1510,9 +1635,37 @@ fn decode_b_inter_mb(
             } else if use_l0 {
                 let ref_pic = ref_pics[(ref_l0 as usize).min(ref_pics.len() - 1)];
                 apply_mc_partition(ctx, ref_pic, mb_x, mb_y, px_x, px_y, 4, 4, mv_l0);
+                if slice_hdr.use_weight || slice_hdr.use_weight_chroma {
+                    apply_weight_list(
+                        ctx,
+                        slice_hdr,
+                        mb_x,
+                        mb_y,
+                        px_x,
+                        px_y,
+                        4,
+                        4,
+                        ref_l0.max(0) as usize,
+                        0,
+                    );
+                }
             } else if use_l1 {
                 let ref_pic = ref_pics_l1[(ref_l1 as usize).min(ref_pics_l1.len() - 1)];
                 apply_mc_partition(ctx, ref_pic, mb_x, mb_y, px_x, px_y, 4, 4, mv_l1);
+                if slice_hdr.use_weight || slice_hdr.use_weight_chroma {
+                    apply_weight_list(
+                        ctx,
+                        slice_hdr,
+                        mb_x,
+                        mb_y,
+                        px_x,
+                        px_y,
+                        4,
+                        4,
+                        ref_l1.max(0) as usize,
+                        1,
+                    );
+                }
             }
 
             ctx.mv_ctx.set(mb_x, mb_y, i4, mv_l0, ref_l0);
@@ -1694,9 +1847,37 @@ fn decode_b_inter_mb(
             } else if uses_l0 && !ref_pics.is_empty() {
                 let ref_pic = ref_pics[(ref_l0 as usize).min(ref_pics.len() - 1)];
                 apply_mc_partition(ctx, ref_pic, mb_x, mb_y, px_x, px_y, pw, ph, mv_l0);
+                if slice_hdr.use_weight || slice_hdr.use_weight_chroma {
+                    apply_weight_list(
+                        ctx,
+                        slice_hdr,
+                        mb_x,
+                        mb_y,
+                        px_x,
+                        px_y,
+                        pw,
+                        ph,
+                        ref_l0.max(0) as usize,
+                        0,
+                    );
+                }
             } else if uses_l1 && !ref_pics_l1.is_empty() {
                 let ref_pic = ref_pics_l1[(ref_l1 as usize).min(ref_pics_l1.len() - 1)];
                 apply_mc_partition(ctx, ref_pic, mb_x, mb_y, px_x, px_y, pw, ph, mv_l1);
+                if slice_hdr.use_weight || slice_hdr.use_weight_chroma {
+                    apply_weight_list(
+                        ctx,
+                        slice_hdr,
+                        mb_x,
+                        mb_y,
+                        px_x,
+                        px_y,
+                        pw,
+                        ph,
+                        ref_l1.max(0) as usize,
+                        1,
+                    );
+                }
             }
         }
     }
@@ -1776,9 +1957,37 @@ fn decode_b_8x8_mb(
                     } else if use_l0 {
                         let ref_pic = ref_pics[(ref_l0 as usize).min(ref_pics.len() - 1)];
                         apply_mc_partition(ctx, ref_pic, mb_x, mb_y, px_x, px_y, 4, 4, mv_l0);
+                        if slice_hdr.use_weight || slice_hdr.use_weight_chroma {
+                            apply_weight_list(
+                                ctx,
+                                slice_hdr,
+                                mb_x,
+                                mb_y,
+                                px_x,
+                                px_y,
+                                4,
+                                4,
+                                ref_l0.max(0) as usize,
+                                0,
+                            );
+                        }
                     } else if use_l1 {
                         let ref_pic = ref_pics_l1[(ref_l1 as usize).min(ref_pics_l1.len() - 1)];
                         apply_mc_partition(ctx, ref_pic, mb_x, mb_y, px_x, px_y, 4, 4, mv_l1);
+                        if slice_hdr.use_weight || slice_hdr.use_weight_chroma {
+                            apply_weight_list(
+                                ctx,
+                                slice_hdr,
+                                mb_x,
+                                mb_y,
+                                px_x,
+                                px_y,
+                                4,
+                                4,
+                                ref_l1.max(0) as usize,
+                                1,
+                            );
+                        }
                     }
 
                     ctx.mv_ctx.set(mb_x, mb_y, i4, mv_l0, ref_l0);
@@ -1926,9 +2135,37 @@ fn decode_b_8x8_mb(
                 } else if uses_l0 && !ref_pics.is_empty() {
                     let ref_pic = ref_pics[(ref_l0 as usize).min(ref_pics.len() - 1)];
                     apply_mc_partition(ctx, ref_pic, mb_x, mb_y, px_x, px_y, pw, ph, mv_l0);
+                    if slice_hdr.use_weight || slice_hdr.use_weight_chroma {
+                        apply_weight_list(
+                            ctx,
+                            slice_hdr,
+                            mb_x,
+                            mb_y,
+                            px_x,
+                            px_y,
+                            pw,
+                            ph,
+                            ref_l0.max(0) as usize,
+                            0,
+                        );
+                    }
                 } else if uses_l1 && !ref_pics_l1.is_empty() {
                     let ref_pic = ref_pics_l1[(ref_l1 as usize).min(ref_pics_l1.len() - 1)];
                     apply_mc_partition(ctx, ref_pic, mb_x, mb_y, px_x, px_y, pw, ph, mv_l1);
+                    if slice_hdr.use_weight || slice_hdr.use_weight_chroma {
+                        apply_weight_list(
+                            ctx,
+                            slice_hdr,
+                            mb_x,
+                            mb_y,
+                            px_x,
+                            px_y,
+                            pw,
+                            ph,
+                            ref_l1.max(0) as usize,
+                            1,
+                        );
+                    }
                 }
             }
         }
@@ -2260,12 +2497,43 @@ fn apply_weight_p(
     ph: usize,
     ref_idx: usize,
 ) {
+    apply_weight_list(ctx, hdr, mb_x, mb_y, px_x, px_y, pw, ph, ref_idx, 0);
+}
+
+/// Apply uni-directional weighted prediction for a specific list (0=L0, 1=L1).
+///
+/// Called for P-slice weighted pred (list=0) and B-slice uni-directional
+/// weighted pred (B_L0 uses list=0, B_L1 uses list=1).
+#[allow(clippy::too_many_arguments)]
+fn apply_weight_list(
+    ctx: &mut FrameDecodeContext,
+    hdr: &SliceHeader,
+    mb_x: u32,
+    mb_y: u32,
+    px_x: u32,
+    px_y: u32,
+    pw: usize,
+    ph: usize,
+    ref_idx: usize,
+    list: u8,
+) {
+    let luma_weights = if list == 0 {
+        &hdr.luma_weight_l0
+    } else {
+        &hdr.luma_weight_l1
+    };
+    let chroma_weights = if list == 0 {
+        &hdr.chroma_weight_l0
+    } else {
+        &hdr.chroma_weight_l1
+    };
+
     let lx = (mb_x * 16 + px_x) as usize;
     let ly = (mb_y * 16 + px_y) as usize;
 
     // Luma (skip when only chroma weights are active)
-    if hdr.use_weight && ref_idx < hdr.luma_weight_l0.len() {
-        let (w, o) = hdr.luma_weight_l0[ref_idx];
+    if hdr.use_weight && ref_idx < luma_weights.len() {
+        let (w, o) = luma_weights[ref_idx];
         apply_weight_uni(
             &mut ctx.pic.y,
             ctx.pic.y_stride,
@@ -2280,12 +2548,12 @@ fn apply_weight_p(
     }
 
     // Chroma
-    if hdr.use_weight_chroma && ref_idx < hdr.chroma_weight_l0.len() {
+    if hdr.use_weight_chroma && ref_idx < chroma_weights.len() {
         let cx = lx / 2;
         let cy = ly / 2;
         let cw = pw / 2;
         let ch = ph / 2;
-        let cw_entry = hdr.chroma_weight_l0[ref_idx];
+        let cw_entry = chroma_weights[ref_idx];
         // Cb
         apply_weight_uni(
             &mut ctx.pic.u,
@@ -2426,7 +2694,26 @@ fn apply_mc_bi_partition(
     let l0_idx = ref_idx_l0.max(0) as usize;
     let l1_idx = ref_idx_l1.max(0) as usize;
 
-    if slice_hdr.use_weight
+    if slice_hdr.weighted_bipred_idc == 2
+        && l0_idx < ctx.implicit_weight.len()
+        && l1_idx < ctx.implicit_weight.get(l0_idx).map_or(0, |v| v.len())
+    {
+        // Implicit weighted bipred: weights from POC distances, denom=5, offset=0
+        let w0 = ctx.implicit_weight[l0_idx][l1_idx];
+        let w1 = 64 - w0;
+        biweight_pixels(
+            &mut ctx.pic.y[luma_offset..],
+            ctx.pic.y_stride,
+            &tmp_y,
+            block_w,
+            block_w,
+            block_h,
+            5,
+            w0,
+            w1,
+            0,
+        );
+    } else if slice_hdr.use_weight
         && l0_idx < slice_hdr.luma_weight_l0.len()
         && l1_idx < slice_hdr.luma_weight_l1.len()
     {
@@ -2503,14 +2790,44 @@ fn apply_mc_bi_partition(
         ref_l1.height / 2,
     );
 
-    if slice_hdr.use_weight_chroma
+    if slice_hdr.weighted_bipred_idc == 2
+        && l0_idx < ctx.implicit_weight.len()
+        && l1_idx < ctx.implicit_weight.get(l0_idx).map_or(0, |v| v.len())
+    {
+        // Implicit weighted bipred: same weight for luma and chroma, denom=5, offset=0
+        let w0 = ctx.implicit_weight[l0_idx][l1_idx];
+        let w1 = 64 - w0;
+        biweight_pixels(
+            &mut ctx.pic.u[chroma_off..],
+            ctx.pic.uv_stride,
+            &tmp_u,
+            chroma_w,
+            chroma_w,
+            chroma_h,
+            5,
+            w0,
+            w1,
+            0,
+        );
+        biweight_pixels(
+            &mut ctx.pic.v[chroma_off..],
+            ctx.pic.uv_stride,
+            &tmp_v,
+            chroma_w,
+            chroma_w,
+            chroma_h,
+            5,
+            w0,
+            w1,
+            0,
+        );
+    } else if slice_hdr.use_weight_chroma
         && l0_idx < slice_hdr.chroma_weight_l0.len()
         && l1_idx < slice_hdr.chroma_weight_l1.len()
     {
         let cw0 = slice_hdr.chroma_weight_l0[l0_idx];
         let cw1 = slice_hdr.chroma_weight_l1[l1_idx];
         let denom = slice_hdr.chroma_log2_weight_denom;
-        // Cb
         biweight_pixels(
             &mut ctx.pic.u[chroma_off..],
             ctx.pic.uv_stride,
@@ -2523,7 +2840,6 @@ fn apply_mc_bi_partition(
             cw1[0].0,
             cw0[0].1 + cw1[0].1,
         );
-        // Cr
         biweight_pixels(
             &mut ctx.pic.v[chroma_off..],
             ctx.pic.uv_stride,

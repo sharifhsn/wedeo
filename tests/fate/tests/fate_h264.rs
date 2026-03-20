@@ -386,11 +386,7 @@ fn fate_h264_ba_mw_d_frame_count() {
     }
 
     let frames = decode_all_frames(&path);
-    assert_eq!(
-        frames.len(),
-        100,
-        "BA_MW_D.264 should decode 100 frames"
-    );
+    assert_eq!(frames.len(), 100, "BA_MW_D.264 should decode 100 frames");
     for (i, &(w, h, pf, _)) in frames.iter().enumerate() {
         assert_eq!(w, 176, "Frame {} width", i);
         assert_eq!(h, 144, "Frame {} height", i);
@@ -408,11 +404,7 @@ fn fate_h264_sva_base_b_frame_count() {
     }
 
     let frames = decode_all_frames(&path);
-    assert_eq!(
-        frames.len(),
-        17,
-        "SVA_Base_B.264 should decode 17 frames"
-    );
+    assert_eq!(frames.len(), 17, "SVA_Base_B.264 should decode 17 frames");
 }
 
 /// SVA_FM1_E.264: Multi-slice Baseline, 17 frames.
@@ -425,11 +417,7 @@ fn fate_h264_sva_fm1_e_frame_count() {
     }
 
     let frames = decode_all_frames(&path);
-    assert_eq!(
-        frames.len(),
-        17,
-        "SVA_FM1_E.264 should decode 17 frames"
-    );
+    assert_eq!(frames.len(), 17, "SVA_FM1_E.264 should decode 17 frames");
 }
 
 /// BA1_FT_C.264: Baseline 352x288, 299 frames.
@@ -442,11 +430,7 @@ fn fate_h264_ba1_ft_c_frame_count() {
     }
 
     let frames = decode_all_frames(&path);
-    assert_eq!(
-        frames.len(),
-        299,
-        "BA1_FT_C.264 should decode 299 frames"
-    );
+    assert_eq!(frames.len(), 299, "BA1_FT_C.264 should decode 299 frames");
     for (i, &(w, h, _, _)) in frames.iter().enumerate() {
         assert_eq!(w, 352, "Frame {} width", i);
         assert_eq!(h, 288, "Frame {} height", i);

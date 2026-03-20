@@ -275,13 +275,17 @@ pub fn blk_idx_to_xy(blk_idx: usize) -> (u32, u32) {
 
 impl MvContext {
     /// Create a new MvContext for a frame of the given MB dimensions.
+    /// Sentinel for "block not yet decoded" (matches FFmpeg's PART_NOT_AVAILABLE = -2).
+    /// Distinguishes from ref=-1 which means "list not used" (LIST_NOT_USED).
+    pub const PART_NOT_AVAILABLE: i8 = -2;
+
     pub fn new(mb_width: u32, mb_height: u32) -> Self {
         let total_blocks = (mb_width * mb_height * 16) as usize;
         Self {
             mv: vec![[0i16; 2]; total_blocks],
-            ref_idx: vec![-1i8; total_blocks],
+            ref_idx: vec![Self::PART_NOT_AVAILABLE; total_blocks],
             mv_l1: vec![[0i16; 2]; total_blocks],
-            ref_idx_l1: vec![-1i8; total_blocks],
+            ref_idx_l1: vec![Self::PART_NOT_AVAILABLE; total_blocks],
             mb_width,
             mb_height,
         }
@@ -427,15 +431,15 @@ impl MvContext {
         };
 
         if c_is_past && let Some(result) = self.try_get_neighbor(mb_x, mb_y, cr_x, cr_y) {
-            // If C is within the current MB and ref_idx=-1, the target 4x4 block
-            // has not been decoded yet (e.g., sub 3 when processing sub 2 of a
-            // P_8x8 MB).  FFmpeg marks these positions PART_NOT_AVAILABLE and
-            // falls back to D; wedeo must do the same.  ref_idx=-1 from a
-            // *different* MB means intra-coded (LIST_NOT_USED) and is valid.
-            if !c_is_same_mb || result.1 >= 0 {
+            // If C is within the current MB and ref == PART_NOT_AVAILABLE (-2),
+            // the target 4x4 block has not been decoded yet. Fall back to D.
+            // ref=-1 (LIST_NOT_USED) means the block IS decoded but doesn't use
+            // this list — this is a valid neighbor (matching FFmpeg's
+            // PART_NOT_AVAILABLE vs LIST_NOT_USED distinction).
+            if !c_is_same_mb || result.1 != Self::PART_NOT_AVAILABLE {
                 return Some(result);
             }
-            // Same MB + ref=-1 → fall through to D
+            // Same MB + PART_NOT_AVAILABLE → fall through to D
         }
 
         // Fall back to top-left (D)
@@ -664,8 +668,8 @@ impl MvContext {
                     let blk_idx = (target_blk_x + target_blk_y * 4) as usize;
                     let is_same_mb = target_mb_x == mb_x && target_mb_y == mb_y;
                     let (mv, r) = self.get_for_list(target_mb_x, target_mb_y, blk_idx, list);
-                    // Same-MB + ref=-1 means not yet decoded → fall through to D
-                    if is_same_mb && r < 0 {
+                    // Same-MB + PART_NOT_AVAILABLE means not yet decoded → fall through to D
+                    if is_same_mb && r == Self::PART_NOT_AVAILABLE {
                         // Fall through to D (top-left)
                         let dl_x = blk_x.wrapping_sub(1);
                         let dl_y = blk_y.wrapping_sub(1);
@@ -914,10 +918,10 @@ mod tests {
         assert_eq!(mv, [10, 20]);
         assert_eq!(r, 0);
 
-        // Default values
+        // Default values (PART_NOT_AVAILABLE = -2 for uninitialized blocks)
         let (mv, r) = ctx.get(1, 1, 15);
         assert_eq!(mv, [0, 0]);
-        assert_eq!(r, -1);
+        assert_eq!(r, MvContext::PART_NOT_AVAILABLE);
     }
 
     #[test]

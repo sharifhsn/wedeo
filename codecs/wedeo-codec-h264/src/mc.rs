@@ -237,7 +237,17 @@ fn qpel_h_avg(
     let src_w = block_w + 5;
     let src_h = block_h;
     let mut src = vec![0i32; src_w * src_h];
-    extract_ref_block(&mut src, ref_y, ref_stride, ref_x - 2, ref_y_pos, src_w, src_h, pw, ph);
+    extract_ref_block(
+        &mut src,
+        ref_y,
+        ref_stride,
+        ref_x - 2,
+        ref_y_pos,
+        src_w,
+        src_h,
+        pw,
+        ph,
+    );
 
     let mut half_h = vec![0u8; block_w * block_h];
     h_lowpass(&mut half_h, block_w, &src, src_w, block_w, block_h);
@@ -248,7 +258,9 @@ fn qpel_h_avg(
             full_pel[j * block_w + i] = src[j * src_w + i + full_pel_col_offset] as u8;
         }
     }
-    avg_pixels(dst, dst_stride, &full_pel, block_w, &half_h, block_w, block_w, block_h);
+    avg_pixels(
+        dst, dst_stride, &full_pel, block_w, &half_h, block_w, block_w, block_h,
+    );
 }
 
 /// Group B helper: compute v_lowpass, then average with a full-pel row
@@ -273,7 +285,17 @@ fn qpel_v_avg(
     let src_w = block_w;
     let src_h = block_h + 5;
     let mut src = vec![0i32; src_w * src_h];
-    extract_ref_block(&mut src, ref_y, ref_stride, ref_x, ref_y_pos - 2, src_w, src_h, pw, ph);
+    extract_ref_block(
+        &mut src,
+        ref_y,
+        ref_stride,
+        ref_x,
+        ref_y_pos - 2,
+        src_w,
+        src_h,
+        pw,
+        ph,
+    );
 
     let mut half_v = vec![0u8; block_w * block_h];
     v_lowpass(&mut half_v, block_w, &src, src_w, block_w, block_h);
@@ -284,7 +306,9 @@ fn qpel_v_avg(
             full_pel[j * block_w + i] = src[(j + full_pel_row_offset) * src_w + i] as u8;
         }
     }
-    avg_pixels(dst, dst_stride, &full_pel, block_w, &half_v, block_w, block_w, block_h);
+    avg_pixels(
+        dst, dst_stride, &full_pel, block_w, &half_v, block_w, block_w, block_h,
+    );
 }
 
 /// Group C helper: diagonal quarter-pel = avg(h_lowpass, v_lowpass).
@@ -343,7 +367,9 @@ fn qpel_diagonal(
     let mut half_v = vec![0u8; block_w * block_h];
     v_lowpass(&mut half_v, block_w, &src_v_buf, src_v_w, block_w, block_h);
 
-    avg_pixels(dst, dst_stride, &half_h, block_w, &half_v, block_w, block_w, block_h);
+    avg_pixels(
+        dst, dst_stride, &half_h, block_w, &half_v, block_w, block_w, block_h,
+    );
 }
 
 /// Group D helper: h_lowpass (at row `ref_y_pos + h_row_delta`) + hv_lowpass, averaged.
@@ -396,9 +422,18 @@ fn qpel_mixed_h_hv(
         ph,
     );
     let mut half_hv = vec![0u8; block_w * block_h];
-    hv_lowpass(&mut half_hv, block_w, &src_hv_buf, src_hv_w, block_w, block_h);
+    hv_lowpass(
+        &mut half_hv,
+        block_w,
+        &src_hv_buf,
+        src_hv_w,
+        block_w,
+        block_h,
+    );
 
-    avg_pixels(dst, dst_stride, &half_h, block_w, &half_hv, block_w, block_w, block_h);
+    avg_pixels(
+        dst, dst_stride, &half_h, block_w, &half_hv, block_w, block_w, block_h,
+    );
 }
 
 /// Group D helper: v_lowpass (at col `ref_x + v_col_delta`) + hv_lowpass, averaged.
@@ -451,9 +486,18 @@ fn qpel_mixed_v_hv(
         ph,
     );
     let mut half_hv = vec![0u8; block_w * block_h];
-    hv_lowpass(&mut half_hv, block_w, &src_hv_buf, src_hv_w, block_w, block_h);
+    hv_lowpass(
+        &mut half_hv,
+        block_w,
+        &src_hv_buf,
+        src_hv_w,
+        block_w,
+        block_h,
+    );
 
-    avg_pixels(dst, dst_stride, &half_v, block_w, &half_hv, block_w, block_w, block_h);
+    avg_pixels(
+        dst, dst_stride, &half_v, block_w, &half_hv, block_w, block_w, block_h,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -593,96 +637,84 @@ pub fn mc_luma(
         // (1,0): quarter-pel = avg(G, b) — avg of full-pel and horizontal half
         // ------------------------------------------------------------------
         (1, 0) => qpel_h_avg(
-            dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos,
-            block_w, block_h, pw, ph, 2,
+            dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos, block_w, block_h, pw, ph, 2,
         ),
 
         // ------------------------------------------------------------------
         // (3,0): quarter-pel = avg(G+1, b) — avg of full-pel+1 and horizontal half
         // ------------------------------------------------------------------
         (3, 0) => qpel_h_avg(
-            dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos,
-            block_w, block_h, pw, ph, 3,
+            dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos, block_w, block_h, pw, ph, 3,
         ),
 
         // ------------------------------------------------------------------
         // (0,1): quarter-pel = avg(G, h) — avg of full-pel and vertical half
         // ------------------------------------------------------------------
         (0, 1) => qpel_v_avg(
-            dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos,
-            block_w, block_h, pw, ph, 2,
+            dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos, block_w, block_h, pw, ph, 2,
         ),
 
         // ------------------------------------------------------------------
         // (0,3): quarter-pel = avg(G_below, h) — avg of full-pel+1row and vertical half
         // ------------------------------------------------------------------
         (0, 3) => qpel_v_avg(
-            dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos,
-            block_w, block_h, pw, ph, 3,
+            dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos, block_w, block_h, pw, ph, 3,
         ),
 
         // ------------------------------------------------------------------
         // (1,1): avg(halfH, halfV) — diagonal quarter-pel "e"
         // ------------------------------------------------------------------
         (1, 1) => qpel_diagonal(
-            dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos,
-            block_w, block_h, pw, ph, 0, 0,
+            dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos, block_w, block_h, pw, ph, 0, 0,
         ),
 
         // ------------------------------------------------------------------
         // (3,1): avg(halfH, halfV_right) — "g" position
         // ------------------------------------------------------------------
         (3, 1) => qpel_diagonal(
-            dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos,
-            block_w, block_h, pw, ph, 0, 1,
+            dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos, block_w, block_h, pw, ph, 0, 1,
         ),
 
         // ------------------------------------------------------------------
         // (1,3): avg(halfH_below, halfV) — "m" position
         // ------------------------------------------------------------------
         (1, 3) => qpel_diagonal(
-            dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos,
-            block_w, block_h, pw, ph, 1, 0,
+            dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos, block_w, block_h, pw, ph, 1, 0,
         ),
 
         // ------------------------------------------------------------------
         // (3,3): avg(halfH_below, halfV_right) — "o" position
         // ------------------------------------------------------------------
         (3, 3) => qpel_diagonal(
-            dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos,
-            block_w, block_h, pw, ph, 1, 1,
+            dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos, block_w, block_h, pw, ph, 1, 1,
         ),
 
         // ------------------------------------------------------------------
         // (2,1): avg(halfH, halfHV) — "f" position
         // ------------------------------------------------------------------
         (2, 1) => qpel_mixed_h_hv(
-            dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos,
-            block_w, block_h, pw, ph, 0,
+            dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos, block_w, block_h, pw, ph, 0,
         ),
 
         // ------------------------------------------------------------------
         // (2,3): avg(halfH_below, halfHV) — "n" position
         // ------------------------------------------------------------------
         (2, 3) => qpel_mixed_h_hv(
-            dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos,
-            block_w, block_h, pw, ph, 1,
+            dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos, block_w, block_h, pw, ph, 1,
         ),
 
         // ------------------------------------------------------------------
         // (1,2): avg(halfV, halfHV) — "i" position
         // ------------------------------------------------------------------
         (1, 2) => qpel_mixed_v_hv(
-            dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos,
-            block_w, block_h, pw, ph, 0,
+            dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos, block_w, block_h, pw, ph, 0,
         ),
 
         // ------------------------------------------------------------------
         // (3,2): avg(halfV_right, halfHV) — "k" position
         // ------------------------------------------------------------------
         (3, 2) => qpel_mixed_v_hv(
-            dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos,
-            block_w, block_h, pw, ph, 1,
+            dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos, block_w, block_h, pw, ph, 1,
         ),
 
         _ => unreachable!("dx and dy must be in 0..4, got ({}, {})", dx, dy),

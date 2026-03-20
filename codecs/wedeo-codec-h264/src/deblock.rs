@@ -97,14 +97,24 @@ pub struct MbDeblockInfo {
     pub is_intra: bool,
     /// QP value for this macroblock.
     pub qp: u8,
+    /// Number of reference lists used: 1 for P-slice MBs, 2 for B-slice MBs.
+    /// Used by the two-permutation BS check for B-frames (FFmpeg check_mv).
+    pub list_count: u8,
     /// Non-zero coefficient count per 4x4 block (16 luma + 8 chroma).
     /// Luma: indices 0..16 in raster scan of 4x4 sub-blocks.
     /// Chroma Cb: indices 16..20, Cr: indices 20..24.
     pub non_zero_count: [u8; 24],
-    /// Reference indices per 4x4 block (list 0).
-    pub ref_idx: [i8; 16],
+    /// Reference picture POC per 4x4 block (list 0).
+    /// Stores POC (not list-relative index) so deblocking compares picture
+    /// identity regardless of which list a block uses.  i32::MIN = unavailable.
+    pub ref_poc: [i32; 16],
     /// Motion vectors per 4x4 block (list 0) [x, y].
     pub mv: [[i16; 2]; 16],
+    /// Reference picture POC per 4x4 block (list 1, for B-slice MBs).
+    /// i32::MIN = unavailable.
+    pub ref_poc_l1: [i32; 16],
+    /// Motion vectors per 4x4 block (list 1, for B-slice MBs) [x, y].
+    pub mv_l1: [[i16; 2]; 16],
 }
 
 impl Default for MbDeblockInfo {
@@ -112,9 +122,12 @@ impl Default for MbDeblockInfo {
         Self {
             is_intra: false,
             qp: 0,
+            list_count: 1,
             non_zero_count: [0; 24],
-            ref_idx: [-1; 16],
+            ref_poc: [i32::MIN; 16],
             mv: [[0; 2]; 16],
+            ref_poc_l1: [i32::MIN; 16],
+            mv_l1: [[0; 2]; 16],
         }
     }
 }
@@ -198,13 +211,60 @@ fn luma_block_idx(block_x: usize, block_y: usize) -> usize {
 // Boundary strength calculation
 // ---------------------------------------------------------------------------
 
+/// Check if two blocks have different motion, implementing FFmpeg's check_mv()
+/// (h264_loopfilter.c:438-466) with the two-permutation check for B-frames.
+///
+/// For B-frames, blocks can use opposite reference lists with identical predictions.
+/// The two-permutation check detects this: L0↔L0 + L1↔L1, then cross L0↔L1 + L1↔L0.
+#[allow(clippy::too_many_arguments)] // mirrors FFmpeg check_mv's per-block L0+L1 parameters
+#[inline]
+fn check_mv(
+    p_ref: i32,
+    q_ref: i32,
+    p_mv: [i16; 2],
+    q_mv: [i16; 2],
+    p_ref_l1: i32,
+    q_ref_l1: i32,
+    p_mv_l1: [i16; 2],
+    q_mv_l1: [i16; 2],
+    list_count: u8,
+) -> bool {
+    // Step 1: Check L0 ref and MV (same for P and B slices)
+    let mut v = p_ref != q_ref
+        || (p_mv[0] - q_mv[0]).unsigned_abs() >= 4
+        || (p_mv[1] - q_mv[1]).unsigned_abs() >= 4;
+
+    if list_count == 2 {
+        // Step 2: If L0 passed (v==false), also check L1
+        if !v {
+            v = p_ref_l1 != q_ref_l1
+                || (p_mv_l1[0] - q_mv_l1[0]).unsigned_abs() >= 4
+                || (p_mv_l1[1] - q_mv_l1[1]).unsigned_abs() >= 4;
+        }
+        // Step 3: If either same-list check failed, try cross-list permutation.
+        // Blocks might use opposite lists with the same prediction.
+        if v {
+            if p_ref != q_ref_l1 || p_ref_l1 != q_ref {
+                return true;
+            }
+            return (p_mv[0] - q_mv_l1[0]).unsigned_abs() >= 4
+                || (p_mv[1] - q_mv_l1[1]).unsigned_abs() >= 4
+                || (p_mv_l1[0] - q_mv[0]).unsigned_abs() >= 4
+                || (p_mv_l1[1] - q_mv[1]).unsigned_abs() >= 4;
+        }
+    }
+
+    v
+}
+
 /// Compute boundary strength for an edge between block P and block Q.
 ///
 /// `is_mb_edge`: true if this is a macroblock boundary edge (edge 0)
 /// `p_intra`, `q_intra`: whether blocks are intra
 /// `p_nnz`, `q_nnz`: non-zero coefficient counts
-/// `p_ref`, `q_ref`: reference indices
-/// `p_mv`, `q_mv`: motion vectors [x, y]
+/// `p_ref`/`q_ref`: L0 reference indices; `p_ref_l1`/`q_ref_l1`: L1 reference indices
+/// `p_mv`/`q_mv`: L0 motion vectors; `p_mv_l1`/`q_mv_l1`: L1 motion vectors
+/// `list_count`: max of P/Q list counts (1 for P-only, 2 if either is from B-slice)
 #[allow(clippy::too_many_arguments)] // matches the H.264 spec's per-edge decision tree
 pub fn compute_bs(
     is_mb_edge: bool,
@@ -212,19 +272,23 @@ pub fn compute_bs(
     q_intra: bool,
     p_nnz: u8,
     q_nnz: u8,
-    p_ref: i8,
-    q_ref: i8,
+    p_ref: i32,
+    q_ref: i32,
     p_mv: [i16; 2],
     q_mv: [i16; 2],
+    p_ref_l1: i32,
+    q_ref_l1: i32,
+    p_mv_l1: [i16; 2],
+    q_mv_l1: [i16; 2],
+    list_count: u8,
 ) -> u8 {
     if p_intra || q_intra {
         if is_mb_edge { 4 } else { 3 }
     } else if p_nnz != 0 || q_nnz != 0 {
         2
-    } else if p_ref != q_ref
-        || (p_mv[0] - q_mv[0]).unsigned_abs() >= 4
-        || (p_mv[1] - q_mv[1]).unsigned_abs() >= 4
-    {
+    } else if check_mv(
+        p_ref, q_ref, p_mv, q_mv, p_ref_l1, q_ref_l1, p_mv_l1, q_mv_l1, list_count,
+    ) {
         1
     } else {
         0
@@ -581,6 +645,10 @@ fn compute_luma_bs(
     let mb_idx = (mb_y * mb_width + mb_x) as usize;
     let cur = &mb_info[mb_idx];
 
+    // Use the current MB's list_count for the two-permutation check.
+    // This matches FFmpeg's check_mv which uses sl->list_count (current slice).
+    let list_count = cur.list_count;
+
     for (edge, bs_edge) in bs.iter_mut().enumerate() {
         let is_mb_edge = edge == 0;
 
@@ -601,21 +669,37 @@ fn compute_luma_bs(
             let q_idx = luma_block_idx(q_bx, q_by);
             let q_intra = cur.is_intra;
             let q_nnz = cur.non_zero_count[q_idx];
-            let q_ref = cur.ref_idx[q_idx];
+            let q_ref = cur.ref_poc[q_idx];
             let q_mv = cur.mv[q_idx];
+            let q_ref_l1 = cur.ref_poc_l1[q_idx];
+            let q_mv_l1 = cur.mv_l1[q_idx];
 
             // P block: one step in the opposite direction.
-            let (p_intra, p_nnz, p_ref, p_mv) = if is_mb_edge {
+            let (p_intra, p_nnz, p_ref, p_mv, p_ref_l1, p_mv_l1) = if is_mb_edge {
                 if is_vertical {
                     // P is in the left macroblock, rightmost column
                     let left = &mb_info[mb_idx - 1];
                     let p_idx = luma_block_idx(3, q_by);
-                    (left.is_intra, left.non_zero_count[p_idx], left.ref_idx[p_idx], left.mv[p_idx])
+                    (
+                        left.is_intra,
+                        left.non_zero_count[p_idx],
+                        left.ref_poc[p_idx],
+                        left.mv[p_idx],
+                        left.ref_poc_l1[p_idx],
+                        left.mv_l1[p_idx],
+                    )
                 } else {
                     // P is in the above macroblock, bottom row
                     let above = &mb_info[mb_idx - mb_width as usize];
                     let p_idx = luma_block_idx(q_bx, 3);
-                    (above.is_intra, above.non_zero_count[p_idx], above.ref_idx[p_idx], above.mv[p_idx])
+                    (
+                        above.is_intra,
+                        above.non_zero_count[p_idx],
+                        above.ref_poc[p_idx],
+                        above.mv[p_idx],
+                        above.ref_poc_l1[p_idx],
+                        above.mv_l1[p_idx],
+                    )
                 }
             } else {
                 let p_idx = if is_vertical {
@@ -623,11 +707,19 @@ fn compute_luma_bs(
                 } else {
                     luma_block_idx(q_bx, q_by - 1)
                 };
-                (cur.is_intra, cur.non_zero_count[p_idx], cur.ref_idx[p_idx], cur.mv[p_idx])
+                (
+                    cur.is_intra,
+                    cur.non_zero_count[p_idx],
+                    cur.ref_poc[p_idx],
+                    cur.mv[p_idx],
+                    cur.ref_poc_l1[p_idx],
+                    cur.mv_l1[p_idx],
+                )
             };
 
             *bs_val = compute_bs(
-                is_mb_edge, p_intra, q_intra, p_nnz, q_nnz, p_ref, q_ref, p_mv, q_mv,
+                is_mb_edge, p_intra, q_intra, p_nnz, q_nnz, p_ref, q_ref, p_mv, q_mv, p_ref_l1,
+                q_ref_l1, p_mv_l1, q_mv_l1, list_count,
             );
         }
     }
@@ -693,7 +785,17 @@ fn deblock_mb(
             } else {
                 cur_qp
             };
-            filter_mb_edge_luma(is_vertical, pic, mb_x, mb_y, edge, bs_edge, qp, alpha_c0_offset, beta_offset);
+            filter_mb_edge_luma(
+                is_vertical,
+                pic,
+                mb_x,
+                mb_y,
+                edge,
+                bs_edge,
+                qp,
+                alpha_c0_offset,
+                beta_offset,
+            );
         }
 
         // --- Chroma edges (4:2:0: 2 edges per direction) ---
@@ -717,8 +819,30 @@ fn deblock_mb(
             };
 
             let uv_stride = pic.uv_stride;
-            filter_mb_edge_chroma(is_vertical, &mut pic.u, uv_stride, mb_x, mb_y, edge, bs_edge, qp, alpha_c0_offset, beta_offset);
-            filter_mb_edge_chroma(is_vertical, &mut pic.v, uv_stride, mb_x, mb_y, edge, bs_edge, qp, alpha_c0_offset, beta_offset);
+            filter_mb_edge_chroma(
+                is_vertical,
+                &mut pic.u,
+                uv_stride,
+                mb_x,
+                mb_y,
+                edge,
+                bs_edge,
+                qp,
+                alpha_c0_offset,
+                beta_offset,
+            );
+            filter_mb_edge_chroma(
+                is_vertical,
+                &mut pic.v,
+                uv_stride,
+                mb_x,
+                mb_y,
+                edge,
+                bs_edge,
+                qp,
+                alpha_c0_offset,
+                beta_offset,
+            );
         }
     }
 }
@@ -830,94 +954,151 @@ mod tests {
 
     // --- Boundary strength tests ---
 
+    /// P-slice helper: compute_bs with list_count=1 (no L1 data).
+    fn bs_p(
+        is_mb_edge: bool,
+        p_intra: bool,
+        q_intra: bool,
+        p_nnz: u8,
+        q_nnz: u8,
+        p_ref: i32,
+        q_ref: i32,
+        p_mv: [i16; 2],
+        q_mv: [i16; 2],
+    ) -> u8 {
+        compute_bs(
+            is_mb_edge,
+            p_intra,
+            q_intra,
+            p_nnz,
+            q_nnz,
+            p_ref,
+            q_ref,
+            p_mv,
+            q_mv,
+            i32::MIN,
+            i32::MIN,
+            [0, 0],
+            [0, 0],
+            1,
+        )
+    }
+
     #[test]
     fn bs_both_intra_mb_edge() {
-        assert_eq!(compute_bs(true, true, true, 0, 0, 0, 0, [0, 0], [0, 0]), 4);
+        assert_eq!(bs_p(true, true, true, 0, 0, 0, 0, [0, 0], [0, 0]), 4);
     }
 
     #[test]
     fn bs_one_intra_mb_edge() {
-        assert_eq!(compute_bs(true, true, false, 0, 0, 0, 0, [0, 0], [0, 0]), 4);
-        assert_eq!(compute_bs(true, false, true, 0, 0, 0, 0, [0, 0], [0, 0]), 4);
+        assert_eq!(bs_p(true, true, false, 0, 0, 0, 0, [0, 0], [0, 0]), 4);
+        assert_eq!(bs_p(true, false, true, 0, 0, 0, 0, [0, 0], [0, 0]), 4);
     }
 
     #[test]
     fn bs_intra_internal_edge() {
-        assert_eq!(compute_bs(false, true, true, 0, 0, 0, 0, [0, 0], [0, 0]), 3);
-        assert_eq!(
-            compute_bs(false, true, false, 0, 0, 0, 0, [0, 0], [0, 0]),
-            3
-        );
+        assert_eq!(bs_p(false, true, true, 0, 0, 0, 0, [0, 0], [0, 0]), 3);
+        assert_eq!(bs_p(false, true, false, 0, 0, 0, 0, [0, 0], [0, 0]), 3);
     }
 
     #[test]
     fn bs_nonzero_coeffs() {
-        // P has non-zero coefficients
-        assert_eq!(
-            compute_bs(false, false, false, 1, 0, 0, 0, [0, 0], [0, 0]),
-            2
-        );
-        // Q has non-zero coefficients
-        assert_eq!(
-            compute_bs(false, false, false, 0, 1, 0, 0, [0, 0], [0, 0]),
-            2
-        );
-        // Both have non-zero
-        assert_eq!(
-            compute_bs(false, false, false, 5, 3, 0, 0, [0, 0], [0, 0]),
-            2
-        );
+        assert_eq!(bs_p(false, false, false, 1, 0, 0, 0, [0, 0], [0, 0]), 2);
+        assert_eq!(bs_p(false, false, false, 0, 1, 0, 0, [0, 0], [0, 0]), 2);
+        assert_eq!(bs_p(false, false, false, 5, 3, 0, 0, [0, 0], [0, 0]), 2);
     }
 
     #[test]
     fn bs_different_ref() {
-        assert_eq!(
-            compute_bs(false, false, false, 0, 0, 0, 1, [0, 0], [0, 0]),
-            1
-        );
+        assert_eq!(bs_p(false, false, false, 0, 0, 0, 1, [0, 0], [0, 0]), 1);
     }
 
     #[test]
     fn bs_mv_diff_x() {
-        // MV diff of 4 in x triggers bS=1
-        assert_eq!(
-            compute_bs(false, false, false, 0, 0, 0, 0, [0, 0], [4, 0]),
-            1
-        );
-        // MV diff of 3 in x does NOT trigger
-        assert_eq!(
-            compute_bs(false, false, false, 0, 0, 0, 0, [0, 0], [3, 0]),
-            0
-        );
-        // Negative difference
-        assert_eq!(
-            compute_bs(false, false, false, 0, 0, 0, 0, [2, 0], [-2, 0]),
-            1
-        );
+        assert_eq!(bs_p(false, false, false, 0, 0, 0, 0, [0, 0], [4, 0]), 1);
+        assert_eq!(bs_p(false, false, false, 0, 0, 0, 0, [0, 0], [3, 0]), 0);
+        assert_eq!(bs_p(false, false, false, 0, 0, 0, 0, [2, 0], [-2, 0]), 1);
     }
 
     #[test]
     fn bs_mv_diff_y() {
-        assert_eq!(
-            compute_bs(false, false, false, 0, 0, 0, 0, [0, 0], [0, 4]),
-            1
-        );
-        assert_eq!(
-            compute_bs(false, false, false, 0, 0, 0, 0, [0, 0], [0, 3]),
-            0
-        );
+        assert_eq!(bs_p(false, false, false, 0, 0, 0, 0, [0, 0], [0, 4]), 1);
+        assert_eq!(bs_p(false, false, false, 0, 0, 0, 0, [0, 0], [0, 3]), 0);
     }
 
     #[test]
     fn bs_zero_no_filtering() {
+        assert_eq!(bs_p(false, false, false, 0, 0, 0, 0, [0, 0], [0, 0]), 0);
+        assert_eq!(bs_p(false, false, false, 0, 0, 5, 5, [1, 2], [3, 4]), 0);
+    }
+
+    #[test]
+    fn bs_b_frame_two_permutation() {
+        // B-frame: blocks with opposite lists should NOT be filtered.
+        // P: L0 ref=0 mv=[0,0], L1 ref=1 mv=[2,0]
+        // Q: L0 ref=1 mv=[2,0], L1 ref=0 mv=[0,0]
+        // Same-list check fails (L0 refs differ, L1 refs differ),
+        // but cross-list matches (P.L0==Q.L1, P.L1==Q.L0, MVs match).
         assert_eq!(
-            compute_bs(false, false, false, 0, 0, 0, 0, [0, 0], [0, 0]),
+            compute_bs(
+                false,
+                false,
+                false,
+                0,
+                0,
+                0,
+                1,
+                [0, 0],
+                [2, 0],
+                1,
+                0,
+                [2, 0],
+                [0, 0],
+                2,
+            ),
             0
         );
-        // Same ref, small MV diff
+
+        // B-frame: same-list check passes → bS=0 without needing cross-check.
         assert_eq!(
-            compute_bs(false, false, false, 0, 0, 5, 5, [1, 2], [3, 4]),
+            compute_bs(
+                false,
+                false,
+                false,
+                0,
+                0,
+                0,
+                0,
+                [0, 0],
+                [0, 0],
+                1,
+                1,
+                [1, 1],
+                [1, 1],
+                2,
+            ),
             0
+        );
+
+        // B-frame: different refs on both lists, no cross match → bS=1.
+        assert_eq!(
+            compute_bs(
+                false,
+                false,
+                false,
+                0,
+                0,
+                0,
+                1,
+                [0, 0],
+                [0, 0],
+                0,
+                1,
+                [0, 0],
+                [0, 0],
+                2,
+            ),
+            1
         );
     }
 
@@ -944,15 +1125,58 @@ mod tests {
         // Full table verified against FFmpeg tc0_table in h264_loopfilter.c
         // (bS=1,2,3 columns; bS=0 column is -1 in FFmpeg, not stored here)
         let expected: [[i32; 3]; 52] = [
-            [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0],
-            [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0],
-            [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 1],
-            [0, 0, 1], [0, 0, 1], [0, 0, 1], [0, 1, 1], [0, 1, 1], [1, 1, 1],
-            [1, 1, 1], [1, 1, 1], [1, 1, 1], [1, 1, 2], [1, 1, 2], [1, 1, 2],
-            [1, 1, 2], [1, 2, 3], [1, 2, 3], [2, 2, 3], [2, 2, 4], [2, 3, 4],
-            [2, 3, 4], [3, 3, 5], [3, 4, 6], [3, 4, 6], [4, 5, 7], [4, 5, 8],
-            [4, 6, 9], [5, 7, 10], [6, 8, 11], [6, 8, 13], [7, 10, 14],
-            [8, 11, 16], [9, 12, 18], [10, 13, 20], [11, 15, 23], [13, 17, 25],
+            [0, 0, 0],
+            [0, 0, 0],
+            [0, 0, 0],
+            [0, 0, 0],
+            [0, 0, 0],
+            [0, 0, 0],
+            [0, 0, 0],
+            [0, 0, 0],
+            [0, 0, 0],
+            [0, 0, 0],
+            [0, 0, 0],
+            [0, 0, 0],
+            [0, 0, 0],
+            [0, 0, 0],
+            [0, 0, 0],
+            [0, 0, 0],
+            [0, 0, 0],
+            [0, 0, 1],
+            [0, 0, 1],
+            [0, 0, 1],
+            [0, 0, 1],
+            [0, 1, 1],
+            [0, 1, 1],
+            [1, 1, 1],
+            [1, 1, 1],
+            [1, 1, 1],
+            [1, 1, 1],
+            [1, 1, 2],
+            [1, 1, 2],
+            [1, 1, 2],
+            [1, 1, 2],
+            [1, 2, 3],
+            [1, 2, 3],
+            [2, 2, 3],
+            [2, 2, 4],
+            [2, 3, 4],
+            [2, 3, 4],
+            [3, 3, 5],
+            [3, 4, 6],
+            [3, 4, 6],
+            [4, 5, 7],
+            [4, 5, 8],
+            [4, 6, 9],
+            [5, 7, 10],
+            [6, 8, 11],
+            [6, 8, 13],
+            [7, 10, 14],
+            [8, 11, 16],
+            [9, 12, 18],
+            [10, 13, 20],
+            [11, 15, 23],
+            [13, 17, 25],
         ];
         for i in 0..52 {
             assert_eq!(
@@ -1204,8 +1428,9 @@ mod tests {
             is_intra: false,
             qp: 30,
             non_zero_count: [0; 24],
-            ref_idx: [0; 16],
+            ref_poc: [0; 16],
             mv: [[0, 0]; 16],
+            ..Default::default()
         }];
 
         deblock_frame(&mut pic, &mb_info, 0, 0, 0);
@@ -1225,8 +1450,9 @@ mod tests {
             is_intra: true,
             qp: 30,
             non_zero_count: [1; 24],
-            ref_idx: [0; 16],
+            ref_poc: [0; 16],
             mv: [[0, 0]; 16],
+            ..Default::default()
         }];
 
         let y_before = pic.y.clone();
@@ -1258,15 +1484,17 @@ mod tests {
                 is_intra: true,
                 qp: 51,
                 non_zero_count: [0; 24],
-                ref_idx: [0; 16],
+                ref_poc: [0; 16],
                 mv: [[0, 0]; 16],
+                ..Default::default()
             },
             MbDeblockInfo {
                 is_intra: true,
                 qp: 51,
                 non_zero_count: [0; 24],
-                ref_idx: [0; 16],
+                ref_poc: [0; 16],
                 mv: [[0, 0]; 16],
+                ..Default::default()
             },
         ];
 
@@ -1317,15 +1545,17 @@ mod tests {
                 is_intra: true,
                 qp: 51,
                 non_zero_count: [0; 24],
-                ref_idx: [0; 16],
+                ref_poc: [0; 16],
                 mv: [[0, 0]; 16],
+                ..Default::default()
             },
             MbDeblockInfo {
                 is_intra: true,
                 qp: 51,
                 non_zero_count: [0; 24],
-                ref_idx: [0; 16],
+                ref_poc: [0; 16],
                 mv: [[0, 0]; 16],
+                ..Default::default()
             },
         ];
 

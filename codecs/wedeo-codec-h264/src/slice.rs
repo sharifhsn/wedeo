@@ -184,6 +184,9 @@ pub struct SliceHeader {
     pub use_weight: bool,
     /// True if any non-default chroma weight is present.
     pub use_weight_chroma: bool,
+    /// Weighted bipred idc from PPS (0=none, 1=explicit, 2=implicit).
+    /// Stored per-slice for convenience during MC dispatch.
+    pub weighted_bipred_idc: u8,
 
     // --- Deblocking ---
     pub disable_deblocking_filter_idc: u32,
@@ -233,6 +236,7 @@ impl Default for SliceHeader {
             chroma_weight_l1: Vec::new(),
             use_weight: false,
             use_weight_chroma: false,
+            weighted_bipred_idc: 0,
             disable_deblocking_filter_idc: 0,
             slice_alpha_c0_offset: 0,
             slice_beta_offset: 0,
@@ -580,6 +584,7 @@ pub fn parse_slice_header(
     }
 
     // 13. Weighted prediction
+    hdr.weighted_bipred_idc = pps.weighted_bipred_idc;
     if (pps.weighted_pred_flag && hdr.slice_type.is_p())
         || (pps.weighted_bipred_idc == 1 && hdr.slice_type.is_b())
     {
