@@ -41,10 +41,14 @@ pub struct DpbEntry {
     pub status: RefStatus,
     /// Long-term frame index (only valid if status == LongTerm).
     pub long_term_frame_idx: u32,
-    /// Per-4x4-block motion vectors (16 entries per MB, row-major).
+    /// Per-4x4-block motion vectors (16 entries per MB, row-major, L0).
     pub mv_info: Vec<[i16; 2]>,
-    /// Per-4x4-block reference indices (16 entries per MB, row-major).
+    /// Per-4x4-block reference indices (16 entries per MB, row-major, L0).
     pub ref_info: Vec<i8>,
+    /// Per-4x4-block motion vectors (L1, for B-slice colocated fallback).
+    pub mv_info_l1: Vec<[i16; 2]>,
+    /// Per-4x4-block reference indices (L1, for B-slice colocated fallback).
+    pub ref_info_l1: Vec<i8>,
     /// Per-MB intra flag (true if the MB was decoded as intra).
     pub mb_intra: Vec<bool>,
     /// Whether this picture is needed for output (not yet displayed).
@@ -52,6 +56,9 @@ pub struct DpbEntry {
     /// POCs of L0 references used during this frame's decode.
     /// Used for temporal direct mode to map colocated ref_idx → POC.
     pub ref_poc_l0: Vec<i32>,
+    /// POCs of L1 references used during this frame's decode.
+    /// Used for temporal direct mode L1 fallback when colocated L0 ref < 0.
+    pub ref_poc_l1: Vec<i32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -312,9 +319,12 @@ mod tests {
             long_term_frame_idx: 0,
             mv_info: vec![[0i16; 2]; 16],
             ref_info: vec![-1i8; 16],
+            mv_info_l1: vec![[0i16; 2]; 16],
+            ref_info_l1: vec![-1i8; 16],
             mb_intra: vec![false; 1],
             needs_output: true,
             ref_poc_l0: Vec::new(),
+            ref_poc_l1: Vec::new(),
         }
     }
 

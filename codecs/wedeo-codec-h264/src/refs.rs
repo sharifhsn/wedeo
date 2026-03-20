@@ -610,9 +610,12 @@ mod tests {
             long_term_frame_idx: 0,
             mv_info: vec![[0i16; 2]; 16],
             ref_info: vec![-1i8; 16],
+            mv_info_l1: vec![[0i16; 2]; 16],
+            ref_info_l1: vec![-1i8; 16],
             mb_intra: vec![false; 1],
             needs_output: false,
             ref_poc_l0: Vec::new(),
+            ref_poc_l1: Vec::new(),
         }
     }
 

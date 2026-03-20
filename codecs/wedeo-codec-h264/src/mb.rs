@@ -84,6 +84,10 @@ pub struct FrameDecodeContext {
     pub col_mv: Vec<[i16; 2]>,
     /// Colocated L0 reference indices from L1[0] reference frame.
     pub col_ref: Vec<i8>,
+    /// Colocated L1 MVs from L1[0] reference frame (fallback when col L0 ref < 0).
+    pub col_mv_l1: Vec<[i16; 2]>,
+    /// Colocated L1 reference indices from L1[0] reference frame.
+    pub col_ref_l1: Vec<i8>,
     /// Per-MB intra flag from L1[0] reference frame.
     pub col_mb_intra: Vec<bool>,
     /// PPS constrained_intra_pred flag: inter neighbor pixels unavailable for intra prediction.
@@ -95,6 +99,8 @@ pub struct FrameDecodeContext {
     /// L0 ref POCs stored from the colocated frame, for temporal direct mode.
     /// Maps col_ref[blk] → ref_poc_l0[col_ref[blk]] → POC.
     pub col_ref_poc_l0: Vec<i32>,
+    /// L1 ref POCs stored from the colocated frame, for temporal direct L1 fallback.
+    pub col_ref_poc_l1: Vec<i32>,
     /// Current frame's L0 ref POCs (for temporal direct dist_scale_factor).
     pub cur_l0_ref_poc: Vec<i32>,
     /// Current frame's L1 ref POCs (for implicit weighted bipred).
@@ -145,11 +151,14 @@ impl FrameDecodeContext {
             current_slice: 0,
             col_mv: Vec::new(),
             col_ref: Vec::new(),
+            col_mv_l1: Vec::new(),
+            col_ref_l1: Vec::new(),
             col_mb_intra: Vec::new(),
             constrained_intra_pred: pps.constrained_intra_pred,
             direct_8x8_inference_flag: sps.direct_8x8_inference_flag,
             col_poc: 0,
             col_ref_poc_l0: Vec::new(),
+            col_ref_poc_l1: Vec::new(),
             cur_l0_ref_poc: Vec::new(),
             cur_l1_ref_poc: Vec::new(),
             cur_poc: 0,
@@ -2400,27 +2409,53 @@ fn pred_temporal_direct(
             [[0, 1, 4, 5], [2, 3, 6, 7], [8, 9, 12, 13], [10, 11, 14, 15]];
 
         for i8x8 in 0..4 {
-            let col_ref_idx = ctx
+            let col_ref_idx_l0 = ctx
                 .col_ref
                 .get(blk_base + REF_POS[i8x8])
                 .copied()
                 .unwrap_or(-1);
-            if col_ref_idx < 0 {
-                // Intra sub-block: zero MV, ref 0
-                for &blk in &FILL[i8x8] {
-                    results[blk] = ([0, 0], 0, [0, 0], 0);
+
+            // FFmpeg h264_direct.c: if L0 ref >= 0, use it; else fall back to L1.
+            // If both are < 0, the block is intra → zero MV, ref 0.
+            let (col_ref_poc_val, col_mv) = if col_ref_idx_l0 >= 0 {
+                let poc = ctx
+                    .col_ref_poc_l0
+                    .get(col_ref_idx_l0 as usize)
+                    .copied()
+                    .unwrap_or(ctx.col_poc);
+                let mv = ctx
+                    .col_mv
+                    .get(blk_base + MV_POS[i8x8])
+                    .copied()
+                    .unwrap_or([0, 0]);
+                (poc, mv)
+            } else {
+                let col_ref_idx_l1 = ctx
+                    .col_ref_l1
+                    .get(blk_base + REF_POS[i8x8])
+                    .copied()
+                    .unwrap_or(-1);
+                if col_ref_idx_l1 < 0 {
+                    // Intra sub-block: zero MV, ref 0
+                    for &blk in &FILL[i8x8] {
+                        results[blk] = ([0, 0], 0, [0, 0], 0);
+                    }
+                    continue;
                 }
-                continue;
-            }
+                let poc = ctx
+                    .col_ref_poc_l1
+                    .get(col_ref_idx_l1 as usize)
+                    .copied()
+                    .unwrap_or(ctx.col_poc);
+                let mv = ctx
+                    .col_mv_l1
+                    .get(blk_base + MV_POS[i8x8])
+                    .copied()
+                    .unwrap_or([0, 0]);
+                (poc, mv)
+            };
 
-            // Get colocated ref's POC
-            let col_ref_poc_val = ctx
-                .col_ref_poc_l0
-                .get(col_ref_idx as usize)
-                .copied()
-                .unwrap_or(ctx.col_poc);
-
-            // Map to current L0: find L0 ref with matching POC
+            // Map colocated ref POC to current L0 index
             let l0_ref = ctx
                 .cur_l0_ref_poc
                 .iter()
@@ -2430,11 +2465,6 @@ fn pred_temporal_direct(
             let l0_ref_poc = ctx.cur_l0_ref_poc.get(l0_ref).copied().unwrap_or(0);
             let scale = compute_scale(l0_ref_poc, col_ref_poc_val);
 
-            let col_mv = ctx
-                .col_mv
-                .get(blk_base + MV_POS[i8x8])
-                .copied()
-                .unwrap_or([0, 0]);
             let mv_l0 = [
                 ((scale * col_mv[0] as i32 + 128) >> 8) as i16,
                 ((scale * col_mv[1] as i32 + 128) >> 8) as i16,
@@ -2449,17 +2479,31 @@ fn pred_temporal_direct(
         // Per-4x4 block
         for (blk, result) in results.iter_mut().enumerate() {
             let col_blk = blk_base + blk;
-            let col_ref_idx = ctx.col_ref.get(col_blk).copied().unwrap_or(-1);
-            if col_ref_idx < 0 {
-                *result = ([0, 0], 0, [0, 0], 0);
-                continue;
-            }
+            let col_ref_idx_l0 = ctx.col_ref.get(col_blk).copied().unwrap_or(-1);
 
-            let col_ref_poc_val = ctx
-                .col_ref_poc_l0
-                .get(col_ref_idx as usize)
-                .copied()
-                .unwrap_or(ctx.col_poc);
+            // L1 fallback: if colocated L0 ref < 0, use L1 ref and MV
+            let (col_ref_poc_val, col_mv) = if col_ref_idx_l0 >= 0 {
+                let poc = ctx
+                    .col_ref_poc_l0
+                    .get(col_ref_idx_l0 as usize)
+                    .copied()
+                    .unwrap_or(ctx.col_poc);
+                let mv = ctx.col_mv.get(col_blk).copied().unwrap_or([0, 0]);
+                (poc, mv)
+            } else {
+                let col_ref_idx_l1 = ctx.col_ref_l1.get(col_blk).copied().unwrap_or(-1);
+                if col_ref_idx_l1 < 0 {
+                    *result = ([0, 0], 0, [0, 0], 0);
+                    continue;
+                }
+                let poc = ctx
+                    .col_ref_poc_l1
+                    .get(col_ref_idx_l1 as usize)
+                    .copied()
+                    .unwrap_or(ctx.col_poc);
+                let mv = ctx.col_mv_l1.get(col_blk).copied().unwrap_or([0, 0]);
+                (poc, mv)
+            };
 
             let l0_ref = ctx
                 .cur_l0_ref_poc
@@ -2470,7 +2514,6 @@ fn pred_temporal_direct(
             let l0_ref_poc = ctx.cur_l0_ref_poc.get(l0_ref).copied().unwrap_or(0);
             let scale = compute_scale(l0_ref_poc, col_ref_poc_val);
 
-            let col_mv = ctx.col_mv.get(col_blk).copied().unwrap_or([0, 0]);
             let mv_l0 = [
                 ((scale * col_mv[0] as i32 + 128) >> 8) as i16,
                 ((scale * col_mv[1] as i32 + 128) >> 8) as i16,

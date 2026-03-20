@@ -544,9 +544,12 @@ impl H264Decoder {
                         if let Some(entry) = self.dpb.get(l1_0_dpb_idx) {
                             fdc.col_mv = entry.mv_info.clone();
                             fdc.col_ref = entry.ref_info.clone();
+                            fdc.col_mv_l1 = entry.mv_info_l1.clone();
+                            fdc.col_ref_l1 = entry.ref_info_l1.clone();
                             fdc.col_mb_intra = entry.mb_intra.clone();
                             fdc.col_poc = entry.poc;
                             fdc.col_ref_poc_l0 = entry.ref_poc_l0.clone();
+                            fdc.col_ref_poc_l1 = entry.ref_poc_l1.clone();
                         }
                         fdc.cur_poc = self.current_poc;
 
@@ -734,8 +737,17 @@ impl H264Decoder {
             } else {
                 vec![-1i8; total_blocks]
             };
+            let mv_info_l1 = if fdc.mv_ctx.mv_l1.len() == total_blocks {
+                fdc.mv_ctx.mv_l1.clone()
+            } else {
+                vec![[0i16; 2]; total_blocks]
+            };
+            let ref_info_l1 = if fdc.mv_ctx.ref_idx_l1.len() == total_blocks {
+                fdc.mv_ctx.ref_idx_l1.clone()
+            } else {
+                vec![-1i8; total_blocks]
+            };
 
-            // Debug: check if MB(10,2) is populated
             #[cfg(feature = "tracing-detail")]
             {
                 let px = 10 * 16;
@@ -754,9 +766,14 @@ impl H264Decoder {
 
             let mb_intra: Vec<bool> = fdc.mb_info.iter().map(|info| info.is_intra).collect();
 
-            // Store L0 ref POCs for temporal direct mode mapping.
+            // Store L0/L1 ref POCs for temporal direct mode mapping.
             let ref_poc_l0: Vec<i32> = self
                 .ref_list_l0
+                .iter()
+                .filter_map(|&dpb_idx| self.dpb.get(dpb_idx).map(|e| e.poc))
+                .collect();
+            let ref_poc_l1: Vec<i32> = self
+                .ref_list_l1
                 .iter()
                 .filter_map(|&dpb_idx| self.dpb.get(dpb_idx).map(|e| e.poc))
                 .collect();
@@ -769,9 +786,12 @@ impl H264Decoder {
                 long_term_frame_idx: 0,
                 mv_info,
                 ref_info,
+                mv_info_l1,
+                ref_info_l1,
                 mb_intra,
                 needs_output: false,
                 ref_poc_l0,
+                ref_poc_l1,
             };
 
             // Try to store in DPB; if full, remove oldest first
