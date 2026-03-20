@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Shared parser for conformance_report.py output.
 
-Used by conformance_snapshot.py, conformance_diff.py, and classify_diff_files.py.
+Used by conformance_snapshot.py, conformance_diff.py, and stream_features.py.
 """
 
 import os

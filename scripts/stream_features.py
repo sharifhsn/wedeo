@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""Classify H.264 conformance DIFF files by stream features.
+"""Classify H.264 conformance files by stream features.
 
 For each non-BITEXACT file, extracts key H.264 features via FFmpeg's
 trace_headers BSF and prints a structured summary to aid debugging triage.
 
+This classifies by *stream features* (CABAC, weighted pred, etc.) — orthogonal
+to classify_diffs.py which classifies by *error type* (reorder vs pixel-diff).
+
 Usage:
-    python3 scripts/classify_diff_files.py
+    python3 scripts/stream_features.py
 
     # Include BITEXACT files too
-    python3 scripts/classify_diff_files.py --all
+    python3 scripts/stream_features.py --all
 
     # Only show files matching a prefix
-    python3 scripts/classify_diff_files.py --prefix CVWP
+    python3 scripts/stream_features.py --prefix CVWP
 
 Requires:
     - ffmpeg binary in PATH

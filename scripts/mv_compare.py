@@ -14,73 +14,17 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 import numpy as np
 
-ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-
-
-def find_wedeo_bin() -> str:
-    """Find the wedeo-framecrc binary (debug preferred for tracing support)."""
-    for profile in ["debug", "release"]:
-        candidate = Path("target") / profile / "wedeo-framecrc"
-        if candidate.exists():
-            return str(candidate.resolve())
-    print(
-        "Error: wedeo-framecrc not found. Run:\n"
-        "  cargo build --bin wedeo-framecrc -p wedeo-fate --features tracing",
-        file=sys.stderr,
-    )
-    sys.exit(1)
-
-
-def strip_ansi(s: str) -> str:
-    return ANSI_RE.sub("", s)
-
-
-def get_dimensions(input_path: str) -> tuple[int, int]:
-    """Get video dimensions from wedeo-framecrc header output."""
-    wedeo_bin = find_wedeo_bin()
-    result = subprocess.run(
-        [wedeo_bin, input_path],
-        capture_output=True,
-        env={**os.environ, "WEDEO_NO_DEBLOCK": "1"},
-    )
-    for line in result.stdout.decode().splitlines():
-        if line.startswith("#dimensions"):
-            parts = line.split(":")[-1].strip().split("x")
-            return int(parts[0]), int(parts[1])
-    print("Error: could not determine dimensions", file=sys.stderr)
-    sys.exit(1)
-
-
-def decode_yuv(input_path: str, tool: str, no_deblock: bool = True) -> bytes:
-    """Decode to raw YUV420p using the specified tool."""
-    with tempfile.NamedTemporaryFile(suffix=".yuv", delete=False) as f:
-        yuv_path = f.name
-    try:
-        if tool == "wedeo":
-            wedeo_bin = find_wedeo_bin()
-            env = {**os.environ}
-            if no_deblock:
-                env["WEDEO_NO_DEBLOCK"] = "1"
-            subprocess.run(
-                [wedeo_bin, input_path, "--raw-yuv", yuv_path],
-                capture_output=True,
-                env=env,
-                check=True,
-            )
-        else:
-            cmd = ["ffmpeg", "-y", "-bitexact"]
-            if no_deblock:
-                cmd += ["-skip_loop_filter", "all"]
-            cmd += ["-i", input_path, "-pix_fmt", "yuv420p", "-f", "rawvideo", yuv_path]
-            subprocess.run(cmd, capture_output=True, check=True)
-        return Path(yuv_path).read_bytes()
-    finally:
-        Path(yuv_path).unlink(missing_ok=True)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from ffmpeg_debug import (
+    decode_yuv,
+    find_wedeo_binary,
+    get_video_info,
+    strip_ansi,
+)
 
 
 def extract_wedeo_mvs(input_path: str, frame_idx: int) -> dict:
@@ -88,7 +32,7 @@ def extract_wedeo_mvs(input_path: str, frame_idx: int) -> dict:
 
     Returns dict keyed by (mb_x, mb_y) with mb_type, mv, ref_idx info.
     """
-    wedeo_bin = find_wedeo_bin()
+    wedeo_bin = str(find_wedeo_binary(prefer_debug=True, features=["tracing"]))
     env = {
         **os.environ,
         "RUST_LOG": "wedeo_codec_h264=trace",
@@ -108,8 +52,6 @@ def extract_wedeo_mvs(input_path: str, frame_idx: int) -> dict:
     # We need to map display frame_idx to decode frame based on POC ordering.
 
     mbs = {}
-    current_decode_frame = -1
-    in_target_frame = False
     # Count frames completed to track decode order
     frames_completed = 0
 
@@ -247,8 +189,9 @@ def main():
             print(f"Error: --mb must be integers X,Y, got '{args.mb}'", file=sys.stderr)
             sys.exit(1)
 
-    width, height = get_dimensions(input_path)
-    mb_w, mb_h = width // 16, height // 16
+    info = get_video_info(input_path)
+    width, height = info.width, info.height
+    mb_w, mb_h = info.mb_w, info.mb_h
     print(f"Dimensions: {width}x{height} ({mb_w}x{mb_h} MBs)")
 
     # Extract wedeo MV info
@@ -281,8 +224,8 @@ def main():
 
         print(f"\n=== MB({mx},{my}) frame {args.frame} ===")
         if (mx, my) in wedeo_mvs:
-            info = wedeo_mvs[(mx, my)]
-            print(f"  wedeo: {info}")
+            mv_data = wedeo_mvs[(mx, my)]
+            print(f"  wedeo: {mv_data}")
         else:
             print(f"  wedeo: no MV data")
 
@@ -300,8 +243,8 @@ def main():
             print("Cannot compare pixels without YUV data")
             # Just dump all wedeo MV info
             for (mx, my) in sorted(wedeo_mvs.keys()):
-                info = wedeo_mvs[(mx, my)]
-                print(f"  MB({mx},{my}): {info}")
+                mv_data = wedeo_mvs[(mx, my)]
+                print(f"  MB({mx},{my}): {mv_data}")
             return
 
         print(f"\n=== Differing MBs in frame {args.frame} ===")

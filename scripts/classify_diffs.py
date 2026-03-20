@@ -28,33 +28,16 @@ Requires:
 
 import argparse
 import os
-import subprocess
 import sys
 from pathlib import Path
 from typing import NamedTuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from ffmpeg_debug import find_wedeo_binary
+from ffmpeg_debug import find_wedeo_binary, run_framecrc
 
 
 CONFORMANCE_DIR = Path("fate-suite/h264-conformance")
 EXTENSIONS = (".264", ".jsv", ".26l")
-
-
-def run_framecrc(cmd, env=None):
-    """Run a framecrc command and return list of CRC strings."""
-    full_env = {**os.environ, **(env or {})}
-    result = subprocess.run(cmd, capture_output=True, env=full_env)
-    if result.returncode != 0:
-        print(f"WARN: {' '.join(str(c) for c in cmd[:3])}... exited with {result.returncode}", file=sys.stderr)
-    crcs = []
-    for line in result.stdout.decode(errors="replace").splitlines():
-        if line.startswith("#") or not line.strip():
-            continue
-        parts = line.split(",")
-        if len(parts) >= 6:
-            crcs.append(parts[5].strip())
-    return crcs
 
 
 class ClassifyResult(NamedTuple):

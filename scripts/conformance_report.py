@@ -28,14 +28,13 @@ Requires:
 
 import argparse
 import json
-import os
 import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ffmpeg_debug import find_wedeo_binary
+from ffmpeg_debug import find_wedeo_binary, run_framecrc
 
 
 # ---------------------------------------------------------------------------
@@ -185,25 +184,6 @@ class ConformanceResult:
     features: H264Features | None = None
     unsupported: list[str] = field(default_factory=list)
     error: str = ""
-
-
-def run_framecrc(cmd: list[str], env: dict | None = None) -> list[str]:
-    """Run a command and return framecrc CRC values."""
-    full_env = {**os.environ, **(env or {})}
-    try:
-        result = subprocess.run(
-            cmd, capture_output=True, env=full_env, timeout=60,
-        )
-    except subprocess.TimeoutExpired:
-        return []
-    crcs = []
-    for line in result.stdout.decode(errors="replace").splitlines():
-        if line.startswith("#") or not line.strip():
-            continue
-        parts = line.split(",")
-        if len(parts) >= 6:
-            crcs.append(parts[5].strip())
-    return crcs
 
 
 def compare_file(

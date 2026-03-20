@@ -13,27 +13,18 @@ Requires:
 """
 
 import argparse
-import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 import numpy as np
 
-
-def get_dimensions_from_framecrc(lines: list[str]) -> tuple[int, int]:
-    """Extract width x height from framecrc header comments."""
-    for line in lines:
-        if line.startswith("#dimensions"):
-            # #dimensions 0: 176x144
-            parts = line.split(":")[-1].strip().split("x")
-            return int(parts[0]), int(parts[1])
-    raise ValueError("No #dimensions line found in framecrc output")
-
-
-def count_frames(lines: list[str]) -> int:
-    """Count non-comment data lines."""
-    return sum(1 for l in lines if l.strip() and not l.startswith("#"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from ffmpeg_debug import (
+    check_yuv_frame_count,
+    decode_yuv,
+    find_wedeo_binary,
+    get_video_info,
+)
 
 
 def main():
@@ -56,59 +47,20 @@ def main():
         print(f"Error: {input_path} not found", file=sys.stderr)
         sys.exit(1)
 
-    # Find wedeo-framecrc binary (release first to match conformance_snapshot.py)
-    wedeo_bin = None
-    for profile in ["release", "debug"]:
-        candidate = Path("target") / profile / "wedeo-framecrc"
-        if candidate.exists():
-            wedeo_bin = str(candidate.resolve())
-            break
-    if wedeo_bin is None:
-        print("Error: wedeo-framecrc not found. Run `cargo build -p wedeo-fate`", file=sys.stderr)
-        sys.exit(1)
-
-    # Build env: disable deblocking by default unless --deblock is passed
-    wedeo_env = {**subprocess.os.environ}
-    if not args.deblock:
-        wedeo_env["WEDEO_NO_DEBLOCK"] = "1"
+    no_deblock = not args.deblock
+    wedeo_bin = find_wedeo_binary()
 
     # Step 1: Get dimensions from wedeo framecrc header
-    result = subprocess.run(
-        [wedeo_bin, str(input_path)],
-        capture_output=True,
-        env=wedeo_env,
+    info = get_video_info(input_path, wedeo_bin=wedeo_bin, no_deblock=no_deblock)
+    width, height = info.width, info.height
+    mb_w, mb_h = info.mb_w, info.mb_h
+    print(f"Dimensions: {width}x{height}, {info.frame_count} frames")
+
+    # Step 2: Decode raw YUV with both tools
+    wedeo_data = decode_yuv(
+        input_path, "wedeo", no_deblock=no_deblock, wedeo_bin=wedeo_bin,
     )
-    wedeo_lines = result.stdout.decode().splitlines()
-    width, height = get_dimensions_from_framecrc(wedeo_lines)
-    n_frames = count_frames(wedeo_lines)
-    print(f"Dimensions: {width}x{height}, {n_frames} frames")
-
-    mb_w = width // 16
-    mb_h = height // 16
-
-    # Step 2: Decode raw YUV with both tools (deblocking disabled)
-    with tempfile.NamedTemporaryFile(suffix=".yuv", delete=False) as f:
-        wedeo_yuv_path = f.name
-    with tempfile.NamedTemporaryFile(suffix=".yuv", delete=False) as f:
-        ffmpeg_yuv_path = f.name
-
-    subprocess.run(
-        [wedeo_bin, str(input_path), "--raw-yuv", wedeo_yuv_path],
-        capture_output=True,
-        env=wedeo_env,
-        check=True,
-    )
-
-    ffmpeg_cmd = ["ffmpeg", "-y", "-bitexact"]
-    if not args.deblock:
-        ffmpeg_cmd += ["-skip_loop_filter", "all"]
-    ffmpeg_cmd += ["-i", str(input_path), "-pix_fmt", "yuv420p", "-f", "rawvideo", ffmpeg_yuv_path]
-    subprocess.run(ffmpeg_cmd, capture_output=True, check=True)
-
-    wedeo_data = Path(wedeo_yuv_path).read_bytes()
-    ffmpeg_data = Path(ffmpeg_yuv_path).read_bytes()
-    Path(wedeo_yuv_path).unlink(missing_ok=True)
-    Path(ffmpeg_yuv_path).unlink(missing_ok=True)
+    ffmpeg_data = decode_yuv(input_path, "ffmpeg", no_deblock=no_deblock)
 
     frame_size = width * height * 3 // 2
     y_size = width * height
@@ -118,19 +70,15 @@ def main():
         print(f"Error: YUV data too short (wedeo={len(wedeo_data)}, ffmpeg={len(ffmpeg_data)})")
         sys.exit(1)
 
-    wedeo_frames = len(wedeo_data) // frame_size
-    ffmpeg_frames = len(ffmpeg_data) // frame_size
+    wedeo_frames = check_yuv_frame_count(
+        wedeo_data, width, height, info.frame_count, label="wedeo",
+    )
+    ffmpeg_frames = check_yuv_frame_count(
+        ffmpeg_data, width, height, info.frame_count, label="ffmpeg",
+    )
     if wedeo_frames != ffmpeg_frames:
         print(
             f"WARNING: Frame count mismatch! wedeo={wedeo_frames}, ffmpeg={ffmpeg_frames}",
-            file=sys.stderr,
-        )
-        print(
-            "FFmpeg rawvideo may output different frame counts than framecrc.",
-            file=sys.stderr,
-        )
-        print(
-            "Results may be misleading — consider framecrc_compare.py instead.",
             file=sys.stderr,
         )
         print(file=sys.stderr)

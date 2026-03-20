@@ -18,26 +18,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-
-ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-
-
-def find_wedeo_bin() -> str:
-    """Find the wedeo-framecrc binary (debug preferred for tracing support)."""
-    for profile in ["debug", "release"]:
-        candidate = Path("target") / profile / "wedeo-framecrc"
-        if candidate.exists():
-            return str(candidate.resolve())
-    print(
-        "Error: wedeo-framecrc not found. Run:\n"
-        "  cargo build --bin wedeo-framecrc -p wedeo-fate --features tracing",
-        file=sys.stderr,
-    )
-    sys.exit(1)
-
-
-def strip_ansi(s: str) -> str:
-    return ANSI_RE.sub("", s)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from ffmpeg_debug import find_wedeo_binary, strip_ansi
 
 
 def wedeo_poc_dump(input_path: str) -> list[dict]:
@@ -45,7 +27,7 @@ def wedeo_poc_dump(input_path: str) -> list[dict]:
 
     Returns list of dicts: {decode_order, poc, slice_type, ref_idc} in decode order.
     """
-    wedeo_bin = find_wedeo_bin()
+    wedeo_bin = str(find_wedeo_binary(prefer_debug=True, features=["tracing"]))
     env = {**os.environ, "RUST_LOG": "debug"}
 
     result = subprocess.run(

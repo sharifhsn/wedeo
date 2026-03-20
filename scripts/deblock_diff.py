@@ -17,76 +17,13 @@ Requirements:
 """
 
 import argparse
-import os
-import re
-import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 import numpy as np
 
-
-def find_wedeo_bin() -> str:
-    for path in ["target/debug/wedeo-framecrc", "target/release/wedeo-framecrc"]:
-        if os.path.isfile(path):
-            return path
-    print("Error: wedeo-framecrc not found. Run: cargo build --bin wedeo-framecrc")
-    sys.exit(1)
-
-
-def get_dimensions(wedeo_bin: str, input_path: str) -> tuple[int, int, int]:
-    """Get width, height, frame_count from wedeo framecrc output."""
-    result = subprocess.run([wedeo_bin, input_path], capture_output=True)
-    if result.returncode != 0:
-        stderr = result.stderr.decode().strip()
-        print(f"Error: wedeo-framecrc failed: {stderr[:200]}")
-        sys.exit(1)
-    lines = result.stdout.decode().splitlines()
-    width = height = 0
-    frame_count = 0
-    for line in lines:
-        if line.startswith("#dimensions"):
-            m = re.search(r'(\d+)x(\d+)', line)
-            if m:
-                width, height = int(m.group(1)), int(m.group(2))
-        elif not line.startswith("#") and line.strip():
-            frame_count += 1
-    return width, height, frame_count
-
-
-def decode_yuv(wedeo_bin: str, input_path: str, deblock: bool) -> bytes:
-    """Decode to raw YUV420p using wedeo."""
-    with tempfile.NamedTemporaryFile(suffix=".yuv", delete=False) as f:
-        yuv_path = f.name
-    try:
-        env = {**os.environ}
-        if not deblock:
-            env["WEDEO_NO_DEBLOCK"] = "1"
-        subprocess.run(
-            [wedeo_bin, input_path, "--raw-yuv", yuv_path],
-            capture_output=True, env=env, check=True
-        )
-        return Path(yuv_path).read_bytes()
-    finally:
-        if os.path.exists(yuv_path):
-            os.unlink(yuv_path)
-
-
-def decode_yuv_ffmpeg(input_path: str, deblock: bool) -> bytes:
-    """Decode to raw YUV420p using FFmpeg."""
-    with tempfile.NamedTemporaryFile(suffix=".yuv", delete=False) as f:
-        yuv_path = f.name
-    try:
-        cmd = ["ffmpeg", "-y", "-bitexact", "-threads", "1"]
-        if not deblock:
-            cmd += ["-skip_loop_filter", "all"]
-        cmd += ["-i", input_path, "-pix_fmt", "yuv420p", "-f", "rawvideo", yuv_path]
-        subprocess.run(cmd, capture_output=True, check=True)
-        return Path(yuv_path).read_bytes()
-    finally:
-        if os.path.exists(yuv_path):
-            os.unlink(yuv_path)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from ffmpeg_debug import decode_yuv, find_wedeo_binary, get_video_info
 
 
 def analyze_edge(plane_name: str, pre_w: np.ndarray, post_w: np.ndarray,
@@ -123,10 +60,11 @@ def main():
                         help="Max edges to report per plane (default: 10)")
     args = parser.parse_args()
 
-    wedeo_bin = find_wedeo_bin()
+    wedeo_bin = find_wedeo_binary()
     input_path = str(args.input)
 
-    w, h, n_frames = get_dimensions(wedeo_bin, input_path)
+    info = get_video_info(input_path, wedeo_bin=wedeo_bin, no_deblock=True)
+    w, h, n_frames = info.width, info.height, info.frame_count
     if w == 0 or h == 0:
         print("Error: could not determine frame dimensions")
         sys.exit(1)
@@ -141,10 +79,10 @@ def main():
 
     # Decode all versions
     print("Decoding (4 runs)...")
-    wedeo_nd = decode_yuv(wedeo_bin, input_path, deblock=False)
-    wedeo_db = decode_yuv(wedeo_bin, input_path, deblock=True)
-    ffmpeg_db = decode_yuv_ffmpeg(input_path, deblock=True)
-    ffmpeg_nd = decode_yuv_ffmpeg(input_path, deblock=False)
+    wedeo_nd = decode_yuv(input_path, "wedeo", no_deblock=True, wedeo_bin=wedeo_bin)
+    wedeo_db = decode_yuv(input_path, "wedeo", no_deblock=False, wedeo_bin=wedeo_bin)
+    ffmpeg_db = decode_yuv(input_path, "ffmpeg", no_deblock=False)
+    ffmpeg_nd = decode_yuv(input_path, "ffmpeg", no_deblock=True)
 
     y_size = w * h
     # YUV420p chroma dimensions round up for odd frame sizes

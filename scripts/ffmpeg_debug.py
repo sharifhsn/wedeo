@@ -272,6 +272,82 @@ def load_yuv_frame(
     return y, u, v
 
 
+# ── Section 2b: Framecrc & Frame Count ────────────────────────────────────────
+
+
+def run_framecrc(
+    cmd: list[str],
+    env: dict[str, str] | None = None,
+    timeout: int = 60,
+) -> list[str]:
+    """Run a framecrc command and return list of CRC strings.
+
+    Handles timeout, non-zero exit, and non-UTF8 output.
+    Skips comment lines (starting with #) and empty lines.
+
+    Args:
+        cmd: Command to run (e.g., [wedeo_bin, input_path] or ffmpeg args).
+        env: Extra environment variables (merged with os.environ).
+        timeout: Timeout in seconds.
+
+    Returns:
+        List of CRC strings (the 6th comma-separated field from each data line).
+    """
+    full_env = {**os.environ, **(env or {})}
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, env=full_env, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        print(
+            f"WARN: {' '.join(str(c) for c in cmd[:3])}... timed out after {timeout}s",
+            file=sys.stderr,
+        )
+        return []
+    if result.returncode != 0:
+        print(
+            f"WARN: {' '.join(str(c) for c in cmd[:3])}... exited with {result.returncode}",
+            file=sys.stderr,
+        )
+    crcs = []
+    for line in result.stdout.decode(errors="replace").splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        parts = line.split(",")
+        if len(parts) >= 6:
+            crcs.append(parts[5].strip())
+    return crcs
+
+
+def check_yuv_frame_count(
+    data: bytes,
+    width: int,
+    height: int,
+    expected: int,
+    label: str = "",
+) -> int:
+    """Compute frame count from YUV420p data and warn if it differs from expected.
+
+    Protects against the CVSE3-style mismatch where FFmpeg rawvideo outputs
+    a different number of frames than framecrc.
+
+    Returns the actual frame count.
+    """
+    frame_size = width * height * 3 // 2
+    if frame_size == 0:
+        return 0
+    actual = len(data) // frame_size
+    if actual != expected:
+        tag = f" ({label})" if label else ""
+        print(
+            f"WARNING: Frame count mismatch{tag}! "
+            f"actual={actual}, expected={expected}. "
+            f"Results may be misleading — consider framecrc_compare.py instead.",
+            file=sys.stderr,
+        )
+    return actual
+
+
 # ── Section 3: Trace Extraction ──────────────────────────────────────────────
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")

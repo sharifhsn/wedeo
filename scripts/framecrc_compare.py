@@ -21,10 +21,16 @@ Requires:
 """
 
 import argparse
-import subprocess
 import sys
-import tempfile
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from ffmpeg_debug import (
+    decode_yuv,
+    find_wedeo_binary,
+    get_video_info,
+    run_framecrc,
+)
 
 
 CONFORMANCE_FILES = [
@@ -36,71 +42,24 @@ CONFORMANCE_FILES = [
 ]
 
 
-def find_wedeo_bin():
-    """Find the wedeo-framecrc binary (release first, then debug).
-
-    Prefers release to match conformance_snapshot.py behavior.
-    Using debug-first caused false results when only one was rebuilt.
-    """
-    for profile in ["release", "debug"]:
-        candidate = Path("target") / profile / "wedeo-framecrc"
-        if candidate.exists():
-            return str(candidate.resolve())
-    return None
-
-
-def run_framecrc(cmd, env=None):
-    """Run a framecrc command and return parsed lines as (frame_idx, crc) tuples."""
-    full_env = {**subprocess.os.environ, **(env or {})}
-    result = subprocess.run(cmd, capture_output=True, env=full_env)
-    if result.returncode != 0:
-        print(f"WARN: {' '.join(cmd[:3])}... exited with {result.returncode}", file=sys.stderr)
-    lines = result.stdout.decode().splitlines()
-    frames = []
-    for line in lines:
-        if line.startswith("#") or not line.strip():
-            continue
-        parts = line.split(",")
-        if len(parts) >= 6:
-            frame_idx = int(parts[1].strip())
-            crc = parts[5].strip()
-            frames.append((frame_idx, crc))
-    return frames
-
-
-def get_dimensions(wedeo_bin, input_path, env=None):
-    """Extract width x height from wedeo framecrc header."""
-    full_env = {**subprocess.os.environ, **(env or {})}
-    result = subprocess.run(
-        [wedeo_bin, str(input_path)], capture_output=True, env=full_env
-    )
-    for line in result.stdout.decode().splitlines():
-        if line.startswith("#dimensions"):
-            parts = line.split(":")[-1].strip().split("x")
-            return int(parts[0]), int(parts[1])
-    return None, None
-
-
 def compare_one(input_path, wedeo_bin, no_deblock=False, pixel_detail=False):
     """Compare framecrc for a single file. Returns (total, matching, diffs_info)."""
     env = {"WEDEO_NO_DEBLOCK": "1"} if no_deblock else {}
 
-    wedeo_frames = run_framecrc([wedeo_bin, str(input_path)], env=env)
+    wedeo_crcs = run_framecrc([str(wedeo_bin), str(input_path)], env=env)
 
     ffmpeg_cmd = ["ffmpeg", "-bitexact"]
     if no_deblock:
         ffmpeg_cmd += ["-skip_loop_filter", "all"]
     ffmpeg_cmd += ["-i", str(input_path), "-f", "framecrc", "-"]
-    ffmpeg_frames = run_framecrc(ffmpeg_cmd)
+    ffmpeg_crcs = run_framecrc(ffmpeg_cmd)
 
-    total = min(len(wedeo_frames), len(ffmpeg_frames))
+    total = min(len(wedeo_crcs), len(ffmpeg_crcs))
     matching = 0
     diffs = []
 
     for i in range(total):
-        w_idx, w_crc = wedeo_frames[i]
-        f_idx, f_crc = ffmpeg_frames[i]
-        if w_crc == f_crc:
+        if wedeo_crcs[i] == ffmpeg_crcs[i]:
             matching += 1
         else:
             diffs.append(i)
@@ -119,40 +78,15 @@ def pixel_plane_analysis(input_path, wedeo_bin, no_deblock, diff_frames):
     """Decode raw YUV and compare Y/U/V planes for differing frames."""
     import numpy as np
 
-    w, h = get_dimensions(wedeo_bin, input_path)
-    if w is None:
-        return None
-
+    info = get_video_info(input_path, wedeo_bin=wedeo_bin, no_deblock=no_deblock)
+    w, h = info.width, info.height
     cw, ch = w // 2, h // 2
     y_size = w * h
     uv_size = cw * ch
     frame_size = y_size + 2 * uv_size
 
-    env = {"WEDEO_NO_DEBLOCK": "1"} if no_deblock else {}
-
-    # Decode raw YUV from both
-    with tempfile.NamedTemporaryFile(suffix=".yuv", delete=False) as f:
-        wedeo_path = f.name
-    with tempfile.NamedTemporaryFile(suffix=".yuv", delete=False) as f:
-        ffmpeg_path = f.name
-
-    subprocess.run(
-        [wedeo_bin, str(input_path), "--raw-yuv", wedeo_path],
-        capture_output=True,
-        env={**subprocess.os.environ, **env},
-        check=True,
-    )
-
-    ffmpeg_cmd = ["ffmpeg", "-y", "-bitexact"]
-    if no_deblock:
-        ffmpeg_cmd += ["-skip_loop_filter", "all"]
-    ffmpeg_cmd += ["-i", str(input_path), "-pix_fmt", "yuv420p", "-f", "rawvideo", ffmpeg_path]
-    subprocess.run(ffmpeg_cmd, capture_output=True, check=True)
-
-    wd = Path(wedeo_path).read_bytes()
-    fd = Path(ffmpeg_path).read_bytes()
-    Path(wedeo_path).unlink(missing_ok=True)
-    Path(ffmpeg_path).unlink(missing_ok=True)
+    wd = decode_yuv(input_path, "wedeo", no_deblock=no_deblock, wedeo_bin=wedeo_bin)
+    fd = decode_yuv(input_path, "ffmpeg", no_deblock=no_deblock)
 
     results = []
     for frame_idx in diff_frames:
@@ -184,10 +118,7 @@ def main():
                         help="Path to conformance files (default: fate-suite/h264-conformance)")
     args = parser.parse_args()
 
-    wedeo_bin = find_wedeo_bin()
-    if wedeo_bin is None:
-        print("Error: wedeo-framecrc not found. Run `cargo build --bin wedeo-framecrc`", file=sys.stderr)
-        sys.exit(1)
+    wedeo_bin = find_wedeo_binary()
 
     if args.all:
         files = [Path(args.fate_dir) / f for f in CONFORMANCE_FILES]
