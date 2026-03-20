@@ -99,10 +99,15 @@ pub fn build_ref_list_p(
         );
     }
 
-    // Truncate to num_ref_idx_l0_active
+    // Truncate or pad to num_ref_idx_l0_active.
+    // Padding uses list[0] (most recent ref) as the default, matching
+    // FFmpeg's default_ref behavior (h264_refs.c:212, 391-404).
     let max_refs = slice_hdr.num_ref_idx_l0_active as usize;
     if list.len() > max_refs {
         list.truncate(max_refs);
+    } else if !list.is_empty() && list.len() < max_refs {
+        let default_ref = list[0];
+        list.resize(max_refs, default_ref);
     }
 
     list
@@ -194,14 +199,20 @@ pub fn build_ref_list_b(
         );
     }
 
-    // Truncate to active counts
+    // Truncate or pad to active counts (padding with default_ref = list[0]).
     let max_l0 = slice_hdr.num_ref_idx_l0_active as usize;
     if list0.len() > max_l0 {
         list0.truncate(max_l0);
+    } else if !list0.is_empty() && list0.len() < max_l0 {
+        let default_ref = list0[0];
+        list0.resize(max_l0, default_ref);
     }
     let max_l1 = slice_hdr.num_ref_idx_l1_active as usize;
     if list1.len() > max_l1 {
         list1.truncate(max_l1);
+    } else if !list1.is_empty() && list1.len() < max_l1 {
+        let default_ref = list1[0];
+        list1.resize(max_l1, default_ref);
     }
 
     (list0, list1)
