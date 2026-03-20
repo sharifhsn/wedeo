@@ -56,9 +56,9 @@ def main():
         print(f"Error: {input_path} not found", file=sys.stderr)
         sys.exit(1)
 
-    # Find wedeo-framecrc binary
+    # Find wedeo-framecrc binary (release first to match conformance_snapshot.py)
     wedeo_bin = None
-    for profile in ["debug", "release"]:
+    for profile in ["release", "debug"]:
         candidate = Path("target") / profile / "wedeo-framecrc"
         if candidate.exists():
             wedeo_bin = str(candidate.resolve())
@@ -118,7 +118,24 @@ def main():
         print(f"Error: YUV data too short (wedeo={len(wedeo_data)}, ffmpeg={len(ffmpeg_data)})")
         sys.exit(1)
 
-    actual_frames = min(len(wedeo_data), len(ffmpeg_data)) // frame_size
+    wedeo_frames = len(wedeo_data) // frame_size
+    ffmpeg_frames = len(ffmpeg_data) // frame_size
+    if wedeo_frames != ffmpeg_frames:
+        print(
+            f"WARNING: Frame count mismatch! wedeo={wedeo_frames}, ffmpeg={ffmpeg_frames}",
+            file=sys.stderr,
+        )
+        print(
+            "FFmpeg rawvideo may output different frame counts than framecrc.",
+            file=sys.stderr,
+        )
+        print(
+            "Results may be misleading — consider framecrc_compare.py instead.",
+            file=sys.stderr,
+        )
+        print(file=sys.stderr)
+
+    actual_frames = min(wedeo_frames, ffmpeg_frames)
     end_frame = min(actual_frames, args.start_frame + args.max_frames)
     if args.start_frame >= actual_frames:
         print(f"Error: start-frame {args.start_frame} >= {actual_frames} actual frames")

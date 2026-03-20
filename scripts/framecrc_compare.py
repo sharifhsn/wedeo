@@ -37,8 +37,12 @@ CONFORMANCE_FILES = [
 
 
 def find_wedeo_bin():
-    """Find the wedeo-framecrc binary (debug first, then release)."""
-    for profile in ["debug", "release"]:
+    """Find the wedeo-framecrc binary (release first, then debug).
+
+    Prefers release to match conformance_snapshot.py behavior.
+    Using debug-first caused false results when only one was rebuilt.
+    """
+    for profile in ["release", "debug"]:
         candidate = Path("target") / profile / "wedeo-framecrc"
         if candidate.exists():
             return str(candidate.resolve())
