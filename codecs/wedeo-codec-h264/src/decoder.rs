@@ -785,12 +785,33 @@ impl H264Decoder {
                 self.last_pocs = [i64::MIN; 16];
             }
 
+            // Determine if this frame has an MMCO-5 (Reset) operation.
+            // Needed early because MMCO-5 resets POC to 0, and we must
+            // use the reset POC for last_pocs insertion (matching FFmpeg
+            // where MMCO runs before h264_select_output_frame).
+            let has_mmco5 = last_hdr.adaptive_ref_pic_marking
+                && last_hdr
+                    .mmco_ops
+                    .iter()
+                    .any(|op| matches!(op, crate::slice::MmcoOp::Reset));
+
             // Dynamically compute reorder depth using FFmpeg's last_pocs
             // algorithm (h264_slice.c:1309-1332). Insert current POC into
             // the sorted ascending last_pocs array and derive out_of_order
             // from the insertion position. The algorithm shifts values left
             // as it scans, then places cur_poc at the insertion point.
-            let cur_poc = self.current_poc as i64;
+            //
+            // When MMCO-5 is present, reset last_pocs and use POC 0
+            // (matching FFmpeg where MMCO_RESET clears last_pocs in
+            // h264_refs.c:724-725 and resets POC before this runs).
+            if has_mmco5 {
+                self.last_pocs = [i64::MIN; 16];
+            }
+            let cur_poc = if has_mmco5 {
+                0i64
+            } else {
+                self.current_poc as i64
+            };
             let mut insert_pos = 0usize;
             for i in 0..=16 {
                 if i == 16 || cur_poc < self.last_pocs[i] {
@@ -823,19 +844,15 @@ impl H264Decoder {
                 self.reorder_depth = out_of_order;
             }
 
-            // Determine if this frame has an MMCO-5 (Reset) operation.
-            // This flag acts as a barrier in the delayed_pics buffer,
-            // preventing min-POC search from mixing frames across POC
-            // sequence boundaries.
+            // The mmco_reset flag acts as a barrier in the delayed_pics
+            // buffer, preventing min-POC search from mixing frames across
+            // POC sequence boundaries.
             // Reference: FFmpeg h264_slice.c:1301, 1327, 1346-1353.
-            let has_mmco5 = last_hdr.adaptive_ref_pic_marking
-                && last_hdr
-                    .mmco_ops
-                    .iter()
-                    .any(|op| matches!(op, crate::slice::MmcoOp::Reset));
             let frame_mmco_reset = has_mmco5 || (out_of_order == 16 && !self.current_is_idr);
 
             // Add current frame to the delayed_pics buffer.
+            // Use the original POC (not the MMCO-5 reset value) since
+            // min-POC ordering needs the real POC for correct output.
             self.delayed_pics
                 .push((self.current_poc, frame, frame_mmco_reset));
 
@@ -1415,9 +1432,31 @@ impl Decoder for H264Decoder {
                 // Flush any in-progress frame.
                 self.finish_current_frame();
 
-                // Flush all remaining delayed_pics in POC order
-                self.delayed_pics.sort_by_key(|(poc, _, _)| *poc);
-                for (_, mut f, _) in self.delayed_pics.drain(..) {
+                // Flush all remaining delayed_pics using barrier-aware
+                // min-POC search, matching FFmpeg's send_next_delayed_frame()
+                // (h264dec.c:987-1001). Unlike a simple sort, this respects
+                // mmco_reset barriers to avoid interleaving frames from
+                // different POC sequences.
+                while !self.delayed_pics.is_empty() {
+                    let out_idx = if self.delayed_pics[0].2 {
+                        0
+                    } else {
+                        let barrier = self
+                            .delayed_pics
+                            .iter()
+                            .enumerate()
+                            .skip(1)
+                            .find(|(_, (_, _, reset))| *reset)
+                            .map(|(i, _)| i)
+                            .unwrap_or(self.delayed_pics.len());
+                        self.delayed_pics[..barrier]
+                            .iter()
+                            .enumerate()
+                            .min_by_key(|(_, (poc, _, _))| *poc)
+                            .map(|(i, _)| i)
+                            .unwrap()
+                    };
+                    let (_, mut f, _) = self.delayed_pics.remove(out_idx);
                     f.pts = self.output_frame_counter;
                     self.output_frame_counter += 1;
                     self.output_queue.push_back(f);
