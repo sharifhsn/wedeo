@@ -2574,9 +2574,15 @@ fn apply_weight_list(
     let lx = (mb_x * 16 + px_x) as usize;
     let ly = (mb_y * 16 + px_y) as usize;
 
-    // Luma (skip when only chroma weights are active)
-    if hdr.use_weight && ref_idx < luma_weights.len() {
-        let (w, o) = luma_weights[ref_idx];
+    // Luma — fall back to default weight (1<<denom, 0) when ref_idx exceeds
+    // the parsed weight table. FFmpeg applies this implicitly; without it,
+    // refs beyond the explicit table get no weighting at all.
+    if hdr.use_weight {
+        let (w, o) = if ref_idx < luma_weights.len() {
+            luma_weights[ref_idx]
+        } else {
+            (1i32 << hdr.luma_log2_weight_denom, 0i32)
+        };
         apply_weight_uni(
             &mut ctx.pic.y,
             ctx.pic.y_stride,
@@ -2590,13 +2596,20 @@ fn apply_weight_list(
         );
     }
 
-    // Chroma
-    if hdr.use_weight_chroma && ref_idx < chroma_weights.len() {
+    // Chroma — same default fallback for chroma weights.
+    if hdr.use_weight_chroma {
         let cx = lx / 2;
         let cy = ly / 2;
         let cw = pw / 2;
         let ch = ph / 2;
-        let cw_entry = chroma_weights[ref_idx];
+        let cw_entry = if ref_idx < chroma_weights.len() {
+            chroma_weights[ref_idx]
+        } else {
+            [
+                (1i32 << hdr.chroma_log2_weight_denom, 0i32),
+                (1i32 << hdr.chroma_log2_weight_denom, 0i32),
+            ]
+        };
         // Cb
         apply_weight_uni(
             &mut ctx.pic.u,

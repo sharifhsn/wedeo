@@ -112,7 +112,9 @@ pub struct H264Decoder {
     /// Delayed picture buffer for POC-ordered output (matching FFmpeg's
     /// `delayed_pic`). Frames are inserted here and the minimum-POC frame
     /// is output when `delayed_pics.len() > reorder_depth`.
-    delayed_pics: Vec<(i32, Frame)>, // (poc, frame)
+    /// The bool flag is `mmco_reset` — set when MMCO-5 or out_of_order==16
+    /// causes a POC sequence restart. Acts as a barrier in min-POC search.
+    delayed_pics: Vec<(i32, Frame, bool)>, // (poc, frame, mmco_reset)
 }
 
 impl H264Decoder {
@@ -377,6 +379,128 @@ impl H264Decoder {
         }
     }
 
+    /// Fill frame_num gap by creating dummy DPB entries.
+    ///
+    /// When frame_num is not consecutive with prev_frame_num, advance
+    /// prev_frame_num through each missing value, creating dummy DPB
+    /// entries (cloned from the most recent short-term ref) and running
+    /// sliding window marking for each.
+    ///
+    /// Reference: FFmpeg h264_slice.c:1506-1570.
+    fn fill_frame_num_gap(&mut self, frame_num: u32, max_frame_num: u32, sps: &Sps) {
+        let expected_next = (self.prev_frame_num_h264 + 1) % max_frame_num;
+        if frame_num == self.prev_frame_num_h264 || frame_num == expected_next {
+            return;
+        }
+
+        debug!(
+            frame_num,
+            prev_frame_num = self.prev_frame_num_h264,
+            max_frame_num,
+            max_refs = sps.max_num_ref_frames,
+            gaps_allowed = sps.gaps_in_frame_num_allowed,
+            "frame_num gap detected"
+        );
+
+        if !sps.gaps_in_frame_num_allowed {
+            self.last_pocs = [i64::MIN; 16];
+        }
+
+        let mb_w = sps.mb_width;
+        let mb_h = sps.mb_height;
+        let pic_w = mb_w * 16;
+        let pic_h = mb_h * 16;
+        let y_stride = pic_w as usize;
+        let uv_stride = (pic_w / 2) as usize;
+        let total_4x4 = (mb_w * mb_h * 16) as usize;
+
+        let max_refs = sps.max_num_ref_frames;
+
+        // Find the most recent short-term ref to clone pixel data from
+        // (error concealment, matching FFmpeg h264_slice.c:1546-1558).
+        let prev_pic = self
+            .dpb
+            .entries
+            .iter()
+            .filter_map(|e| e.as_ref())
+            .filter(|e| e.status == RefStatus::ShortTerm)
+            .max_by_key(|e| e.frame_num)
+            .map(|e| (e.pic.clone(), e.poc));
+
+        // Safety limit: never fill more than max_frame_num steps
+        let mut steps = 0u32;
+        while self.prev_frame_num_h264 != frame_num
+            && (self.prev_frame_num_h264 + 1) % max_frame_num != frame_num
+            && steps < max_frame_num
+        {
+            self.prev_frame_num_h264 = (self.prev_frame_num_h264 + 1) % max_frame_num;
+            steps += 1;
+
+            let gap_frame_num = self.prev_frame_num_h264;
+
+            // Clone previous ref picture data, or use mid-grey fallback.
+            let (pic, poc) = if let Some((prev_pic, prev_poc)) = &prev_pic {
+                (prev_pic.clone(), *prev_poc + 2 * steps as i32)
+            } else {
+                (
+                    PictureBuffer {
+                        y: vec![128u8; y_stride * pic_h as usize],
+                        u: vec![128u8; uv_stride * (pic_h / 2) as usize],
+                        v: vec![128u8; uv_stride * (pic_h / 2) as usize],
+                        y_stride,
+                        uv_stride,
+                        width: pic_w,
+                        height: pic_h,
+                        mb_width: mb_w,
+                        mb_height: mb_h,
+                    },
+                    0,
+                )
+            };
+
+            let entry = DpbEntry {
+                pic,
+                poc,
+                frame_num: gap_frame_num,
+                status: RefStatus::Unused,
+                long_term_frame_idx: 0,
+                mv_info: vec![[0i16; 2]; total_4x4],
+                ref_info: vec![-1i8; total_4x4],
+                mv_info_l1: vec![[0i16; 2]; total_4x4],
+                ref_info_l1: vec![-1i8; total_4x4],
+                mb_intra: vec![true; (mb_w * mb_h) as usize],
+                needs_output: false,
+                ref_poc_l0: Vec::new(),
+                ref_poc_l1: Vec::new(),
+            };
+
+            // Make room if DPB is full
+            if self.dpb.is_full() {
+                self.dpb.remove_oldest_short_term();
+                if self.dpb.is_full() {
+                    for i in 0..self.dpb.entries.len() {
+                        if let Some(e) = &self.dpb.entries[i]
+                            && e.status == RefStatus::Unused
+                        {
+                            self.dpb.entries[i] = None;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if let Some(dpb_idx) = self.dpb.store(entry) {
+                refs::sliding_window_mark_gap(
+                    &mut self.dpb,
+                    max_refs,
+                    dpb_idx,
+                    gap_frame_num,
+                    max_frame_num,
+                );
+            }
+        }
+    }
+
     /// Process a single NAL unit.
     #[cfg_attr(feature = "tracing-detail", tracing::instrument(skip_all, fields(nal_type = ?nalu.nal_type)))]
     fn process_nal(&mut self, nalu: &NalUnit, _pkt_pts: i64) -> Result<()> {
@@ -450,8 +574,17 @@ impl H264Decoder {
                         self.reorder_depth = 1;
                     }
 
-                    // Compute spec-compliant POC
+                    // Frame num gap fill (H.264 Section 8.2.5.2).
+                    // When frame_num is not consecutive, advance prev_frame_num
+                    // through each gap value, creating dummy DPB entries and
+                    // running sliding window marking for each.
+                    // Reference: FFmpeg h264_slice.c:1506-1570.
                     let max_frame_num = 1u32 << sps.log2_max_frame_num;
+                    if !is_idr {
+                        self.fill_frame_num_gap(hdr.frame_num, max_frame_num, &sps);
+                    }
+
+                    // Compute spec-compliant POC
                     self.compute_frame_num_offset(hdr.frame_num, max_frame_num, is_idr);
 
                     if sps.poc_type == 0 {
@@ -681,7 +814,8 @@ impl H264Decoder {
             }
 
             // If all entries are smaller than current (out_of_order == 16),
-            // it means POC went backwards (e.g., IDR). Reset last_pocs.
+            // it means POC went backwards (e.g., frame_num gap wrap or
+            // MMCO reset). Reset last_pocs.
             if out_of_order == 16 {
                 self.last_pocs = [i64::MIN; 16];
                 self.last_pocs[0] = cur_poc;
@@ -689,29 +823,57 @@ impl H264Decoder {
                 self.reorder_depth = out_of_order;
             }
 
+            // Determine if this frame has an MMCO-5 (Reset) operation.
+            // This flag acts as a barrier in the delayed_pics buffer,
+            // preventing min-POC search from mixing frames across POC
+            // sequence boundaries.
+            // Reference: FFmpeg h264_slice.c:1301, 1327, 1346-1353.
+            let has_mmco5 = last_hdr.adaptive_ref_pic_marking
+                && last_hdr
+                    .mmco_ops
+                    .iter()
+                    .any(|op| matches!(op, crate::slice::MmcoOp::Reset));
+            let frame_mmco_reset = has_mmco5 || (out_of_order == 16 && !self.current_is_idr);
+
             // Add current frame to the delayed_pics buffer.
-            self.delayed_pics.push((self.current_poc, frame));
+            self.delayed_pics
+                .push((self.current_poc, frame, frame_mmco_reset));
 
             // Output frames when buffer exceeds reorder_depth AND the
-            // current frame is in order (matching FFmpeg h264_slice.c:
-            // 1359-1369, specifically the `!out_of_order` check at 1364).
-            // When out_of_order > 0, the buffer is still accumulating and
-            // outputting now would produce incorrect display order.
-            if out_of_order == 0 {
-                while self.delayed_pics.len() > self.reorder_depth {
-                    // Find the index of the minimum POC entry
-                    let min_idx = self
+            // current frame is in order (out_of_order == 0).
+            // Exception: always allow output when there's an mmco_reset
+            // barrier in the buffer, to drain old POC sequences. This
+            // prevents the out_of_order gate from blocking output when
+            // POC cycling (due to MMCO-5) keeps out_of_order > 0.
+            let has_barrier = self.delayed_pics.iter().any(|(_, _, reset)| *reset);
+            let allow_output = out_of_order == 0 || has_barrier;
+            while allow_output && self.delayed_pics.len() > self.reorder_depth {
+                let out_idx = if self.delayed_pics[0].2 {
+                    // mmco_reset at front: output it directly
+                    0
+                } else {
+                    // Find barrier: first mmco_reset at index >= 1
+                    let barrier = self
                         .delayed_pics
                         .iter()
                         .enumerate()
-                        .min_by_key(|(_, (poc, _))| *poc)
+                        .skip(1)
+                        .find(|(_, (_, _, reset))| *reset)
                         .map(|(i, _)| i)
-                        .unwrap();
-                    let (_, mut f) = self.delayed_pics.remove(min_idx);
-                    f.pts = self.output_frame_counter;
-                    self.output_frame_counter += 1;
-                    self.output_queue.push_back(f);
-                }
+                        .unwrap_or(self.delayed_pics.len());
+
+                    // Find min-POC within [0, barrier)
+                    self.delayed_pics[..barrier]
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, (poc, _, _))| *poc)
+                        .map(|(i, _)| i)
+                        .unwrap()
+                };
+                let (_, mut f, _) = self.delayed_pics.remove(out_idx);
+                f.pts = self.output_frame_counter;
+                self.output_frame_counter += 1;
+                self.output_queue.push_back(f);
             }
 
             // Non-reference pictures (nal_ref_idc == 0, typically B-frames)
@@ -810,6 +972,7 @@ impl H264Decoder {
                 }
             }
 
+            let mut mmco_did_reset = false;
             if let Some(dpb_idx) = self.dpb.store(entry) {
                 #[cfg(feature = "tracing-detail")]
                 {
@@ -832,7 +995,7 @@ impl H264Decoder {
                             .map(|sps| (sps.max_num_ref_frames, 1u32 << sps.log2_max_frame_num))
                     })
                     .unwrap_or((4, 16));
-                refs::mark_reference(
+                mmco_did_reset = refs::mark_reference(
                     &mut self.dpb,
                     last_hdr,
                     self.current_is_idr,
@@ -910,6 +1073,18 @@ impl H264Decoder {
             // all frames (not just references).
             self.prev_frame_num_offset = self.frame_num_offset;
             self.prev_frame_num_h264 = self.current_frame_num_h264;
+
+            // MMCO-5 (Reset) resets frame_num to 0 and frame_num_offset.
+            // Must happen AFTER the normal prev_frame_num update above,
+            // so the reset overrides the normal assignment.
+            // Reference: FFmpeg h264_field_end.c.
+            if mmco_did_reset {
+                debug!(
+                    h264_fn = self.current_frame_num_h264,
+                    "MMCO-5 reset: prev_frame_num → 0"
+                );
+                self.prev_frame_num_h264 = 0;
+            }
 
             self.frame_num += 1;
         }
@@ -1241,8 +1416,8 @@ impl Decoder for H264Decoder {
                 self.finish_current_frame();
 
                 // Flush all remaining delayed_pics in POC order
-                self.delayed_pics.sort_by_key(|(poc, _)| *poc);
-                for (_, mut f) in self.delayed_pics.drain(..) {
+                self.delayed_pics.sort_by_key(|(poc, _, _)| *poc);
+                for (_, mut f, _) in self.delayed_pics.drain(..) {
                     f.pts = self.output_frame_counter;
                     self.output_frame_counter += 1;
                     self.output_queue.push_back(f);

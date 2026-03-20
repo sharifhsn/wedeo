@@ -291,6 +291,8 @@ fn reorder_list(list: &mut Vec<usize>, dpb_idx: usize, target_pos: usize, max_le
 /// For non-IDR with sliding window: remove oldest short-term ref if DPB full.
 ///
 /// Reference: FFmpeg `ff_h264_execute_ref_pic_marking`.
+/// Returns `true` if MMCO-5 (Reset) was applied (caller must reset
+/// `prev_frame_num_h264` to 0 and update POC state).
 pub fn mark_reference(
     dpb: &mut Dpb,
     slice_hdr: &SliceHeader,
@@ -299,7 +301,7 @@ pub fn mark_reference(
     max_frame_num: u32,
     max_num_ref_frames: u32,
     current_dpb_idx: Option<usize>,
-) {
+) -> bool {
     if is_idr {
         // Clear all entries except the current one. The current entry
         // was just stored with RefStatus::Unused and needs to survive
@@ -326,7 +328,12 @@ pub fn mark_reference(
                 entry.status = RefStatus::ShortTerm;
             }
         }
+        false
     } else if slice_hdr.adaptive_ref_pic_marking {
+        let had_reset = slice_hdr
+            .mmco_ops
+            .iter()
+            .any(|op| matches!(op, MmcoOp::Reset));
         apply_mmco(
             dpb,
             &slice_hdr.mmco_ops,
@@ -335,6 +342,7 @@ pub fn mark_reference(
             current_dpb_idx,
             max_num_ref_frames,
         );
+        had_reset
     } else {
         sliding_window_mark(
             dpb,
@@ -343,6 +351,7 @@ pub fn mark_reference(
             current_frame_num,
             max_frame_num,
         );
+        false
     }
 }
 
@@ -398,6 +407,28 @@ fn sliding_window_mark(
     {
         entry.status = RefStatus::ShortTerm;
     }
+}
+
+/// Sliding window marking for gap-fill frames.
+///
+/// Gap frames always use sliding window (never MMCO) and are always
+/// marked as short-term references.
+///
+/// Reference: FFmpeg h264_slice.c:1527-1528 (`explicit_ref_marking = 0`).
+pub fn sliding_window_mark_gap(
+    dpb: &mut Dpb,
+    max_num_ref_frames: u32,
+    current_dpb_idx: usize,
+    current_frame_num: u32,
+    max_frame_num: u32,
+) {
+    sliding_window_mark(
+        dpb,
+        max_num_ref_frames,
+        Some(current_dpb_idx),
+        current_frame_num,
+        max_frame_num,
+    );
 }
 
 /// Apply Memory Management Control Operations (MMCO).

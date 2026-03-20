@@ -162,7 +162,7 @@ See `H264.md` for detailed architecture, module map, and conformance parity repo
 - Access unit grouping (AUD, SPS, first_mb_in_slice boundaries)
 - File extensions: .264, .h264, .h26l, .avc
 
-**FATE conformance: 42/57 progressive CAVLC tests bitexact, all 17/17 Baseline** (2026-03-19):
+**FATE conformance: 45/57 progressive CAVLC tests bitexact, all 17/17 Baseline** (2026-03-20):
 
 | Test | Status | Notes |
 |------|--------|-------|
@@ -180,8 +180,8 @@ See `H264.md` for detailed architecture, module map, and conformance parity repo
 | CVWP2/CVWP3 | 29/90 | direct_8x8_inference=0 + weighted pred |
 | CVFC1 | 19/50 | Frame crop + multi-slice diffs |
 | HCMP1 | 33/250 | 15-ref Main profile, pixel diffs |
-| MR3_TANDBERG_B | 284/300 | POC type 2, 16 frames differ at end |
-| MR4_TANDBERG_C, MR5_TANDBERG_C | 135/300, 52/300 | Complex MMCO sequences |
+| MR3_TANDBERG_B | **BITEXACT** | POC type 2, frame_num gap fill |
+| MR4_TANDBERG_C, MR5_TANDBERG_C | 215/300, 215/300 | Complex MMCO sequences |
 | cvmp_mot_frm0_full_B | 27/30 | direct_8x8_inference=0 |
 | FM1_FT_E, FM1_BT_B | 119/305, 0/0 | FMO (out of scope) |
 | MR6-9_BT_B, FI1_Sony_E | Gap | Interlaced (PAFF) / CABAC |
@@ -251,7 +251,7 @@ symphonia wrappers (priority 50) when both exist (e.g., WAV/PCM always uses nati
 - **Error**: No error context (where/why), no codec-specific error codes.
 
 ### In progress
-- **H.264 decoder** — I+P+B frame decode with deblocking, 42/57 progressive CAVLC conformance files BITEXACT (all 17 Baseline). Remaining: chroma-only bug (CVWP1), P-frame MC cascading diffs (CVBS3/CVSE3/CVSEFDFT3), complex MMCO (MR4/MR5). See `H264.md`.
+- **H.264 decoder** — I+P+B frame decode with deblocking, 45/57 progressive CAVLC conformance files BITEXACT (all 17 Baseline). Remaining: chroma-only bug (CVWP1), P-frame MC cascading diffs (CVBS3/CVSE3/CVSEFDFT3), complex MMCO (MR4/MR5). See `H264.md`.
 
 ### Not yet started
 - Video codecs (HEVC, VP9, AV1, etc.) — native Rust implementations, no existing crate covers these

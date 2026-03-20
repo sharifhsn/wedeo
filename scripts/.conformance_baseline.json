@@ -187,18 +187,18 @@
       "total": 300
     },
     "MR3_TANDBERG_B.264": {
-      "status": "DIFF",
-      "match": 284,
+      "status": "BITEXACT",
+      "match": 300,
       "total": 300
     },
     "MR4_TANDBERG_C.264": {
       "status": "DIFF",
-      "match": 142,
+      "match": 215,
       "total": 300
     },
     "MR5_TANDBERG_C.264": {
       "status": "DIFF",
-      "match": 53,
+      "match": 215,
       "total": 300
     },
     "NL1_Sony_D.jsv": {

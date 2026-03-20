@@ -133,6 +133,7 @@ impl Default for MbDeblockInfo {
 }
 
 /// Picture buffer with Y, U, V planes.
+#[derive(Clone)]
 pub struct PictureBuffer {
     pub y: Vec<u8>,
     pub u: Vec<u8>,

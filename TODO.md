@@ -17,7 +17,7 @@
 - [x] **Pixel format conversion** — wedeo-scale now wraps dcv-color-primitives for I420/NV12↔RGB24/BGR24/RGBA/BGRA conversions. Converter struct with metadata preservation. 11 unit tests.
 
 ### Video codecs (native Rust, no existing crate covers these)
-- [~] **H.264 decoder** — 39/57 progressive CAVLC conformance BITEXACT, all 17 Baseline pass. See `H264.md` for detailed status.
+- [~] **H.264 decoder** — 45/57 progressive CAVLC conformance BITEXACT, all 17 Baseline pass. See `H264.md` for detailed status.
   - [x] Wire P-frame inter prediction (mb_skip_run + P_SKIP + coded P-MB types 0-4)
   - [x] Fix demuxer access unit grouping (SPS/AUD/first_mb_in_slice boundaries)
   - [x] Write FATE integration tests (4 bitexact + 4 frame count regression tests)
