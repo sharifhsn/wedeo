@@ -18,6 +18,36 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+# ── Section 0: Conformance File Resolution ───────────────────────────────────
+
+CONFORMANCE_DIR = Path("fate-suite/h264-conformance")
+CONFORMANCE_EXTENSIONS = (".264", ".jsv", ".26l", ".h264")
+
+
+def resolve_conformance_file(name: str) -> Path:
+    """Resolve a file name or partial match to an H.264 conformance file path.
+
+    Accepts an exact path, a filename, or a partial name for fuzzy matching
+    within the conformance directory.
+    """
+    p = Path(name)
+    if p.exists():
+        return p
+    if CONFORMANCE_DIR.exists():
+        for ext in CONFORMANCE_EXTENSIONS:
+            matches = list(CONFORMANCE_DIR.glob(f"*{name}*{ext}"))
+            if len(matches) == 1:
+                return matches[0]
+            if len(matches) > 1:
+                print(
+                    f"Ambiguous match for '{name}': {[m.name for m in matches]}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+    print(f"Not found: {name}", file=sys.stderr)
+    sys.exit(1)
+
+
 # ── Section 1: Binary Discovery ──────────────────────────────────────────────
 
 # Directories whose .rs files determine source freshness
