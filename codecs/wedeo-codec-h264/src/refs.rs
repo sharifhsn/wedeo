@@ -87,6 +87,17 @@ pub fn build_ref_list_p(
         .chain(lt_indices)
         .collect();
 
+    // Pad to num_ref_idx_l0_active BEFORE modification (matching FFmpeg
+    // h264_refs.c:181-182). Entries beyond the available refs are set to
+    // usize::MAX (NULL equivalent). The modification algorithm operates on
+    // the full-sized list, and the post-modification fixup (below) replaces
+    // any remaining NULL entries with the default ref.
+    let max_refs = slice_hdr.num_ref_idx_l0_active as usize;
+    let available_len = list.len();
+    if list.len() < max_refs {
+        list.resize(max_refs, usize::MAX);
+    }
+
     // Apply ref_pic_list_modification commands if present
     if !slice_hdr.ref_pic_list_modification_l0.is_empty() {
         apply_ref_pic_list_modification(
@@ -94,20 +105,27 @@ pub fn build_ref_list_p(
             &slice_hdr.ref_pic_list_modification_l0,
             dpb,
             current_frame_num,
-            slice_hdr.num_ref_idx_l0_active as usize,
+            max_refs,
             max_frame_num,
         );
     }
 
-    // Truncate or pad to num_ref_idx_l0_active.
-    // Padding uses list[0] (most recent ref) as the default, matching
-    // FFmpeg's default_ref behavior (h264_refs.c:212, 391-404).
-    let max_refs = slice_hdr.num_ref_idx_l0_active as usize;
-    if list.len() > max_refs {
-        list.truncate(max_refs);
-    } else if !list.is_empty() && list.len() < max_refs {
-        let default_ref = list[0];
-        list.resize(max_refs, default_ref);
+    // Truncate to num_ref_idx_l0_active.
+    list.truncate(max_refs);
+
+    // Replace any remaining NULL entries (usize::MAX) with the default ref
+    // (first entry), matching FFmpeg h264_refs.c:391-404.
+    if available_len > 0 {
+        let default_ref = list
+            .iter()
+            .find(|&&x| x != usize::MAX)
+            .copied()
+            .unwrap_or(0);
+        for entry in list.iter_mut() {
+            if *entry == usize::MAX {
+                *entry = default_ref;
+            }
+        }
     }
 
     list
@@ -176,6 +194,18 @@ pub fn build_ref_list_b(
         list1.swap(0, 1);
     }
 
+    // Pad lists to active counts BEFORE modification (matching FFmpeg).
+    let max_l0 = slice_hdr.num_ref_idx_l0_active as usize;
+    let max_l1 = slice_hdr.num_ref_idx_l1_active as usize;
+    let l0_avail = list0.len();
+    let l1_avail = list1.len();
+    if list0.len() < max_l0 {
+        list0.resize(max_l0, usize::MAX);
+    }
+    if list1.len() < max_l1 {
+        list1.resize(max_l1, usize::MAX);
+    }
+
     // Apply ref_pic_list_modification for L0
     if !slice_hdr.ref_pic_list_modification_l0.is_empty() {
         apply_ref_pic_list_modification(
@@ -183,7 +213,7 @@ pub fn build_ref_list_b(
             &slice_hdr.ref_pic_list_modification_l0,
             dpb,
             slice_hdr.frame_num,
-            slice_hdr.num_ref_idx_l0_active as usize,
+            max_l0,
             max_frame_num,
         );
     }
@@ -194,25 +224,39 @@ pub fn build_ref_list_b(
             &slice_hdr.ref_pic_list_modification_l1,
             dpb,
             slice_hdr.frame_num,
-            slice_hdr.num_ref_idx_l1_active as usize,
+            max_l1,
             max_frame_num,
         );
     }
 
-    // Truncate or pad to active counts (padding with default_ref = list[0]).
-    let max_l0 = slice_hdr.num_ref_idx_l0_active as usize;
-    if list0.len() > max_l0 {
-        list0.truncate(max_l0);
-    } else if !list0.is_empty() && list0.len() < max_l0 {
-        let default_ref = list0[0];
-        list0.resize(max_l0, default_ref);
+    // Truncate to active counts.
+    list0.truncate(max_l0);
+    list1.truncate(max_l1);
+
+    // Replace NULL entries with default ref.
+    if l0_avail > 0 {
+        let default_ref = list0
+            .iter()
+            .find(|&&x| x != usize::MAX)
+            .copied()
+            .unwrap_or(0);
+        for entry in list0.iter_mut() {
+            if *entry == usize::MAX {
+                *entry = default_ref;
+            }
+        }
     }
-    let max_l1 = slice_hdr.num_ref_idx_l1_active as usize;
-    if list1.len() > max_l1 {
-        list1.truncate(max_l1);
-    } else if !list1.is_empty() && list1.len() < max_l1 {
-        let default_ref = list1[0];
-        list1.resize(max_l1, default_ref);
+    if l1_avail > 0 {
+        let default_ref = list1
+            .iter()
+            .find(|&&x| x != usize::MAX)
+            .copied()
+            .unwrap_or(0);
+        for entry in list1.iter_mut() {
+            if *entry == usize::MAX {
+                *entry = default_ref;
+            }
+        }
     }
 
     (list0, list1)
@@ -223,7 +267,7 @@ pub fn build_ref_list_b(
 /// `max_pic_num` = MaxFrameNum for frame mode (2^log2_max_frame_num).
 /// Wrap-around uses `& (max_pic_num - 1)` per H.264 spec 8.2.4.3.1.
 fn apply_ref_pic_list_modification(
-    list: &mut Vec<usize>,
+    list: &mut [usize],
     mods: &[RefPicListModification],
     dpb: &Dpb,
     current_frame_num: u32,
@@ -259,33 +303,30 @@ fn apply_ref_pic_list_modification(
     }
 }
 
-/// Reorder a reference list by moving `dpb_idx` to position `target_pos`.
-fn reorder_list(list: &mut Vec<usize>, dpb_idx: usize, target_pos: usize, max_len: usize) {
-    let found_pos = list.iter().position(|&x| x == dpb_idx);
+/// Reorder a reference list by inserting `dpb_idx` at `target_pos`.
+///
+/// Matches FFmpeg h264_refs.c:375-384: search for the same entry starting
+/// from target_pos, shift everything between found_pos and target_pos
+/// right by one, then place the entry at target_pos. This allows
+/// duplicates when the entry already exists before target_pos.
+fn reorder_list(list: &mut [usize], dpb_idx: usize, target_pos: usize, max_len: usize) {
+    // Find the first occurrence of dpb_idx at or after target_pos.
+    // If not found, use the end of the list (max_len - 1).
+    let end = max_len.min(list.len());
+    let found = list[target_pos..end]
+        .iter()
+        .position(|&x| x == dpb_idx)
+        .map_or(end.saturating_sub(1), |p| p + target_pos);
 
-    let remove_pos = if let Some(pos) = found_pos {
-        if pos >= target_pos {
-            pos
-        } else {
-            return;
-        }
-    } else {
-        list.push(dpb_idx);
-        list.len() - 1
-    };
-
-    if remove_pos > target_pos {
-        for i in (target_pos..remove_pos).rev() {
-            list.swap(i, i + 1);
-        }
+    // Shift entries from found down to target_pos+1 one position right.
+    // This drops the entry at `found` and makes room at target_pos.
+    for i in (target_pos + 1..=found).rev() {
+        list[i] = list[i - 1];
     }
 
+    // Place the entry at target_pos.
     if target_pos < list.len() {
         list[target_pos] = dpb_idx;
-    }
-
-    if list.len() > max_len {
-        list.truncate(max_len);
     }
 }
 
