@@ -682,7 +682,10 @@ impl MvContext {
                             && {
                                 let d_mb_x = abs_dl_x as u32 / 4;
                                 let d_mb_y = abs_dl_y as u32 / 4;
-                                slice_table.is_none() || same_slice(d_mb_x, d_mb_y)
+                                // D within the current MB is always same-slice
+                                (d_mb_x == mb_x && d_mb_y == mb_y)
+                                    || slice_table.is_none()
+                                    || same_slice(d_mb_x, d_mb_y)
                             };
                         if d_ok {
                             match self.try_get_neighbor_list(mb_x, mb_y, dl_x, dl_y, list) {

@@ -2052,6 +2052,31 @@ fn decode_b_8x8_mb(
                         n.mv_a, n.mv_b, n.mv_c, n.ref_a, n.ref_b, n.ref_c, ref_l0, n.a_avail,
                         n.b_avail, n.c_avail,
                     );
+                    trace!(
+                        mb_x,
+                        mb_y,
+                        part,
+                        j,
+                        list = 0,
+                        sub_blk_x,
+                        sub_blk_y,
+                        sw,
+                        a_mv_x = n.mv_a[0],
+                        a_mv_y = n.mv_a[1],
+                        a_ref = n.ref_a,
+                        a_avail = n.a_avail,
+                        b_mv_x = n.mv_b[0],
+                        b_mv_y = n.mv_b[1],
+                        b_ref = n.ref_b,
+                        b_avail = n.b_avail,
+                        c_mv_x = n.mv_c[0],
+                        c_mv_y = n.mv_c[1],
+                        c_ref = n.ref_c,
+                        c_avail = n.c_avail,
+                        mvp_x = mvp[0],
+                        mvp_y = mvp[1],
+                        "B_8x8 neighbors"
+                    );
                     [
                         mvp[0].wrapping_add(mb.mvd_l0[mvd_idx][0]),
                         mvp[1].wrapping_add(mb.mvd_l0[mvd_idx][1]),
@@ -2083,6 +2108,31 @@ fn decode_b_8x8_mb(
                     let mvp = mvpred::predict_mv(
                         n.mv_a, n.mv_b, n.mv_c, n.ref_a, n.ref_b, n.ref_c, ref_l1, n.a_avail,
                         n.b_avail, n.c_avail,
+                    );
+                    trace!(
+                        mb_x,
+                        mb_y,
+                        part,
+                        j,
+                        list = 1,
+                        sub_blk_x,
+                        sub_blk_y,
+                        sw,
+                        a_mv_x = n.mv_a[0],
+                        a_mv_y = n.mv_a[1],
+                        a_ref = n.ref_a,
+                        a_avail = n.a_avail,
+                        b_mv_x = n.mv_b[0],
+                        b_mv_y = n.mv_b[1],
+                        b_ref = n.ref_b,
+                        b_avail = n.b_avail,
+                        c_mv_x = n.mv_c[0],
+                        c_mv_y = n.mv_c[1],
+                        c_ref = n.ref_c,
+                        c_avail = n.c_avail,
+                        mvp_x = mvp[0],
+                        mvp_y = mvp[1],
+                        "B_8x8 neighbors"
                     );
                     [
                         mvp[0].wrapping_add(mb.mvd_l1[mvd_idx][0]),
