@@ -17,7 +17,7 @@
 - [x] **Pixel format conversion** — wedeo-scale now wraps dcv-color-primitives for I420/NV12↔RGB24/BGR24/RGBA/BGRA conversions. Converter struct with metadata preservation. 11 unit tests.
 
 ### Video codecs (native Rust, no existing crate covers these)
-- [~] **H.264 decoder** — 45/57 progressive CAVLC conformance BITEXACT, all 17 Baseline pass. See `H264.md` for detailed status.
+- [~] **H.264 decoder** — 50/57 progressive CAVLC conformance BITEXACT, all 17 Baseline pass. See `H264.md` for detailed status.
   - [x] Wire P-frame inter prediction (mb_skip_run + P_SKIP + coded P-MB types 0-4)
   - [x] Fix demuxer access unit grouping (SPS/AUD/first_mb_in_slice boundaries)
   - [x] Write FATE integration tests (4 bitexact + 4 frame count regression tests)
@@ -44,9 +44,13 @@
   - [x] Fix ref_pic_list_modification wrap — modular arithmetic mod MaxFrameNum
   - [x] Fix frame crop offset — apply SPS crop_left/crop_top in frame output
   - [x] Fix sliding window FrameNumWrap — evict smallest FrameNumWrap, not smallest raw frame_num
-  - [ ] Implement weighted prediction application — weights parsed, need MC application
-  - [ ] Debug MMCO complex sequences — MR4/MR5 diverge at frame 17 (Op 1+3+4+6 interactions)
-  - [ ] Debug HCBP1/HCBP2 15-ref DPB — 17/250 match, sliding window not improving
+  - [x] Implement weighted prediction application — weights parsed and applied for P+B uni-directional
+  - [x] Fix MMCO-5 last_pocs reset + barrier-aware drain — MR4/MR5 now BITEXACT
+  - [x] Fix L1 neighbor D fallback same-MB slice_table bypass — CVBS3/CVSE3/CVSEFDFT3 now BITEXACT
+  - [x] HCBP1/HCBP2 15-ref hierarchical — now BITEXACT
+  - [ ] Debug CVWP5 P-frame MC — ref list modification + weighted pred, 7/90 match
+  - [ ] Fix CVWP2/CVWP3 output reorder — 3 initial frames in wrong order
+  - [ ] Debug HCMP1 hierarchical B cascading diffs — 87/250 match
   - [ ] Fix FMO (Flexible Macroblock Ordering) — FM1_FT_E has num_slice_groups>1
 - [ ] **AV1 decoder via rav1d** — wrap Prossimo's rav1d (pure Rust AV1 decoder, port of dav1d) behind wedeo traits, similar to how symphonia is wrapped. Create `adapters/wedeo-rav1d/` with `Decoder` impl. Needs: new `CodecId::Av1` variant, AV1 OBU probe in demuxer, frame type mapping. rav1d handles all decode internally; wedeo just needs the trait bridge and pixel format conversion. Consider using a git worktree (`feat/rav1d-integration`) since it touches workspace Cargo.toml.
 - [ ] **Video player with audio** — extend `bins/wedeo-play/` with audio playback (currently video-only via minifb). Needs: audio output backend (cpal or rodio crate), A/V sync (PTS-based with audio clock as master), demuxer that handles both audio+video streams (MP4/MKV via symphonia). Consider using a git worktree (`feat/video-player-audio`) since it may need new Frame fields in wedeo-core.
