@@ -166,9 +166,9 @@ class FrameInfo:
 
     def __post_init__(self):
         if self.mb_w == 0:
-            self.mb_w = self.width // 16
+            self.mb_w = (self.width + 15) // 16
         if self.mb_h == 0:
-            self.mb_h = self.height // 16
+            self.mb_h = (self.height + 15) // 16
 
 
 def get_video_info(
@@ -614,10 +614,23 @@ def get_register_names() -> RegisterNames:
 
 
 def parse_lldb_int(value_str: str) -> int:
-    """Parse an integer from an lldb expression result like '42' or '-1'."""
-    m = re.search(r"(-?\d+)", value_str)
+    """Parse an integer from an lldb expression result like '(int) 42' or '= -1'.
+
+    Prefers the value after '=' (lldb's standard output format) to avoid
+    matching stray numbers in error messages.
+    """
+    # Prefer "= N" format (standard lldb expression result)
+    m = re.search(r"=\s*(-?\d+)\s*$", value_str.strip())
     if m:
         return int(m.group(1))
+    # Fall back to "(type) N" format
+    m = re.search(r"\)\s*(-?\d+)\s*$", value_str.strip())
+    if m:
+        return int(m.group(1))
+    # Last resort: any integer (but only if the string looks clean)
+    stripped = value_str.strip()
+    if re.fullmatch(r"-?\d+", stripped):
+        return int(stripped)
     raise ValueError(f"Cannot parse integer from: {value_str!r}")
 
 

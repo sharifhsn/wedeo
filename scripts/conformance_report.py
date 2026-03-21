@@ -101,11 +101,20 @@ class H264Features:
 
 def detect_features(input_path: str | Path) -> H264Features:
     """Detect H.264 features using FFmpeg's trace_headers BSF."""
-    result = subprocess.run(
-        ["ffmpeg", "-i", str(input_path), "-c:v", "copy",
-         "-bsf:v", "trace_headers", "-f", "null", "-"],
-        capture_output=True, text=True, timeout=30,
-    )
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-i", str(input_path), "-c:v", "copy",
+             "-bsf:v", "trace_headers", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except FileNotFoundError:
+        print("Error: ffmpeg not found in PATH (needed for feature detection)",
+              file=sys.stderr)
+        sys.exit(1)
+    except subprocess.TimeoutExpired:
+        print(f"Warning: feature detection timed out for {input_path}",
+              file=sys.stderr)
+        return H264Features()
     trace = result.stderr
     feat = H264Features()
 
