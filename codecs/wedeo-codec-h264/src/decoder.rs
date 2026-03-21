@@ -376,6 +376,19 @@ impl H264Decoder {
             if nr > self.reorder_depth {
                 self.reorder_depth = nr;
             }
+        } else if !self.has_bitstream_restriction && sps.profile_idc != 66 {
+            // When VUI bitstream_restriction is absent and the profile
+            // supports B-frames (non-Baseline), use a minimum reorder
+            // depth of 1 to prevent premature output of the first frame.
+            // Without this, streams with negative POC values (POC < IDR's
+            // POC) in the first GOP would output the IDR before frames
+            // that should display earlier. The dynamic detection at line
+            // 846 will increase this further as needed.
+            // Reference: FFmpeg h264_ps.c:538-550 estimates reorder depth
+            // from level when VUI is absent.
+            if self.reorder_depth < 1 {
+                self.reorder_depth = 1;
+            }
         }
     }
 
