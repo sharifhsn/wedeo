@@ -556,6 +556,9 @@ impl H264Decoder {
                         frame_num = hdr.frame_num,
                         qp = hdr.slice_qp,
                         is_idr,
+                        use_weight = hdr.use_weight,
+                        use_weight_chroma = hdr.use_weight_chroma,
+                        num_luma_weights = hdr.luma_weight_l0.len(),
                         "slice start"
                     );
 

@@ -2633,6 +2633,14 @@ fn apply_weight_list(
         } else {
             (1i32 << hdr.luma_log2_weight_denom, 0i32)
         };
+        trace!(
+            ref_idx,
+            list,
+            luma_weight = w,
+            luma_offset = o,
+            denom = hdr.luma_log2_weight_denom,
+            "weighted pred luma"
+        );
         apply_weight_uni(
             &mut ctx.pic.y,
             ctx.pic.y_stride,
