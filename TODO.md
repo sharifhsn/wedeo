@@ -17,7 +17,7 @@
 - [x] **Pixel format conversion** — wedeo-scale now wraps dcv-color-primitives for I420/NV12↔RGB24/BGR24/RGBA/BGRA conversions. Converter struct with metadata preservation. 11 unit tests.
 
 ### Video codecs (native Rust, no existing crate covers these)
-- [~] **H.264 decoder** — 46/51 progressive CAVLC conformance BITEXACT (90%), all 17 Baseline pass. See `H264.md` for detailed status.
+- [~] **H.264 decoder** — 47/51 progressive CAVLC conformance BITEXACT (92%), all 17 Baseline pass. See `H264.md` for detailed status.
   - [x] Wire P-frame inter prediction (mb_skip_run + P_SKIP + coded P-MB types 0-4)
   - [x] Fix demuxer access unit grouping (SPS/AUD/first_mb_in_slice boundaries)
   - [x] Write FATE integration tests (4 bitexact + 4 frame count regression tests)
@@ -49,7 +49,7 @@
   - [x] Fix L1 neighbor D fallback same-MB slice_table bypass — CVBS3/CVSE3/CVSEFDFT3 now BITEXACT
   - [x] HCBP1/HCBP2 15-ref hierarchical — now BITEXACT
   - [x] Fix output reorder for non-Baseline without VUI — set reorder_depth=1, fixed CVWP1/CVWP2/CVBS3/CVSE3/CVSEFDFT3/MR4/MR5/cvmp (8 files)
-  - [ ] Debug CVWP5 P-frame MC — ref list modification + weighted pred, 7/90 match
+  - [x] Fix ref_pic_list_modification — pre-size list, allow duplicates, DPB-based deblock identity (CVWP5 BITEXACT)
   - [ ] Fix CVWP3 pixel diff — 89/90, 1 diff at frame 69
   - [ ] Debug HCMP1 hierarchical B cascading diffs — 87/250 match, diffs from frame 1
   - [ ] Debug CVFC1 multi-slice + crop — 19/50, 4 slices/frame, diffs start frame 17
