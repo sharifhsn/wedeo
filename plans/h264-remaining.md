@@ -1,55 +1,58 @@
-# Plan: H.264 Remaining 7 DIFF Files (50→57 BITEXACT)
+# Plan: H.264 Remaining 4 DIFF Files (47→51 BITEXACT)
 
-## Current state: 50/57 progressive CAVLC BITEXACT
+## Current state: 47/51 progressive CAVLC BITEXACT (92%)
+
+## Completed this session (2026-03-21)
+
+| Fix | Files Fixed | Technique |
+|-----|-------------|-----------|
+| Reorder depth=1 for non-Baseline without VUI | CVWP1, CVWP2, CVBS3, CVSE3, CVSEFDFT3, MR4, MR5, cvmp | One-line change in apply_sps |
+| Ref list modification: pre-size + allow duplicates | CVWP5 (MC part) | Rewrote reorder_list, pre-pad before modification |
+| DPB-based deblock ref identity | CVWP5 (deblock part) | Use DPB index instead of ref_idx for P-slice BS |
 
 ## Remaining files
 
 | File | Match | Category | Next Step |
 |------|-------|----------|-----------|
-| CVWP5 | 7/90 | P-frame MC | Extract MVs from both decoders for MB(9,0) frame 4 |
-| CVWP2 | 87/90 | Reorder (3 frames) | Run poc_output_compare.py, check VUI num_reorder_frames |
-| CVWP3 | 86/90 | 3 reorder + 1 pixel | Same reorder as CVWP2 + one pixel diff at frame 69 |
-| HCMP1 | 87/250 | Hierarchical B cascade | mb_compare on first differing frame, check MC source |
-| CVFC1 | 19/50 | Frame crop + multi-slice | Read FFmpeg h264_slice.c crop handling, compare |
+| CVWP3 | 89/90 | 1 pixel diff at frame 69 | mb_compare at frame 69, check weighted bipred formula |
+| HCMP1 | 87/250 | Hierarchical B cascade from frame 1 | mb_compare --no-deblock frame 1, check ref list and MC |
+| CVFC1 | 19/50 | Multi-slice + crop | mb_compare frame 17, investigate slice boundary effects |
 | FM1_FT_E | 119/305 | FMO | Out of scope (num_slice_groups > 1) |
-| FM1_BT_B | 0/0 | FMO | Out of scope |
 
 ## Priority order
 
-### 1. CVWP2/CVWP3 reorder (likely quick win)
-3 frames in wrong output order. This is NOT a pixel bug — the frames are correct
-but emitted in the wrong sequence. Likely a VUI/num_reorder_frames issue or an
-edge case in the delayed output buffer.
+### 1. CVWP3 (very close — 1 pixel diff)
+89/90 match. Single pixel diff at frame 69 in a weighted bipred stream.
+Likely a rounding error or edge case in the weighted prediction formula.
 
 **Approach:**
-1. `python3 scripts/poc_output_compare.py fate-suite/h264-conformance/CVWP2_TOSHIBA_E.264`
-2. Compare POC output order between wedeo and FFmpeg
-3. Check if weighted_pred PPS changes affect output timing
-4. Read FFmpeg's `h264_field_start` and output logic in `h264dec.c`
+1. `python3 scripts/mb_compare.py fate-suite/h264-conformance/CVWP3_TOSHIBA_E.264 --start-frame 69 --max-frames 1`
+2. Find the differing MB(s) and check the mb_type
+3. Trace the weighted pred weights and MC values for that specific block
+4. Compare with FFmpeg via lldb
 
-### 2. CVWP5 (empirical MV extraction needed)
-7/90, huge diffs starting frame 4. Stream has ref_pic_list_modification commands.
-Weight table parsing is correct (verified). All MBs use ref_idx=0 with identity
-weight. The bug is in MC — either wrong MV or wrong reference picture.
+### 2. HCMP1 (hierarchical B, large diffs)
+87/250, diffs start at frame 1 with Y_max=110+ (no-deblock). This is the
+hierarchical B counterpart to HCBP1 (which passes). HCMP1 uses Main profile
+with weighted bipred. The large diffs from frame 1 suggest a reference
+list or weighted prediction issue specific to hierarchical B structure.
 
 **Approach:**
-1. Add trace to predict_mv for P_L0_L0_8x16 (mb_type=2) showing neighbor values
-2. Extract FFmpeg's MVs via lldb for MB(9,0) in frame 4 (POC=8)
-3. Compare: if MVs match, the ref picture content differs (ref list bug)
-4. If MVs differ, find which neighbor is wrong
+1. Compare HCMP1 vs HCBP1 stream features (profile, weighted pred, etc.)
+2. `python3 scripts/mb_compare.py --start-frame 1 --max-frames 1`
+3. Check if weighted bipred is the differentiator
 
-**Key observation:** Frame has ref_pic_list_modification (bits 27-48 in slice header).
-Verify `apply_ref_pic_list_modification()` produces same ref order as FFmpeg.
+### 3. CVFC1 (multi-slice + crop)
+19/50, diffs start at frame 17. Baseline profile, 4 slices/frame at
+non-row-aligned boundaries (MB 0, 99, 198, 297). Y_max=47 with 26/209
+MBs differing at frame 17. No B-frames (all P after IDR).
 
-### 3. HCMP1 (characterize first)
-87/250 hierarchical B with 15 refs. Run mb_compare on first few differing frames
-to see if they share a pattern (same MB types? same sub-partition types?).
-
-### 4. CVFC1 (code review)
-19/50 with frame crop. The frame crop offsets in SPS affect output dimensions.
-Read FFmpeg's crop handling and compare with wedeo's implementation.
+**Approach:**
+1. Check if diffs correlate with slice boundaries
+2. Investigate cross-slice MV prediction at slice boundaries
+3. Check if frame crop interacts with slice boundary deblocking
 
 ## Anti-patterns
-- Don't debug CVWP5 weights (they're correct — all identity for differing frames)
+- Don't debug CVWP5 weights (FIXED — was ref list modification bug)
 - Don't theorize about cache layout — extract actual values
-- Run `test_file.py --diff` after every fix to check for regressions/bonuses
+- Run full conformance after every fix to check for regressions/bonuses

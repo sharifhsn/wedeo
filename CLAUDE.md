@@ -162,7 +162,7 @@ See `H264.md` for detailed architecture, module map, and conformance parity repo
 - Access unit grouping (AUD, SPS, first_mb_in_slice boundaries)
 - File extensions: .264, .h264, .h26l, .avc
 
-**FATE conformance: 45/57 progressive CAVLC tests bitexact, all 17/17 Baseline** (2026-03-20):
+**FATE conformance: 47/51 progressive CAVLC tests BITEXACT (92%), all 17/17 Baseline** (2026-03-21):
 
 | Test | Status | Notes |
 |------|--------|-------|
@@ -174,15 +174,13 @@ See `H264.md` for detailed architecture, module map, and conformance parity repo
 | HCBP1, HCBP2 | **BITEXACT** | 15-ref hierarchical, deep reorder buffer |
 | SL1_SVA_B | **BITEXACT** | Temporal direct + direct_8x8_inference=0 |
 | FM2_SVA_B, FM2_SVA_C | **BITEXACT** | Both decoders produce 0 frames |
-| CVBS3/CVSE3/CVSEFDFT3 | 150/300, 137/278, 98/200 | Temporal direct works, P-frame MC diffs cascade |
-| CVWP1 | 19/90 | Chroma-only bug (luma matches, chroma diffs 100+) |
-| CVWP5 | 7/90 | Mixed pixel diffs |
-| CVWP2/CVWP3 | 29/90 | direct_8x8_inference=0 + weighted pred |
-| CVFC1 | 19/50 | Frame crop + multi-slice diffs |
-| HCMP1 | 33/250 | 15-ref Main profile, pixel diffs |
-| MR3_TANDBERG_B | **BITEXACT** | POC type 2, frame_num gap fill |
-| MR4_TANDBERG_C, MR5_TANDBERG_C | 215/300, 215/300 | Complex MMCO sequences |
-| cvmp_mot_frm0_full_B | 27/30 | direct_8x8_inference=0 |
+| CVBS3, CVSE3, CVSEFDFT3 | **BITEXACT** | Reorder fix resolved all prior "cascade" diffs |
+| CVWP1, CVWP2, CVWP5 | **BITEXACT** | Weighted pred, ref list modification, DPB-based deblock |
+| cvmp_mot_frm0_full_B | **BITEXACT** | direct_8x8_inference=0, B_8x8 MC |
+| MR3, MR4, MR5 | **BITEXACT** | POC type 2, MMCO-5, gap fill, complex MMCO |
+| CVWP3 | 89/90 | 1 pixel diff at frame 69 |
+| HCMP1 | 87/250 | 15-ref hierarchical B, cascading MC diffs |
+| CVFC1 | 19/50 | Multi-slice + frame crop diffs |
 | FM1_FT_E, FM1_BT_B | 119/305, 0/0 | FMO (out of scope) |
 | MR6-9_BT_B, FI1_Sony_E | Gap | Interlaced (PAFF) / CABAC |
 
