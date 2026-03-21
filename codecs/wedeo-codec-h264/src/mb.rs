@@ -103,6 +103,10 @@ pub struct FrameDecodeContext {
     pub col_ref_poc_l1: Vec<i32>,
     /// Current frame's L0 ref POCs (for temporal direct dist_scale_factor).
     pub cur_l0_ref_poc: Vec<i32>,
+    /// Current frame's L0 ref DPB indices (for deblocking ref identity).
+    /// DPB index uniquely identifies a picture even when POC collides
+    /// (e.g., after MMCO-5 Reset).
+    pub cur_l0_ref_dpb: Vec<usize>,
     /// Current frame's L1 ref POCs (for implicit weighted bipred).
     pub cur_l1_ref_poc: Vec<i32>,
     /// Current picture POC (for temporal direct dist_scale_factor).
@@ -160,6 +164,7 @@ impl FrameDecodeContext {
             col_ref_poc_l0: Vec::new(),
             col_ref_poc_l1: Vec::new(),
             cur_l0_ref_poc: Vec::new(),
+            cur_l0_ref_dpb: Vec::new(),
             cur_l1_ref_poc: Vec::new(),
             cur_poc: 0,
             implicit_weight: Vec::new(),
@@ -283,10 +288,22 @@ fn store_deblock_info(
                 };
             }
         } else {
-            // P-slice: ref_idx identifies the picture (all blocks share the same L0 list)
-            for (blk, poc) in deblock_ref_poc.iter_mut().enumerate() {
+            // P-slice: convert ref_idx to DPB index for identity comparison.
+            // DPB index uniquely identifies a picture even when:
+            // - ref list has duplicates (ref_pic_list_modification) — different
+            //   ref_idx values can map to the same DPB entry
+            // - POC collides (MMCO-5 Reset can produce multiple pictures with
+            //   POC=0 in the same DPB)
+            for (blk, id) in deblock_ref_poc.iter_mut().enumerate() {
                 let ri = ctx.mv_ctx.ref_idx[mb_idx_base + blk];
-                *poc = if ri >= 0 { ri as i32 } else { i32::MIN };
+                *id = if ri >= 0 {
+                    ctx.cur_l0_ref_dpb
+                        .get(ri as usize)
+                        .map(|&dpb_idx| dpb_idx as i32)
+                        .unwrap_or(i32::MIN)
+                } else {
+                    i32::MIN
+                };
             }
         }
     }

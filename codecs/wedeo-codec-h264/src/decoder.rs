@@ -678,6 +678,7 @@ impl H264Decoder {
                             .iter()
                             .filter_map(|&i| self.dpb.get(i).map(|e| e.poc))
                             .collect();
+                        fdc.cur_l0_ref_dpb = self.ref_list_l0.clone();
                     }
                     if hdr.slice_type.is_b() {
                         fdc.cur_l1_ref_poc = self
