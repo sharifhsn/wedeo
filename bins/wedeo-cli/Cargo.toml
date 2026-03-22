@@ -20,6 +20,7 @@ tracing = [
     "wedeo-format-wav/tracing-detail",
     "wedeo-format-h264/tracing-detail",
     "wedeo-symphonia/tracing-detail",
+    "wedeo-rav1d/tracing-detail",
 ]
 
 [dependencies]
@@ -31,4 +32,5 @@ wedeo-codec-h264 = { workspace = true }
 wedeo-format-wav = { workspace = true }
 wedeo-format-h264 = { workspace = true }
 wedeo-symphonia = { workspace = true }
+wedeo-rav1d = { workspace = true }
 tracing-subscriber = { workspace = true, optional = true }

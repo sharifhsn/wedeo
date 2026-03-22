@@ -1,0 +1,17 @@
+[package]
+name = "wedeo-rav1d"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "rav1d AV1 decoder adapter for wedeo"
+
+[features]
+tracing-detail = ["tracing/attributes"]
+
+[dependencies]
+wedeo-core = { workspace = true }
+wedeo-codec = { workspace = true }
+inventory = { workspace = true }
+tracing = { workspace = true }
+rav1d = { git = "https://github.com/memorysafety/rav1d", default-features = true }
+libc = "0.2"

@@ -11,6 +11,7 @@ members = [
     "formats/wedeo-format-wav",
     "formats/wedeo-format-h264",
     "adapters/wedeo-symphonia",
+    "adapters/wedeo-rav1d",
     "bins/wedeo-cli",
     "bins/wedeo-play",
     "tests/fate",
@@ -41,3 +42,4 @@ wedeo-format-wav = { path = "formats/wedeo-format-wav" }
 wedeo-codec-h264 = { path = "codecs/wedeo-codec-h264" }
 wedeo-format-h264 = { path = "formats/wedeo-format-h264" }
 wedeo-symphonia = { path = "adapters/wedeo-symphonia" }
+wedeo-rav1d = { path = "adapters/wedeo-rav1d" }
