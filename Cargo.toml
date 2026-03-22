@@ -31,7 +31,9 @@ inventory = "0.3"
 tracing = { version = "0.1", default-features = false }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
+cpal = "0.17"
 minifb = "0.28"
+ringbuf = "0.4"
 wedeo-core = { path = "crates/wedeo-core" }
 wedeo-codec = { path = "crates/wedeo-codec" }
 wedeo-format = { path = "crates/wedeo-format" }

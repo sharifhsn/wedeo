@@ -14,9 +14,12 @@ wedeo-core = { workspace = true }
 wedeo-codec = { workspace = true }
 wedeo-format = { workspace = true }
 wedeo-scale = { workspace = true }
+wedeo-resample = { workspace = true }
 wedeo-codec-pcm = { workspace = true }
 wedeo-codec-h264 = { workspace = true }
 wedeo-format-wav = { workspace = true }
 wedeo-format-h264 = { workspace = true }
 wedeo-symphonia = { workspace = true }
+cpal = { workspace = true }
 minifb = { workspace = true }
+ringbuf = { workspace = true }
