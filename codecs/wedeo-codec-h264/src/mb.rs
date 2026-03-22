@@ -115,6 +115,8 @@ pub struct FrameDecodeContext {
     /// `implicit_weight[ref0][ref1]` = w0 weight for biweight formula.
     /// w1 = 64 - w0, log2_denom = 5, offset = 0.
     pub implicit_weight: Vec<Vec<i32>>,
+    /// Previous macroblock's qscale_diff (used by CABAC to select mb_qp_delta context).
+    pub last_qscale_diff: i32,
 }
 
 impl FrameDecodeContext {
@@ -168,6 +170,7 @@ impl FrameDecodeContext {
             cur_l1_ref_poc: Vec::new(),
             cur_poc: 0,
             implicit_weight: Vec::new(),
+            last_qscale_diff: 0,
         }
     }
 
@@ -607,6 +610,7 @@ pub fn decode_macroblock(
     if mb.mb_qp_delta != 0 {
         ctx.qp = ((ctx.qp as i32 + mb.mb_qp_delta).rem_euclid(52)) as u8;
     }
+    ctx.last_qscale_diff = mb.mb_qp_delta;
     let qp = if mb.is_pcm { 0 } else { ctx.qp };
 
     // Compute chroma QP
