@@ -1136,8 +1136,7 @@ impl H264Decoder {
 
     /// Decode a slice into a FrameDecodeContext.
     ///
-    /// `ref_pics` contains the reference pictures for inter prediction (list 0).
-    /// `ref_pics_l1` contains the list 1 reference pictures (B-slices only).
+    /// Dispatches to CAVLC or CABAC slice decode based on PPS entropy_coding_mode_flag.
     /// Returns the number of MBs decoded in this slice.
     #[allow(clippy::too_many_arguments)] // H.264 slice decode needs all parameters
     #[cfg_attr(feature = "tracing-detail", tracing::instrument(skip_all, fields(poc = self.current_poc, first_mb = hdr.first_mb_in_slice, slice_type = ?hdr.slice_type)))]
@@ -1151,12 +1150,31 @@ impl H264Decoder {
         ref_pics: &[&PictureBuffer],
         ref_pics_l1: &[&PictureBuffer],
     ) -> Result<u32> {
+        fdc.qp = hdr.slice_qp as u8;
+
+        if pps.entropy_coding_mode_flag {
+            self.decode_slice_cabac(rbsp, hdr, sps, pps, fdc, ref_pics, ref_pics_l1)
+        } else {
+            self.decode_slice_cavlc(rbsp, hdr, sps, pps, fdc, ref_pics, ref_pics_l1)
+        }
+    }
+
+    /// Decode a CAVLC-coded slice.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_slice_cavlc(
+        &self,
+        rbsp: &[u8],
+        hdr: &SliceHeader,
+        sps: &Sps,
+        pps: &Pps,
+        fdc: &mut FrameDecodeContext,
+        ref_pics: &[&PictureBuffer],
+        ref_pics_l1: &[&PictureBuffer],
+    ) -> Result<u32> {
         let mb_width = sps.mb_width;
         let mb_height = sps.mb_height;
         let total_mbs = mb_width * mb_height;
         let rbsp_bits = rbsp.len() * 8;
-
-        fdc.qp = hdr.slice_qp as u8;
 
         // Create a bitstream reader starting at the macroblock data.
         let mut padded = Vec::with_capacity(rbsp.len() + 8);
@@ -1265,7 +1283,7 @@ impl H264Decoder {
             fdc.neighbor_ctx.top_available =
                 mb_y > 0 && fdc.slice_table[(mb_addr - mb_width) as usize] == fdc.current_slice;
 
-            // Decode coded MB (existing path)
+            // Decode coded MB
             mb::decode_macroblock(
                 fdc,
                 &mut br,
@@ -1298,6 +1316,21 @@ impl H264Decoder {
         }
 
         Ok(mbs_decoded)
+    }
+
+    /// Decode a CABAC-coded slice.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_slice_cabac(
+        &self,
+        _rbsp: &[u8],
+        _hdr: &SliceHeader,
+        _sps: &Sps,
+        _pps: &Pps,
+        _fdc: &mut FrameDecodeContext,
+        _ref_pics: &[&PictureBuffer],
+        _ref_pics_l1: &[&PictureBuffer],
+    ) -> Result<u32> {
+        Err(Error::PatchwelcomeNotImplemented)
     }
 
     /// Convert a completed FrameDecodeContext to a Frame.
