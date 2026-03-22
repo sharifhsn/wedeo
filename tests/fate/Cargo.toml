@@ -23,6 +23,7 @@ tracing = [
     "wedeo-codec-h264/tracing-detail",
     "wedeo-format-wav/tracing-detail",
     "wedeo-format-h264/tracing-detail",
+    "wedeo-format-mp4/tracing-detail",
     "wedeo-symphonia/tracing-detail",
     "wedeo-rav1d/tracing-detail",
 ]
@@ -35,6 +36,7 @@ wedeo-codec-pcm = { workspace = true }
 wedeo-codec-h264 = { workspace = true }
 wedeo-format-wav = { workspace = true }
 wedeo-format-h264 = { workspace = true }
+wedeo-format-mp4 = { workspace = true }
 wedeo-symphonia = { workspace = true }
 wedeo-rav1d = { workspace = true }
 tracing-subscriber = { workspace = true, optional = true }

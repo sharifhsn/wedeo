@@ -14,6 +14,7 @@ use std::io::{self, Write};
 use wedeo_codec_h264 as _;
 use wedeo_codec_pcm as _;
 use wedeo_format_h264 as _;
+use wedeo_format_mp4 as _;
 use wedeo_format_wav as _;
 use wedeo_rav1d as _;
 use wedeo_symphonia as _;
