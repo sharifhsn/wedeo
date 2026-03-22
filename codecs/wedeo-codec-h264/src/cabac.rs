@@ -16,7 +16,7 @@ use crate::cabac_tables::{
     COEFF_ABS_LEVELGT1_CTX, LAST_COEFF_FLAG_OFFSET, LPS_RANGE, MLPS_STATE, NORM_SHIFT,
     SIGNIFICANT_COEFF_FLAG_OFFSET,
 };
-use crate::cavlc::Macroblock;
+use crate::cavlc::{Macroblock, NeighborContext};
 use crate::pps::Pps;
 use crate::slice::SliceType;
 use crate::tables::{B_MB_TYPE_INFO, B_SUB_MB_TYPE_INFO};
@@ -43,18 +43,21 @@ pub struct CabacReader<'a> {
 impl<'a> CabacReader<'a> {
     /// Initialize a CABAC decoder from byte-aligned RBSP data.
     ///
-    /// Reads the first 2-3 bytes to initialize the arithmetic engine.
-    /// Reference: FFmpeg `ff_init_cabac_decoder` (CABAC_BITS=16 path).
+    /// Reads the first 2 bytes to initialize the arithmetic engine, then adds
+    /// `1 << 9` to keep subsequent refills on 2-byte boundaries.
+    ///
+    /// This matches FFmpeg's aligned init path (`ff_init_cabac_decoder`,
+    /// CABAC_BITS=16). FFmpeg's `av_malloc` returns 32-byte aligned buffers,
+    /// so `buf + 2` is always even-aligned and FFmpeg always takes this path.
     pub fn new(data: &'a [u8]) -> Result<Self> {
-        if data.len() < 3 {
+        if data.len() < 2 {
             return Err(Error::InvalidData);
         }
 
         // Read first two bytes into low, shifted for 16-bit precision.
-        // Then read a third byte for additional precision.
-        // This matches FFmpeg's "unaligned" init path which always works
-        // correctly regardless of buffer alignment.
-        let low = (data[0] as i32) << 18 | (data[1] as i32) << 10 | (data[2] as i32) << 2 | 2;
+        // Add (1 << 9) to match FFmpeg's aligned init path, which keeps
+        // the bytestream pointer on a 2-byte boundary for refills.
+        let low = (data[0] as i32) << 18 | (data[1] as i32) << 10 | (1 << 9);
         let range = 0x1FE;
 
         // Validity check: range << (CABAC_BITS+1) must be >= low
@@ -65,7 +68,7 @@ impl<'a> CabacReader<'a> {
         Ok(Self {
             low,
             range,
-            pos: 3,
+            pos: 2,
             data,
         })
     }
@@ -229,17 +232,16 @@ impl<'a> CabacReader<'a> {
         }
 
         let new_start = ptr + n;
-        if new_start + 3 > self.data.len() {
+        if new_start + 2 > self.data.len() {
             return Err(Error::InvalidData);
         }
 
-        // Re-init the engine from the new position
+        // Re-init the engine from the new position (aligned path)
         self.low = (self.data[new_start] as i32) << 18
             | (self.data[new_start + 1] as i32) << 10
-            | (self.data[new_start + 2] as i32) << 2
-            | 2;
+            | (1 << 9);
         self.range = 0x1FE;
-        self.pos = new_start + 3;
+        self.pos = new_start + 2;
 
         Ok(())
     }
@@ -248,6 +250,16 @@ impl<'a> CabacReader<'a> {
     /// Useful for debugging and I_PCM byte reads.
     pub fn pos(&self) -> usize {
         self.pos
+    }
+
+    /// Return the current low value (for debugging).
+    pub fn low(&self) -> i32 {
+        self.low
+    }
+
+    /// Return the current range value (for debugging).
+    pub fn range(&self) -> i32 {
+        self.range
     }
 
     /// Get the number of bytes remaining in the data buffer.
@@ -344,18 +356,25 @@ impl CabacNeighborCtx {
 
     /// Get the left CBP for the current MB. Returns 0 if left is unavailable.
     #[inline]
+    /// Get the left CBP for the current MB.
+    ///
+    /// Returns `u32::MAX` (= -1 as unsigned) when unavailable, matching FFmpeg's
+    /// convention. This is critical: the CBP context derivation uses bitwise AND
+    /// on the neighbor CBP, and `!(u32::MAX & bit) = 0` while `!(0 & bit) = 1`.
     fn left_cbp(&self, mb_idx: usize, mb_x: u32, slice_table: &[u16], cur_slice: u16) -> u32 {
         if mb_x == 0 {
-            return 0;
+            return u32::MAX;
         }
         let left_idx = mb_idx - 1;
         if slice_table[left_idx] != cur_slice {
-            return 0;
+            return u32::MAX;
         }
         self.cbp[left_idx]
     }
 
-    /// Get the top CBP for the current MB. Returns 0 if top is unavailable.
+    /// Get the top CBP for the current MB.
+    ///
+    /// Returns `u32::MAX` when unavailable (see `left_cbp` for rationale).
     #[inline]
     fn top_cbp(
         &self,
@@ -366,11 +385,11 @@ impl CabacNeighborCtx {
         cur_slice: u16,
     ) -> u32 {
         if mb_y == 0 {
-            return 0;
+            return u32::MAX;
         }
         let top_idx = mb_idx - mb_width as usize;
         if slice_table[top_idx] != cur_slice {
-            return 0;
+            return u32::MAX;
         }
         self.cbp[top_idx]
     }
@@ -442,6 +461,12 @@ const I_MB_TYPE_INFO: [(i8, u8); 26] = [
 /// Block scan order: maps H.264 block scan index to raster-order index.
 /// Identical to SCAN_TO_RASTER in cavlc.rs.
 const SCAN_TO_RASTER: [usize; 16] = [0, 1, 4, 5, 2, 3, 6, 7, 8, 9, 12, 13, 10, 11, 14, 15];
+
+/// Standard 4x4 zigzag scan: maps scan position (0..15) to raster position
+/// (row * 4 + col) within the 4x4 block.
+///
+/// From FFmpeg `ff_zigzag_scan` in mathtables.c.
+const ZIGZAG_SCAN_4X4: [usize; 16] = [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15];
 
 /// P sub-macroblock type partition counts.
 const P_SUB_MB_PARTITION_COUNT: [u8; 4] = [1, 2, 2, 4];
@@ -1250,12 +1275,19 @@ fn get_nz_neighbors(
 /// Returns the number of non-zero coefficients.
 ///
 /// Reference: FFmpeg h264_cabac.c:1590-1776 (decode_cabac_residual_internal).
+///
+/// `scantable` maps significance-map position to raster position within the
+/// coefficient block. For DC and full 4x4 blocks this is `ZIGZAG_SCAN_4X4`;
+/// for AC blocks (where DC is separate) this is `&ZIGZAG_SCAN_4X4[1..]`
+/// (offset by 1 so that scan position 0 maps to raster position 1 in the
+/// zigzag order, skipping the DC position).
 fn decode_cabac_residual(
     reader: &mut CabacReader,
     state: &mut [u8; 1024],
     block: &mut [i16],
     cat: usize,
     max_coeff: usize,
+    scantable: &[usize],
 ) -> usize {
     let sig_ctx_base = SIGNIFICANT_COEFF_FLAG_OFFSET[cat] as usize;
     let last_ctx_base = LAST_COEFF_FLAG_OFFSET[cat] as usize;
@@ -1293,11 +1325,13 @@ fn decode_cabac_residual(
         return 0;
     }
 
-    // Phase 2: decode coefficient levels (in reverse order)
+    // Phase 2: decode coefficient levels (in reverse order).
+    // Apply the scan table to convert significance-map positions to raster
+    // positions within the block, matching FFmpeg's `j = scantable[index[...]]`.
     let mut node_ctx = 0usize;
 
     for i in (0..coeff_count).rev() {
-        let scan_pos = index[i];
+        let raster_pos = scantable[index[i]];
         let ctx_idx = COEFF_ABS_LEVEL1_CTX[node_ctx] as usize + abs_level_ctx_base;
 
         let coeff_abs;
@@ -1332,7 +1366,7 @@ fn decode_cabac_residual(
 
         // Decode sign via bypass
         let signed_val = reader.get_cabac_bypass_sign(-(coeff_abs as i32));
-        block[scan_pos] = signed_val as i16;
+        block[raster_pos] = signed_val as i16;
     }
 
     coeff_count
@@ -1382,7 +1416,7 @@ fn decode_cabac_luma_residual(
         if reader.get_cabac(&mut state[cbf_ctx]) != 0 {
             // Store DC coded flag in cbp (bit 8)
             // (We'll set this in the caller's cbp tracking)
-            let nz = decode_cabac_residual(reader, state, &mut mb.luma_dc, 0, 16);
+            let nz = decode_cabac_residual(reader, state, &mut mb.luma_dc, 0, 16, &ZIGZAG_SCAN_4X4);
             let _ = nz; // nz used for DC coded flag
         }
 
@@ -1409,6 +1443,7 @@ fn decode_cabac_luma_residual(
                         &mut mb.luma_coeffs[raster_idx],
                         1,
                         15,
+                        &ZIGZAG_SCAN_4X4[1..],
                     );
                     nz_cache[raster_idx] = nz as u8;
                 }
@@ -1442,6 +1477,7 @@ fn decode_cabac_luma_residual(
                             &mut mb.luma_coeffs[raster_idx],
                             2,
                             16,
+                            &ZIGZAG_SCAN_4X4,
                         );
                         nz_cache[raster_idx] = nz as u8;
                     }
@@ -1488,7 +1524,17 @@ fn decode_cabac_chroma_residual(
                 nz_cache,
             );
             if reader.get_cabac(&mut state[cbf_ctx]) != 0 {
-                decode_cabac_residual(reader, state, &mut mb.chroma_dc[c as usize], 3, 4);
+                // Chroma DC 2x2 uses identity scan (positions map 1:1 to the
+                // chroma_dc[0..4] array, matching CAVLC's direct storage).
+                const CHROMA_DC_SCAN: [usize; 4] = [0, 1, 2, 3];
+                decode_cabac_residual(
+                    reader,
+                    state,
+                    &mut mb.chroma_dc[c as usize],
+                    3,
+                    4,
+                    &CHROMA_DC_SCAN,
+                );
                 // Set chroma DC coded flag in cbp (bits 6..7)
                 *stored_cbp |= 0x40 << c;
             }
@@ -1515,7 +1561,14 @@ fn decode_cabac_chroma_residual(
                     nz_cache,
                 );
                 if reader.get_cabac(&mut state[cbf_ctx]) != 0 {
-                    let nz = decode_cabac_residual(reader, state, &mut mb.chroma_ac[c][i], 4, 15);
+                    let nz = decode_cabac_residual(
+                        reader,
+                        state,
+                        &mut mb.chroma_ac[c][i],
+                        4,
+                        15,
+                        &ZIGZAG_SCAN_4X4[1..],
+                    );
                     nz_cache[nz_idx] = nz as u8;
                 }
             }
@@ -1538,6 +1591,7 @@ pub fn decode_mb_cabac(
     slice_type: SliceType,
     _pps: &Pps,
     cabac_nb: &CabacNeighborCtx,
+    neighbor: &NeighborContext,
     slice_table: &[u16],
     cur_slice: u16,
     mb_x: u32,
@@ -1767,7 +1821,9 @@ pub fn decode_mb_cabac(
 
     // 3. Intra prediction modes
     if mb.is_intra4x4 {
-        // Decode intra 4x4 prediction modes
+        // Decode intra 4x4 prediction modes.
+        // Cross-MB neighbors come from the NeighborContext, matching CAVLC behavior.
+        // Reference: FFmpeg pred_intra_mode() in h264_mvpred.h.
         const DC_PRED: u8 = 2;
         let mut mode_cache = [-1i8; 16]; // raster order
 
@@ -1776,20 +1832,21 @@ pub fn decode_mb_cabac(
             let blk_y = raster_idx / 4;
 
             // Get left neighbor's mode
-            // Left neighbor: within-MB or from previous MB (unavailable = -1)
             let left_mode: i8 = if blk_x > 0 {
                 mode_cache[raster_idx - 1]
+            } else if neighbor.left_available {
+                neighbor.left_intra4x4_mode[blk_y]
             } else {
-                // Cross-MB left neighbor: not available in CABAC context
-                // (the CAVLC NeighborContext handles this in apply_macroblock)
                 -1
             };
 
-            // Top neighbor: within-MB or from previous MB (unavailable = -1)
+            // Get top neighbor's mode
             let top_mode: i8 = if blk_y > 0 {
                 mode_cache[raster_idx - 4]
+            } else if neighbor.top_available {
+                let abs_blk_x = mb_x as usize * 4 + blk_x;
+                neighbor.top_intra4x4_mode[abs_blk_x]
             } else {
-                // Cross-MB top neighbor: not available in CABAC context
                 -1
             };
 
@@ -2313,8 +2370,8 @@ mod tests {
         let data = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
         let reader = CabacReader::new(&data).unwrap();
         assert_eq!(reader.range, 0x1FE);
-        assert_eq!(reader.pos, 3);
-        assert_eq!(reader.low, 2); // 0<<18 + 0<<10 + 0<<2 + 2
+        assert_eq!(reader.pos, 2);
+        assert_eq!(reader.low, 1 << 9); // 0<<18 + 0<<10 + (1<<9)
     }
 
     #[test]
@@ -2323,13 +2380,13 @@ mod tests {
         let data = [0x01, 0x02, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00];
         let reader = CabacReader::new(&data).unwrap();
         assert_eq!(reader.range, 0x1FE);
-        let expected_low = (0x01 << 18) | (0x02 << 10) | (0x03 << 2) | 2;
+        let expected_low = (0x01 << 18) | (0x02 << 10) | (1 << 9);
         assert_eq!(reader.low, expected_low);
     }
 
     #[test]
     fn test_cabac_init_too_short() {
-        let data = [0x00, 0x00];
+        let data = [0x00];
         assert!(CabacReader::new(&data).is_err());
     }
 
@@ -2349,9 +2406,9 @@ mod tests {
 
     #[test]
     fn test_cabac_bypass() {
-        // 0xAA has low = 0xAA<<18 + 0xAA<<10 + 0xAA<<2 + 2
-        // = 0x2AA0000 + 0x2A800 + 0x2A8 + 2 = 0x2ACABAA
-        // range<<17 = 0x3FC0000 > 0x2ACABAA, so valid
+        // 0xAA has low = 0xAA<<18 + 0xAA<<10 + (1<<9)
+        // = 0x2AA0000 + 0x2A800 + 0x200 = 0x2ACAA00
+        // range<<17 = 0x3FC0000 > 0x2ACAA00, so valid
         let data = vec![0xAA; 32];
         let mut reader = CabacReader::new(&data).unwrap();
         for _ in 0..16 {

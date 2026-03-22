@@ -1446,6 +1446,7 @@ impl H264Decoder {
                 hdr.slice_type,
                 pps,
                 &cabac_nb,
+                &fdc.neighbor_ctx,
                 &fdc.slice_table,
                 fdc.current_slice,
                 mb_x,
