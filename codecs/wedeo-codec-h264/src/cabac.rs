@@ -2328,7 +2328,7 @@ pub fn decode_mb_cabac(
                             mb_y,
                             mb_width,
                             0,
-                            0,
+                            i,
                             false,
                         ) as i8;
                     } else {
@@ -2395,7 +2395,7 @@ pub fn decode_mb_cabac(
                         mb_y,
                         mb_width,
                         0,
-                        i * 4,
+                        i,
                         true,
                     ) as i8;
                 } else if info.2 {
@@ -2420,7 +2420,7 @@ pub fn decode_mb_cabac(
                         mb_y,
                         mb_width,
                         1,
-                        i * 4,
+                        i,
                         true,
                     ) as i8;
                 } else if info.3 {
