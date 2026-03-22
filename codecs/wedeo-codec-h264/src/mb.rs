@@ -589,8 +589,6 @@ pub fn decode_macroblock(
     ref_pics: &[&PictureBuffer],
     ref_pics_l1: &[&PictureBuffer],
 ) -> Result<()> {
-    let mb_idx = (mb_y * ctx.mb_width + mb_x) as usize;
-
     // 1. Parse macroblock syntax via CAVLC
     let mut mb = decode_mb_cavlc(
         br,
@@ -604,7 +602,40 @@ pub fn decode_macroblock(
         slice_hdr.num_ref_idx_l1_active,
     )?;
 
-    // 2. Update QP with mb_qp_delta
+    // 2. Apply entropy-agnostic processing
+    apply_macroblock(
+        ctx,
+        &mut mb,
+        slice_hdr,
+        pps,
+        mb_x,
+        mb_y,
+        ref_pics,
+        ref_pics_l1,
+    )
+}
+
+/// Apply entropy-agnostic macroblock processing.
+///
+/// Takes a parsed `Macroblock` (from either CAVLC or CABAC) and applies:
+/// QP update, dequantization, IDCT, intra prediction, motion compensation,
+/// neighbor context update, and deblock info storage.
+///
+/// This function is the shared backend for both CAVLC and CABAC decode paths.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_macroblock(
+    ctx: &mut FrameDecodeContext,
+    mb: &mut Macroblock,
+    slice_hdr: &SliceHeader,
+    pps: &Pps,
+    mb_x: u32,
+    mb_y: u32,
+    ref_pics: &[&PictureBuffer],
+    ref_pics_l1: &[&PictureBuffer],
+) -> Result<()> {
+    let mb_idx = (mb_y * ctx.mb_width + mb_x) as usize;
+
+    // Update QP with mb_qp_delta
     // I_PCM: QP=0 for deblocking table, but running QP stays unchanged
     // (FFmpeg h264_cavlc.c: sl->qscale is NOT modified for I_PCM).
     if mb.mb_qp_delta != 0 {
@@ -645,9 +676,9 @@ pub fn decode_macroblock(
         "decoded MB"
     );
 
-    // 3. Decode based on macroblock type
+    // Decode based on macroblock type
     if mb.is_pcm {
-        // I_PCM: raw samples already in the CAVLC output
+        // I_PCM: raw samples already in the entropy coder output
         // Copy luma samples (16x16)
         for y in 0..16u32 {
             for x in 0..16u32 {
@@ -680,9 +711,9 @@ pub fn decode_macroblock(
             }
         }
     } else if mb.is_intra4x4 {
-        decode_intra4x4(ctx, &mut mb, mb_x, mb_y, qp, c_qp, has_top, has_left);
+        decode_intra4x4(ctx, mb, mb_x, mb_y, qp, c_qp, has_top, has_left);
     } else if mb.is_intra16x16 {
-        decode_intra16x16(ctx, &mut mb, mb_x, mb_y, qp, c_qp, has_top, has_left);
+        decode_intra16x16(ctx, mb, mb_x, mb_y, qp, c_qp, has_top, has_left);
     }
 
     // Intra MBs: set MV context to ref=-1 (LIST_NOT_USED), mv=[0,0].
@@ -701,7 +732,7 @@ pub fn decode_macroblock(
         // Inter macroblock (P or B)
         decode_inter_mb(
             ctx,
-            &mut mb,
+            mb,
             slice_hdr,
             mb_x,
             mb_y,
@@ -712,7 +743,7 @@ pub fn decode_macroblock(
         );
     }
 
-    // 6. Update neighbor context
+    // Update neighbor context
     // Build intra4x4 mode array for neighbor tracking.
     // For I_4x4 MBs: pass the decoded modes.
     // For other MBs (I_16x16, I_PCM, inter): pass 2 (DC_PRED).
@@ -740,7 +771,7 @@ pub fn decode_macroblock(
         .update_after_mb(mb_x, &mb.non_zero_count, &intra4x4_modes);
     ctx.neighbor_ctx.left_available = true;
 
-    // 7. Store MbDeblockInfo for the deblocking filter
+    // Store MbDeblockInfo for the deblocking filter
     store_deblock_info(
         ctx,
         mb_idx,
