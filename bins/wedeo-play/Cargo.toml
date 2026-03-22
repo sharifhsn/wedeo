@@ -19,6 +19,8 @@ wedeo-codec-pcm = { workspace = true }
 wedeo-codec-h264 = { workspace = true }
 wedeo-format-wav = { workspace = true }
 wedeo-format-h264 = { workspace = true }
+wedeo-format-mp4 = { workspace = true }
+wedeo-rav1d = { workspace = true }
 wedeo-symphonia = { workspace = true }
 cpal = { workspace = true }
 minifb = { workspace = true }
