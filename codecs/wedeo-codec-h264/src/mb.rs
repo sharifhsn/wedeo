@@ -679,7 +679,21 @@ pub fn decode_macroblock(
         decode_intra4x4(ctx, &mut mb, mb_x, mb_y, qp, c_qp, has_top, has_left);
     } else if mb.is_intra16x16 {
         decode_intra16x16(ctx, &mut mb, mb_x, mb_y, qp, c_qp, has_top, has_left);
-    } else if !mb.is_intra {
+    }
+
+    // Intra MBs: set MV context to ref=-1 (LIST_NOT_USED), mv=[0,0].
+    // Without this, the initialization value of -2 (PART_NOT_AVAILABLE) remains,
+    // which causes spatial direct prediction to compute wrong ref_idx when an
+    // intra MB is a neighbor (unsigned min treats -2 as 254, not 255).
+    // Reference: FFmpeg fill_decode_caches sets LIST_NOT_USED for intra neighbors.
+    if mb.is_intra {
+        for blk in 0..16 {
+            ctx.mv_ctx.set(mb_x, mb_y, blk, [0, 0], -1);
+            ctx.mv_ctx.set_l1(mb_x, mb_y, blk, [0, 0], -1);
+        }
+    }
+
+    if !mb.is_intra {
         // Inter macroblock (P or B)
         decode_inter_mb(
             ctx,
