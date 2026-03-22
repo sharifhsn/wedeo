@@ -1146,6 +1146,9 @@ fn decode_cabac_mb_mvd_component(
 
 /// Decode MVD for a block, returning (mvd_x, mvd_y, abs_mvd_x, abs_mvd_y).
 ///
+/// `local_mvd` is a 16-entry cache indexed by `blk_y * 4 + blk_x` within the
+/// current MB, storing `[abs_mvd_x, abs_mvd_y]` for intra-MB neighbor lookups.
+///
 /// Reference: FFmpeg DECODE_CABAC_MB_MVD macro, h264_cabac.c:1543-1556.
 #[allow(clippy::too_many_arguments)]
 fn decode_cabac_mb_mvd(
@@ -1161,6 +1164,7 @@ fn decode_cabac_mb_mvd(
     list: usize,
     blk_x: u32,
     blk_y: u32,
+    local_mvd: &[[u8; 2]; 16],
 ) -> (i16, i16, u8, u8) {
     // Compute amvd0 and amvd1 from left and top neighbor absolute MVDs
     let (amvd0, amvd1) = get_amvd(
@@ -1174,6 +1178,7 @@ fn decode_cabac_mb_mvd(
         list,
         blk_x,
         blk_y,
+        local_mvd,
     );
 
     let (mx, abs_x) = decode_cabac_mb_mvd_component(reader, state, 40, amvd0);
@@ -1187,6 +1192,8 @@ fn decode_cabac_mb_mvd(
 }
 
 /// Compute amvd (sum of absolute MVDs from left and top neighbors).
+///
+/// `local_mvd` provides intra-MB neighbor lookups for `blk_x > 0` or `blk_y > 0`.
 #[allow(clippy::too_many_arguments)]
 fn get_amvd(
     cabac_nb: &CabacNeighborCtx,
@@ -1199,6 +1206,7 @@ fn get_amvd(
     list: usize,
     blk_x: u32,
     blk_y: u32,
+    local_mvd: &[[u8; 2]; 16],
 ) -> (i32, i32) {
     let mvd_cache = if list == 0 {
         &cabac_nb.mvd_cache_l0
@@ -1208,9 +1216,9 @@ fn get_amvd(
 
     // Left neighbor MVD
     let (left_mvd_x, left_mvd_y) = if blk_x > 0 {
-        // Within current MB — we don't have this yet during decode.
-        // Return 0 for now; the caller will need to track intra-MB MVDs.
-        (0i32, 0i32)
+        // Within current MB — read from local cache
+        let idx = (blk_y * 4 + (blk_x - 1)) as usize;
+        (local_mvd[idx][0] as i32, local_mvd[idx][1] as i32)
     } else if mb_x > 0 && slice_table[mb_idx - 1] == cur_slice {
         let left_idx = mb_idx - 1;
         // Right column of left MB: blk_x=3. For the corresponding blk_y row.
@@ -1230,7 +1238,9 @@ fn get_amvd(
 
     // Top neighbor MVD
     let (top_mvd_x, top_mvd_y) = if blk_y > 0 {
-        (0, 0) // Within current MB
+        // Within current MB — read from local cache
+        let idx = ((blk_y - 1) * 4 + blk_x) as usize;
+        (local_mvd[idx][0] as i32, local_mvd[idx][1] as i32)
     } else if mb_y > 0 && slice_table[mb_idx - mb_width as usize] == cur_slice {
         let top_idx = mb_idx - mb_width as usize;
         // Bottom row of top MB: blk_y=3. For the corresponding blk_x column.
@@ -1249,6 +1259,39 @@ fn get_amvd(
     };
 
     (left_mvd_x + top_mvd_x, left_mvd_y + top_mvd_y)
+}
+
+/// Fill the local MVD cache for a sub-block at (blk_x, blk_y) with the given
+/// block dimensions (w x h in 4x4 units).
+fn fill_local_mvd(
+    cache: &mut [[u8; 2]; 16],
+    blk_x: u32,
+    blk_y: u32,
+    w: u32,
+    h: u32,
+    abs_x: u8,
+    abs_y: u8,
+) {
+    for dy in 0..h {
+        for dx in 0..w {
+            let idx = ((blk_y + dy) * 4 + (blk_x + dx)) as usize;
+            if idx < 16 {
+                cache[idx] = [abs_x, abs_y];
+            }
+        }
+    }
+}
+
+/// Sub-block offset within an 8x8 partition for P_8x8 sub_mb_types.
+/// Returns (dx, dy, width, height) in 4x4 units for sub-partition index j.
+const fn p8x8_sub_blk(sub_mb_type: u32, j: usize) -> (u32, u32, u32, u32) {
+    match sub_mb_type {
+        0 => (0, 0, 2, 2),                            // 8x8
+        1 => (0, j as u32, 2, 1),                     // 8x4
+        2 => (j as u32, 0, 1, 2),                     // 4x8
+        3 => ((j & 1) as u32, (j >> 1) as u32, 1, 1), // 4x4
+        _ => (0, 0, 2, 2),
+    }
 }
 
 /// Decode QP delta using CABAC.
@@ -2133,6 +2176,9 @@ pub fn decode_mb_cabac(
     }
 
     // 5. Inter prediction (P-slice, not intra)
+    // Local MVD caches for intra-MB neighbor context derivation.
+    let mut local_mvd_l0 = [[0u8; 2]; 16];
+    let mut local_mvd_l1 = [[0u8; 2]; 16];
     if !is_intra && (slice_type == SliceType::P || slice_type == SliceType::SP) {
         match mb.mb_type {
             0 => {
@@ -2168,9 +2214,10 @@ pub fn decode_mb_cabac(
                     0,
                     0,
                     0,
+                    &local_mvd_l0,
                 );
                 mb.mvd_l0[0] = [mx, my];
-                let _ = (ax, ay);
+                fill_local_mvd(&mut local_mvd_l0, 0, 0, 4, 4, ax, ay);
             }
             1 => {
                 // P_L0_L0_16x8
@@ -2195,7 +2242,8 @@ pub fn decode_mb_cabac(
                     }
                 }
                 for part in 0..2u32 {
-                    let (mx, my, _, _) = decode_cabac_mb_mvd(
+                    let blk_y = part * 2;
+                    let (mx, my, ax, ay) = decode_cabac_mb_mvd(
                         reader,
                         state,
                         cabac_nb,
@@ -2207,9 +2255,11 @@ pub fn decode_mb_cabac(
                         mb_width,
                         0,
                         0,
-                        part * 2,
+                        blk_y,
+                        &local_mvd_l0,
                     );
                     mb.mvd_l0[part as usize] = [mx, my];
+                    fill_local_mvd(&mut local_mvd_l0, 0, blk_y, 4, 2, ax, ay);
                 }
             }
             2 => {
@@ -2235,7 +2285,8 @@ pub fn decode_mb_cabac(
                     }
                 }
                 for part in 0..2u32 {
-                    let (mx, my, _, _) = decode_cabac_mb_mvd(
+                    let blk_x = part * 2;
+                    let (mx, my, ax, ay) = decode_cabac_mb_mvd(
                         reader,
                         state,
                         cabac_nb,
@@ -2246,10 +2297,12 @@ pub fn decode_mb_cabac(
                         mb_y,
                         mb_width,
                         0,
-                        part * 2,
+                        blk_x,
                         0,
+                        &local_mvd_l0,
                     );
                     mb.mvd_l0[part as usize] = [mx, my];
+                    fill_local_mvd(&mut local_mvd_l0, blk_x, 0, 2, 4, ax, ay);
                 }
             }
             3 | 4 => {
@@ -2283,11 +2336,16 @@ pub fn decode_mb_cabac(
                     }
                 }
                 for i in 0..4 {
+                    let base_x = (i & 1) as u32 * 2;
+                    let base_y = (i >> 1) as u32 * 2;
                     let sub_part_count = P_SUB_MB_PARTITION_COUNT[mb.sub_mb_type[i] as usize];
                     for j in 0..sub_part_count as usize {
                         let mvd_idx = i * 4 + j;
                         if mvd_idx < 16 {
-                            let (mx, my, _, _) = decode_cabac_mb_mvd(
+                            let (dx, dy, w, h) = p8x8_sub_blk(mb.sub_mb_type[i] as u32, j);
+                            let blk_x = base_x + dx;
+                            let blk_y = base_y + dy;
+                            let (mx, my, ax, ay) = decode_cabac_mb_mvd(
                                 reader,
                                 state,
                                 cabac_nb,
@@ -2298,10 +2356,12 @@ pub fn decode_mb_cabac(
                                 mb_y,
                                 mb_width,
                                 0,
-                                0,
-                                0,
+                                blk_x,
+                                blk_y,
+                                &local_mvd_l0,
                             );
                             mb.mvd_l0[mvd_idx] = [mx, my];
+                            fill_local_mvd(&mut local_mvd_l0, blk_x, blk_y, w, h, ax, ay);
                         }
                     }
                 }
@@ -2374,11 +2434,16 @@ pub fn decode_mb_cabac(
                 }
                 let info = &B_SUB_MB_TYPE_INFO[mb.sub_mb_type[i] as usize];
                 if info.2 {
+                    let base_x = (i & 1) as u32 * 2;
+                    let base_y = (i >> 1) as u32 * 2;
                     let sub_part_count = info.0 as usize;
                     for j in 0..sub_part_count {
                         let mvd_idx = i * 4 + j;
                         if mvd_idx < 16 {
-                            let (mx, my, _, _) = decode_cabac_mb_mvd(
+                            let (dx, dy, w, h) = p8x8_sub_blk(info.1 as u32, j);
+                            let blk_x = base_x + dx;
+                            let blk_y = base_y + dy;
+                            let (mx, my, ax, ay) = decode_cabac_mb_mvd(
                                 reader,
                                 state,
                                 cabac_nb,
@@ -2389,10 +2454,12 @@ pub fn decode_mb_cabac(
                                 mb_y,
                                 mb_width,
                                 0,
-                                0,
-                                0,
+                                blk_x,
+                                blk_y,
+                                &local_mvd_l0,
                             );
                             mb.mvd_l0[mvd_idx] = [mx, my];
+                            fill_local_mvd(&mut local_mvd_l0, blk_x, blk_y, w, h, ax, ay);
                         }
                     }
                 }
@@ -2404,11 +2471,16 @@ pub fn decode_mb_cabac(
                 }
                 let info = &B_SUB_MB_TYPE_INFO[mb.sub_mb_type[i] as usize];
                 if info.3 {
+                    let base_x = (i & 1) as u32 * 2;
+                    let base_y = (i >> 1) as u32 * 2;
                     let sub_part_count = info.0 as usize;
                     for j in 0..sub_part_count {
                         let mvd_idx = i * 4 + j;
                         if mvd_idx < 16 {
-                            let (mx, my, _, _) = decode_cabac_mb_mvd(
+                            let (dx, dy, w, h) = p8x8_sub_blk(info.1 as u32, j);
+                            let blk_x = base_x + dx;
+                            let blk_y = base_y + dy;
+                            let (mx, my, ax, ay) = decode_cabac_mb_mvd(
                                 reader,
                                 state,
                                 cabac_nb,
@@ -2419,10 +2491,12 @@ pub fn decode_mb_cabac(
                                 mb_y,
                                 mb_width,
                                 1,
-                                0,
-                                0,
+                                blk_x,
+                                blk_y,
+                                &local_mvd_l1,
                             );
                             mb.mvd_l1[mvd_idx] = [mx, my];
+                            fill_local_mvd(&mut local_mvd_l1, blk_x, blk_y, w, h, ax, ay);
                         }
                     }
                 }
@@ -2480,7 +2554,12 @@ pub fn decode_mb_cabac(
             // mvd L0
             for p in 0..part_count {
                 if mb.b_list_flags[p][0] {
-                    let (mx, my, _, _) = decode_cabac_mb_mvd(
+                    let (blk_x, blk_y, w, h) = match mb.b_part_size {
+                        1 => (0u32, p as u32 * 2, 4u32, 2u32), // 16x8
+                        2 => (p as u32 * 2, 0u32, 2u32, 4u32), // 8x16
+                        _ => (0, 0, 4, 4),                     // 16x16
+                    };
+                    let (mx, my, ax, ay) = decode_cabac_mb_mvd(
                         reader,
                         state,
                         cabac_nb,
@@ -2491,16 +2570,23 @@ pub fn decode_mb_cabac(
                         mb_y,
                         mb_width,
                         0,
-                        0,
-                        0,
+                        blk_x,
+                        blk_y,
+                        &local_mvd_l0,
                     );
                     mb.mvd_l0[p] = [mx, my];
+                    fill_local_mvd(&mut local_mvd_l0, blk_x, blk_y, w, h, ax, ay);
                 }
             }
             // mvd L1
             for p in 0..part_count {
                 if mb.b_list_flags[p][1] {
-                    let (mx, my, _, _) = decode_cabac_mb_mvd(
+                    let (blk_x, blk_y, w, h) = match mb.b_part_size {
+                        1 => (0u32, p as u32 * 2, 4u32, 2u32),
+                        2 => (p as u32 * 2, 0u32, 2u32, 4u32),
+                        _ => (0, 0, 4, 4),
+                    };
+                    let (mx, my, ax, ay) = decode_cabac_mb_mvd(
                         reader,
                         state,
                         cabac_nb,
@@ -2511,10 +2597,12 @@ pub fn decode_mb_cabac(
                         mb_y,
                         mb_width,
                         1,
-                        0,
-                        0,
+                        blk_x,
+                        blk_y,
+                        &local_mvd_l1,
                     );
                     mb.mvd_l1[p] = [mx, my];
+                    fill_local_mvd(&mut local_mvd_l1, blk_x, blk_y, w, h, ax, ay);
                 }
             }
         }
