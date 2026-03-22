@@ -2379,24 +2379,53 @@ fn pred_spatial_direct(
                     .copied()
                     .unwrap_or(-1);
 
-                if col_ref0 == 0 {
-                    let col_mv0 = ctx
-                        .col_mv
-                        .get(blk_base + MV_CORNERS[i8])
+                // col_zero_flag: check colocated L0 ref first, fall back to L1.
+                // Reference: FFmpeg h264_direct.c lines 443-447
+                //   (l1ref0[i8] == 0 || (l1ref0[i8] < 0 && l1ref1[i8] == 0))
+                let col_mv_to_check = if col_ref0 == 0 {
+                    // Colocated L0 ref is 0: use L0 MV
+                    Some(
+                        ctx.col_mv
+                            .get(blk_base + MV_CORNERS[i8])
+                            .copied()
+                            .unwrap_or([0, 0]),
+                    )
+                } else if col_ref0 < 0 {
+                    // Colocated L0 ref not used: check L1 ref
+                    let col_ref1 = ctx
+                        .col_ref_l1
+                        .get(blk_base + REF_CORNERS[i8])
                         .copied()
-                        .unwrap_or([0, 0]);
-                    if col_mv0[0].abs() <= 1 && col_mv0[1].abs() <= 1 {
-                        let mut a = mv[0];
-                        let mut b = mv[1];
-                        if ref_idx[0] == 0 {
-                            a = [0, 0];
-                        }
-                        if ref_idx[1] == 0 {
-                            b = [0, 0];
-                        }
-                        for &b4 in &BLOCK_8X8_TO_4X4[i8] {
-                            results[b4] = (a, ref_idx[0], b, ref_idx[1]);
-                        }
+                        .unwrap_or(-1);
+                    if col_ref1 == 0 {
+                        // L1 ref is 0: use L1 MV
+                        Some(
+                            ctx.col_mv_l1
+                                .get(blk_base + MV_CORNERS[i8])
+                                .copied()
+                                .unwrap_or([0, 0]),
+                        )
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(col_mv_val) = col_mv_to_check
+                    && col_mv_val[0].abs() <= 1
+                    && col_mv_val[1].abs() <= 1
+                {
+                    let mut a = mv[0];
+                    let mut b = mv[1];
+                    if ref_idx[0] == 0 {
+                        a = [0, 0];
+                    }
+                    if ref_idx[1] == 0 {
+                        b = [0, 0];
+                    }
+                    for &b4 in &BLOCK_8X8_TO_4X4[i8] {
+                        results[b4] = (a, ref_idx[0], b, ref_idx[1]);
                     }
                 }
             }
@@ -2406,19 +2435,34 @@ fn pred_spatial_direct(
             for (i4, result) in results.iter_mut().enumerate() {
                 let col_ref0 = ctx.col_ref.get(blk_base + i4).copied().unwrap_or(-1);
 
-                if col_ref0 == 0 {
-                    let col_mv0 = ctx.col_mv.get(blk_base + i4).copied().unwrap_or([0, 0]);
-                    if col_mv0[0].abs() <= 1 && col_mv0[1].abs() <= 1 {
-                        let mut a = mv[0];
-                        let mut b = mv[1];
-                        if ref_idx[0] == 0 {
-                            a = [0, 0];
-                        }
-                        if ref_idx[1] == 0 {
-                            b = [0, 0];
-                        }
-                        *result = (a, ref_idx[0], b, ref_idx[1]);
+                // col_zero_flag: check colocated L0 ref first, fall back to L1.
+                // Reference: FFmpeg h264_direct.c lines 443-447
+                let col_mv_to_check = if col_ref0 == 0 {
+                    Some(ctx.col_mv.get(blk_base + i4).copied().unwrap_or([0, 0]))
+                } else if col_ref0 < 0 {
+                    let col_ref1 = ctx.col_ref_l1.get(blk_base + i4).copied().unwrap_or(-1);
+                    if col_ref1 == 0 {
+                        Some(ctx.col_mv_l1.get(blk_base + i4).copied().unwrap_or([0, 0]))
+                    } else {
+                        None
                     }
+                } else {
+                    None
+                };
+
+                if let Some(col_mv_val) = col_mv_to_check
+                    && col_mv_val[0].abs() <= 1
+                    && col_mv_val[1].abs() <= 1
+                {
+                    let mut a = mv[0];
+                    let mut b = mv[1];
+                    if ref_idx[0] == 0 {
+                        a = [0, 0];
+                    }
+                    if ref_idx[1] == 0 {
+                        b = [0, 0];
+                    }
+                    *result = (a, ref_idx[0], b, ref_idx[1]);
                 }
             }
         }
