@@ -1,3 +1,5 @@
+pub mod cabac;
+pub mod cabac_tables;
 pub mod cavlc;
 pub mod cavlc_tables;
 pub mod deblock;
