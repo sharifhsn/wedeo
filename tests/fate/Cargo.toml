@@ -27,6 +27,7 @@ tracing = [
     "wedeo-symphonia/tracing-detail",
     "wedeo-rav1d/tracing-detail",
 ]
+cabac-trace = ["wedeo-codec-h264/cabac-trace"]
 
 [dependencies]
 wedeo-core = { workspace = true }

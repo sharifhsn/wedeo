@@ -122,6 +122,13 @@ impl<'a> CabacReader<'a> {
     /// Reference: FFmpeg `get_cabac_inline`.
     #[inline]
     pub fn get_cabac(&mut self, state: &mut u8) -> u8 {
+        #[cfg(feature = "cabac-trace")]
+        let pre_state = *state;
+        #[cfg(feature = "cabac-trace")]
+        let pre_low = self.low;
+        #[cfg(feature = "cabac-trace")]
+        let pre_range = self.range;
+
         let s = *state as i32;
         let range_lps = LPS_RANGE[(2 * (self.range & 0xC0) + s) as usize] as i32;
 
@@ -142,6 +149,31 @@ impl<'a> CabacReader<'a> {
             self.refill2();
         }
 
+        #[cfg(feature = "cabac-trace")]
+        {
+            use std::sync::atomic::{AtomicI32, Ordering};
+            static BIN_COUNT: AtomicI32 = AtomicI32::new(0);
+            static MAX_BINS: AtomicI32 = AtomicI32::new(-1);
+            let max = MAX_BINS.load(Ordering::Relaxed);
+            let max = if max < 0 {
+                let v = std::env::var("CABAC_MAX_BINS")
+                    .ok()
+                    .and_then(|s| s.parse::<i32>().ok())
+                    .unwrap_or(10000);
+                MAX_BINS.store(v, Ordering::Relaxed);
+                v
+            } else {
+                max
+            };
+            let n = BIN_COUNT.fetch_add(1, Ordering::Relaxed);
+            if n < max {
+                eprintln!(
+                    "CABAC_BIN {} state={} low={} range={} -> bit={} post_low={} post_range={}",
+                    n, pre_state, pre_low, pre_range, bit, self.low, self.range
+                );
+            }
+        }
+
         bit as u8
     }
 
@@ -153,6 +185,11 @@ impl<'a> CabacReader<'a> {
     /// Reference: FFmpeg `get_cabac_bypass`.
     #[inline]
     pub fn get_cabac_bypass(&mut self) -> u8 {
+        #[cfg(feature = "cabac-trace")]
+        let pre_low = self.low;
+        #[cfg(feature = "cabac-trace")]
+        let pre_range = self.range;
+
         self.low += self.low;
 
         if self.low & CABAC_MASK == 0 {
@@ -160,12 +197,39 @@ impl<'a> CabacReader<'a> {
         }
 
         let range = self.range << (CABAC_BITS + 1);
-        if self.low < range {
+        let bit = if self.low < range {
             0
         } else {
             self.low -= range;
             1
+        };
+
+        #[cfg(feature = "cabac-trace")]
+        {
+            use std::sync::atomic::{AtomicI32, Ordering};
+            static BYPASS_COUNT: AtomicI32 = AtomicI32::new(0);
+            static MAX_BINS_BP: AtomicI32 = AtomicI32::new(-1);
+            let max = MAX_BINS_BP.load(Ordering::Relaxed);
+            let max = if max < 0 {
+                let v = std::env::var("CABAC_MAX_BINS")
+                    .ok()
+                    .and_then(|s| s.parse::<i32>().ok())
+                    .unwrap_or(10000);
+                MAX_BINS_BP.store(v, Ordering::Relaxed);
+                v
+            } else {
+                max
+            };
+            let n = BYPASS_COUNT.fetch_add(1, Ordering::Relaxed);
+            if n < max {
+                eprintln!(
+                    "CABAC_BYPASS {} low={} range={} -> bit={} post_low={}",
+                    n, pre_low, pre_range, bit, self.low
+                );
+            }
         }
+
+        bit
     }
 
     /// Decode a bypass symbol and apply it as a sign to `val`.
@@ -177,6 +241,11 @@ impl<'a> CabacReader<'a> {
     /// Reference: FFmpeg `get_cabac_bypass_sign`.
     #[inline]
     pub fn get_cabac_bypass_sign(&mut self, val: i32) -> i32 {
+        #[cfg(feature = "cabac-trace")]
+        let pre_low = self.low;
+        #[cfg(feature = "cabac-trace")]
+        let pre_range = self.range;
+
         self.low += self.low;
 
         if self.low & CABAC_MASK == 0 {
@@ -187,7 +256,36 @@ impl<'a> CabacReader<'a> {
         self.low -= range;
         let mask = self.low >> 31;
         self.low += range & mask;
-        (val ^ mask) - mask
+        let result = (val ^ mask) - mask;
+
+        #[cfg(feature = "cabac-trace")]
+        {
+            use std::sync::atomic::{AtomicI32, Ordering};
+            static BYPASS_SIGN_COUNT: AtomicI32 = AtomicI32::new(0);
+            static MAX_BINS_BPS: AtomicI32 = AtomicI32::new(-1);
+            let max = MAX_BINS_BPS.load(Ordering::Relaxed);
+            let max = if max < 0 {
+                let v = std::env::var("CABAC_MAX_BINS")
+                    .ok()
+                    .and_then(|s| s.parse::<i32>().ok())
+                    .unwrap_or(10000);
+                MAX_BINS_BPS.store(v, Ordering::Relaxed);
+                v
+            } else {
+                max
+            };
+            let n = BYPASS_SIGN_COUNT.fetch_add(1, Ordering::Relaxed);
+            if n < max {
+                // bit=1 means negative (LPS), bit=0 means positive (MPS)
+                let bit = if mask == 0 { 0 } else { 1 };
+                eprintln!(
+                    "CABAC_BYPASS_SIGN {} low={} range={} val={} -> bit={} result={} post_low={}",
+                    n, pre_low, pre_range, val, bit, result, self.low
+                );
+            }
+        }
+
+        result
     }
 
     /// Check for end-of-slice (terminate symbol).
@@ -198,8 +296,13 @@ impl<'a> CabacReader<'a> {
     /// Reference: FFmpeg `get_cabac_terminate`.
     #[inline]
     pub fn get_cabac_terminate(&mut self) -> bool {
+        #[cfg(feature = "cabac-trace")]
+        let pre_low = self.low;
+        #[cfg(feature = "cabac-trace")]
+        let pre_range = self.range;
+
         self.range -= 2;
-        if self.low < (self.range << (CABAC_BITS + 1)) {
+        let result = if self.low < (self.range << (CABAC_BITS + 1)) {
             // Not terminated: renormalize once
             let shift = ((self.range as u32).wrapping_sub(0x100) >> 31) as i32;
             self.range <<= shift;
@@ -210,7 +313,20 @@ impl<'a> CabacReader<'a> {
             false
         } else {
             true
+        };
+
+        #[cfg(feature = "cabac-trace")]
+        {
+            use std::sync::atomic::{AtomicI32, Ordering};
+            static TERM_COUNT: AtomicI32 = AtomicI32::new(0);
+            let n = TERM_COUNT.fetch_add(1, Ordering::Relaxed);
+            eprintln!(
+                "CABAC_TERM {} low={} range={} -> result={} post_low={} post_range={}",
+                n, pre_low, pre_range, result as i32, self.low, self.range
+            );
         }
+
+        result
     }
 
     /// Skip `n` bytes and re-initialize the CABAC engine.
