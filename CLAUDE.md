@@ -171,7 +171,7 @@ See `H264.md` for detailed architecture, module map, and conformance parity repo
 - Access unit grouping (AUD, SPS, first_mb_in_slice boundaries)
 - File extensions: .264, .h264, .h26l, .avc
 
-**FATE conformance: 47/51 progressive CAVLC tests BITEXACT (92%), all 17/17 Baseline** (2026-03-21):
+**FATE conformance: 50/51 progressive CAVLC tests BITEXACT (98%), all 17/17 Baseline** (2026-03-21):
 
 | Test | Status | Notes |
 |------|--------|-------|
@@ -180,16 +180,14 @@ See `H264.md` for detailed architecture, module map, and conformance parity repo
 | MR1_MW_A, MR2_MW_A, MR2_TANDBERG_E, MR1_BT_A | **BITEXACT** | Multi-reference, POC type 1 |
 | MIDR_MW_D, MPS_MW_A, NRF_MW_E | **BITEXACT** | IDR, multi-PPS, non-ref frames |
 | CVPCMNL1, CVPCMNL2 | **BITEXACT** | I_PCM macroblocks |
-| HCBP1, HCBP2 | **BITEXACT** | 15-ref hierarchical, deep reorder buffer |
+| HCBP1, HCBP2, HCMP1 | **BITEXACT** | 15-ref hierarchical, deep reorder buffer |
 | SL1_SVA_B | **BITEXACT** | Temporal direct + direct_8x8_inference=0 |
 | FM2_SVA_B, FM2_SVA_C | **BITEXACT** | Both decoders produce 0 frames |
 | CVBS3, CVSE3, CVSEFDFT3 | **BITEXACT** | Reorder fix resolved all prior "cascade" diffs |
-| CVWP1, CVWP2, CVWP5 | **BITEXACT** | Weighted pred, ref list modification, DPB-based deblock |
+| CVWP1, CVWP2, CVWP3, CVWP5 | **BITEXACT** | Weighted pred, ref list modification, DPB-based deblock |
 | cvmp_mot_frm0_full_B | **BITEXACT** | direct_8x8_inference=0, B_8x8 MC |
 | MR3, MR4, MR5 | **BITEXACT** | POC type 2, MMCO-5, gap fill, complex MMCO |
-| CVWP3 | 89/90 | 1 pixel diff at frame 69 |
-| HCMP1 | 87/250 | 15-ref hierarchical B, cascading MC diffs |
-| CVFC1 | 19/50 | Multi-slice + frame crop diffs |
+| CVFC1 | **BITEXACT** | Multi-slice + frame crop, non-row-aligned slice boundaries |
 | FM1_FT_E, FM1_BT_B | 119/305, 0/0 | FMO (out of scope) |
 | MR6-9_BT_B, FI1_Sony_E | Gap | Interlaced (PAFF) / CABAC |
 
@@ -258,7 +256,7 @@ symphonia wrappers (priority 50) when both exist (e.g., WAV/PCM always uses nati
 - **Error**: No error context (where/why), no codec-specific error codes.
 
 ### In progress
-- **H.264 decoder** — I+P+B frame decode with deblocking, 45/57 progressive CAVLC conformance files BITEXACT (all 17 Baseline). Remaining: chroma-only bug (CVWP1), P-frame MC cascading diffs (CVBS3/CVSE3/CVSEFDFT3), complex MMCO (MR4/MR5). See `H264.md`.
+- **H.264 decoder** — I+P+B frame decode with deblocking, 50/51 progressive CAVLC conformance files BITEXACT (98%). Only FM1_FT_E (FMO) remains. See `H264.md`.
 
 ### Not yet started
 - Video codecs (HEVC, VP9, AV1, etc.) — native Rust implementations, no existing crate covers these
