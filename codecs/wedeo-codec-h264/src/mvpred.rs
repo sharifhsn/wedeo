@@ -652,52 +652,45 @@ impl MvContext {
             };
 
             if c_mb_ok {
-                // Use the L0 neighbor_c method for same-MB availability (ref=-1 check),
-                // then re-read from the correct list if list=1.
-                if list == 0 {
-                    match self.neighbor_c(mb_x, mb_y, blk_x, blk_y, part_width) {
-                        Some((mv, r)) => (mv, r, true),
-                        None => ([0, 0], -1, false),
-                    }
-                } else {
-                    // For L1 we replicate neighbor_c's same-MB ref=-1 guard ourselves.
-                    let target_mb_x = abs_cr_x as u32 / 4;
-                    let target_mb_y = abs_cr_y as u32 / 4;
-                    let target_blk_x = abs_cr_x as u32 % 4;
-                    let target_blk_y = abs_cr_y as u32 % 4;
-                    let blk_idx = (target_blk_x + target_blk_y * 4) as usize;
-                    let is_same_mb = target_mb_x == mb_x && target_mb_y == mb_y;
-                    let (mv, r) = self.get_for_list(target_mb_x, target_mb_y, blk_idx, list);
-                    // Same-MB + PART_NOT_AVAILABLE means not yet decoded → fall through to D
-                    if is_same_mb && r == Self::PART_NOT_AVAILABLE {
-                        // Fall through to D (top-left)
-                        let dl_x = blk_x.wrapping_sub(1);
-                        let dl_y = blk_y.wrapping_sub(1);
-                        let abs_dl_x = mb_x as i32 * 4 + dl_x as i32;
-                        let abs_dl_y = mb_y as i32 * 4 + dl_y as i32;
-                        let d_ok = abs_dl_x >= 0
-                            && abs_dl_y >= 0
-                            && abs_dl_x < self.mb_width as i32 * 4
-                            && abs_dl_y < self.mb_height as i32 * 4
-                            && {
-                                let d_mb_x = abs_dl_x as u32 / 4;
-                                let d_mb_y = abs_dl_y as u32 / 4;
-                                // D within the current MB is always same-slice
-                                (d_mb_x == mb_x && d_mb_y == mb_y)
-                                    || slice_table.is_none()
-                                    || same_slice(d_mb_x, d_mb_y)
-                            };
-                        if d_ok {
-                            match self.try_get_neighbor_list(mb_x, mb_y, dl_x, dl_y, list) {
-                                Some((mv, r)) => (mv, r, true),
-                                None => ([0, 0], -1, false),
-                            }
-                        } else {
-                            ([0, 0], -1, false)
+                // Inline C→D fallback with slice-boundary awareness.
+                // When C is same-MB but PART_NOT_AVAILABLE (not yet decoded),
+                // fall back to D (top-left). D must also be in the same slice.
+                let target_mb_x = abs_cr_x as u32 / 4;
+                let target_mb_y = abs_cr_y as u32 / 4;
+                let target_blk_x = abs_cr_x as u32 % 4;
+                let target_blk_y = abs_cr_y as u32 % 4;
+                let blk_idx = (target_blk_x + target_blk_y * 4) as usize;
+                let is_same_mb = target_mb_x == mb_x && target_mb_y == mb_y;
+                let (mv, r) = self.get_for_list(target_mb_x, target_mb_y, blk_idx, list);
+                // Same-MB + PART_NOT_AVAILABLE means not yet decoded → fall through to D
+                if is_same_mb && r == Self::PART_NOT_AVAILABLE {
+                    // Fall through to D (top-left)
+                    let dl_x = blk_x.wrapping_sub(1);
+                    let dl_y = blk_y.wrapping_sub(1);
+                    let abs_dl_x = mb_x as i32 * 4 + dl_x as i32;
+                    let abs_dl_y = mb_y as i32 * 4 + dl_y as i32;
+                    let d_ok = abs_dl_x >= 0
+                        && abs_dl_y >= 0
+                        && abs_dl_x < self.mb_width as i32 * 4
+                        && abs_dl_y < self.mb_height as i32 * 4
+                        && {
+                            let d_mb_x = abs_dl_x as u32 / 4;
+                            let d_mb_y = abs_dl_y as u32 / 4;
+                            // D within the current MB is always same-slice
+                            (d_mb_x == mb_x && d_mb_y == mb_y)
+                                || slice_table.is_none()
+                                || same_slice(d_mb_x, d_mb_y)
+                        };
+                    if d_ok {
+                        match self.try_get_neighbor_list(mb_x, mb_y, dl_x, dl_y, list) {
+                            Some((mv, r)) => (mv, r, true),
+                            None => ([0, 0], -1, false),
                         }
                     } else {
-                        (mv, r, true)
+                        ([0, 0], -1, false)
                     }
+                } else {
+                    (mv, r, true)
                 }
             } else {
                 // C not available — try D (top-left fallback)
