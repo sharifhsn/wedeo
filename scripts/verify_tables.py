@@ -17,6 +17,13 @@ Checks tables from:
     - cavlc_tables.rs: COEFF_TOKEN_LEN/BITS, CHROMA_DC_COEFF_TOKEN_LEN/BITS,
                         TOTAL_ZEROS_LEN/BITS, CHROMA_DC_TOTAL_ZEROS_LEN/BITS,
                         RUN_BEFORE_LEN/BITS, COEFF_TOKEN_TABLE_INDEX
+    - cabac_tables.rs: NORM_SHIFT, LPS_RANGE, MLPS_STATE, LAST_COEFF_FLAG_OFFSET_8X8,
+                        CABAC_CONTEXT_INIT_I, CABAC_CONTEXT_INIT_PB0/1/2,
+                        SIGNIFICANT_COEFF_FLAG_OFFSET, LAST_COEFF_FLAG_OFFSET,
+                        COEFF_ABS_LEVEL_M1_OFFSET, SIGNIFICANT_COEFF_FLAG_OFFSET_8X8,
+                        SIG_COEFF_OFFSET_DC, COEFF_ABS_LEVEL1_CTX,
+                        COEFF_ABS_LEVELGT1_CTX, COEFF_ABS_LEVEL_TRANSITION
+    - cabac.rs: CBF_CTX_BASE
 """
 
 import argparse
@@ -378,6 +385,217 @@ def check_cavlc_run_before(ffmpeg_dir: Path, wedeo_dir: Path) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Check functions — CABAC tables
+# ---------------------------------------------------------------------------
+
+def _signed_to_unsigned_byte(v: int) -> int:
+    """Convert a signed int8 value to unsigned uint8 (C two's complement)."""
+    return v & 0xFF
+
+
+def check_cabac_core_tables(ffmpeg_dir: Path, wedeo_dir: Path) -> int:
+    """Check NORM_SHIFT, LPS_RANGE, MLPS_STATE, LAST_COEFF_FLAG_OFFSET_8X8.
+
+    These are all stored in one flat C array `ff_h264_cabac_tables` in cabac.c.
+    """
+    print("Checking CABAC core tables (NORM_SHIFT, LPS_RANGE, MLPS_STATE, LAST_COEFF_FLAG_OFFSET_8X8)...")
+    cabac_c = read_file(ffmpeg_dir / "libavcodec" / "cabac.c", strip_comments=True)
+    cabac_rs = read_file(wedeo_dir / "codecs" / "wedeo-codec-h264" / "src" / "cabac_tables.rs")
+    errors = 0
+
+    # Parse the flat ff_h264_cabac_tables array.
+    # Declaration uses DECLARE_ASM_ALIGNED macro, so match by name.
+    match = re.search(
+        r'ff_h264_cabac_tables\)\s*\[.*?\]\s*=\s*\{(.*?)\};',
+        cabac_c, re.DOTALL,
+    )
+    if not match:
+        print("  ERROR: Could not find ff_h264_cabac_tables")
+        return 1
+    all_vals = [int(x) for x in re.findall(r'-?\d+', match.group(1))]
+
+    # Split by offset: NORM_SHIFT [0..512), LPS_RANGE [512..1024),
+    # MLPS_STATE [1024..1280), LAST_COEFF_FLAG_OFFSET_8X8 [1280..1343)
+    ffmpeg_norm = all_vals[0:512]
+    ffmpeg_lps_signed = all_vals[512:1024]
+    ffmpeg_mlps = all_vals[1024:1280]
+    ffmpeg_last8x8 = all_vals[1280:1343]
+
+    # NORM_SHIFT: uint8 in both C and Rust
+    wedeo_norm = parse_rust_array_1d(cabac_rs, "NORM_SHIFT")
+    errors += compare_arrays("NORM_SHIFT", ffmpeg_norm, wedeo_norm)
+
+    # LPS_RANGE: C source has signed int8 literals (e.g. -128) but the array
+    # type is uint8_t, so C wraps them. Wedeo stores the unsigned values.
+    ffmpeg_lps = [_signed_to_unsigned_byte(v) for v in ffmpeg_lps_signed]
+    wedeo_lps = parse_rust_array_1d(cabac_rs, "LPS_RANGE")
+    errors += compare_arrays("LPS_RANGE", ffmpeg_lps, wedeo_lps)
+
+    # MLPS_STATE: uint8 in both
+    wedeo_mlps = parse_rust_array_1d(cabac_rs, "MLPS_STATE")
+    errors += compare_arrays("MLPS_STATE", ffmpeg_mlps, wedeo_mlps)
+
+    # LAST_COEFF_FLAG_OFFSET_8X8: uint8 in both
+    wedeo_last8x8 = parse_rust_array_1d(cabac_rs, "LAST_COEFF_FLAG_OFFSET_8X8")
+    errors += compare_arrays("LAST_COEFF_FLAG_OFFSET_8X8", ffmpeg_last8x8, wedeo_last8x8)
+
+    return errors
+
+
+def check_cabac_context_init(ffmpeg_dir: Path, wedeo_dir: Path) -> int:
+    """Check CABAC_CONTEXT_INIT_I and CABAC_CONTEXT_INIT_PB0/1/2."""
+    print("Checking CABAC context init tables (I + PB0/1/2, 4×1024×2 entries)...")
+    h264_cabac = read_file(ffmpeg_dir / "libavcodec" / "h264_cabac.c", strip_comments=True)
+    cabac_rs = read_file(wedeo_dir / "codecs" / "wedeo-codec-h264" / "src" / "cabac_tables.rs")
+    errors = 0
+
+    # Parse cabac_context_init_I: int8_t[1024][2]
+    ffmpeg_init_i = parse_c_array_2d(h264_cabac, "cabac_context_init_I")
+    wedeo_init_i = parse_rust_array_2d(cabac_rs, "CABAC_CONTEXT_INIT_I")
+    errors += compare_arrays("CABAC_CONTEXT_INIT_I", ffmpeg_init_i, wedeo_init_i)
+
+    # Parse cabac_context_init_PB: int8_t[3][1024][2]
+    # This is a 3D array. Extract the body, then split into 3 sub-arrays.
+    match = re.search(
+        r'const\s+\w+\s+cabac_context_init_PB\s*\[3\]\s*\[1024\]\s*\[2\]\s*=\s*\{(.*?)\};',
+        h264_cabac, re.DOTALL,
+    )
+    if not match:
+        print("  ERROR: Could not find cabac_context_init_PB")
+        return errors + 1
+
+    pb_body = match.group(1)
+    # Find top-level brace groups: { { {a,b}, ... }, { {a,b}, ... }, { {a,b}, ... } }
+    # Strategy: find each sub-array by matching balanced braces at depth 1.
+    # The outer body contains 3 groups enclosed in { ... }.
+    # We need to find them at the correct nesting level.
+    pb_subarrays = _split_3d_array(pb_body, 3)
+
+    for idx, (sub_body, wedeo_name) in enumerate(zip(
+        pb_subarrays,
+        ["CABAC_CONTEXT_INIT_PB0", "CABAC_CONTEXT_INIT_PB1", "CABAC_CONTEXT_INIT_PB2"],
+    )):
+        # Parse the inner {a,b} pairs from this sub-array
+        rows = re.findall(r'\{([^}]+)\}', sub_body)
+        ffmpeg_rows = [[int(x) for x in re.findall(r'-?\d+', row)] for row in rows]
+        wedeo_rows = parse_rust_array_2d(cabac_rs, wedeo_name)
+        errors += compare_arrays(wedeo_name, ffmpeg_rows, wedeo_rows)
+
+    return errors
+
+
+def _split_3d_array(body: str, count: int) -> list[str]:
+    """Split the body of a 3D C array into `count` sub-array bodies.
+
+    Finds top-level `{ ... }` groups by tracking brace depth.
+    """
+    groups = []
+    depth = 0
+    start = None
+    for i, ch in enumerate(body):
+        if ch == '{':
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0 and start is not None:
+                groups.append(body[start + 1:i])
+                start = None
+                if len(groups) == count:
+                    break
+    if len(groups) != count:
+        raise ValueError(f"Expected {count} sub-arrays, found {len(groups)}")
+    return groups
+
+
+def check_cabac_residual_tables(ffmpeg_dir: Path, wedeo_dir: Path) -> int:
+    """Check residual decoding context offset tables + CBF_CTX_BASE."""
+    print("Checking CABAC residual tables (offsets, level ctx, transition, CBF_CTX_BASE)...")
+    h264_cabac = read_file(ffmpeg_dir / "libavcodec" / "h264_cabac.c", strip_comments=True)
+    cabac_rs = read_file(wedeo_dir / "codecs" / "wedeo-codec-h264" / "src" / "cabac_tables.rs")
+    cabac_mod = read_file(wedeo_dir / "codecs" / "wedeo-codec-h264" / "src" / "cabac.rs")
+    errors = 0
+
+    # --- Tables with C expressions (e.g. 105+0, 105+15) ---
+
+    # significant_coeff_flag_offset[2][14] — wedeo uses index [0] only
+    ffmpeg_sig = _parse_c_expr_array_2d(h264_cabac, "significant_coeff_flag_offset")
+    wedeo_sig = parse_rust_array_1d(cabac_rs, "SIGNIFICANT_COEFF_FLAG_OFFSET")
+    errors += compare_arrays("SIGNIFICANT_COEFF_FLAG_OFFSET", ffmpeg_sig[0], wedeo_sig)
+
+    # last_coeff_flag_offset[2][14] — wedeo uses index [0] only
+    ffmpeg_last = _parse_c_expr_array_2d(h264_cabac, "last_coeff_flag_offset")
+    wedeo_last = parse_rust_array_1d(cabac_rs, "LAST_COEFF_FLAG_OFFSET")
+    errors += compare_arrays("LAST_COEFF_FLAG_OFFSET", ffmpeg_last[0], wedeo_last)
+
+    # coeff_abs_level_m1_offset[14] — 1D with expressions
+    ffmpeg_abs = _parse_c_expr_array_1d(h264_cabac, "coeff_abs_level_m1_offset")
+    wedeo_abs = parse_rust_array_1d(cabac_rs, "COEFF_ABS_LEVEL_M1_OFFSET")
+    errors += compare_arrays("COEFF_ABS_LEVEL_M1_OFFSET", ffmpeg_abs, wedeo_abs)
+
+    # --- Direct-value tables ---
+
+    # significant_coeff_flag_offset_8x8[2][63] — wedeo uses index [0] only
+    ffmpeg_sig8x8 = parse_c_array_2d(h264_cabac, "significant_coeff_flag_offset_8x8")
+    wedeo_sig8x8 = parse_rust_array_1d(cabac_rs, "SIGNIFICANT_COEFF_FLAG_OFFSET_8X8")
+    errors += compare_arrays("SIGNIFICANT_COEFF_FLAG_OFFSET_8X8", ffmpeg_sig8x8[0], wedeo_sig8x8)
+
+    # sig_coeff_offset_dc[7]
+    ffmpeg_dc = parse_c_array_1d(h264_cabac, "sig_coeff_offset_dc")
+    wedeo_dc = parse_rust_array_1d(cabac_rs, "SIG_COEFF_OFFSET_DC")
+    errors += compare_arrays("SIG_COEFF_OFFSET_DC", ffmpeg_dc, wedeo_dc)
+
+    # coeff_abs_level1_ctx[8]
+    ffmpeg_l1 = parse_c_array_1d(h264_cabac, "coeff_abs_level1_ctx")
+    wedeo_l1 = parse_rust_array_1d(cabac_rs, "COEFF_ABS_LEVEL1_CTX")
+    errors += compare_arrays("COEFF_ABS_LEVEL1_CTX", ffmpeg_l1, wedeo_l1)
+
+    # coeff_abs_levelgt1_ctx[2][8]
+    ffmpeg_gt1 = parse_c_array_2d(h264_cabac, "coeff_abs_levelgt1_ctx")
+    wedeo_gt1 = parse_rust_array_2d(cabac_rs, "COEFF_ABS_LEVELGT1_CTX")
+    errors += compare_arrays("COEFF_ABS_LEVELGT1_CTX", ffmpeg_gt1, wedeo_gt1)
+
+    # coeff_abs_level_transition[2][8]
+    ffmpeg_trans = parse_c_array_2d(h264_cabac, "coeff_abs_level_transition")
+    wedeo_trans = parse_rust_array_2d(cabac_rs, "COEFF_ABS_LEVEL_TRANSITION")
+    errors += compare_arrays("COEFF_ABS_LEVEL_TRANSITION", ffmpeg_trans, wedeo_trans)
+
+    # base_ctx[14] (CBF_CTX_BASE in cabac.rs)
+    ffmpeg_base = parse_c_array_1d(h264_cabac, "base_ctx")
+    wedeo_base = parse_rust_array_1d(cabac_mod, "CBF_CTX_BASE")
+    errors += compare_arrays("CBF_CTX_BASE", ffmpeg_base, wedeo_base)
+
+    return errors
+
+
+def _parse_c_expr_array_1d(content: str, name: str) -> list[int]:
+    """Parse a 1D C array where values may be expressions like `105+0`."""
+    pattern = rf'const\s+\w+\s+{re.escape(name)}\s*\[[^\]]*\]\s*=\s*\{{([^;]+)\}};'
+    match = re.search(pattern, content, re.DOTALL)
+    if not match:
+        raise ValueError(f"Could not find array '{name}' in source")
+    body = match.group(1)
+    parts = [p.strip() for p in body.split(',') if p.strip()]
+    return [_eval_c_expr(p) for p in parts]
+
+
+def _parse_c_expr_array_2d(content: str, name: str) -> list[list[int]]:
+    """Parse a 2D C array where values may be expressions like `105+15`."""
+    pattern = rf'const\s+\w+\s+{re.escape(name)}\s*\[[^\]]*\]\s*\[[^\]]*\]\s*=\s*\{{(.*?)\}};'
+    match = re.search(pattern, content, re.DOTALL)
+    if not match:
+        raise ValueError(f"Could not find array '{name}' in source")
+    body = match.group(1)
+    rows = re.findall(r'\{([^}]+)\}', body)
+    result = []
+    for row in rows:
+        parts = [p.strip() for p in row.split(',') if p.strip()]
+        result.append([_eval_c_expr(p) for p in parts])
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -412,6 +630,10 @@ def main():
         check_cavlc_chroma_dc_coeff,
         check_cavlc_total_zeros,
         check_cavlc_run_before,
+        # CABAC
+        check_cabac_core_tables,
+        check_cabac_context_init,
+        check_cabac_residual_tables,
     ]
 
     for check in checks:
