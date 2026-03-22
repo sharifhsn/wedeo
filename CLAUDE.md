@@ -20,8 +20,8 @@ to FFmpeg 8.0.1 across all PCM formats and all FATE suite WAV samples.
 
 ```
 wedeo/
-  Cargo.toml                    # workspace root (14 crates)
-  FFmpeg/                       # C reference source (read-only, not compiled)
+  Cargo.toml                    # workspace root (16 crates)
+  FFmpeg/                       # C reference source (read-only, n8.1)
   fate-suite/                   # FATE test samples (synced externally)
   start.json                    # original planning conversation
   H264.md                       # H.264 decoder architecture & status (detailed)
@@ -36,6 +36,7 @@ wedeo/
 
   adapters/
     wedeo-symphonia/            # Wraps symphonia decoders/demuxers behind wedeo traits (priority 50)
+    wedeo-rav1d/                # Wraps rav1d AV1 decoder behind wedeo traits
 
   codecs/
     wedeo-codec-pcm/            # PCM encoder (17 formats); decoders registered via symphonia at pri 100
@@ -44,10 +45,11 @@ wedeo/
   formats/
     wedeo-format-wav/           # WAV demuxer + muxer — RIFF/RIFX/RF64/BW64 probe, WAVEFORMATEXTENSIBLE, streaming
     wedeo-format-h264/          # H.264 Annex B raw bitstream demuxer — probe, AU grouping
+    wedeo-format-mp4/           # MP4/MOV demuxer + muxer — ftyp/moov/mdat parsing, H.264+AAC support
 
   bins/
     wedeo-cli/                  # CLI tools: info (like ffprobe), decode, codecs, formats
-    wedeo-play/                 # Simple video player (decode + YUV→RGBA + minifb display)
+    wedeo-play/                 # Video player with audio (decode thread, cpal output, keyboard controls)
 
   tests/
     fate/                       # FATE test harness
@@ -223,20 +225,20 @@ symphonia wrappers (priority 50) when both exist (e.g., WAV/PCM always uses nati
 | H.264 Annex B | Native | Probe + decode verified |
 | OGG | Symphonia | Probe + Vorbis decode verified |
 | FLAC | Symphonia | Probe + decode bitexact verified |
-| MP4/M4A | Symphonia | Probe verified |
+| MP4/MOV/M4A | Native + Symphonia | Probe + H.264/AAC decode verified |
 | MKV/WebM | Symphonia | Probe verified |
 | AIFF/AIFC | Symphonia | Probe verified |
 | CAF | Symphonia | Probe verified |
 | MP3 (ID3v2/sync) | Symphonia | Probe + decode SNR verified |
 
-**Mux coverage (1 muxer):** WAV — bitexact roundtrip (demux → decode → encode → mux → demux = identical).
+**Mux coverage (2 muxers):** WAV — bitexact roundtrip. MP4 — H.264+AAC muxing with moov/mdat layout.
 
 **Gapless support:** MP3 (via symphonia's LAME/Xing header parsing), AAC in M4A (via iTunSMPB metadata parsing), OGG/Vorbis (via symphonia's gapless mode). Trim applied through `Packet.trim_start`/`trim_end` fields.
 
 **Audio resampling:** `wedeo-resample` wraps `rubato` with Fast/Normal/High quality modes, interleaved I/O, chunked processing.
 
 ### Fully implemented and verified
-- **WAV demuxer**: RIFF/RIFX/RF64/BW64 probe, all PCM format tags, streaming, truncated file handling. 13/13 FATE suite files bitexact vs FFmpeg 8.0.1.
+- **WAV demuxer**: RIFF/RIFX/RF64/BW64 probe, all PCM format tags, streaming, truncated file handling. 13/13 FATE suite files bitexact vs FFmpeg 8.1.
 - **PCM codec**: 17 decoders (via symphonia adapter at priority 100) + 17 native encoders (`wedeo-codec-pcm`). Byte-swapping, unsigned-to-signed conversion, 24→32-bit expansion matching FFmpeg's pcm.c.
 - **WAV muxer**: RIFF/WAVE with fmt + data chunks, PCM/float/alaw/mulaw format tags. Roundtrip bitexact.
 - **Symphonia audio backend** (`adapters/wedeo-symphonia/`): 10 non-PCM decoder factories (FLAC, MP1, MP2, MP3, AAC, Vorbis, ALAC, WavPack, ADPCM IMA/MS) + 17 PCM decoder factories + 1 Opus (`opus-decoder` crate) + 8 demuxer factories.
@@ -259,8 +261,8 @@ symphonia wrappers (priority 50) when both exist (e.g., WAV/PCM always uses nati
 - **H.264 decoder** — I+P+B frame decode with deblocking, 50/51 progressive CAVLC conformance files BITEXACT (98%). Only FM1_FT_E (FMO) remains. See `H264.md`.
 
 ### Not yet started
-- Video codecs (HEVC, VP9, AV1, etc.) — native Rust implementations, no existing crate covers these
-- Non-WAV muxers (MP4, MKV, etc.)
+- Video codecs (HEVC, VP9) — native Rust implementations
+- MKV muxer
 - Hardware acceleration
 
 ### Available infrastructure crates (added as dependencies)
