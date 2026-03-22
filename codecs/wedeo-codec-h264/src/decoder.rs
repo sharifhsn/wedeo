@@ -1389,6 +1389,13 @@ impl H264Decoder {
 
             // For inter slices: decode skip flag
             if is_inter_slice {
+                #[cfg(feature = "cabac-trace")]
+                eprintln!(
+                    "CABAC_SKIP_DECODE mb_x={} mb_y={} is_b={}",
+                    mb_x,
+                    mb_y,
+                    hdr.slice_type.is_b()
+                );
                 let skip = decode_cabac_mb_skip(
                     &mut reader,
                     &mut cabac_state,

@@ -470,27 +470,39 @@ impl CabacNeighborCtx {
         }
     }
 
-    /// Get the left CBP for the current MB. Returns 0 if left is unavailable.
-    #[inline]
     /// Get the left CBP for the current MB.
     ///
-    /// Returns `u32::MAX` (= -1 as unsigned) when unavailable, matching FFmpeg's
-    /// convention. This is critical: the CBP context derivation uses bitwise AND
-    /// on the neighbor CBP, and `!(u32::MAX & bit) = 0` while `!(0 & bit) = 1`.
-    fn left_cbp(&self, mb_idx: usize, mb_x: u32, slice_table: &[u16], cur_slice: u16) -> u32 {
+    /// When the left neighbor is unavailable, returns a default value matching
+    /// FFmpeg's `fill_decode_caches`: `0x7CF` for intra MBs, `0x00F` for inter.
+    /// Both defaults have luma=0xF (all coded) and chroma CBP field=0.
+    /// The intra default also sets chroma DC and luma DC coded flags (bits 6-10),
+    /// which affects residual coded_block_flag context derivation.
+    ///
+    /// Reference: FFmpeg h264_mvpred.h:726-732.
+    #[inline]
+    fn left_cbp(
+        &self,
+        mb_idx: usize,
+        mb_x: u32,
+        slice_table: &[u16],
+        cur_slice: u16,
+        is_intra: bool,
+    ) -> u32 {
         if mb_x == 0 {
-            return u32::MAX;
+            return if is_intra { 0x7CF } else { 0x00F };
         }
         let left_idx = mb_idx - 1;
         if slice_table[left_idx] != cur_slice {
-            return u32::MAX;
+            return if is_intra { 0x7CF } else { 0x00F };
         }
         self.cbp[left_idx]
     }
 
     /// Get the top CBP for the current MB.
     ///
-    /// Returns `u32::MAX` when unavailable (see `left_cbp` for rationale).
+    /// When the top neighbor is unavailable, returns the same default as `left_cbp`.
+    ///
+    /// Reference: FFmpeg h264_mvpred.h:722-725.
     #[inline]
     fn top_cbp(
         &self,
@@ -499,13 +511,14 @@ impl CabacNeighborCtx {
         mb_width: u32,
         slice_table: &[u16],
         cur_slice: u16,
+        is_intra: bool,
     ) -> u32 {
         if mb_y == 0 {
-            return u32::MAX;
+            return if is_intra { 0x7CF } else { 0x00F };
         }
         let top_idx = mb_idx - mb_width as usize;
         if slice_table[top_idx] != cur_slice {
-            return u32::MAX;
+            return if is_intra { 0x7CF } else { 0x00F };
         }
         self.cbp[top_idx]
     }
@@ -668,11 +681,25 @@ fn decode_cabac_intra_mb_type(
                 ctx += 1;
             }
         }
+        #[cfg(feature = "cabac-trace")]
+        eprintln!(
+            "CABAC_INTRA_MB_TYPE ctx_base={} ctx={} state_idx={}",
+            ctx_base,
+            ctx,
+            ctx_base + ctx
+        );
         if reader.get_cabac(&mut state[ctx_base + ctx]) == 0 {
             return 0; // I_4x4
         }
-    } else if reader.get_cabac(&mut state[ctx_base]) == 0 {
-        return 0; // I_4x4
+    } else {
+        #[cfg(feature = "cabac-trace")]
+        eprintln!(
+            "CABAC_INTRA_MB_TYPE ctx_base={} ctx=0 state_idx={} (inter_slice)",
+            ctx_base, ctx_base
+        );
+        if reader.get_cabac(&mut state[ctx_base]) == 0 {
+            return 0; // I_4x4
+        }
     }
 
     // Check for I_PCM
@@ -1212,8 +1239,14 @@ fn get_cabac_cbf_ctx(
     block_idx: usize,
     is_dc: bool,
     nz_cache: &[u8; 24],
+    is_intra: bool,
 ) -> usize {
     let mut ctx = 0usize;
+    // For unavailable neighbors, FFmpeg's fill_decode_caches uses:
+    //   left_cbp/top_cbp = 0x7CF (intra) or 0x00F (inter)
+    //   non_zero_count_cache = 64 (intra) or 0 (inter)
+    // Reference: FFmpeg h264_mvpred.h:fill_decode_caches.
+    let dc_unavail = if is_intra { 1u32 } else { 0 };
 
     if is_dc {
         if cat == 3 {
@@ -1223,12 +1256,12 @@ fn get_cabac_cbf_ctx(
             let nza = if mb_x > 0 && slice_table[mb_idx - 1] == cur_slice {
                 (cabac_nb.cbp[mb_idx - 1] >> (6 + chroma_idx)) & 0x01
             } else {
-                0
+                dc_unavail
             };
             let nzb = if mb_y > 0 && slice_table[mb_idx - mb_width as usize] == cur_slice {
                 (cabac_nb.cbp[mb_idx - mb_width as usize] >> (6 + chroma_idx)) & 0x01
             } else {
-                0
+                dc_unavail
             };
             if nza > 0 {
                 ctx += 1;
@@ -1240,11 +1273,15 @@ fn get_cabac_cbf_ctx(
             // Luma DC (I16x16): idx is 0
             let nza = if mb_x > 0 && slice_table[mb_idx - 1] == cur_slice {
                 cabac_nb.cbp[mb_idx - 1] & 0x100
+            } else if is_intra {
+                0x100
             } else {
                 0
             };
             let nzb = if mb_y > 0 && slice_table[mb_idx - mb_width as usize] == cur_slice {
                 cabac_nb.cbp[mb_idx - mb_width as usize] & 0x100
+            } else if is_intra {
+                0x100
             } else {
                 0
             };
@@ -1258,6 +1295,7 @@ fn get_cabac_cbf_ctx(
     } else {
         // Non-DC: use non-zero count cache from left and top blocks.
         // block_idx is the 4x4 block scan index (0..15 for luma, 16..19 Cb, 20..23 Cr).
+        let unavail_nz = if is_intra { 64 } else { 0 };
         let (nza, nzb) = get_nz_neighbors(
             cabac_nb,
             slice_table,
@@ -1268,6 +1306,7 @@ fn get_cabac_cbf_ctx(
             mb_width,
             block_idx,
             nz_cache,
+            unavail_nz,
         );
         if nza > 0 {
             ctx += 1;
@@ -1282,7 +1321,12 @@ fn get_cabac_cbf_ctx(
 
 /// Get left and top non-zero count neighbors for a 4x4 block.
 ///
+/// When the neighbor is unavailable, returns `unavail_nz` (64 for intra, 0 for inter).
+/// This matches FFmpeg's `fill_decode_caches` which uses `CABAC && !IS_INTRA ? 0 : 64`.
+///
 /// Returns (nz_left, nz_top).
+///
+/// Reference: FFmpeg h264_mvpred.h:fill_decode_caches (non_zero_count_cache init).
 #[allow(clippy::too_many_arguments)]
 fn get_nz_neighbors(
     cabac_nb: &CabacNeighborCtx,
@@ -1294,6 +1338,7 @@ fn get_nz_neighbors(
     mb_width: u32,
     block_idx: usize,
     nz_cache: &[u8; 24],
+    unavail_nz: u8,
 ) -> (u8, u8) {
     if block_idx < 16 {
         // Luma block: raster index = block_idx
@@ -1308,7 +1353,7 @@ fn get_nz_neighbors(
             let left_blk = blk_y * 4 + 3;
             cabac_nb.nz_count[left_idx * 24 + left_blk]
         } else {
-            0
+            unavail_nz
         };
 
         let nzb = if blk_y > 0 {
@@ -1319,7 +1364,7 @@ fn get_nz_neighbors(
             let top_blk = 12 + blk_x;
             cabac_nb.nz_count[top_idx * 24 + top_blk]
         } else {
-            0
+            unavail_nz
         };
 
         (nza, nzb)
@@ -1336,7 +1381,7 @@ fn get_nz_neighbors(
             let left_blk = 16 + blk_y * 2 + 1;
             cabac_nb.nz_count[left_idx * 24 + left_blk]
         } else {
-            0
+            unavail_nz
         };
 
         let nzb = if blk_y > 0 {
@@ -1346,7 +1391,7 @@ fn get_nz_neighbors(
             let top_blk = 16 + 2 + blk_x;
             cabac_nb.nz_count[top_idx * 24 + top_blk]
         } else {
-            0
+            unavail_nz
         };
 
         (nza, nzb)
@@ -1363,7 +1408,7 @@ fn get_nz_neighbors(
             let left_blk = 20 + blk_y * 2 + 1;
             cabac_nb.nz_count[left_idx * 24 + left_blk]
         } else {
-            0
+            unavail_nz
         };
 
         let nzb = if blk_y > 0 {
@@ -1373,7 +1418,7 @@ fn get_nz_neighbors(
             let top_blk = 20 + 2 + blk_x;
             cabac_nb.nz_count[top_idx * 24 + top_blk]
         } else {
-            0
+            unavail_nz
         };
 
         (nza, nzb)
@@ -1511,6 +1556,7 @@ fn decode_cabac_luma_residual(
     mb_width: u32,
     cbp: u32,
     is_intra16x16: bool,
+    is_intra: bool,
 ) {
     let nz_cache = &mut mb.non_zero_count;
 
@@ -1528,6 +1574,7 @@ fn decode_cabac_luma_residual(
             0,
             true,
             nz_cache,
+            is_intra,
         );
         if reader.get_cabac(&mut state[cbf_ctx]) != 0 {
             // Store DC coded flag in cbp (bit 8)
@@ -1551,6 +1598,7 @@ fn decode_cabac_luma_residual(
                     raster_idx,
                     false,
                     nz_cache,
+                    is_intra,
                 );
                 if reader.get_cabac(&mut state[cbf_ctx]) != 0 {
                     let nz = decode_cabac_residual(
@@ -1585,6 +1633,7 @@ fn decode_cabac_luma_residual(
                         raster_idx,
                         false,
                         nz_cache,
+                        is_intra,
                     );
                     if reader.get_cabac(&mut state[cbf_ctx]) != 0 {
                         let nz = decode_cabac_residual(
@@ -1620,6 +1669,7 @@ fn decode_cabac_chroma_residual(
     mb_width: u32,
     cbp: u32,
     stored_cbp: &mut u32,
+    is_intra: bool,
 ) {
     let nz_cache = &mut mb.non_zero_count;
 
@@ -1638,6 +1688,7 @@ fn decode_cabac_chroma_residual(
                 c as usize,
                 true,
                 nz_cache,
+                is_intra,
             );
             if reader.get_cabac(&mut state[cbf_ctx]) != 0 {
                 // Chroma DC 2x2 uses identity scan (positions map 1:1 to the
@@ -1675,6 +1726,7 @@ fn decode_cabac_chroma_residual(
                     nz_idx,
                     false,
                     nz_cache,
+                    is_intra,
                 );
                 if reader.get_cabac(&mut state[cbf_ctx]) != 0 {
                     let nz = decode_cabac_residual(
@@ -1719,6 +1771,12 @@ pub fn decode_mb_cabac(
 ) -> Result<Macroblock> {
     let mut mb = Macroblock::default();
     let mb_idx = (mb_y * mb_width + mb_x) as usize;
+
+    #[cfg(feature = "cabac-trace")]
+    eprintln!(
+        "CABAC_MB_START mb_x={} mb_y={} slice_type={:?}",
+        mb_x, mb_y, slice_type
+    );
 
     // 1. Parse mb_type
     let is_intra;
@@ -1794,6 +1852,9 @@ pub fn decode_mb_cabac(
                     b_ctx += 1;
                 }
             }
+
+            #[cfg(feature = "cabac-trace")]
+            eprintln!("CABAC_B_MB_TYPE b_ctx={} state_idx={}", b_ctx, 27 + b_ctx);
 
             if reader.get_cabac(&mut state[27 + b_ctx]) == 0 {
                 // B_Direct_16x16
@@ -1936,6 +1997,8 @@ pub fn decode_mb_cabac(
     }
 
     // 3. Intra prediction modes
+    #[cfg(feature = "cabac-trace")]
+    eprintln!("CABAC_SECTION intra_pred_modes");
     if mb.is_intra4x4 {
         // Decode intra 4x4 prediction modes.
         // Cross-MB neighbors come from the NeighborContext, matching CAVLC behavior.
@@ -1979,6 +2042,8 @@ pub fn decode_mb_cabac(
     }
 
     // 4. Chroma prediction mode (for intra MBs)
+    #[cfg(feature = "cabac-trace")]
+    eprintln!("CABAC_SECTION chroma_pred_mode");
     if is_intra {
         mb.chroma_pred_mode = decode_cabac_mb_chroma_pre_mode(
             reader,
@@ -2382,15 +2447,19 @@ pub fn decode_mb_cabac(
     }
 
     // 6. CBP (for non-I16x16)
+    #[cfg(feature = "cabac-trace")]
+    eprintln!("CABAC_SECTION cbp");
     if !mb.is_intra16x16 {
-        let left_cbp = cabac_nb.left_cbp(mb_idx, mb_x, slice_table, cur_slice);
-        let top_cbp = cabac_nb.top_cbp(mb_idx, mb_y, mb_width, slice_table, cur_slice);
+        let left_cbp = cabac_nb.left_cbp(mb_idx, mb_x, slice_table, cur_slice, is_intra);
+        let top_cbp = cabac_nb.top_cbp(mb_idx, mb_y, mb_width, slice_table, cur_slice, is_intra);
         cbp = decode_cabac_mb_cbp_luma(reader, state, left_cbp, top_cbp);
         cbp |= decode_cabac_mb_cbp_chroma(reader, state, left_cbp, top_cbp) << 4;
     }
     mb.cbp = cbp;
 
     // 7. QP delta and residual coefficients
+    #[cfg(feature = "cabac-trace")]
+    eprintln!("CABAC_SECTION qp_delta_and_residual cbp={}", cbp);
     let mut stored_cbp = cbp;
     let is_i16x16 = mb.is_intra16x16;
     if cbp > 0 || is_i16x16 {
@@ -2398,6 +2467,8 @@ pub fn decode_mb_cabac(
         mb.mb_qp_delta = decode_cabac_mb_dqp(reader, state, last_qscale_diff)?;
 
         // Decode luma residual
+        #[cfg(feature = "cabac-trace")]
+        eprintln!("CABAC_SECTION luma_residual");
         decode_cabac_luma_residual(
             reader,
             state,
@@ -2411,9 +2482,12 @@ pub fn decode_mb_cabac(
             mb_width,
             cbp,
             is_i16x16,
+            is_intra,
         );
 
         // Decode chroma residual (4:2:0)
+        #[cfg(feature = "cabac-trace")]
+        eprintln!("CABAC_SECTION chroma_residual");
         decode_cabac_chroma_residual(
             reader,
             state,
@@ -2427,6 +2501,7 @@ pub fn decode_mb_cabac(
             mb_width,
             cbp,
             &mut stored_cbp,
+            is_intra,
         );
 
         // Store the luma DC coded flag if I16x16 had non-zero DC
