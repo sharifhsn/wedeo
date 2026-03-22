@@ -64,6 +64,28 @@ PROGRESSIVE_CAVLC_FILES = [
     "FM1_FT_E.264", "FM1_BT_B.h264",
 ]
 
+# 27 progressive CABAC conformance files (frame_mbs_only=1)
+PROGRESSIVE_CABAC_FILES = [
+    # Tier 1 — Simplest
+    "CABA2_SVA_B.264",
+    "CANL1_SVA_B.264", "CANL2_SVA_B.264", "CANL3_SVA_B.264", "CANL4_SVA_B.264",
+    "CABA1_SVA_B.264", "CABA3_SVA_B.264",
+    # Tier 2 — Longer sequences
+    "CANL1_Sony_E.jsv", "CANL2_Sony_E.jsv", "CANL3_Sony_C.jsv",
+    "CABA1_Sony_D.jsv", "CABA2_Sony_E.jsv", "CABA3_Sony_C.jsv",
+    "CANL1_TOSHIBA_G.264", "CABA3_TOSHIBA_E.264",
+    # Tier 3 — Special features
+    "CACQP3_Sony_D.jsv", "CAQP1_Sony_B.jsv",
+    "CAPCM1_Sand_E.264", "CAPCMNL1_Sand_E.264",
+    "CAWP1_TOSHIBA_E.264", "CAWP5_TOSHIBA_E.264",
+    "camp_mot_frm0_full.26l",
+    "src19td.IBP.264",
+    # Tier 4 — Edge cases
+    "CABACI3_Sony_B.jsv",
+    "CABAST3_Sony_E.jsv", "CABASTBR3_Sony_B.jsv",
+    "CAPM3_Sony_D.jsv",
+]
+
 SNAPSHOT_PATH = Path(__file__).resolve().parent / ".conformance_snapshot.json"
 
 
@@ -90,6 +112,7 @@ def run_full(
     quick: bool = False,
     triage: bool = False,
     no_deblock: bool = False,
+    cabac: bool = False,
 ) -> tuple[list[str], list[tuple[str, int, int]]]:
     """Run conformance on all files. Returns (passing, diffs)."""
     wedeo_bin = find_wedeo_binary()
@@ -99,7 +122,8 @@ def run_full(
     diffs = []
     skipped = 0
 
-    for fname in PROGRESSIVE_CAVLC_FILES:
+    file_list = PROGRESSIVE_CABAC_FILES if cabac else PROGRESSIVE_CAVLC_FILES
+    for fname in file_list:
         fpath = Path(fate_dir) / fname
         if not fpath.exists():
             skipped += 1
@@ -154,6 +178,8 @@ def main():
                         help="Also test without deblock for DIFF files")
     parser.add_argument("--no-deblock", action="store_true",
                         help="Run all tests without deblocking")
+    parser.add_argument("--cabac", action="store_true",
+                        help="Test CABAC files instead of CAVLC")
     parser.add_argument("--save-snapshot", action="store_true",
                         help="Save current passing files as snapshot")
     args = parser.parse_args()
@@ -164,6 +190,7 @@ def main():
         quick=args.quick,
         triage=args.triage,
         no_deblock=args.no_deblock,
+        cabac=args.cabac,
     )
     elapsed = time.monotonic() - t0
 
