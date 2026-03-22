@@ -2063,6 +2063,10 @@ pub fn decode_mb_cabac(
 
         mb.non_zero_count = [16; 24];
         mb.mb_qp_delta = 0;
+        // I_PCM: all blocks are coded. Set CBP so neighbor context derivation
+        // sees correct values. Matches FFmpeg's h->cbp_table[mb_xy] = 0xf7ef.
+        // Bits: luma=0xF, chroma=2<<4, Cb DC=0x40, Cr DC=0x80, luma DC=0x100.
+        mb.cbp = 0x1EF;
         return Ok(mb);
     }
 
