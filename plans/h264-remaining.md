@@ -1,70 +1,41 @@
-# Plan: H.264 Remaining 3 DIFF Files (47→50 BITEXACT)
+# Plan: H.264 Remaining DIFF Files — COMPLETED
 
-## Current state: 47/51 progressive CAVLC BITEXACT (92%)
+## Final state: 50/51 progressive CAVLC BITEXACT (98%)
 
-## Triage results (no-deblock)
+Only FM1_FT_E.264 remains (FMO, out of scope).
 
-| File | With deblock | No deblock | First diff | Max Y diff | Conclusion |
-|------|-------------|------------|------------|-----------|------------|
-| CVWP3 | 89/90 | 89/90 | frame 69 | 68 | MC bug, not deblock |
-| HCMP1 | 87/250 | 87/250 | frame 1 | 110 | MC bug, not deblock |
-| CVFC1 | 19/50 | 19/50 | frame 17 | 47 | MC bug, not deblock |
+## Fixes applied (47→50 BITEXACT)
 
-All three are MC issues (same match count with/without deblock).
+### HCMP1 — already BITEXACT before this session (48/51 baseline)
 
-## Priority 1: CVWP3 (89/90 — single frame diff)
+### CVFC1_Sony_C.jsv — FIXED (19/50 → 50/50)
 
-**Profile:** Main, weighted bipred stream, B-frames.
-**Diff:** 10/396 MBs differ at frame 69, first at MB(12,14), Y_max=29, chroma V_max=10.
+**Root cause:** Cross-slice C→D MV neighbor fallback missing slice boundary check.
 
-**Approach:**
-1. Trace MB(12,14) at frame 69 — check mb_type, ref_idx, MV, weighted pred params
-2. If B-frame: check if it's B_Direct, B_L0, B_L1, or B_Bi
-3. For B_Bi: check weighted bipred formula (explicit or implicit)
-4. Extract same MB from FFmpeg via lldb, compare intermediates
-5. The diff is small (max 29) — likely a rounding or weight calculation issue
+When the C (top-right) MV neighbor was within the current MB but not yet decoded
+(PART_NOT_AVAILABLE), the code fell back to D (top-left). The L0 path delegated
+to `neighbor_c()` which performed this fallback without checking slice boundaries,
+reading MV data from a cross-slice MB.
 
-## Priority 2: HCMP1 (87/250 — hierarchical B with 15 refs)
+**Fix:** `mvpred.rs` — inline C→D fallback with slice_table checks (matching L1 path).
 
-**Profile:** Main, NO weighted pred (weighted_pred=0, weighted_bipred=0).
-**Slice types:** 1 I-slice + 1 P-slice + 8 B-slices per GOP.
-**HCBP1 (Baseline, same structure but I+P only) passes BITEXACT.**
-**Diff:** 163 frames differ starting at frame 1, Y_max=110+.
+### CVWP3_TOSHIBA_E.264 — FIXED (89/90 → 90/90)
 
-The key difference: HCMP1 has B-frames while HCBP1 doesn't. With no weighted pred,
-the B-frame MC should be simple (unweighted average). Large diffs from frame 1
-suggest a fundamental issue: wrong reference picture, wrong MV, or wrong bi-pred formula.
+**Root cause:** Intra MBs in B-slices left MV context at PART_NOT_AVAILABLE (-2).
 
-**Approach:**
-1. `mb_compare --start-frame 1 --max-frames 1` — find first differing MB
-2. Trace that MB: check B-frame type (B_Direct vs B_L0/L1 vs B_Bi)
-3. If B_Bi with unweighted: verify `(L0 + L1 + 1) >> 1` formula
-4. Check ref lists for frame 1 via `reflist_compare.py --ffmpeg --frame 1`
-5. If ref lists match: extract MVs from both decoders for the first differing MB
+Intra MBs (I4x4, I16x16, I_PCM) didn't update the MV context after decoding.
+The ref_idx stayed at the initialization value of -2 (PART_NOT_AVAILABLE) instead
+of -1 (LIST_NOT_USED). When spatial direct prediction computed the unsigned minimum
+of neighbor refs, -2 was treated as 254 (valid ref) instead of 255 (unavailable),
+producing a wrong ref_idx.
 
-## Priority 3: CVFC1 (19/50 — multi-slice + crop)
+**Fix:** `mb.rs` — set MV context to ref=-1, mv=[0,0] for all 16 blocks after
+intra MB decode.
 
-**Profile:** Baseline (no B-frames), 4 slices/frame, frame crop.
-**Diff:** 31 frames differ starting at frame 17, Y_max=47, 26/209 MBs at frame 17.
-**Slice boundaries:** first_mb = 0, 99, 198, 297 (non-row-aligned).
+### Also fixed: spatial direct col_zero_flag L1 fallback
 
-All P-frames, no B-frames or weighted pred. The issue is likely cross-slice
-MV prediction at non-row-aligned slice boundaries. FFmpeg's fill_decode_caches
-handles slice boundaries carefully; wedeo may treat MBs at mid-row slice
-boundaries differently.
+When colocated L0 ref was < 0 (not used), L1 ref wasn't checked as fallback.
+Per FFmpeg h264_direct.c lines 443-447: `(l1ref0 == 0 || (l1ref0 < 0 && l1ref1 == 0))`.
 
-**Approach:**
-1. `mb_compare --start-frame 17 --max-frames 1` — map which MBs differ
-2. Check if differing MBs cluster at slice boundary positions (MB 99, 198, 297)
-3. If yes: read FFmpeg's fill_decode_caches for slice boundary handling
-4. If no: check if it correlates with DPB eviction (frame 17 = frame_num 17,
-   max_num_ref_frames=5, so sliding window starts evicting at frame 5)
-
-## Diagnostic protocol (for each file)
-
-1. `framecrc_compare.py --no-deblock --pixel-detail` — done (above)
-2. `mb_compare.py --start-frame N --max-frames 1` — find differing MBs
-3. `reflist_compare.py --ffmpeg --frame N` — if ref list suspected
-4. Trace MB with `--features tracing` — check mb_type, ref_idx, MV, weights
-5. lldb on FFmpeg — extract ground truth for the same MB
-6. `regression_check.py` — after every fix
+**Fix:** `mb.rs` — check L1 colocated ref/MV when L0 ref < 0, for both
+direct_8x8_inference paths.
