@@ -44,24 +44,23 @@ impl<'a> CabacReader<'a> {
     /// Initialize a CABAC decoder from byte-aligned RBSP data.
     ///
     /// Reads the first 2 bytes to initialize the arithmetic engine, then adds
-    /// `1 << 9` to keep subsequent refills on 2-byte boundaries.
+    /// `1 << 9` matching FFmpeg's aligned init path (`ff_init_cabac_decoder`,
+    /// CABAC_BITS=16).
     ///
-    /// This matches FFmpeg's aligned init path (`ff_init_cabac_decoder`,
-    /// CABAC_BITS=16). Both init paths (aligned and unaligned) produce
-    /// identical decoded bits — the internal `low` value differs but never
-    /// affects decode decisions.
+    /// FFmpeg's init has two paths depending on pointer alignment; which path
+    /// is taken varies per run due to ASLR. Both paths produce equivalent
+    /// decoded bits within FFmpeg. Wedeo uses the aligned path consistently.
+    /// The ~50-70 `low` offset vs FFmpeg's opposite path does not affect
+    /// context-coded BIN decisions but can eventually cause BYPASS bit flips
+    /// in long sequences. This is a known limitation pending engine parity work.
     pub fn new(data: &'a [u8]) -> Result<Self> {
         if data.len() < 2 {
             return Err(Error::InvalidData);
         }
 
-        // Read first two bytes into low, shifted for 16-bit precision.
-        // Add (1 << 9) to match FFmpeg's aligned init path, which keeps
-        // the bytestream pointer on a 2-byte boundary for refills.
         let low = (data[0] as i32) << 18 | (data[1] as i32) << 10 | (1 << 9);
         let range = 0x1FE;
 
-        // Validity check: range << (CABAC_BITS+1) must be >= low
         if (range << (CABAC_BITS + 1)) < low {
             return Err(Error::InvalidData);
         }
