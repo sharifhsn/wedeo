@@ -167,7 +167,7 @@ impl<'a> CabacReader<'a> {
             };
             let n = BIN_COUNT.fetch_add(1, Ordering::Relaxed);
             if n < max {
-                eprintln!(
+                trace!(
                     "CABAC_BIN {} state={} low={} range={} -> bit={} post_low={} post_range={}",
                     n, pre_state, pre_low, pre_range, bit, self.low, self.range
                 );
@@ -222,7 +222,7 @@ impl<'a> CabacReader<'a> {
             };
             let n = BYPASS_COUNT.fetch_add(1, Ordering::Relaxed);
             if n < max {
-                eprintln!(
+                trace!(
                     "CABAC_BYPASS {} low={} range={} -> bit={} post_low={}",
                     n, pre_low, pre_range, bit, self.low
                 );
@@ -278,7 +278,7 @@ impl<'a> CabacReader<'a> {
             if n < max {
                 // bit=1 means negative (LPS), bit=0 means positive (MPS)
                 let bit = if mask == 0 { 0 } else { 1 };
-                eprintln!(
+                trace!(
                     "CABAC_BYPASS_SIGN {} low={} range={} val={} -> bit={} result={} post_low={}",
                     n, pre_low, pre_range, val, bit, result, self.low
                 );
@@ -320,7 +320,7 @@ impl<'a> CabacReader<'a> {
             use std::sync::atomic::{AtomicI32, Ordering};
             static TERM_COUNT: AtomicI32 = AtomicI32::new(0);
             let n = TERM_COUNT.fetch_add(1, Ordering::Relaxed);
-            eprintln!(
+            trace!(
                 "CABAC_TERM {} low={} range={} -> result={} post_low={} post_range={}",
                 n, pre_low, pre_range, result as i32, self.low, self.range
             );
@@ -682,7 +682,7 @@ fn decode_cabac_intra_mb_type(
             }
         }
         #[cfg(feature = "cabac-trace")]
-        eprintln!(
+        trace!(
             "CABAC_INTRA_MB_TYPE ctx_base={} ctx={} state_idx={}",
             ctx_base,
             ctx,
@@ -693,7 +693,7 @@ fn decode_cabac_intra_mb_type(
         }
     } else {
         #[cfg(feature = "cabac-trace")]
-        eprintln!(
+        trace!(
             "CABAC_INTRA_MB_TYPE ctx_base={} ctx=0 state_idx={} (inter_slice)",
             ctx_base, ctx_base
         );
@@ -1773,7 +1773,7 @@ pub fn decode_mb_cabac(
     let mb_idx = (mb_y * mb_width + mb_x) as usize;
 
     #[cfg(feature = "cabac-trace")]
-    eprintln!(
+    trace!(
         "CABAC_MB_START mb_x={} mb_y={} slice_type={:?}",
         mb_x, mb_y, slice_type
     );
@@ -1854,7 +1854,7 @@ pub fn decode_mb_cabac(
             }
 
             #[cfg(feature = "cabac-trace")]
-            eprintln!("CABAC_B_MB_TYPE b_ctx={} state_idx={}", b_ctx, 27 + b_ctx);
+            trace!("CABAC_B_MB_TYPE b_ctx={} state_idx={}", b_ctx, 27 + b_ctx);
 
             if reader.get_cabac(&mut state[27 + b_ctx]) == 0 {
                 // B_Direct_16x16
@@ -1998,7 +1998,7 @@ pub fn decode_mb_cabac(
 
     // 3. Intra prediction modes
     #[cfg(feature = "cabac-trace")]
-    eprintln!("CABAC_SECTION intra_pred_modes");
+    trace!("CABAC_SECTION intra_pred_modes");
     if mb.is_intra4x4 {
         // Decode intra 4x4 prediction modes.
         // Cross-MB neighbors come from the NeighborContext, matching CAVLC behavior.
@@ -2043,7 +2043,7 @@ pub fn decode_mb_cabac(
 
     // 4. Chroma prediction mode (for intra MBs)
     #[cfg(feature = "cabac-trace")]
-    eprintln!("CABAC_SECTION chroma_pred_mode");
+    trace!("CABAC_SECTION chroma_pred_mode");
     if is_intra {
         mb.chroma_pred_mode = decode_cabac_mb_chroma_pre_mode(
             reader,
@@ -2448,7 +2448,7 @@ pub fn decode_mb_cabac(
 
     // 6. CBP (for non-I16x16)
     #[cfg(feature = "cabac-trace")]
-    eprintln!("CABAC_SECTION cbp");
+    trace!("CABAC_SECTION cbp");
     if !mb.is_intra16x16 {
         let left_cbp = cabac_nb.left_cbp(mb_idx, mb_x, slice_table, cur_slice, is_intra);
         let top_cbp = cabac_nb.top_cbp(mb_idx, mb_y, mb_width, slice_table, cur_slice, is_intra);
@@ -2459,7 +2459,7 @@ pub fn decode_mb_cabac(
 
     // 7. QP delta and residual coefficients
     #[cfg(feature = "cabac-trace")]
-    eprintln!("CABAC_SECTION qp_delta_and_residual cbp={}", cbp);
+    trace!("CABAC_SECTION qp_delta_and_residual cbp={}", cbp);
     let mut stored_cbp = cbp;
     let is_i16x16 = mb.is_intra16x16;
     if cbp > 0 || is_i16x16 {
@@ -2468,7 +2468,7 @@ pub fn decode_mb_cabac(
 
         // Decode luma residual
         #[cfg(feature = "cabac-trace")]
-        eprintln!("CABAC_SECTION luma_residual");
+        trace!("CABAC_SECTION luma_residual");
         decode_cabac_luma_residual(
             reader,
             state,
@@ -2487,7 +2487,7 @@ pub fn decode_mb_cabac(
 
         // Decode chroma residual (4:2:0)
         #[cfg(feature = "cabac-trace")]
-        eprintln!("CABAC_SECTION chroma_residual");
+        trace!("CABAC_SECTION chroma_residual");
         decode_cabac_chroma_residual(
             reader,
             state,

@@ -8,7 +8,7 @@
 
 use std::collections::VecDeque;
 
-#[cfg(feature = "tracing-detail")]
+#[cfg(any(feature = "tracing-detail", feature = "cabac-trace"))]
 use tracing::trace;
 use tracing::{debug, warn};
 use wedeo_codec::bitstream::{BitRead, BitReadBE, get_ue_golomb};
@@ -1390,7 +1390,7 @@ impl H264Decoder {
             // For inter slices: decode skip flag
             if is_inter_slice {
                 #[cfg(feature = "cabac-trace")]
-                eprintln!(
+                trace!(
                     "CABAC_SKIP_DECODE mb_x={} mb_y={} is_b={}",
                     mb_x,
                     mb_y,

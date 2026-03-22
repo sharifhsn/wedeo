@@ -98,7 +98,7 @@ def parse_trace_file(path: str) -> dict[str, list[CabacBin]]:
         for line in f:
             line = line.strip()
 
-            m = RE_BIN.match(line)
+            m = RE_BIN.search(line)
             if m:
                 bins["BIN"].append(
                     CabacBin(
@@ -114,7 +114,7 @@ def parse_trace_file(path: str) -> dict[str, list[CabacBin]]:
                 )
                 continue
 
-            m = RE_BYPASS.match(line)
+            m = RE_BYPASS.search(line)
             if m:
                 bins["BYPASS"].append(
                     CabacBin(
@@ -130,7 +130,7 @@ def parse_trace_file(path: str) -> dict[str, list[CabacBin]]:
                 )
                 continue
 
-            m = RE_BYPASS_SIGN.match(line)
+            m = RE_BYPASS_SIGN.search(line)
             if m:
                 bins["BYPASS_SIGN"].append(
                     CabacBin(
@@ -148,7 +148,7 @@ def parse_trace_file(path: str) -> dict[str, list[CabacBin]]:
                 )
                 continue
 
-            m = RE_TERM.match(line)
+            m = RE_TERM.search(line)
             if m:
                 bins["TERM"].append(
                     CabacBin(
@@ -386,8 +386,9 @@ def run_wedeo_trace(
     env["CABAC_MAX_BINS"] = str(max_bins)
     if no_deblock:
         env["WEDEO_NO_DEBLOCK"] = "1"
-    # Suppress tracing subscriber output to avoid mixing with CABAC trace
-    env.pop("RUST_LOG", None)
+    # Enable trace-level logging for CABAC traces (which use tracing::trace!).
+    # Only enable the cabac module to avoid noise from other modules.
+    env["RUST_LOG"] = "wedeo_codec_h264::cabac=trace"
 
     cmd = [str(wedeo_bin), input_file]
 

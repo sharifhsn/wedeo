@@ -25,7 +25,7 @@ use wedeo_core::media_type::MediaType;
 use wedeo_core::packet::PacketFlags;
 use wedeo_format::context::InputContext;
 
-#[cfg(feature = "tracing")]
+#[cfg(any(feature = "tracing", feature = "cabac-trace"))]
 fn init_tracing() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -52,7 +52,7 @@ fn needs_decode(media_type: MediaType) -> bool {
 }
 
 fn main() {
-    #[cfg(feature = "tracing")]
+    #[cfg(any(feature = "tracing", feature = "cabac-trace"))]
     init_tracing();
 
     let args: Vec<String> = env::args().collect();
