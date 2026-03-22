@@ -28,8 +28,11 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ffmpeg_debug import (
+    find_ffmpeg_binary,
     find_wedeo_binary,
+    parse_lldb_int,
     strip_ansi,
 )
 
@@ -189,6 +192,86 @@ def format_reflist(infos: list[SliceRefInfo], target_frame: int | None) -> None:
 
 
 # ---------------------------------------------------------------------------
+# FFmpeg extraction via lldb
+# ---------------------------------------------------------------------------
+
+def extract_ffmpeg_reflist(
+    input_path: str,
+    frame_idx: int,
+    max_refs: int = 16,
+) -> SliceRefInfo | None:
+    """Extract ref list from FFmpeg at a specific frame via lldb.
+
+    Uses a breakpoint on ff_h264_build_ref_list, skips `frame_idx` hits,
+    then reads sl->ref_list[0][i].parent->poc for each entry.
+
+    Returns None if the debug FFmpeg binary is not found or lldb fails.
+    """
+    from ffmpeg_debug import run_lldb
+
+    try:
+        ffmpeg_bin = find_ffmpeg_binary()
+    except SystemExit:
+        return None
+
+    # First get ref_count and short_ref_count
+    exprs = [
+        "-f d -- (int)sl->ref_count[0]",
+        "-f d -- (int)h->short_ref_count",
+    ]
+    # Then get L0 POCs for up to max_refs entries.
+    # The ternary checks parent != NULL to avoid crashes on empty slots.
+    for i in range(max_refs):
+        exprs.append(
+            f"-f d -- (int)(sl->ref_list[0][{i}].parent ? "
+            f"sl->ref_list[0][{i}].parent->poc : -99999)"
+        )
+
+    result = run_lldb(
+        ffmpeg_bin=str(ffmpeg_bin),
+        input_path=input_path,
+        expressions=exprs,
+        breakpoint_func="ff_h264_build_ref_list",
+        ignore_count=frame_idx,
+        timeout=60,
+    )
+
+    if result.returncode != 0 or len(result.values) < 2:
+        print(f"lldb extraction failed (rc={result.returncode}, "
+              f"values={len(result.values)})", file=sys.stderr)
+        return None
+
+    # Parse values using the shared parser from ffmpeg_debug
+    try:
+        ref_count = parse_lldb_int(result.values[0])
+    except (ValueError, IndexError):
+        return None
+
+    pocs = []
+    for i in range(min(ref_count, max_refs)):
+        idx = 2 + i
+        if idx >= len(result.values):
+            break
+        try:
+            val = parse_lldb_int(result.values[idx])
+        except ValueError:
+            break
+        if val != -99999:
+            pocs.append(val)
+        else:
+            break
+
+    return SliceRefInfo(
+        decode_idx=frame_idx,
+        frame_num=-1,
+        poc=-1,
+        slice_type="?",
+        l0=[RefListEntry(poc=p) for p in pocs],
+        l1=[],  # Note: only L0 extracted via lldb; L1 not yet supported
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -201,6 +284,8 @@ def main():
                         help="Show ref lists at specific frame")
     parser.add_argument("--max-frames", type=int, default=50,
                         help="Max frames to analyze (0=all)")
+    parser.add_argument("--ffmpeg", action="store_true",
+                        help="Also extract FFmpeg ref lists via lldb")
     args = parser.parse_args()
 
     input_path = args.input
@@ -208,12 +293,38 @@ def main():
         print(f"Error: {input_path} not found", file=sys.stderr)
         sys.exit(1)
 
+    if args.ffmpeg and args.frame is None:
+        print("Warning: --ffmpeg requires --frame N to specify which frame to extract",
+              file=sys.stderr)
+
     print(f"Extracting wedeo ref lists for {Path(input_path).name}...",
           file=sys.stderr)
     wedeo_info = extract_wedeo_reflists(input_path, args.max_frames)
 
-    print(f"\nWedeo ref lists ({len(wedeo_info)} B-slices):")
+    print(f"\nWedeo ref lists ({len(wedeo_info)} slices):")
     format_reflist(wedeo_info, args.frame)
+
+    if args.ffmpeg and args.frame is not None:
+        print(f"\nExtracting FFmpeg ref list for frame {args.frame}...",
+              file=sys.stderr)
+        ffmpeg_info = extract_ffmpeg_reflist(input_path, args.frame)
+        if ffmpeg_info:
+            print(f"\nFFmpeg ref list (frame {args.frame}):")
+            format_reflist([ffmpeg_info], args.frame)
+
+            # Compare
+            wedeo_frame = next(
+                (s for s in wedeo_info if s.decode_idx == args.frame), None
+            )
+            if wedeo_frame:
+                w_pocs = [r.poc for r in wedeo_frame.l0]
+                f_pocs = [r.poc for r in ffmpeg_info.l0]
+                if w_pocs == f_pocs:
+                    print("\n  L0 ref lists MATCH")
+                else:
+                    print(f"\n  L0 ref lists DIFFER:")
+                    print(f"    wedeo:  {w_pocs}")
+                    print(f"    ffmpeg: {f_pocs}")
 
 
 if __name__ == "__main__":

@@ -43,7 +43,7 @@ CONFORMANCE_FILES = [
 
 
 def compare_one(input_path, wedeo_bin, no_deblock=False, pixel_detail=False):
-    """Compare framecrc for a single file. Returns (total, matching, diffs_info)."""
+    """Compare framecrc for a single file. Returns (total, matching, diff_frame_indices, plane_info)."""
     env = {"WEDEO_NO_DEBLOCK": "1"} if no_deblock else {}
 
     wedeo_crcs = run_framecrc([str(wedeo_bin), str(input_path)], env=env)
