@@ -1429,7 +1429,7 @@ impl H264Decoder {
                         &[0; 24],
                         &[[0; 2]; 16],
                         &[[0; 2]; 16],
-                        &[0, 0, 0, 0],   // ref_idx_l0: skip uses ref 0
+                        &[0, 0, 0, 0],     // ref_idx_l0: skip uses ref 0
                         &[-1, -1, -1, -1], // ref_idx_l1
                     );
 

@@ -175,8 +175,14 @@ def compare_bins(
     we_bins: list[CabacBin],
     kind: str,
     context_lines: int = 3,
+    bit_only: bool = False,
 ) -> Optional[int]:
-    """Compare two lists of bins. Returns the index of first divergence, or None."""
+    """Compare two lists of bins. Returns the index of first divergence, or None.
+
+    If bit_only=True, only compare decoded bit/result values, ignoring
+    low/range/state field differences. This filters out the normal
+    low-value divergence from FFmpeg's alignment-dependent CABAC init.
+    """
     min_len = min(len(ff_bins), len(we_bins))
     diverged_at = None
 
@@ -185,23 +191,40 @@ def compare_bins(
         we = we_bins[i]
         mismatch = False
 
-        # Compare fields that should match
-        if ff.pre_low != we.pre_low:
-            mismatch = True
-        if ff.pre_range != we.pre_range:
-            mismatch = True
-        if ff.bit != we.bit:
-            mismatch = True
-        if ff.post_low != we.post_low:
-            mismatch = True
-        if kind == "BIN":
-            if ff.pre_state != we.pre_state:
+        if bit_only:
+            # Only compare the decoded bit (and state/range for BIN,
+            # since those indicate context bugs, not engine drift).
+            # For TERM, normalize result to 0/1 since FFmpeg returns a
+            # byte offset while wedeo returns 0/1.
+            if kind == "TERM":
+                ff_term = 0 if ff.bit == 0 else 1
+                we_term = 0 if we.bit == 0 else 1
+                if ff_term != we_term:
+                    mismatch = True
+            elif ff.bit != we.bit:
                 mismatch = True
-            if ff.post_range != we.post_range:
+            if kind == "BIN" and ff.pre_state != we.pre_state:
                 mismatch = True
-        if kind == "TERM":
-            if ff.post_range != we.post_range:
+            if kind == "BIN" and ff.pre_range != we.pre_range:
                 mismatch = True
+        else:
+            # Compare all fields that should match
+            if ff.pre_low != we.pre_low:
+                mismatch = True
+            if ff.pre_range != we.pre_range:
+                mismatch = True
+            if ff.bit != we.bit:
+                mismatch = True
+            if ff.post_low != we.post_low:
+                mismatch = True
+            if kind == "BIN":
+                if ff.pre_state != we.pre_state:
+                    mismatch = True
+                if ff.post_range != we.post_range:
+                    mismatch = True
+            if kind == "TERM":
+                if ff.post_range != we.post_range:
+                    mismatch = True
 
         if mismatch:
             diverged_at = i
@@ -460,6 +483,12 @@ examples:
         action="store_true",
         help="Don't rebuild wedeo (use existing binary)",
     )
+    parser.add_argument(
+        "--bit-only",
+        action="store_true",
+        help="Only report actual bit/result differences (ignore low/range field diffs). "
+        "This filters out the normal low-value divergence from FFmpeg's alignment-dependent init.",
+    )
 
     args = parser.parse_args()
 
@@ -469,10 +498,14 @@ examples:
     if args.parse_only and (not args.ffmpeg_log or not args.wedeo_log):
         parser.error("--parse-only requires both --ffmpeg-log and --wedeo-log")
 
-    # Determine log file paths
-    tmpdir = tempfile.mkdtemp(prefix="cabac_trace_")
-    ff_log = args.ffmpeg_log or os.path.join(tmpdir, "ffmpeg_cabac.log")
-    we_log = args.wedeo_log or os.path.join(tmpdir, "wedeo_cabac.log")
+    # Determine log file paths (only create tmpdir if needed)
+    if args.ffmpeg_log and args.wedeo_log:
+        ff_log = args.ffmpeg_log
+        we_log = args.wedeo_log
+    else:
+        tmpdir = tempfile.mkdtemp(prefix="cabac_trace_")
+        ff_log = args.ffmpeg_log or os.path.join(tmpdir, "ffmpeg_cabac.log")
+        we_log = args.wedeo_log or os.path.join(tmpdir, "wedeo_cabac.log")
 
     # Run decoders (unless parse-only)
     if not args.parse_only:
@@ -492,7 +525,12 @@ examples:
     for kind in ["BIN", "BYPASS", "BYPASS_SIGN", "TERM"]:
         ff_count = len(ff_bins[kind])
         we_count = len(we_bins[kind])
-        status = "OK" if ff_count == we_count else f"MISMATCH ({ff_count} vs {we_count})"
+        if kind == "BYPASS_SIGN" and ff_count == 0 and we_count > 0:
+            status = "expected (FFmpeg bypass_sign is inline, not traced)"
+        elif ff_count == we_count:
+            status = "OK"
+        else:
+            status = f"MISMATCH ({ff_count} vs {we_count})"
         print(f"  {kind:15s}  FFmpeg={ff_count:6d}  wedeo={we_count:6d}  {status}")
 
     if all(len(ff_bins[k]) == 0 and len(we_bins[k]) == 0 for k in ff_bins):
@@ -509,7 +547,11 @@ examples:
     for kind in ["BIN", "BYPASS", "BYPASS_SIGN", "TERM"]:
         if len(ff_bins[kind]) == 0 and len(we_bins[kind]) == 0:
             continue
-        idx = compare_bins(ff_bins[kind], we_bins[kind], kind, args.context)
+        # Skip BYPASS_SIGN comparison when FFmpeg has no traces (inline
+        # function not patched in the trace build — count mismatch is expected).
+        if kind == "BYPASS_SIGN" and len(ff_bins[kind]) == 0:
+            continue
+        idx = compare_bins(ff_bins[kind], we_bins[kind], kind, args.context, args.bit_only)
         if idx is not None:
             any_divergence = True
             first_divergences[kind] = idx
