@@ -7,6 +7,9 @@
 # Planning artifacts
 start.json
 
+# Reference specs (not redistributable)
+/h264_spec
+
 # IDE
 .idea/
 .vscode/
