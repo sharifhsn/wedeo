@@ -1429,6 +1429,8 @@ impl H264Decoder {
                         &[0; 24],
                         &[[0; 2]; 16],
                         &[[0; 2]; 16],
+                        &[0, 0, 0, 0],   // ref_idx_l0: skip uses ref 0
+                        &[-1, -1, -1, -1], // ref_idx_l1
                     );
 
                     mb_addr += 1;
@@ -1493,6 +1495,8 @@ impl H264Decoder {
                 &mb.non_zero_count,
                 &mvd_abs_l0,
                 &mvd_abs_l1,
+                &mb.ref_idx_l0,
+                &mb.ref_idx_l1,
             );
 
             mb_addr += 1;

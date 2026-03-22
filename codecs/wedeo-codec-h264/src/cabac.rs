@@ -47,8 +47,9 @@ impl<'a> CabacReader<'a> {
     /// `1 << 9` to keep subsequent refills on 2-byte boundaries.
     ///
     /// This matches FFmpeg's aligned init path (`ff_init_cabac_decoder`,
-    /// CABAC_BITS=16). FFmpeg's `av_malloc` returns 32-byte aligned buffers,
-    /// so `buf + 2` is always even-aligned and FFmpeg always takes this path.
+    /// CABAC_BITS=16). Both init paths (aligned and unaligned) produce
+    /// identical decoded bits — the internal `low` value differs but never
+    /// affects decode decisions.
     pub fn new(data: &'a [u8]) -> Result<Self> {
         if data.len() < 2 {
             return Err(Error::InvalidData);
@@ -450,6 +451,12 @@ pub struct CabacNeighborCtx {
     pub mvd_cache_l0: Vec<[u8; 2]>,
     /// Same for L1.
     pub mvd_cache_l1: Vec<[u8; 2]>,
+    /// Per-8x8-partition reference indices for CABAC ref context derivation.
+    /// Layout: ref_cache_l0[mb_idx * 4 + part8x8] = ref_idx (-1 if intra/unavailable).
+    /// Length = (mb_width * mb_height) * 4.
+    pub ref_cache_l0: Vec<i8>,
+    /// Same for L1.
+    pub ref_cache_l1: Vec<i8>,
 }
 
 impl CabacNeighborCtx {
@@ -467,6 +474,8 @@ impl CabacNeighborCtx {
             mb_direct: vec![false; total_mbs],
             mvd_cache_l0: vec![[0; 2]; total_mbs * 16],
             mvd_cache_l1: vec![[0; 2]; total_mbs * 16],
+            ref_cache_l0: vec![-1; total_mbs * 4],
+            ref_cache_l1: vec![-1; total_mbs * 4],
         }
     }
 
@@ -537,6 +546,8 @@ impl CabacNeighborCtx {
         nz: &[u8; 24],
         mvd_l0: &[[u8; 2]; 16],
         mvd_l1: &[[u8; 2]; 16],
+        ref_idx_l0: &[i8; 4],
+        ref_idx_l1: &[i8; 4],
     ) {
         self.mb_skip[mb_idx] = is_skip;
         self.mb_type_intra16x16_or_pcm[mb_idx] = is_intra16x16_or_pcm;
@@ -549,6 +560,9 @@ impl CabacNeighborCtx {
         let mvd_base = mb_idx * 16;
         self.mvd_cache_l0[mvd_base..mvd_base + 16].copy_from_slice(mvd_l0);
         self.mvd_cache_l1[mvd_base..mvd_base + 16].copy_from_slice(mvd_l1);
+        let ref_base = mb_idx * 4;
+        self.ref_cache_l0[ref_base..ref_base + 4].copy_from_slice(ref_idx_l0);
+        self.ref_cache_l1[ref_base..ref_base + 4].copy_from_slice(ref_idx_l1);
     }
 }
 
@@ -979,22 +993,77 @@ fn decode_cabac_mb_ref(
 
 /// Get left and top ref_idx neighbors for ref context derivation.
 /// Returns (ref_left, ref_top). -1 if unavailable.
+///
+/// `blk_idx` is the 8x8 partition index (0-3) mapped from scan8:
+///   0 = top-left 8x8, 1 = top-right 8x8,
+///   2 = bottom-left 8x8, 3 = bottom-right 8x8.
+///
+/// For the left neighbor of blk_idx 0 or 2 (left column), look at the
+/// right column (part 1 or 3) of the left MB. For blk_idx 1 or 3
+/// (right column), look at part 0 or 2 of the current MB (intra-MB).
+///
+/// For the top neighbor of blk_idx 0 or 1 (top row), look at the
+/// bottom row (part 2 or 3) of the top MB. For blk_idx 2 or 3
+/// (bottom row), look at part 0 or 1 of the current MB (intra-MB).
+///
+/// Reference: FFmpeg h264_cabac.c:1479-1480 via scan8-based ref_cache.
 #[allow(clippy::too_many_arguments)]
 fn get_ref_neighbors(
-    _cabac_nb: &CabacNeighborCtx,
-    _slice_table: &[u16],
-    _cur_slice: u16,
-    _mb_idx: usize,
-    _mb_x: u32,
-    _mb_y: u32,
-    _mb_width: u32,
-    _list: usize,
-    _blk_idx: usize,
+    cabac_nb: &CabacNeighborCtx,
+    slice_table: &[u16],
+    cur_slice: u16,
+    mb_idx: usize,
+    mb_x: u32,
+    mb_y: u32,
+    mb_width: u32,
+    list: usize,
+    blk_idx: usize,
 ) -> (i32, i32) {
-    // For CABAC ref context, FFmpeg uses scan8-based cache.
-    // We simplify: ctx=0 always (conservative). This will be refined
-    // when conformance testing reveals the need.
-    (0, 0)
+    let ref_cache = if list == 0 {
+        &cabac_nb.ref_cache_l0
+    } else {
+        &cabac_nb.ref_cache_l1
+    };
+
+    let blk_x = blk_idx & 1; // 0 = left column, 1 = right column
+    let blk_y = blk_idx >> 1; // 0 = top row, 1 = bottom row
+
+    // Left neighbor ref_idx
+    let ref_a = if blk_x == 0 {
+        // Left column → look at right column of left MB
+        if mb_x > 0 && slice_table[mb_idx - 1] == cur_slice {
+            let left_idx = mb_idx - 1;
+            // Right column partner: part 1 (if blk_y=0) or part 3 (if blk_y=1)
+            let left_part = 1 + blk_y * 2;
+            ref_cache[left_idx * 4 + left_part] as i32
+        } else {
+            -1
+        }
+    } else {
+        // Right column → look at left column of current MB (same row)
+        // part 0 (if blk_y=0) or part 2 (if blk_y=1)
+        let cur_part = blk_y * 2;
+        ref_cache[mb_idx * 4 + cur_part] as i32
+    };
+
+    // Top neighbor ref_idx
+    let ref_b = if blk_y == 0 {
+        // Top row → look at bottom row of top MB
+        if mb_y > 0 && slice_table[mb_idx - mb_width as usize] == cur_slice {
+            let top_idx = mb_idx - mb_width as usize;
+            // Bottom row partner: part 2 (if blk_x=0) or part 3 (if blk_x=1)
+            let top_part = 2 + blk_x;
+            ref_cache[top_idx * 4 + top_part] as i32
+        } else {
+            -1
+        }
+    } else {
+        // Bottom row → look at top row of current MB (same column)
+        // part 0 (if blk_x=0) or part 1 (if blk_x=1)
+        ref_cache[mb_idx * 4 + blk_x] as i32
+    };
+
+    (ref_a, ref_b)
 }
 
 /// Check if a neighbor MB is direct mode (for B-slice ref context).
