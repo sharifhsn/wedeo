@@ -104,9 +104,11 @@ pub struct MbDeblockInfo {
     /// Luma: indices 0..16 in raster scan of 4x4 sub-blocks.
     /// Chroma Cb: indices 16..20, Cr: indices 20..24.
     pub non_zero_count: [u8; 24],
-    /// Reference picture POC per 4x4 block (list 0).
-    /// Stores POC (not list-relative index) so deblocking compares picture
-    /// identity regardless of which list a block uses.  i32::MIN = unavailable.
+    /// Reference picture identity per 4x4 block (list 0).
+    /// B-slices: stores POC so cross-list (L0/L1) identity comparison works.
+    /// P-slices: stores DPB index (cast to i32) — handles ref list duplicates
+    /// from ref_pic_list_modification and POC collisions from MMCO-5.
+    /// i32::MIN = unavailable.
     pub ref_poc: [i32; 16],
     /// Motion vectors per 4x4 block (list 0) [x, y].
     pub mv: [[i16; 2]; 16],

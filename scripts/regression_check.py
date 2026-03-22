@@ -21,16 +21,14 @@ Requires:
 """
 
 import argparse
-import json
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from conformance_full import SNAPSHOT_PATH, load_snapshot
 from ffmpeg_debug import find_wedeo_binary
 from framecrc_compare import compare_one
-
-SNAPSHOT_PATH = Path(__file__).resolve().parent / ".conformance_snapshot.json"
 
 
 def main():
@@ -48,8 +46,7 @@ def main():
               file=sys.stderr)
         sys.exit(2)
 
-    data = json.loads(SNAPSHOT_PATH.read_text())
-    known_passing = data.get("passing", [])
+    known_passing = sorted(load_snapshot())
     if not known_passing:
         print("Snapshot has no passing files.", file=sys.stderr)
         sys.exit(2)
@@ -58,16 +55,23 @@ def main():
     t0 = time.monotonic()
     regressions = []
     tested = 0
+    skipped = 0
 
     for fname in known_passing:
         fpath = Path(args.fate_dir) / fname
         if not fpath.exists():
+            skipped += 1
             if args.verbose:
                 print(f"  SKIP  {fname} (not found)")
             continue
 
         tested += 1
-        total, matching, diff_frames, _ = compare_one(fpath, wedeo_bin)
+        try:
+            total, matching, diff_frames, _ = compare_one(fpath, wedeo_bin)
+        except Exception as e:
+            regressions.append((fname, -1, -1))
+            print(f"  ERROR     {fname}: {e}")
+            continue
 
         if diff_frames:
             regressions.append((fname, matching, total))
@@ -83,7 +87,10 @@ def main():
             print(f"  {fname}: {matching}/{total}")
         sys.exit(1)
     else:
-        print(f"All {tested} known-passing files still pass ({elapsed:.1f}s)")
+        msg = f"All {tested} known-passing files still pass ({elapsed:.1f}s)"
+        if skipped:
+            msg += f" ({skipped} not found, skipped)"
+        print(msg)
         sys.exit(0)
 
 

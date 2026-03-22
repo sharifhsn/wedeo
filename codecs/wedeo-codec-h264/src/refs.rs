@@ -113,20 +113,8 @@ pub fn build_ref_list_p(
     // Truncate to num_ref_idx_l0_active.
     list.truncate(max_refs);
 
-    // Replace any remaining NULL entries (usize::MAX) with the default ref
-    // (first entry), matching FFmpeg h264_refs.c:391-404.
-    if available_len > 0 {
-        let default_ref = list
-            .iter()
-            .find(|&&x| x != usize::MAX)
-            .copied()
-            .unwrap_or(0);
-        for entry in list.iter_mut() {
-            if *entry == usize::MAX {
-                *entry = default_ref;
-            }
-        }
-    }
+    // Replace remaining NULL sentinels with the default ref.
+    replace_null_entries(&mut list, available_len);
 
     list
 }
@@ -233,33 +221,30 @@ pub fn build_ref_list_b(
     list0.truncate(max_l0);
     list1.truncate(max_l1);
 
-    // Replace NULL entries with default ref.
-    if l0_avail > 0 {
-        let default_ref = list0
-            .iter()
-            .find(|&&x| x != usize::MAX)
-            .copied()
-            .unwrap_or(0);
-        for entry in list0.iter_mut() {
-            if *entry == usize::MAX {
-                *entry = default_ref;
-            }
-        }
-    }
-    if l1_avail > 0 {
-        let default_ref = list1
-            .iter()
-            .find(|&&x| x != usize::MAX)
-            .copied()
-            .unwrap_or(0);
-        for entry in list1.iter_mut() {
-            if *entry == usize::MAX {
-                *entry = default_ref;
-            }
-        }
-    }
+    // Replace remaining NULL sentinels with the default ref.
+    replace_null_entries(&mut list0, l0_avail);
+    replace_null_entries(&mut list1, l1_avail);
 
     (list0, list1)
+}
+
+/// Replace `usize::MAX` sentinel entries with the first valid ref.
+///
+/// After padding a ref list to `num_ref_idx_lX_active` with `usize::MAX`
+/// and running ref_pic_list_modification, any remaining sentinels are
+/// replaced with the default ref (first non-sentinel entry).
+/// Matching FFmpeg h264_refs.c:391-404.
+fn replace_null_entries(list: &mut [usize], available_len: usize) {
+    if available_len == 0 {
+        return;
+    }
+    if let Some(&default_ref) = list.iter().find(|&&x| x != usize::MAX) {
+        for entry in list.iter_mut() {
+            if *entry == usize::MAX {
+                *entry = default_ref;
+            }
+        }
+    }
 }
 
 /// Apply ref_pic_list_modification() reordering commands to a reference list.

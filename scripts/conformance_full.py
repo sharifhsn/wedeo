@@ -105,9 +105,14 @@ def run_full(
             skipped += 1
             continue
 
-        total, matching, diff_frames, _ = compare_one(
-            fpath, wedeo_bin, no_deblock=no_deblock,
-        )
+        try:
+            total, matching, diff_frames, _ = compare_one(
+                fpath, wedeo_bin, no_deblock=no_deblock,
+            )
+        except Exception as e:
+            diffs.append((fname, -1, -1))
+            print(f"  ERROR     {fname}: {e}", file=sys.stderr)
+            continue
 
         if not diff_frames:
             passing.append(fname)

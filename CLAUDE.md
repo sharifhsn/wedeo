@@ -74,14 +74,23 @@ wedeo/
 - The framecrc tool auto-detects: audio uses packet passthrough (checksums raw packets), video uses decode mode (checksums decoded YUV frames)
 
 ### Debugging H.264 Differences
+
+**Conformance workflow (do this in order):**
+1. `python3 scripts/conformance_full.py` — full 51-file conformance report (~5s). Use `--save-snapshot` to baseline.
+2. `python3 scripts/regression_check.py` — quick check against snapshot (~4s). Run after every code change.
+3. `python3 scripts/framecrc_compare.py --no-deblock --pixel-detail <file>` — triage MC vs deblock issues. **Always do this FIRST** for any DIFF file.
+4. `python3 scripts/classify_diffs.py` — categorize all DIFF files as reorder vs pixel-diff.
+5. `python3 scripts/mb_compare.py <file> --start-frame N --max-frames 1` — find differing MBs at a specific frame.
+6. `python3 scripts/reflist_compare.py <file> --ffmpeg --frame N` — side-by-side ref list comparison via lldb.
+7. `python3 scripts/conformance_full.py --triage` — show deblock vs no-deblock status for every DIFF file.
+
+**Key rules:**
 - **Read the FFmpeg C code FIRST** — before investigating any wedeo code path, open the corresponding FFmpeg function in `./FFmpeg/` and compare line by line. Key files: `h264_cavlc.c`, `h264idct_template.c`, `h264_mb.c`, `h264_mb_template.c`, `h264_ps.c`.
 - **HARD RULE:** After 2 failed hypotheses about pixel diffs, **STOP theorizing**. Extract actual intermediate values from FFmpeg (via lldb or C program) and wedeo (via `--features tracing`). Find **WHERE** the values first diverge before explaining **WHY**. **Time-based backstop:** if 5 minutes pass on the same pixel diff without extracting ground-truth values from BOTH decoders, STOP immediately and use `scripts/ffmpeg_lldb_chroma_dc.py` or lldb directly. The "almost there" feeling is unreliable — each algebraic proof feels cheap but the chain of proofs burns enormous context without progress.
+- **Match FFmpeg's output empirically** — don't trace FFmpeg's internal output reorder mechanism. Implement the fix, verify with conformance_full.py.
 - **Never infer intermediate values from outputs** — don't compute total_zeros from block positions or levels from dequant values. Measure directly via lldb: `breakpoint set -f file.c -l N` → `frame variable` / `expression`.
 - **FFmpeg's block layout is transposed** — `h264_slice.c:757` applies `TRANSPOSE()` to the zigzag scan, storing coefficients in column-major order. When reading block memory via lldb, `block[i]` = position `(i%4, i/4)` NOT `(i/4, i%4)`. The IDCT pass order must account for this.
 - **FFmpeg's `gb->index` includes NAL header** — 8-bit offset vs wedeo's `br.consumed()` which starts after the NAL header.
-- Use `scripts/mb_compare.py` to find differing MBs (checks luma AND chroma U/V), then `--features tracing` trace output for intermediates.
-- Use `scripts/framecrc_compare.py --all --no-deblock --pixel-detail` to get a full per-file, per-plane conformance report. This is the authoritative BITEXACT check (not mb_compare alone, which was luma-only until recently).
-- Use `scripts/ffmpeg_lldb_chroma_dc.py` to generate lldb scripts for extracting FFmpeg's chroma DC intermediate values at a specific MB/frame/plane.
 - Use `scripts/verify_tables.py` to validate ALL lookup tables (tc0, alpha, beta, chroma_qp) against FFmpeg's C source. Run after any table change. This catches transcription errors that caused two bugs (CHROMA_QP_TABLE, TC0_TABLE).
 - Use `scripts/deblock_diff.py <file> --frame N` to analyze deblocking filter differences. Extracts pre/post-deblock pixels from both decoders, identifies differing edges, and computes applied deltas.
 - **Never manually count entries in C arrays** — always parse programmatically. Manual counting caused two bugs: CHROMA_QP_TABLE (extra `33` at index 36) and TC0_TABLE (missing `[1,1,1]` at QP 26). Use `scripts/verify_tables.py` or write a Python regex parser.

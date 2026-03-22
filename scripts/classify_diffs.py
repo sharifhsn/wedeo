@@ -33,11 +33,12 @@ from pathlib import Path
 from typing import NamedTuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from ffmpeg_debug import find_wedeo_binary, run_framecrc
-
-
-CONFORMANCE_DIR = Path("fate-suite/h264-conformance")
-EXTENSIONS = (".264", ".jsv", ".26l")
+from ffmpeg_debug import (
+    CONFORMANCE_DIR,
+    CONFORMANCE_EXTENSIONS,
+    find_wedeo_binary,
+    run_framecrc,
+)
 
 
 class ClassifyResult(NamedTuple):
@@ -126,7 +127,7 @@ def main():
             sys.exit(1)
         files = sorted(
             p for p in CONFORMANCE_DIR.iterdir()
-            if p.suffix in EXTENSIONS
+            if p.suffix in CONFORMANCE_EXTENSIONS
         )
 
     print(f"{'File':<35} {'Match':>7} {'Reorder':>8} {'PixDiff':>8} {'Total':>6}  Notes")
