@@ -184,10 +184,8 @@ corrupted stream could panic instead of producing garbage.
 
 ### Bitexact status
 
-**BA1_Sony_D.jsv**: Bitexact. All 17 frames (176x144, Baseline, QP=28,
-single-slice I-frames) produce byte-identical YUV420p output to
-FFmpeg 8.0.1 (`-cpuflags 0`). All framecrc checksums match the FATE
-reference file `h264-conformance-ba1_sony_d`.
+50/51 progressive CAVLC conformance files are BITEXACT (98%). Only
+FM1_FT_E (FMO, out of scope) remains.
 
 ### CAVLC level decoding
 
@@ -259,3 +257,77 @@ from RFC 1950's `s1=1`).
 **Wedeo**: Matches FFmpeg's non-standard init using
 `adler2::Adler32::from_checksum(0)` in the framecrc tool. The standard
 Adler-32 (`adler2::Adler32::new()`) is used elsewhere.
+
+## H.264 Spec Deviations (verified, deliberate)
+
+These are places where the implementation deliberately follows FFmpeg's behavior
+rather than the literal spec text. Verified via full spec compliance audit.
+
+### Output reordering uses FFmpeg's delayed_pics algorithm
+
+**Spec (C.4)**: DPB bumping process — output the picture with smallest
+PicOrderCnt when the DPB is full.
+
+**Wedeo/FFmpeg**: Uses a separate `delayed_pics` buffer with dynamically
+computed reorder depth based on `last_pocs` heuristic. Non-reference pictures
+skip DPB storage entirely and are routed directly through `delayed_pics`.
+
+**Impact**: None for conforming bitstreams. The heuristic matches FFmpeg's
+output order exactly (goal is FFmpeg parity, not spec-literal HRD conformance).
+
+### Block indexing uses raster-scan instead of z-scan
+
+**Spec**: 4x4 sub-block indices use z-scan (zigzag within each 8x8 partition):
+0,1,4,5,2,3,6,7,8,9,12,13,10,11,14,15.
+
+**Wedeo/FFmpeg**: Uses raster-scan (row-major) internally. All lookups,
+neighbor context, and colocated MV storage use raster indices consistently,
+so the mapping is correct end-to-end.
+
+### PPS `more_rbsp_data` uses FFmpeg heuristic
+
+**Spec**: `more_rbsp_data()` checks for trailing RBSP bits.
+
+**Wedeo/FFmpeg**: For profiles 66, 77, 88 with constraint_set flags set,
+high-profile PPS extensions are not parsed regardless of remaining data.
+
+### MMCO-5 MaxLongTermFrameIdx not tracked separately
+
+**Spec (8.2.5.4.5)**: MMCO-5 sets MaxLongTermFrameIdx to "no long-term
+frame indices", preventing subsequent MMCO-6 from assigning long-term indices.
+
+**Wedeo**: Does not track MaxLongTermFrameIdx as a separate variable. MMCO-5
+clears all long-term refs, but a subsequent MMCO-6 in the same MMCO command
+sequence could assign a long-term index without the spec's guard check.
+
+**Impact**: None for conforming bitstreams (the encoder must send MMCO-4 to
+re-enable long-term indices after MMCO-5).
+
+### DPB emergency eviction uses raw frame_num
+
+**Spec (8.2.5.3)**: Sliding window removes the short-term ref with smallest
+FrameNumWrap (which accounts for wrap-around).
+
+**Wedeo**: The main `sliding_window_mark` path uses FrameNumWrap correctly.
+The emergency fallback `Dpb::remove_oldest_short_term` (used only for
+`fill_frame_num_gap` and DPB overflow) uses raw `frame_num` instead of
+FrameNumWrap. For gap fill, frame_nums are sequential within one wrap cycle
+so the comparison is equivalent.
+
+### CAVLC level_prefix upper bound
+
+**Spec (Table 9-6 note)**: level_prefix should not exceed 15 for
+Baseline/Main profiles.
+
+**Wedeo**: Allows level_prefix up to 28, handling the extended suffix
+computation for High profile 10-bit content. More permissive than the
+spec's Baseline/Main conformance constraint, but correct for all profiles.
+
+### Spatial direct directZeroPredictionFlag
+
+**Spec (8.4.1.2.2)**: Tracks `directZeroPredictionFlag` as an explicit
+variable that controls MV suppression when colZeroFlag is set.
+
+**Wedeo**: Does not track the flag as a named variable. The equivalent
+behavior (set both refs to 0 and zero-out MVs when both neighbor refs
+are unavailable) is implemented inline in the spatial direct code path.

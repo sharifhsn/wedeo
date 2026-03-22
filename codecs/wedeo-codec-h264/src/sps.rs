@@ -61,6 +61,9 @@ fn is_high_profile(profile_idc: u8) -> bool {
         | 118 // Stereo High (MVC)
         | 128 // Multiview High (MVC)
         | 138 // Multiview Depth High (MVCD)
+        | 139 // 3D-AVC High (Amendment 8)
+        | 134 // MFC Depth High (Amendment 9)
+        | 135 // Enhanced Multiview Depth High (Amendment 10)
         | 144 // old High444
     )
 }

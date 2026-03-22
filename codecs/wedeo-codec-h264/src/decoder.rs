@@ -1109,15 +1109,25 @@ impl H264Decoder {
             self.prev_frame_num_h264 = self.current_frame_num_h264;
 
             // MMCO-5 (Reset) resets frame_num to 0 and frame_num_offset.
-            // Must happen AFTER the normal prev_frame_num update above,
-            // so the reset overrides the normal assignment.
-            // Reference: FFmpeg h264_field_end.c.
+            // Must happen AFTER the normal prev_frame_num/POC update above,
+            // so the reset overrides the normal assignments.
+            //
+            // Spec 8.2.1.1: after MMCO-5, prevPicOrderCntMsb = 0 and
+            // prevPicOrderCntLsb = TopFieldOrderCnt (which is 0 for frames
+            // after MMCO-5 resets PicOrderCnt).
+            // Spec 8.2.1.2/8.2.1.3: after MMCO-5, prevFrameNumOffset = 0.
+            // Reference: FFmpeg h264_slice.c — MMCO-5 resets poc_msb/poc_lsb
+            // inside ff_h264_execute_ref_pic_marking BEFORE the prev_poc
+            // assignments, so prev_poc_msb and prev_poc_lsb end up as 0.
             if mmco_did_reset {
                 debug!(
                     h264_fn = self.current_frame_num_h264,
-                    "MMCO-5 reset: prev_frame_num → 0"
+                    "MMCO-5 reset: prev_frame_num/poc/offset → 0"
                 );
                 self.prev_frame_num_h264 = 0;
+                self.prev_poc_msb = 0;
+                self.prev_poc_lsb = 0;
+                self.prev_frame_num_offset = 0;
             }
 
             self.frame_num += 1;
