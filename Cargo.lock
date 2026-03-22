@@ -1771,6 +1771,7 @@ dependencies = [
  "wedeo-core",
  "wedeo-format",
  "wedeo-format-h264",
+ "wedeo-format-mp4",
  "wedeo-format-wav",
  "wedeo-rav1d",
  "wedeo-symphonia",
@@ -1832,6 +1833,7 @@ dependencies = [
  "wedeo-core",
  "wedeo-format",
  "wedeo-format-h264",
+ "wedeo-format-mp4",
  "wedeo-format-wav",
  "wedeo-rav1d",
  "wedeo-symphonia",
@@ -1866,6 +1868,17 @@ dependencies = [
  "tracing",
  "wedeo-codec",
  "wedeo-codec-h264",
+ "wedeo-core",
+ "wedeo-format",
+]
+
+[[package]]
+name = "wedeo-format-mp4"
+version = "0.1.0"
+dependencies = [
+ "inventory",
+ "tracing",
+ "wedeo-codec",
  "wedeo-core",
  "wedeo-format",
 ]

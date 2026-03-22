@@ -25,7 +25,12 @@ impl FileIo {
     }
 
     pub fn create(path: &str) -> Result<Self> {
-        let file = std::fs::File::create(path)?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
         Ok(Self { file })
     }
 }

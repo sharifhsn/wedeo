@@ -10,6 +10,7 @@ members = [
     "codecs/wedeo-codec-h264",
     "formats/wedeo-format-wav",
     "formats/wedeo-format-h264",
+    "formats/wedeo-format-mp4",
     "adapters/wedeo-symphonia",
     "adapters/wedeo-rav1d",
     "bins/wedeo-cli",
@@ -41,5 +42,6 @@ wedeo-codec-pcm = { path = "codecs/wedeo-codec-pcm" }
 wedeo-format-wav = { path = "formats/wedeo-format-wav" }
 wedeo-codec-h264 = { path = "codecs/wedeo-codec-h264" }
 wedeo-format-h264 = { path = "formats/wedeo-format-h264" }
+wedeo-format-mp4 = { path = "formats/wedeo-format-mp4" }
 wedeo-symphonia = { path = "adapters/wedeo-symphonia" }
 wedeo-rav1d = { path = "adapters/wedeo-rav1d" }
