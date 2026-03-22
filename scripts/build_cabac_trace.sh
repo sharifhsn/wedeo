@@ -91,10 +91,11 @@ filepath = sys.argv[1]
 with open(filepath, 'r') as f:
     content = f.read()
 
-# 1. Add #include <stdio.h> after the first #include <stdint.h>
+# 1. Add #include <stdio.h> and <stdlib.h> after the first #include <stdint.h>
+#    (stdlib.h needed for getenv/atoi, stdio.h for fprintf)
 content = content.replace(
     '#include <stdint.h>',
-    '#include <stdint.h>\n#include <stdio.h>',
+    '#include <stdint.h>\n#include <stdio.h>\n#include <stdlib.h>',
     1
 )
 
