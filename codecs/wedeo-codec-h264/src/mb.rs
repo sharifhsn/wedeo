@@ -9,7 +9,7 @@ use tracing::trace;
 use wedeo_codec::bitstream::BitReadBE;
 use wedeo_core::error::Result;
 
-use crate::cavlc::{MacroblockCavlc, NeighborContext, decode_mb_cavlc};
+use crate::cavlc::{Macroblock, NeighborContext, decode_mb_cavlc};
 use crate::deblock::{MbDeblockInfo, PictureBuffer};
 use crate::dequant::{self, Dequant4Table};
 use crate::idct;
@@ -458,7 +458,7 @@ fn gather_top_left(plane: &[u8], stride: usize, px: usize, py: usize) -> u8 {
 /// then AC dequant + IDCT for each 4x4 chroma block.
 fn decode_chroma(
     ctx: &mut FrameDecodeContext,
-    mb: &mut MacroblockCavlc,
+    mb: &mut Macroblock,
     mb_x: u32,
     mb_y: u32,
     chroma_qp: u8,
@@ -761,7 +761,7 @@ pub fn decode_macroblock(
 #[allow(clippy::too_many_arguments)] // H.264 decode requires all these parameters
 fn decode_inter_mb(
     ctx: &mut FrameDecodeContext,
-    mb: &mut MacroblockCavlc,
+    mb: &mut Macroblock,
     slice_hdr: &SliceHeader,
     mb_x: u32,
     mb_y: u32,
@@ -1617,7 +1617,7 @@ pub fn decode_b_skip_mb(
 #[allow(clippy::too_many_arguments)]
 fn decode_b_inter_mb(
     ctx: &mut FrameDecodeContext,
-    mb: &mut MacroblockCavlc,
+    mb: &mut Macroblock,
     slice_hdr: &SliceHeader,
     mb_x: u32,
     mb_y: u32,
@@ -1937,7 +1937,7 @@ fn decode_b_inter_mb(
 #[allow(clippy::too_many_arguments)]
 fn decode_b_8x8_mb(
     ctx: &mut FrameDecodeContext,
-    mb: &mut MacroblockCavlc,
+    mb: &mut Macroblock,
     slice_hdr: &SliceHeader,
     mb_x: u32,
     mb_y: u32,
@@ -2266,7 +2266,7 @@ fn decode_b_8x8_mb(
 #[allow(clippy::too_many_arguments)]
 fn add_b_residual(
     ctx: &mut FrameDecodeContext,
-    mb: &mut MacroblockCavlc,
+    mb: &mut Macroblock,
     mb_x: u32,
     mb_y: u32,
     qp: u8,
@@ -3122,7 +3122,7 @@ fn fill_mb_gray(ctx: &mut FrameDecodeContext, mb_x: u32, mb_y: u32) {
 #[allow(clippy::too_many_arguments)]
 fn decode_chroma_inter(
     ctx: &mut FrameDecodeContext,
-    mb: &mut MacroblockCavlc,
+    mb: &mut Macroblock,
     mb_x: u32,
     mb_y: u32,
     chroma_qp: u8,
@@ -3194,7 +3194,7 @@ fn decode_chroma_inter(
 #[allow(clippy::too_many_arguments)] // H.264 decode requires all these parameters
 fn decode_intra4x4(
     ctx: &mut FrameDecodeContext,
-    mb: &mut MacroblockCavlc,
+    mb: &mut Macroblock,
     mb_x: u32,
     mb_y: u32,
     qp: u8,
@@ -3318,7 +3318,7 @@ fn decode_intra4x4(
 #[allow(clippy::too_many_arguments)] // H.264 decode requires all these parameters
 fn decode_intra16x16(
     ctx: &mut FrameDecodeContext,
-    mb: &mut MacroblockCavlc,
+    mb: &mut Macroblock,
     mb_x: u32,
     mb_y: u32,
     qp: u8,

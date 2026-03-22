@@ -544,9 +544,10 @@ pub fn decode_residual(
 // Macroblock-level types
 // ---------------------------------------------------------------------------
 
-/// Decoded macroblock data from CAVLC parsing.
+/// Decoded macroblock data — entropy-agnostic representation produced by both
+/// CAVLC and CABAC parsing paths.
 #[derive(Debug, Clone)]
-pub struct MacroblockCavlc {
+pub struct Macroblock {
     /// Raw mb_type value from the bitstream (before mapping to internal flags).
     pub mb_type: u32,
     /// True if this is an intra macroblock.
@@ -601,7 +602,7 @@ pub struct MacroblockCavlc {
     pub b_part_size: u8,
 }
 
-impl Default for MacroblockCavlc {
+impl Default for Macroblock {
     fn default() -> Self {
         Self {
             mb_type: 0,
@@ -750,8 +751,8 @@ pub fn decode_mb_cavlc(
     _mb_width: u32,
     num_ref_idx_l0_active: u32,
     _num_ref_idx_l1_active: u32,
-) -> Result<MacroblockCavlc> {
-    let mut mb = MacroblockCavlc::default();
+) -> Result<Macroblock> {
+    let mut mb = Macroblock::default();
 
     // 1. Parse mb_type
     let raw_mb_type = get_ue_golomb(br)?;
@@ -1127,8 +1128,8 @@ pub fn decode_mb_cavlc(
     Ok(mb)
 }
 
-/// Decode intra mb_type and fill in the MacroblockCavlc fields.
-fn decode_intra_mb_type(mb: &mut MacroblockCavlc, mt: u32) -> Result<()> {
+/// Decode intra mb_type and fill in the Macroblock fields.
+fn decode_intra_mb_type(mb: &mut Macroblock, mt: u32) -> Result<()> {
     if mt > 25 {
         trace!("CAVLC error site 1107");
         return Err(Error::InvalidData);
@@ -1185,7 +1186,7 @@ fn read_ref_idx(br: &mut BitReadBE<'_>, ref_count: u32) -> Result<u32> {
 /// Handles I_16x16 (luma DC + AC), I_4x4 (luma), and chroma DC + AC.
 fn decode_residual_blocks(
     br: &mut BitReadBE<'_>,
-    mb: &mut MacroblockCavlc,
+    mb: &mut Macroblock,
     neighbor: &NeighborContext,
     mb_x: u32,
 ) -> Result<()> {
@@ -1535,7 +1536,7 @@ mod tests {
 
     #[test]
     fn intra_mb_type_i4x4() {
-        let mut mb = MacroblockCavlc::default();
+        let mut mb = Macroblock::default();
         decode_intra_mb_type(&mut mb, 0).unwrap();
         assert!(mb.is_intra4x4);
         assert!(!mb.is_intra16x16);
@@ -1544,7 +1545,7 @@ mod tests {
 
     #[test]
     fn intra_mb_type_i16x16() {
-        let mut mb = MacroblockCavlc::default();
+        let mut mb = Macroblock::default();
         decode_intra_mb_type(&mut mb, 1).unwrap();
         assert!(!mb.is_intra4x4);
         assert!(mb.is_intra16x16);
@@ -1555,7 +1556,7 @@ mod tests {
 
     #[test]
     fn intra_mb_type_i16x16_with_cbp() {
-        let mut mb = MacroblockCavlc::default();
+        let mut mb = Macroblock::default();
         decode_intra_mb_type(&mut mb, 13).unwrap();
         assert!(mb.is_intra16x16);
         // mb_type 13: pred_mode=0, cbp=15 (H.264 Table 7-11)
@@ -1565,7 +1566,7 @@ mod tests {
 
     #[test]
     fn intra_mb_type_i16x16_full_cbp() {
-        let mut mb = MacroblockCavlc::default();
+        let mut mb = Macroblock::default();
         decode_intra_mb_type(&mut mb, 24).unwrap();
         assert!(mb.is_intra16x16);
         // mb_type 24: pred_mode=3, cbp=47 (luma=15, chroma=32)
@@ -1575,7 +1576,7 @@ mod tests {
 
     #[test]
     fn intra_mb_type_ipcm() {
-        let mut mb = MacroblockCavlc::default();
+        let mut mb = Macroblock::default();
         decode_intra_mb_type(&mut mb, 25).unwrap();
         assert!(mb.is_pcm);
         assert!(!mb.is_intra4x4);
@@ -1584,7 +1585,7 @@ mod tests {
 
     #[test]
     fn intra_mb_type_invalid() {
-        let mut mb = MacroblockCavlc::default();
+        let mut mb = Macroblock::default();
         assert!(decode_intra_mb_type(&mut mb, 26).is_err());
     }
 
