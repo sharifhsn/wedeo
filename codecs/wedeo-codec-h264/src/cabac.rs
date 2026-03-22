@@ -709,9 +709,10 @@ fn decode_cabac_intra_mb_type(
 
     // I_16x16: decode sub-fields
     let intra_offset = if intra_slice { 1usize } else { 0 };
-    // state pointer offset for the sub-fields: ctx_base + 2 (for intra_slice)
-    // or ctx_base + 1 (for inter slice)
-    let s_base = ctx_base + if intra_slice { 2 } else { 1 };
+    // FFmpeg does `state += 2` for intra_slice then indexes from state[1],
+    // so the absolute offset is ctx_base + 3. For inter, no pointer advance,
+    // so state[1] = ctx_base + 1.
+    let s_base = ctx_base + if intra_slice { 3 } else { 1 };
 
     let mut mb_type = 1u32;
     mb_type += 12 * reader.get_cabac(&mut state[s_base]) as u32; // cbp_luma != 0
