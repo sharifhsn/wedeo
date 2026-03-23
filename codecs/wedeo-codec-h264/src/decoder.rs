@@ -632,41 +632,40 @@ impl H264Decoder {
                         // POC type 2
                         self.current_poc = self.compute_poc_type2(hdr.frame_num, nalu.nal_ref_idc);
                     }
+                }
 
-                    // Build reference lists
-                    if hdr.slice_type.is_p() {
-                        let max_frame_num = 1u32 << sps.log2_max_frame_num;
-                        self.ref_list_l0 =
-                            refs::build_ref_list_p(&self.dpb, &hdr, hdr.frame_num, max_frame_num);
-                        self.ref_list_l1.clear();
-                        debug!(
-                            poc = self.current_poc,
-                            l0_len = self.ref_list_l0.len(),
-                            l0_frame_nums = ?self.ref_list_l0.iter().map(|&i| self.dpb.get(i).map(|e| e.frame_num)).collect::<Vec<_>>(),
-                            "P-frame ref list"
-                        );
-                    } else if hdr.slice_type.is_b() {
-                        let max_frame_num_b = 1u32 << sps.log2_max_frame_num;
-                        let (l0, l1) = refs::build_ref_list_b(
-                            &self.dpb,
-                            &hdr,
-                            self.current_poc,
-                            max_frame_num_b,
-                        );
-                        debug!(
-                            poc = self.current_poc,
-                            l0_len = l0.len(),
-                            l1_len = l1.len(),
-                            l0_pocs = ?l0.iter().map(|&i| self.dpb.get(i).map(|e| e.poc)).collect::<Vec<_>>(),
-                            l1_pocs = ?l1.iter().map(|&i| self.dpb.get(i).map(|e| e.poc)).collect::<Vec<_>>(),
-                            "B-frame ref lists"
-                        );
-                        self.ref_list_l0 = l0;
-                        self.ref_list_l1 = l1;
-                    } else {
-                        self.ref_list_l0.clear();
-                        self.ref_list_l1.clear();
-                    }
+                // Build reference lists per-slice. Different slices within
+                // a frame can have different types (e.g., CABAST3 has
+                // alternating I/P slices). Each P/B slice needs its own
+                // reference list; I-slices clear the lists.
+                if hdr.slice_type.is_p() {
+                    let max_frame_num = 1u32 << sps.log2_max_frame_num;
+                    self.ref_list_l0 =
+                        refs::build_ref_list_p(&self.dpb, &hdr, hdr.frame_num, max_frame_num);
+                    self.ref_list_l1.clear();
+                    debug!(
+                        poc = self.current_poc,
+                        l0_len = self.ref_list_l0.len(),
+                        l0_frame_nums = ?self.ref_list_l0.iter().map(|&i| self.dpb.get(i).map(|e| e.frame_num)).collect::<Vec<_>>(),
+                        "P-slice ref list"
+                    );
+                } else if hdr.slice_type.is_b() {
+                    let max_frame_num_b = 1u32 << sps.log2_max_frame_num;
+                    let (l0, l1) =
+                        refs::build_ref_list_b(&self.dpb, &hdr, self.current_poc, max_frame_num_b);
+                    debug!(
+                        poc = self.current_poc,
+                        l0_len = l0.len(),
+                        l1_len = l1.len(),
+                        l0_pocs = ?l0.iter().map(|&i| self.dpb.get(i).map(|e| e.poc)).collect::<Vec<_>>(),
+                        l1_pocs = ?l1.iter().map(|&i| self.dpb.get(i).map(|e| e.poc)).collect::<Vec<_>>(),
+                        "B-slice ref lists"
+                    );
+                    self.ref_list_l0 = l0;
+                    self.ref_list_l1 = l1;
+                } else {
+                    self.ref_list_l0.clear();
+                    self.ref_list_l1.clear();
                 }
 
                 // Decode this slice into the current frame context.
@@ -1171,6 +1170,7 @@ impl H264Decoder {
         ref_pics_l1: &[&PictureBuffer],
     ) -> Result<u32> {
         fdc.qp = hdr.slice_qp as u8;
+        fdc.last_qscale_diff = 0; // H.264 spec: prevMbQpDelta = 0 at slice start
 
         if pps.entropy_coding_mode_flag {
             self.decode_slice_cabac(rbsp, hdr, sps, pps, fdc, ref_pics, ref_pics_l1)
