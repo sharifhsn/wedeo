@@ -43,23 +43,40 @@ pub struct CabacReader<'a> {
 impl<'a> CabacReader<'a> {
     /// Initialize a CABAC decoder from byte-aligned RBSP data.
     ///
-    /// Reads the first 2 bytes to initialize the arithmetic engine, then adds
-    /// `1 << 9` matching FFmpeg's aligned init path (`ff_init_cabac_decoder`,
-    /// CABAC_BITS=16).
+    /// Matches FFmpeg's `ff_init_cabac_decoder` (CABAC_BITS=16), which has
+    /// two paths based on the alignment of the bytestream pointer after
+    /// reading the first 2 bytes:
     ///
-    /// FFmpeg's init has two paths depending on pointer alignment; which path
-    /// is taken varies per run due to ASLR. Both paths produce equivalent
-    /// decoded bits within FFmpeg. Wedeo uses the aligned path consistently.
-    /// The ~50-70 `low` offset vs FFmpeg's opposite path does not affect
-    /// context-coded BIN decisions but can eventually cause BYPASS bit flips
-    /// in long sequences. This is a known limitation pending engine parity work.
-    pub fn new(data: &'a [u8]) -> Result<Self> {
+    /// - **Aligned** (`(ptr+2) & 1 == 0`): `low += 1 << 9`, pos=2
+    /// - **Unaligned** (`(ptr+2) & 1 == 1`): `low += buf[2]<<2 + 2`, pos=3
+    ///
+    /// In FFmpeg, the pointer alignment depends on the RBSP buffer allocation
+    /// (always even-aligned via `av_malloc`) plus the slice header byte offset.
+    /// The `rbsp_offset` parameter is the byte offset of this CABAC data within
+    /// the original RBSP buffer, used to replicate FFmpeg's alignment decision:
+    /// `rbsp_offset & 1` determines which path is taken.
+    pub fn new(data: &'a [u8], rbsp_offset: usize) -> Result<Self> {
         if data.len() < 2 {
             return Err(Error::InvalidData);
         }
 
-        let low = (data[0] as i32) << 18 | (data[1] as i32) << 10 | (1 << 9);
+        let mut low = (data[0] as i32) << 18 | (data[1] as i32) << 10;
         let range = 0x1FE;
+
+        // Match FFmpeg's alignment-dependent init. The RBSP buffer is always
+        // heap-allocated (even-aligned), so (ptr + 2) & 1 == rbsp_offset & 1.
+        let pos = if rbsp_offset & 1 == 0 {
+            // Aligned path: add 1<<9, stay at pos 2
+            low += 1 << 9;
+            2
+        } else {
+            // Unaligned path: read a third byte, advance to pos 3
+            if data.len() < 3 {
+                return Err(Error::InvalidData);
+            }
+            low += ((data[2] as i32) << 2) + 2;
+            3
+        };
 
         if (range << (CABAC_BITS + 1)) < low {
             return Err(Error::InvalidData);
@@ -68,7 +85,7 @@ impl<'a> CabacReader<'a> {
         Ok(Self {
             low,
             range,
-            pos: 2,
+            pos,
             data,
         })
     }
@@ -611,7 +628,7 @@ const SCAN_TO_RASTER: [usize; 16] = [0, 1, 4, 5, 2, 3, 6, 7, 8, 9, 12, 13, 10, 1
 const ZIGZAG_SCAN_4X4: [usize; 16] = [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15];
 
 /// P sub-macroblock type partition counts.
-const P_SUB_MB_PARTITION_COUNT: [u8; 4] = [1, 2, 2, 4];
+pub const P_SUB_MB_PARTITION_COUNT: [u8; 4] = [1, 2, 2, 4];
 
 // ---------------------------------------------------------------------------
 // CABAC syntax element decode functions
@@ -1283,7 +1300,7 @@ fn fill_local_mvd(
 
 /// Sub-block offset within an 8x8 partition for P_8x8 sub_mb_types.
 /// Returns (dx, dy, width, height) in 4x4 units for sub-partition index j.
-const fn p8x8_sub_blk(sub_mb_type: u32, j: usize) -> (u32, u32, u32, u32) {
+pub const fn p8x8_sub_blk(sub_mb_type: u32, j: usize) -> (u32, u32, u32, u32) {
     match sub_mb_type {
         0 => (0, 0, 2, 2),                            // 8x8
         1 => (0, j as u32, 2, 1),                     // 8x4
@@ -2720,7 +2737,7 @@ mod tests {
     #[test]
     fn test_cabac_init_zero() {
         let data = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-        let reader = CabacReader::new(&data).unwrap();
+        let reader = CabacReader::new(&data, 0).unwrap();
         assert_eq!(reader.range, 0x1FE);
         assert_eq!(reader.pos, 2);
         assert_eq!(reader.low, 1 << 9); // 0<<18 + 0<<10 + (1<<9)
@@ -2730,7 +2747,7 @@ mod tests {
     fn test_cabac_init_nonzero() {
         // Use values small enough to pass the validity check
         let data = [0x01, 0x02, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00];
-        let reader = CabacReader::new(&data).unwrap();
+        let reader = CabacReader::new(&data, 0).unwrap();
         assert_eq!(reader.range, 0x1FE);
         let expected_low = (0x01 << 18) | (0x02 << 10) | (1 << 9);
         assert_eq!(reader.low, expected_low);
@@ -2739,20 +2756,20 @@ mod tests {
     #[test]
     fn test_cabac_init_too_short() {
         let data = [0x00];
-        assert!(CabacReader::new(&data).is_err());
+        assert!(CabacReader::new(&data, 0).is_err());
     }
 
     #[test]
     fn test_cabac_init_invalid_range() {
         // 0xFF bytes cause low > range<<17, which is invalid
         let data = [0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00];
-        assert!(CabacReader::new(&data).is_err());
+        assert!(CabacReader::new(&data, 0).is_err());
     }
 
     #[test]
     fn test_cabac_terminate() {
         let data = vec![0x00; 32];
-        let mut reader = CabacReader::new(&data).unwrap();
+        let mut reader = CabacReader::new(&data, 0).unwrap();
         let _ = reader.get_cabac_terminate();
     }
 
@@ -2762,7 +2779,7 @@ mod tests {
         // = 0x2AA0000 + 0x2A800 + 0x200 = 0x2ACAA00
         // range<<17 = 0x3FC0000 > 0x2ACAA00, so valid
         let data = vec![0xAA; 32];
-        let mut reader = CabacReader::new(&data).unwrap();
+        let mut reader = CabacReader::new(&data, 0).unwrap();
         for _ in 0..16 {
             let bit = reader.get_cabac_bypass();
             assert!(bit <= 1);
@@ -2772,7 +2789,7 @@ mod tests {
     #[test]
     fn test_cabac_context_decode() {
         let data = vec![0x55; 32];
-        let mut reader = CabacReader::new(&data).unwrap();
+        let mut reader = CabacReader::new(&data, 0).unwrap();
         let mut state = 0u8;
         for _ in 0..16 {
             let bit = reader.get_cabac(&mut state);
@@ -2783,7 +2800,7 @@ mod tests {
     #[test]
     fn test_cabac_bypass_sign() {
         let data = vec![0x20; 32];
-        let mut reader = CabacReader::new(&data).unwrap();
+        let mut reader = CabacReader::new(&data, 0).unwrap();
         let val = reader.get_cabac_bypass_sign(42);
         assert!(val == 42 || val == -42);
     }
