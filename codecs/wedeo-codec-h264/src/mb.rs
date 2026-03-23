@@ -496,7 +496,6 @@ fn decode_chroma(
             has_left,
         );
 
-        #[cfg(feature = "tracing-detail")]
         {
             let mut pred_row0 = [0u8; 8];
             pred_row0.copy_from_slice(&plane_data[offset..offset + 8]);
@@ -547,7 +546,6 @@ fn decode_chroma(
                     }
                 }
 
-                #[cfg(feature = "tracing-detail")]
                 {
                     let mut final_px = [0u8; 16];
                     for r in 0..4 {
@@ -574,10 +572,7 @@ fn decode_chroma(
 /// `ref_pics` contains the decoded reference picture buffers for inter prediction
 /// (list 0). Index into this slice corresponds to ref_idx values from CAVLC.
 #[allow(clippy::too_many_arguments)] // H.264 MB decode requires all these parameters
-#[cfg_attr(
-    feature = "tracing-detail",
-    tracing::instrument(skip_all, fields(mb_x, mb_y))
-)]
+#[tracing::instrument(skip_all, fields(mb_x, mb_y))]
 pub fn decode_macroblock(
     ctx: &mut FrameDecodeContext,
     br: &mut BitReadBE,
@@ -831,7 +826,6 @@ fn decode_inter_mb(
         return;
     }
 
-    #[cfg(feature = "tracing-detail")]
     trace!(mb_x, mb_y, mb_type = mb.mb_type, "inter MB");
 
     match mb.mb_type {
@@ -847,7 +841,6 @@ fn decode_inter_mb(
                 Some(&ctx.slice_table),
                 ctx.current_slice,
             );
-            #[cfg(feature = "tracing-detail")]
             trace!(
                 mb_x, mb_y,
                 mv_a = ?n.mv_a, ref_a = n.ref_a, a_avail = n.a_avail,
@@ -871,7 +864,6 @@ fn decode_inter_mb(
                 mvp[0].wrapping_add(mb.mvd_l0[0][0]),
                 mvp[1].wrapping_add(mb.mvd_l0[0][1]),
             ];
-            #[cfg(feature = "tracing-detail")]
             trace!(mb_x, mb_y, mvp = ?mvp, mvd = ?mb.mvd_l0[0], mv = ?mv, "16x16 MV");
 
             let ref_pic = ref_pics[ref_idx.min(ref_pics.len() - 1)];
@@ -899,7 +891,6 @@ fn decode_inter_mb(
                     Some(&ctx.slice_table),
                     ctx.current_slice,
                 );
-                #[cfg(feature = "tracing-detail")]
                 trace!(mb_x, mb_y, part, ref_idx, blk_y,
                     mv_a = ?n.mv_a, ref_a = n.ref_a, a_avail = n.a_avail,
                     mv_b = ?n.mv_b, ref_b = n.ref_b, b_avail = n.b_avail,
@@ -924,7 +915,6 @@ fn decode_inter_mb(
                     mvp[1].wrapping_add(mb.mvd_l0[part as usize][1]),
                 ];
 
-                #[cfg(feature = "tracing-detail")]
                 trace!(mb_x, mb_y, part, mvp = ?mvp, mvd = ?mb.mvd_l0[part as usize], mv = ?mv, ref_idx, "16x8 MV");
 
                 let ref_pic = ref_pics[ref_idx.min(ref_pics.len() - 1)];
@@ -1000,7 +990,6 @@ fn decode_inter_mb(
                 let part_y = (i8x8 / 2) as u32 * 2; // 0 or 2
 
                 let sub_type = mb.sub_mb_type[i8x8];
-                #[cfg(feature = "tracing-detail")]
                 trace!(mb_x, mb_y, i8x8, sub_type, ref_idx, "P_8x8 sub");
 
                 match sub_type {
@@ -1015,7 +1004,6 @@ fn decode_inter_mb(
                             Some(&ctx.slice_table),
                             ctx.current_slice,
                         );
-                        #[cfg(feature = "tracing-detail")]
                         trace!(
                             mb_x, mb_y, i8x8, part_x, part_y,
                             mv_a = ?n.mv_a, ref_a = n.ref_a, a_avail = n.a_avail,
@@ -1040,7 +1028,6 @@ fn decode_inter_mb(
                             mvp[0].wrapping_add(mb.mvd_l0[mvd_idx][0]),
                             mvp[1].wrapping_add(mb.mvd_l0[mvd_idx][1]),
                         ];
-                        #[cfg(feature = "tracing-detail")]
                         trace!(mb_x, mb_y, i8x8, mvp = ?mvp, mvd = ?mb.mvd_l0[mvd_idx], mv = ?mv, "P_8x8 MV");
 
                         let ref_pic = ref_pics[ref_idx.min(ref_pics.len() - 1)];
@@ -1111,7 +1098,6 @@ fn decode_inter_mb(
                                 mvp[0].wrapping_add(mb.mvd_l0[mvd_idx][0]),
                                 mvp[1].wrapping_add(mb.mvd_l0[mvd_idx][1]),
                             ];
-                            #[cfg(feature = "tracing-detail")]
                             trace!(mb_x, mb_y, i8x8, sub, part_x, sub_y,
                                 mv_a = ?n.mv_a, ref_a = n.ref_a, a_avail = n.a_avail,
                                 mv_b = ?n.mv_b, ref_b = n.ref_b, b_avail = n.b_avail,
@@ -1185,7 +1171,6 @@ fn decode_inter_mb(
                                 mvp[0].wrapping_add(mb.mvd_l0[mvd_idx][0]),
                                 mvp[1].wrapping_add(mb.mvd_l0[mvd_idx][1]),
                             ];
-                            #[cfg(feature = "tracing-detail")]
                             trace!(mb_x, mb_y, i8x8, sub, sub_x, part_y,
                                 mv_a = ?n.mv_a, ref_a = n.ref_a, a_avail = n.a_avail,
                                 mv_b = ?n.mv_b, ref_b = n.ref_b, b_avail = n.b_avail,
@@ -1312,7 +1297,6 @@ fn decode_inter_mb(
         }
     }
 
-    #[cfg(feature = "tracing-detail")]
     {
         let lx = (mb_x * 16) as usize;
         let ly = (mb_y * 16) as usize;
@@ -1340,7 +1324,6 @@ fn decode_inter_mb(
         }
     }
 
-    #[cfg(feature = "tracing-detail")]
     {
         let lx = (mb_x * 16) as usize;
         let ly = (mb_y * 16) as usize;
@@ -1374,7 +1357,6 @@ fn apply_mc_partition(
     let dst_y = (mb_y * 16 + px_offset_y) as i32;
 
     // Temporary debug trace for SVA_Base_B MB(10,2) investigation
-    #[cfg(feature = "tracing-detail")]
     if mb_x == 10 && mb_y == 2 {
         let ref_val = ref_pic.y[32 * ref_pic.y_stride + 160];
         let ref_val2 = ref_pic.y[32 * ref_pic.y_stride + 162];
@@ -1398,7 +1380,6 @@ fn apply_mc_partition(
 
     let luma_offset = dst_y as usize * ctx.pic.y_stride + dst_x as usize;
 
-    #[cfg(feature = "tracing-detail")]
     if mb_x == 10 && mb_y == 2 {
         // Print first row of ref data that the MC will read
         let ry = luma_ref_y.clamp(0, ref_pic.height as i32 - 1) as usize;
@@ -1408,8 +1389,7 @@ fn apply_mc_partition(
         let same_buf = std::ptr::eq(ref_ptr, cur_ptr);
         let ref_row: Vec<u8> = (0..21)
             .map(|i| {
-                let rx =
-                    (luma_ref_x as i32 - 2 + i as i32).clamp(0, ref_pic.width as i32 - 1) as usize;
+                let rx = (luma_ref_x - 2 + i).clamp(0, ref_pic.width as i32 - 1) as usize;
                 ref_pic.y[ry * stride + rx]
             })
             .collect();
@@ -1517,7 +1497,6 @@ pub fn decode_skip_mb(
             Some(&ctx.slice_table),
             ctx.current_slice,
         );
-        #[cfg(feature = "tracing-detail")]
         trace!(
             mb_x, mb_y,
             mv_a = ?n.mv_a, ref_a = n.ref_a, a_avail = n.a_avail,
@@ -1528,7 +1507,6 @@ pub fn decode_skip_mb(
         let mv = mvpred::predict_mv_skip_full(
             n.mv_a, n.mv_b, n.mv_c, n.ref_a, n.ref_b, n.ref_c, n.a_avail, n.b_avail, n.c_avail,
         );
-        #[cfg(feature = "tracing-detail")]
         trace!(mb_x, mb_y, mv = ?mv, "P_SKIP MV");
 
         // Apply motion compensation from ref_pics[0]
@@ -3171,7 +3149,6 @@ fn decode_chroma_inter(
             let mut chroma_dc_out = [0i32; 4];
             idct::chroma_dc_dequant_idct(&mut chroma_dc_out, &mb.chroma_dc[plane_idx], qmul);
 
-            #[cfg(feature = "tracing-detail")]
             {
                 let plane_name = if plane_idx == 0 { "U" } else { "V" };
                 trace!(mb_x, mb_y, plane = plane_name,
@@ -3203,7 +3180,6 @@ fn decode_chroma_inter(
                 } else {
                     // DC-only
                     let dc_add = (dc_val + 32) >> 6;
-                    #[cfg(feature = "tracing-detail")]
                     {
                         let plane_name = if plane_idx == 0 { "U" } else { "V" };
                         let mc_row0: Vec<u8> = (0..4).map(|i| plane_data[c_offset + i]).collect();
@@ -3296,7 +3272,6 @@ fn decode_intra4x4(
             block_has_top_right,
         );
 
-        #[cfg(feature = "tracing-detail")]
         {
             let mut pred = [0u8; 16];
             for r in 0..4 {
@@ -3311,14 +3286,12 @@ fn decode_intra4x4(
         if cbp_luma & (1 << group_8x8) != 0 {
             let raster_idx = block_to_raster(block);
 
-            #[cfg(feature = "tracing-detail")]
             {
                 trace!(mb_x, mb_y, blk_x, blk_y, coeffs = ?mb.luma_coeffs[raster_idx], "intra4x4 pre-dequant");
             }
 
             dequant::dequant_4x4_flat(&mut mb.luma_coeffs[raster_idx], qp);
 
-            #[cfg(feature = "tracing-detail")]
             {
                 trace!(mb_x, mb_y, blk_x, blk_y, coeffs = ?mb.luma_coeffs[raster_idx], "intra4x4 post-dequant");
             }
@@ -3330,7 +3303,6 @@ fn decode_intra4x4(
                 &mut mb.luma_coeffs[raster_idx],
             );
 
-            #[cfg(feature = "tracing-detail")]
             {
                 let mut final_px = [0u8; 16];
                 for r in 0..4 {
@@ -3379,7 +3351,6 @@ fn decode_intra16x16(
         has_left,
     );
 
-    #[cfg(feature = "tracing-detail")]
     {
         let mut pred_row0 = [0u8; 16];
         pred_row0.copy_from_slice(&ctx.pic.y[offset..offset + 16]);
@@ -3391,7 +3362,6 @@ fn decode_intra16x16(
     let mut luma_dc_out = [0i32; 16];
     idct::luma_dc_dequant_idct(&mut luma_dc_out, &mb.luma_dc, qmul);
 
-    #[cfg(feature = "tracing-detail")]
     {
         trace!(mb_x, mb_y, dc_out = ?luma_dc_out, "intra16x16 luma DC Hadamard");
     }

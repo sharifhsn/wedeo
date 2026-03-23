@@ -866,7 +866,7 @@ fn deblock_mb(
 /// * `alpha_c0_offset` - from slice header (already multiplied by 2)
 /// * `beta_offset` - from slice header (already multiplied by 2)
 /// * `chroma_qp_index_offset` - from PPS: \[0\] for Cb, \[1\] for Cr
-#[cfg_attr(feature = "tracing-detail", tracing::instrument(skip_all, fields(mb_width = pic.mb_width, mb_height = pic.mb_height)))]
+#[tracing::instrument(skip_all, fields(mb_width = pic.mb_width, mb_height = pic.mb_height))]
 pub fn deblock_frame(
     pic: &mut PictureBuffer,
     mb_info: &[MbDeblockInfo],

@@ -8,9 +8,7 @@
 
 use std::collections::VecDeque;
 
-#[cfg(any(feature = "tracing-detail", feature = "cabac-trace"))]
-use tracing::trace;
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 use wedeo_codec::bitstream::{BitRead, BitReadBE, get_ue_golomb};
 use wedeo_codec::decoder::{CodecParameters, Decoder, DecoderDescriptor};
 use wedeo_codec::descriptor::{CodecCapabilities, CodecDescriptor, CodecProperties};
@@ -535,7 +533,7 @@ impl H264Decoder {
     }
 
     /// Process a single NAL unit.
-    #[cfg_attr(feature = "tracing-detail", tracing::instrument(skip_all, fields(nal_type = ?nalu.nal_type)))]
+    #[tracing::instrument(skip_all, fields(nal_type = ?nalu.nal_type))]
     fn process_nal(&mut self, nalu: &NalUnit, _pkt_pts: i64) -> Result<()> {
         match nalu.nal_type {
             NalUnitType::Sps => {
@@ -728,7 +726,6 @@ impl H264Decoder {
                         }
                     }
 
-                    #[cfg(feature = "tracing-detail")]
                     if hdr.slice_type.is_p() || hdr.slice_type.is_b() {
                         for &dpb_idx in &self.ref_list_l0 {
                             if let Some(e) = self.dpb.get(dpb_idx) {
@@ -963,7 +960,6 @@ impl H264Decoder {
                 vec![-1i8; total_blocks]
             };
 
-            #[cfg(feature = "tracing-detail")]
             {
                 let px = 10 * 16;
                 let py = 2 * 16;
@@ -1027,7 +1023,6 @@ impl H264Decoder {
 
             let mut mmco_did_reset = false;
             if let Some(dpb_idx) = self.dpb.store(entry) {
-                #[cfg(feature = "tracing-detail")]
                 {
                     let e = self.dpb.get(dpb_idx).unwrap();
                     tracing::trace!(
@@ -1158,7 +1153,7 @@ impl H264Decoder {
     /// Dispatches to CAVLC or CABAC slice decode based on PPS entropy_coding_mode_flag.
     /// Returns the number of MBs decoded in this slice.
     #[allow(clippy::too_many_arguments)] // H.264 slice decode needs all parameters
-    #[cfg_attr(feature = "tracing-detail", tracing::instrument(skip_all, fields(poc = self.current_poc, first_mb = hdr.first_mb_in_slice, slice_type = ?hdr.slice_type)))]
+    #[tracing::instrument(skip_all, fields(poc = self.current_poc, first_mb = hdr.first_mb_in_slice, slice_type = ?hdr.slice_type))]
     fn decode_slice_into(
         &self,
         rbsp: &[u8],
@@ -1243,7 +1238,6 @@ impl H264Decoder {
                     Err(_) if br.consumed() + 8 >= rbsp_bits => break,
                     Err(e) => return Err(e),
                 };
-                #[cfg(feature = "tracing-detail")]
                 trace!(mb_addr, mb_skip_run, bits = br.consumed(), "mb_skip_run");
 
                 // Process skipped MBs
@@ -1410,7 +1404,6 @@ impl H264Decoder {
 
             // For inter slices: decode skip flag
             if is_inter_slice {
-                #[cfg(feature = "cabac-trace")]
                 trace!(
                     "CABAC_SKIP_DECODE mb_x={} mb_y={} is_b={}",
                     mb_x,
@@ -1639,7 +1632,7 @@ fn remove_epb(data: &[u8]) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 
 impl Decoder for H264Decoder {
-    #[cfg_attr(feature = "tracing-detail", tracing::instrument(skip_all, fields(has_packet = packet.is_some())))]
+    #[tracing::instrument(skip_all, fields(has_packet = packet.is_some()))]
     fn send_packet(&mut self, packet: Option<&Packet>) -> Result<()> {
         match packet {
             Some(pkt) => {
@@ -1706,7 +1699,7 @@ impl Decoder for H264Decoder {
         }
     }
 
-    #[cfg_attr(feature = "tracing-detail", tracing::instrument(skip_all))]
+    #[tracing::instrument(skip_all)]
     fn receive_frame(&mut self) -> Result<Frame> {
         if let Some(frame) = self.output_queue.pop_front() {
             Ok(frame)

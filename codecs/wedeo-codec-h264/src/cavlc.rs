@@ -534,7 +534,6 @@ pub fn decode_residual(
         }
     }
 
-    #[cfg(feature = "tracing-detail")]
     tracing::trace!(nc, total_coeff, trailing_ones, "CAVLC residual");
 
     Ok((coeffs, total_coeff))
@@ -739,7 +738,7 @@ const P_SUB_MB_PARTITION_COUNT: [u8; 4] = [1, 2, 2, 4];
 /// - Residual coefficient decoding via decode_residual
 ///
 /// Reference: FFmpeg `ff_h264_decode_mb_cavlc` in h264_cavlc.c.
-#[cfg_attr(feature = "tracing-detail", tracing::instrument(skip_all, fields(mb_x, mb_y = _mb_y, slice_type = ?slice_type)))]
+#[tracing::instrument(skip_all, fields(mb_x, mb_y = _mb_y, slice_type = ?slice_type))]
 #[allow(clippy::too_many_arguments)]
 pub fn decode_mb_cavlc(
     br: &mut BitReadBE<'_>,
@@ -852,7 +851,6 @@ pub fn decode_mb_cavlc(
     }
 
     // 3. Intra prediction modes
-    #[cfg(feature = "tracing-detail")]
     trace!(
         bits_after_mb_type = br.consumed(),
         mb_x,
@@ -927,7 +925,6 @@ pub fn decode_mb_cavlc(
         }
     }
 
-    #[cfg(feature = "tracing-detail")]
     tracing::trace!(bits_after_pred_modes = br.consumed(), "CAVLC MB header");
     if is_intra {
         // Parse chroma intra prediction mode.
@@ -1095,7 +1092,6 @@ pub fn decode_mb_cavlc(
     }
 
     // 5. CBP
-    #[cfg(feature = "tracing-detail")]
     tracing::trace!(bits_before_cbp = br.consumed(), "CAVLC MB header");
     if !mb.is_intra16x16 {
         let cbp_code = get_ue_golomb(br)?;
@@ -1112,11 +1108,9 @@ pub fn decode_mb_cavlc(
     // For I_16x16, cbp was already set from mb_type.
 
     // 6. mb_qp_delta and residual coefficients
-    #[cfg(feature = "tracing-detail")]
     tracing::trace!(bits_before_qp_delta = br.consumed(), "CAVLC MB header");
     if mb.cbp > 0 || mb.is_intra16x16 {
         mb.mb_qp_delta = get_se_golomb(br)?;
-        #[cfg(feature = "tracing-detail")]
         tracing::trace!(
             bits_after_qp_delta = br.consumed(),
             mb_qp_delta = mb.mb_qp_delta,
