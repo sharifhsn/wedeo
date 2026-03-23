@@ -53,41 +53,28 @@ pub struct NalUnit {
     pub nal_type: NalUnitType,
     pub nal_ref_idc: u8,
     pub data: Vec<u8>,
-    /// Parity of the raw RBSP data pointer before EPB removal.
-    /// Used to match FFmpeg's alignment-dependent CABAC init.
-    /// `true` if EPBs were present (use heap-aligned init), `false` if no EPBs
-    /// (init alignment depends on raw pointer position).
-    pub had_epb: bool,
-    /// Parity (bit 0) of the raw RBSP data pointer address.
-    /// Only meaningful when `had_epb` is false.
-    pub raw_data_parity: u8,
 }
 
 /// Remove emulation prevention bytes from raw NAL data to produce RBSP.
-/// Returns `(rbsp_data, had_epb)` — the cleaned data and whether any EPBs were found.
 ///
 /// In H.264, the byte sequence `0x00, 0x00, 0x03` is an emulation prevention pattern.
 /// The `0x03` byte is stripped, leaving the two zero bytes followed by whatever byte
 /// came after the `0x03`. This prevents NAL payload data from accidentally containing
 /// start code patterns (`0x00, 0x00, 0x00` or `0x00, 0x00, 0x01`).
-fn remove_emulation_prevention_bytes(data: &[u8]) -> (Vec<u8>, bool) {
+fn remove_emulation_prevention_bytes(data: &[u8]) -> Vec<u8> {
     let mut rbsp = Vec::with_capacity(data.len());
     let mut i = 0;
-    let mut had_epb = false;
     while i < data.len() {
-        // Check for emulation prevention byte pattern: 0x00 0x00 0x03
         if i + 2 < data.len() && data[i] == 0x00 && data[i + 1] == 0x00 && data[i + 2] == 0x03 {
             rbsp.push(0x00);
             rbsp.push(0x00);
-            // Skip the 0x03 emulation prevention byte
             i += 3;
-            had_epb = true;
         } else {
             rbsp.push(data[i]);
             i += 1;
         }
     }
-    (rbsp, had_epb)
+    rbsp
 }
 
 /// Parse the NAL header byte, returning `(nal_ref_idc, nal_unit_type)`.
@@ -116,17 +103,11 @@ fn parse_nal_unit(raw: &[u8]) -> Result<NalUnit> {
         return Err(Error::InvalidData);
     }
     let (nal_ref_idc, nal_type) = parse_nal_header(raw[0])?;
-    let rbsp_raw = &raw[1..];
-    // Record the raw pointer parity before EPB removal (bit 0 of pointer address).
-    // This matches FFmpeg's `(uintptr_t)bytestream & 1` check for CABAC init.
-    let raw_data_parity = (rbsp_raw.as_ptr() as usize & 1) as u8;
-    let (rbsp, had_epb) = remove_emulation_prevention_bytes(rbsp_raw);
+    let rbsp = remove_emulation_prevention_bytes(&raw[1..]);
     Ok(NalUnit {
         nal_type,
         nal_ref_idc,
         data: rbsp,
-        had_epb,
-        raw_data_parity,
     })
 }
 
@@ -241,57 +222,50 @@ mod tests {
     #[test]
     fn epb_removal_00_00_03_00() {
         let input = [0x00, 0x00, 0x03, 0x00];
-        let (result, had_epb) = remove_emulation_prevention_bytes(&input);
+        let result = remove_emulation_prevention_bytes(&input);
         assert_eq!(result, vec![0x00, 0x00, 0x00]);
-        assert!(had_epb);
     }
 
     #[test]
     fn epb_removal_00_00_03_01() {
         let input = [0x00, 0x00, 0x03, 0x01];
-        let (result, had_epb) = remove_emulation_prevention_bytes(&input);
+        let result = remove_emulation_prevention_bytes(&input);
         assert_eq!(result, vec![0x00, 0x00, 0x01]);
-        assert!(had_epb);
     }
 
     #[test]
     fn epb_removal_00_00_03_02() {
         let input = [0x00, 0x00, 0x03, 0x02];
-        let (result, had_epb) = remove_emulation_prevention_bytes(&input);
+        let result = remove_emulation_prevention_bytes(&input);
         assert_eq!(result, vec![0x00, 0x00, 0x02]);
-        assert!(had_epb);
     }
 
     #[test]
     fn epb_removal_00_00_03_03() {
         let input = [0x00, 0x00, 0x03, 0x03];
-        let (result, had_epb) = remove_emulation_prevention_bytes(&input);
+        let result = remove_emulation_prevention_bytes(&input);
         assert_eq!(result, vec![0x00, 0x00, 0x03]);
-        assert!(had_epb);
     }
 
     #[test]
     fn epb_removal_no_epb() {
         let input = [0x01, 0x02, 0x03, 0x04];
-        let (result, had_epb) = remove_emulation_prevention_bytes(&input);
+        let result = remove_emulation_prevention_bytes(&input);
         assert_eq!(result, input.to_vec());
-        assert!(!had_epb);
     }
 
     #[test]
     fn epb_removal_multiple() {
         // Two EPB sequences in a row
         let input = [0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x03, 0x01];
-        let (result, had_epb) = remove_emulation_prevention_bytes(&input);
+        let result = remove_emulation_prevention_bytes(&input);
         assert_eq!(result, vec![0x00, 0x00, 0x00, 0x00, 0x00, 0x01]);
-        assert!(had_epb);
     }
 
     #[test]
     fn epb_removal_empty() {
-        let (result, had_epb) = remove_emulation_prevention_bytes(&[]);
+        let result = remove_emulation_prevention_bytes(&[]);
         assert!(result.is_empty());
-        assert!(!had_epb);
     }
 
     // --- NAL header parsing tests ---

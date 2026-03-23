@@ -745,8 +745,6 @@ impl H264Decoder {
                         &mut fdc,
                         &ref_pic_list,
                         &ref_pic_list_l1,
-                        nalu.had_epb,
-                        nalu.raw_data_parity,
                     ) {
                         Ok(mbs) => {
                             self.current_mbs_decoded += mbs;
@@ -1151,23 +1149,11 @@ impl H264Decoder {
         fdc: &mut FrameDecodeContext,
         ref_pics: &[&PictureBuffer],
         ref_pics_l1: &[&PictureBuffer],
-        had_epb: bool,
-        raw_data_parity: u8,
     ) -> Result<u32> {
         fdc.qp = hdr.slice_qp as u8;
 
         if pps.entropy_coding_mode_flag {
-            self.decode_slice_cabac(
-                rbsp,
-                hdr,
-                sps,
-                pps,
-                fdc,
-                ref_pics,
-                ref_pics_l1,
-                had_epb,
-                raw_data_parity,
-            )
+            self.decode_slice_cabac(rbsp, hdr, sps, pps, fdc, ref_pics, ref_pics_l1)
         } else {
             self.decode_slice_cavlc(rbsp, hdr, sps, pps, fdc, ref_pics, ref_pics_l1)
         }
@@ -1350,10 +1336,10 @@ impl H264Decoder {
         fdc: &mut FrameDecodeContext,
         ref_pics: &[&PictureBuffer],
         ref_pics_l1: &[&PictureBuffer],
-        had_epb: bool,
-        raw_data_parity: u8,
     ) -> Result<u32> {
-        use crate::cabac::{CabacNeighborCtx, CabacReader, decode_cabac_mb_skip, decode_mb_cabac};
+        use crate::cabac::{
+            CabacDecodeCache, CabacNeighborCtx, CabacReader, decode_cabac_mb_skip, decode_mb_cabac,
+        };
         use crate::cabac_tables::init_cabac_states;
 
         let mb_width = sps.mb_width;
@@ -1371,18 +1357,7 @@ impl H264Decoder {
         padded.extend_from_slice(&rbsp[data_start..]);
         padded.resize(padded.len() + 64, 0);
 
-        // Compute FFmpeg-compatible alignment for CABAC init.
-        // FFmpeg's init checks (uintptr_t)(bytestream) & 1 after reading 2 bytes.
-        // For NALs WITH EPBs: FFmpeg uses a heap-allocated RBSP buffer (even-aligned),
-        //   so alignment = (data_start + 2) & 1 = data_start & 1.
-        // For NALs WITHOUT EPBs: FFmpeg uses the raw data pointer directly,
-        //   so alignment = (raw_ptr + data_start + 2) & 1 = (raw_parity + data_start) & 1.
-        let alignment_parity = if had_epb {
-            data_start & 1
-        } else {
-            (raw_data_parity as usize + data_start) & 1
-        };
-        let mut reader = CabacReader::new(&padded, alignment_parity)?;
+        let mut reader = CabacReader::new(&padded)?;
 
         // Initialize context states
         let is_intra = hdr.slice_type.is_intra();
@@ -1444,20 +1419,8 @@ impl H264Decoder {
                     fdc.last_qscale_diff = 0;
 
                     // Update CABAC neighbor context for skip MB
-                    cabac_nb.update_after_mb(
-                        mb_idx,
-                        true,  // is_skip
-                        false, // is_intra16x16_or_pcm
-                        false, // is_intra
-                        false, // is_direct
-                        0,     // cbp
-                        0,     // chroma_pred
-                        &[0; 24],
-                        &[[0; 2]; 16],
-                        &[[0; 2]; 16],
-                        &[0, 0, 0, 0],     // ref_idx_l0: skip uses ref 0
-                        &[-1, -1, -1, -1], // ref_idx_l1
-                    );
+                    cabac_nb.update_after_mb(mb_idx, true, false, false, false, 0, 0, &[0; 24]);
+                    cabac_nb.update_mvd_ref_skip(mb_idx);
 
                     mb_addr += 1;
                     mbs_decoded += 1;
@@ -1475,6 +1438,7 @@ impl H264Decoder {
                 mb_y > 0 && fdc.slice_table[(mb_addr - mb_width) as usize] == fdc.current_slice;
 
             // Decode coded MB via CABAC
+            let mut cache = CabacDecodeCache::new();
             let mut mb = decode_mb_cabac(
                 &mut reader,
                 &mut cabac_state,
@@ -1490,156 +1454,23 @@ impl H264Decoder {
                 hdr.num_ref_idx_l0_active,
                 hdr.num_ref_idx_l1_active,
                 fdc.last_qscale_diff,
+                &mut cache,
             )?;
 
             // Apply entropy-agnostic processing (dequant, IDCT, pred, MC, neighbor update)
             mb::apply_macroblock(fdc, &mut mb, hdr, pps, mb_x, mb_y, ref_pics, ref_pics_l1)?;
 
-            // Build MVD abs values for CABAC neighbor context.
-            // For P_8x8/B_8x8, MVDs are stored per-sub-partition in mvd_l0/l1
-            // at sequential indices (i*4+j). We must propagate each MVD to all
-            // 4x4 block positions covered by that sub-partition.
-            let mut mvd_abs_l0 = [[0u8; 2]; 16];
-            let mut mvd_abs_l1 = [[0u8; 2]; 16];
-            if mb.mb_type == 3 || mb.mb_type == 22 {
-                // P_8x8 (mb_type=3) or B_8x8 (mb_type=22)
-                use crate::cabac::p8x8_sub_blk;
-                for i in 0..4usize {
-                    let base_x = (i & 1) * 2;
-                    let base_y = (i >> 1) * 2;
-                    let sub_count =
-                        crate::cabac::P_SUB_MB_PARTITION_COUNT[mb.sub_mb_type[i] as usize] as usize;
-                    for j in 0..sub_count {
-                        let mvd_idx = i * 4 + j;
-                        if mvd_idx >= 16 {
-                            continue;
-                        }
-                        let (dx, dy, w, h) = p8x8_sub_blk(mb.sub_mb_type[i] as u32, j);
-                        let val_l0 = [
-                            (mb.mvd_l0[mvd_idx][0].unsigned_abs().min(70)) as u8,
-                            (mb.mvd_l0[mvd_idx][1].unsigned_abs().min(70)) as u8,
-                        ];
-                        let val_l1 = [
-                            (mb.mvd_l1[mvd_idx][0].unsigned_abs().min(70)) as u8,
-                            (mb.mvd_l1[mvd_idx][1].unsigned_abs().min(70)) as u8,
-                        ];
-                        // Propagate to all covered 4x4 positions
-                        for dy2 in 0..h as usize {
-                            for dx2 in 0..w as usize {
-                                let bx = base_x + dx as usize + dx2;
-                                let by = base_y + dy as usize + dy2;
-                                let idx = by * 4 + bx;
-                                if idx < 16 {
-                                    mvd_abs_l0[idx] = val_l0;
-                                    mvd_abs_l1[idx] = val_l1;
-                                }
-                            }
-                        }
-                    }
-                }
-            } else if !mb.is_intra && !mb.is_direct {
-                // Non-8x8 inter: propagate MVDs based on partition structure.
-                // mb.mvd_l0 stores MVDs at sequential indices per partition;
-                // we must fill all 4x4 positions covered by each partition.
-                let mvd_abs = |mvd: [i16; 2]| -> [u8; 2] {
-                    [
-                        (mvd[0].unsigned_abs().min(70)) as u8,
-                        (mvd[1].unsigned_abs().min(70)) as u8,
-                    ]
-                };
-                // Partition layout (in 4x4 units):
-                // P_L0_16x16 / B single-partition: (0,0,4,4) - 1 MVD
-                // P_L0_16x8 / B 16x8: (0,0,4,2),(0,2,4,2) - 2 MVDs
-                // P_L0_8x16 / B 8x16: (0,0,2,4),(2,0,2,4) - 2 MVDs
-                let partitions: &[(usize, usize, usize, usize)] = match mb.partition_count {
-                    1 => &[(0, 0, 4, 4)],
-                    2 => {
-                        // Check orientation: 16x8 vs 8x16
-                        // P: mb_type 1=16x8, 2=8x16
-                        // B: partition shapes from B_MB_TYPE_INFO
-                        let is_16x8 = match hdr.slice_type {
-                            SliceType::P | SliceType::SP => mb.mb_type == 1,
-                            SliceType::B => {
-                                // B-slice: check partition width from mb_type info
-                                // B types with 2 partitions: types 4-11
-                                // Even types (4,6,8,10) are 16x8, odd (5,7,9,11) are 8x16
-                                mb.mb_type >= 4 && mb.mb_type <= 11 && mb.mb_type % 2 == 0
-                            }
-                            _ => true,
-                        };
-                        if is_16x8 {
-                            &[(0, 0, 4, 2), (0, 2, 4, 2)]
-                        } else {
-                            &[(0, 0, 2, 4), (2, 0, 2, 4)]
-                        }
-                    }
-                    _ => &[(0, 0, 4, 4)], // fallback: treat as 16x16
-                };
-
-                for (part_idx, &(px, py, pw, ph)) in partitions.iter().enumerate() {
-                    let val_l0 = mvd_abs(mb.mvd_l0[part_idx]);
-                    let val_l1 = mvd_abs(mb.mvd_l1[part_idx]);
-                    for dy in 0..ph {
-                        for dx in 0..pw {
-                            let idx = (py + dy) * 4 + (px + dx);
-                            if idx < 16 {
-                                mvd_abs_l0[idx] = val_l0;
-                                mvd_abs_l1[idx] = val_l1;
-                            }
-                        }
-                    }
-                }
-            }
-            // else: intra or direct — MVD is 0 (already initialized)
-
-            // Propagate ref_idx to all 4 per-8x8 entries for non-8x8 partitions.
-            // P_8x8/B_8x8 already fill all 4 entries during decode.
-            let mut ref_l0 = mb.ref_idx_l0;
-            let mut ref_l1 = mb.ref_idx_l1;
-            if !mb.is_intra && mb.mb_type != 3 && mb.mb_type != 22 {
-                match mb.partition_count {
-                    1 => {
-                        // 16x16: all 4 entries get the same ref_idx
-                        ref_l0 = [ref_l0[0]; 4];
-                        ref_l1 = [ref_l1[0]; 4];
-                    }
-                    2 => {
-                        // 16x8 or 8x16
-                        let is_16x8 = match hdr.slice_type {
-                            SliceType::P | SliceType::SP => mb.mb_type == 1,
-                            SliceType::B => {
-                                mb.mb_type >= 4 && mb.mb_type <= 11 && mb.mb_type % 2 == 0
-                            }
-                            _ => true,
-                        };
-                        if is_16x8 {
-                            // Top half: parts 0,1 get ref[0]; bottom: parts 2,3 get ref[1]
-                            ref_l0 = [ref_l0[0], ref_l0[0], ref_l0[1], ref_l0[1]];
-                            ref_l1 = [ref_l1[0], ref_l1[0], ref_l1[1], ref_l1[1]];
-                        } else {
-                            // Left half: parts 0,2 get ref[0]; right: parts 1,3 get ref[1]
-                            ref_l0 = [ref_l0[0], ref_l0[1], ref_l0[0], ref_l0[1]];
-                            ref_l1 = [ref_l1[0], ref_l1[1], ref_l1[0], ref_l1[1]];
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
-            // Update CABAC neighbor context
+            // Write back MVD/ref from scan8 cache to flat storage, then update scalar fields
+            cache.write_back(&mut cabac_nb, mb_idx);
             cabac_nb.update_after_mb(
                 mb_idx,
-                false, // is_skip
+                false,
                 mb.is_intra16x16 || mb.is_pcm,
                 mb.is_intra,
                 mb.is_direct,
                 mb.cbp,
                 mb.chroma_pred_mode,
                 &mb.non_zero_count,
-                &mvd_abs_l0,
-                &mvd_abs_l1,
-                &ref_l0,
-                &ref_l1,
             );
 
             mb_addr += 1;

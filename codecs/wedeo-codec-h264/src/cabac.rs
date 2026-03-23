@@ -43,40 +43,18 @@ pub struct CabacReader<'a> {
 impl<'a> CabacReader<'a> {
     /// Initialize a CABAC decoder from byte-aligned RBSP data.
     ///
-    /// Matches FFmpeg's `ff_init_cabac_decoder` (CABAC_BITS=16), which has
-    /// two paths based on the alignment of the bytestream pointer after
-    /// reading the first 2 bytes:
-    ///
-    /// - **Aligned** (`(ptr+2) & 1 == 0`): `low += 1 << 9`, pos=2
-    /// - **Unaligned** (`(ptr+2) & 1 == 1`): `low += buf[2]<<2 + 2`, pos=3
-    ///
-    /// In FFmpeg, the pointer alignment depends on the RBSP buffer allocation
-    /// (always even-aligned via `av_malloc`) plus the slice header byte offset.
-    /// The `rbsp_offset` parameter is the byte offset of this CABAC data within
-    /// the original RBSP buffer, used to replicate FFmpeg's alignment decision:
-    /// `rbsp_offset & 1` determines which path is taken.
-    pub fn new(data: &'a [u8], rbsp_offset: usize) -> Result<Self> {
+    /// Uses the aligned init path from FFmpeg's `ff_init_cabac_decoder`
+    /// (CABAC_BITS=16). Both aligned and unaligned paths produce equivalent
+    /// decoded bits — the `low` offset difference is cosmetic (verified
+    /// experimentally). Using a fixed path avoids tracking pointer alignment
+    /// through the NAL parsing chain.
+    pub fn new(data: &'a [u8]) -> Result<Self> {
         if data.len() < 2 {
             return Err(Error::InvalidData);
         }
 
-        let mut low = (data[0] as i32) << 18 | (data[1] as i32) << 10;
+        let low = ((data[0] as i32) << 18) | ((data[1] as i32) << 10) | (1 << 9);
         let range = 0x1FE;
-
-        // Match FFmpeg's alignment-dependent init. The RBSP buffer is always
-        // heap-allocated (even-aligned), so (ptr + 2) & 1 == rbsp_offset & 1.
-        let pos = if rbsp_offset & 1 == 0 {
-            // Aligned path: add 1<<9, stay at pos 2
-            low += 1 << 9;
-            2
-        } else {
-            // Unaligned path: read a third byte, advance to pos 3
-            if data.len() < 3 {
-                return Err(Error::InvalidData);
-            }
-            low += ((data[2] as i32) << 2) + 2;
-            3
-        };
 
         if (range << (CABAC_BITS + 1)) < low {
             return Err(Error::InvalidData);
@@ -85,7 +63,7 @@ impl<'a> CabacReader<'a> {
         Ok(Self {
             low,
             range,
-            pos,
+            pos: 2,
             data,
         })
     }
@@ -548,7 +526,9 @@ impl CabacNeighborCtx {
         self.cbp[top_idx]
     }
 
-    /// Store the CABAC-relevant state after decoding a macroblock.
+    /// Store the CABAC-relevant scalar state after decoding a macroblock.
+    /// MVD and ref_idx are written separately by `CabacDecodeCache::write_back`
+    /// (for coded MBs) or `update_mvd_ref_skip` (for skip MBs).
     #[allow(clippy::too_many_arguments)]
     pub fn update_after_mb(
         &mut self,
@@ -560,10 +540,6 @@ impl CabacNeighborCtx {
         cbp: u32,
         chroma_pred: u8,
         nz: &[u8; 24],
-        mvd_l0: &[[u8; 2]; 16],
-        mvd_l1: &[[u8; 2]; 16],
-        ref_idx_l0: &[i8; 4],
-        ref_idx_l1: &[i8; 4],
     ) {
         self.mb_skip[mb_idx] = is_skip;
         self.mb_type_intra16x16_or_pcm[mb_idx] = is_intra16x16_or_pcm;
@@ -573,12 +549,200 @@ impl CabacNeighborCtx {
         self.chroma_pred_mode[mb_idx] = chroma_pred;
         let nz_base = mb_idx * 24;
         self.nz_count[nz_base..nz_base + 24].copy_from_slice(nz);
+    }
+
+    /// Write skip-MB defaults for MVD and ref_idx.
+    pub fn update_mvd_ref_skip(&mut self, mb_idx: usize) {
         let mvd_base = mb_idx * 16;
-        self.mvd_cache_l0[mvd_base..mvd_base + 16].copy_from_slice(mvd_l0);
-        self.mvd_cache_l1[mvd_base..mvd_base + 16].copy_from_slice(mvd_l1);
+        self.mvd_cache_l0[mvd_base..mvd_base + 16].fill([0; 2]);
+        self.mvd_cache_l1[mvd_base..mvd_base + 16].fill([0; 2]);
         let ref_base = mb_idx * 4;
-        self.ref_cache_l0[ref_base..ref_base + 4].copy_from_slice(ref_idx_l0);
-        self.ref_cache_l1[ref_base..ref_base + 4].copy_from_slice(ref_idx_l1);
+        self.ref_cache_l0[ref_base..ref_base + 4].fill(0);
+        self.ref_cache_l1[ref_base..ref_base + 4].fill(-1);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// scan8-based per-MB decode cache
+// ---------------------------------------------------------------------------
+
+/// scan8 table: maps H.264 block index (0..50) to position in stride-8 cache.
+///
+/// Layout: luma 4x4 blocks [0-15] in Z-scan within 8x8 partitions,
+/// chroma Cb [16-19], Cr [20-23] interleaved in cols 4-5/6-7,
+/// 4:2:2 extensions [24-47], DC positions [48-50].
+///
+/// Reference: FFmpeg h264_parse.h:40-54.
+pub const SCAN8: [usize; 51] = [
+    12, 13, 20, 21, // luma [0-3]: top-left 8x8      (col 4-5, rows 1-2)
+    14, 15, 22, 23, // luma [4-7]: top-right 8x8     (col 6-7, rows 1-2)
+    28, 29, 36, 37, // luma [8-11]: bottom-left 8x8  (col 4-5, rows 3-4)
+    30, 31, 38, 39, // luma [12-15]: bottom-right 8x8 (col 6-7, rows 3-4)
+    52, 53, 60, 61, // chroma Cb [16-19]              (col 4-5, rows 6-7)
+    54, 55, 62, 63, // chroma Cr [20-23] (4:2:0)     (col 6-7, rows 6-7)
+    68, 69, 76, 77, // [24-27]
+    70, 71, 78, 79, // [28-31]
+    92, 93, 100, 101, // [32-35]
+    94, 95, 102, 103, // [36-39]
+    108, 109, 116, 117, // [40-43]
+    110, 111, 118, 119, // [44-47]
+    0, 40, 80, // DC [48-50]
+];
+
+/// Sentinel: reference index not used by this list.
+pub const LIST_NOT_USED: i8 = -1;
+
+/// Per-MB decode cache matching FFmpeg's scan8-indexed layout.
+///
+/// Filled by `fill()` before each MB's inter prediction, updated during
+/// decode via `fill_rectangle`, persisted by `write_back()` after each MB.
+///
+/// Reference: FFmpeg h264dec.h:290-302 (H264SliceContext cache fields).
+pub struct CabacDecodeCache {
+    /// Reference indices per list. Layout: [list][5*8].
+    /// Values: >=0 ref_idx, LIST_NOT_USED (-1).
+    pub ref_cache: [[i8; 40]; 2],
+    /// Absolute MVD for CABAC context. Layout: [list][5*8][2].
+    pub mvd_cache: [[[u8; 2]; 40]; 2],
+}
+
+/// Fill a w×h rectangle in a stride-8 cache starting at position `pos`.
+///
+/// Reference: FFmpeg rectangle.h fill_rectangle().
+#[inline]
+pub fn fill_rectangle<T: Copy>(
+    cache: &mut [T],
+    pos: usize,
+    w: usize,
+    h: usize,
+    stride: usize,
+    val: T,
+) {
+    for row in 0..h {
+        for col in 0..w {
+            cache[pos + row * stride + col] = val;
+        }
+    }
+}
+
+impl Default for CabacDecodeCache {
+    fn default() -> Self {
+        Self {
+            ref_cache: [[LIST_NOT_USED; 40]; 2],
+            mvd_cache: [[[0u8; 2]; 40]; 2],
+        }
+    }
+}
+
+impl CabacDecodeCache {
+    /// Create a cache initialized with unavailable defaults.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fill the decode cache from neighbor data before decoding inter prediction.
+    ///
+    /// Populates the left column (col 3) and top row (row 0) of each cache
+    /// from the neighboring MBs' stored values. Internal positions (rows 1-4,
+    /// cols 4-7) are filled by `fill_rectangle` during decode.
+    ///
+    /// Reference: FFmpeg h264_mvpred.h:576-929 (fill_decode_caches).
+    #[allow(clippy::too_many_arguments)]
+    pub fn fill(
+        &mut self,
+        cabac_nb: &CabacNeighborCtx,
+        slice_table: &[u16],
+        cur_slice: u16,
+        mb_idx: usize,
+        mb_x: u32,
+        mb_y: u32,
+        mb_width: u32,
+    ) {
+        let has_top = mb_y > 0 && slice_table[mb_idx - mb_width as usize] == cur_slice;
+        let has_left = mb_x > 0 && slice_table[mb_idx - 1] == cur_slice;
+
+        for list in 0..2 {
+            let ref_store = if list == 0 {
+                &cabac_nb.ref_cache_l0
+            } else {
+                &cabac_nb.ref_cache_l1
+            };
+            let mvd_store = if list == 0 {
+                &cabac_nb.mvd_cache_l0
+            } else {
+                &cabac_nb.mvd_cache_l1
+            };
+
+            // Top neighbor: bottom row of top MB
+            if has_top {
+                let top_idx = mb_idx - mb_width as usize;
+                if !cabac_nb.mb_intra[top_idx] {
+                    // ref: bottom-left (part 2) fills cols 4-5, bottom-right (part 3) fills cols 6-7
+                    let r2 = ref_store[top_idx * 4 + 2];
+                    let r3 = ref_store[top_idx * 4 + 3];
+                    self.ref_cache[list][4] = r2;
+                    self.ref_cache[list][5] = r2;
+                    self.ref_cache[list][6] = r3;
+                    self.ref_cache[list][7] = r3;
+                    // mvd: bottom row = raster indices 12..15
+                    for col in 0..4 {
+                        self.mvd_cache[list][4 + col] = mvd_store[top_idx * 16 + 12 + col];
+                    }
+                }
+                // else: intra → ref stays LIST_NOT_USED, mvd stays [0,0]
+            }
+
+            // Left neighbor: right column of left MB
+            if has_left {
+                let left_idx = mb_idx - 1;
+                if !cabac_nb.mb_intra[left_idx] {
+                    // ref: top-right (part 1) → rows 1-2, bottom-right (part 3) → rows 3-4
+                    let r1 = ref_store[left_idx * 4 + 1];
+                    let r3 = ref_store[left_idx * 4 + 3];
+                    self.ref_cache[list][SCAN8[0] - 1] = r1; // col 3, row 1
+                    self.ref_cache[list][SCAN8[2] - 1] = r1; // col 3, row 2
+                    self.ref_cache[list][SCAN8[8] - 1] = r3; // col 3, row 3
+                    self.ref_cache[list][SCAN8[10] - 1] = r3; // col 3, row 4
+                    // mvd: right column = raster indices 3,7,11,15
+                    self.mvd_cache[list][SCAN8[0] - 1] = mvd_store[left_idx * 16 + 3];
+                    self.mvd_cache[list][SCAN8[2] - 1] = mvd_store[left_idx * 16 + 7];
+                    self.mvd_cache[list][SCAN8[8] - 1] = mvd_store[left_idx * 16 + 11];
+                    self.mvd_cache[list][SCAN8[10] - 1] = mvd_store[left_idx * 16 + 15];
+                }
+            }
+        }
+    }
+
+    /// Write back MVD and ref_idx from the cache to persistent flat storage.
+    ///
+    /// Reference: FFmpeg h264_mvpred.h:94-128 (write_back_motion_list).
+    pub fn write_back(&self, cabac_nb: &mut CabacNeighborCtx, mb_idx: usize) {
+        for list in 0..2 {
+            let ref_store = if list == 0 {
+                &mut cabac_nb.ref_cache_l0
+            } else {
+                &mut cabac_nb.ref_cache_l1
+            };
+            let mvd_store = if list == 0 {
+                &mut cabac_nb.mvd_cache_l0
+            } else {
+                &mut cabac_nb.mvd_cache_l1
+            };
+
+            // Write back ref indices (4 per MB, one per 8x8 partition)
+            let ref_base = mb_idx * 4;
+            ref_store[ref_base] = self.ref_cache[list][SCAN8[0]];
+            ref_store[ref_base + 1] = self.ref_cache[list][SCAN8[4]];
+            ref_store[ref_base + 2] = self.ref_cache[list][SCAN8[8]];
+            ref_store[ref_base + 3] = self.ref_cache[list][SCAN8[12]];
+
+            // Write back MVD (16 per MB, raster-ordered from scan8 positions)
+            let mvd_base = mb_idx * 16;
+            for raster in 0..16 {
+                let cache_pos = (4 + raster % 4) + (1 + raster / 4) * 8;
+                mvd_store[mvd_base + raster] = self.mvd_cache[list][cache_pos];
+            }
+        }
     }
 }
 
@@ -926,11 +1090,17 @@ fn decode_cabac_b_mb_sub_type(reader: &mut CabacReader, state: &mut [u8; 1024]) 
 
 /// Decode reference index using CABAC (unary code).
 ///
+/// `cache_pos` is the scan8 cache position of the partition's top-left block.
+/// Left and top ref neighbors are read from `cache.ref_cache[list]` at
+/// `cache_pos - 1` and `cache_pos - 8`, which reach the correct neighbor
+/// positions thanks to the scan8 layout.
+///
 /// Reference: FFmpeg h264_cabac.c:1477-1503.
 #[allow(clippy::too_many_arguments)]
 fn decode_cabac_mb_ref(
     reader: &mut CabacReader,
     state: &mut [u8; 1024],
+    cache: &CabacDecodeCache,
     cabac_nb: &CabacNeighborCtx,
     slice_table: &[u16],
     cur_slice: u16,
@@ -939,30 +1109,23 @@ fn decode_cabac_mb_ref(
     mb_y: u32,
     mb_width: u32,
     list: usize,
-    blk_idx: usize,
+    cache_pos: usize,
     is_b_slice: bool,
-    local_ref: &[i8; 4],
 ) -> i32 {
-    // Get left and top reference indices for context
-    let (ref_a, ref_b) = get_ref_neighbors(
-        cabac_nb,
-        slice_table,
-        cur_slice,
-        mb_idx,
-        mb_x,
-        mb_y,
-        mb_width,
-        list,
-        blk_idx,
-        local_ref,
-    );
+    let ref_a = cache.ref_cache[list][cache_pos - 1] as i32;
+    let ref_b = cache.ref_cache[list][cache_pos - 8] as i32;
 
     let mut ctx = 0usize;
 
     if is_b_slice {
-        // B-slice: check ref > 0 and not direct
+        let left_pos = cache_pos - 1;
+        let top_pos = cache_pos - 8;
+        // B-slice: check ref > 0 and neighbor is not direct-mode.
+        // Left column (col 3) → left MB, top row (row 0) → top MB,
+        // anything else is intra-MB (never direct).
         if ref_a > 0
-            && !is_neighbor_direct(
+            && !is_cache_pos_direct(
+                left_pos,
                 cabac_nb,
                 slice_table,
                 cur_slice,
@@ -970,13 +1133,13 @@ fn decode_cabac_mb_ref(
                 mb_x,
                 mb_y,
                 mb_width,
-                true,
             )
         {
             ctx += 1;
         }
         if ref_b > 0
-            && !is_neighbor_direct(
+            && !is_cache_pos_direct(
+                top_pos,
                 cabac_nb,
                 slice_table,
                 cur_slice,
@@ -984,7 +1147,6 @@ fn decode_cabac_mb_ref(
                 mb_x,
                 mb_y,
                 mb_width,
-                false,
             )
         {
             ctx += 2;
@@ -1009,24 +1171,11 @@ fn decode_cabac_mb_ref(
     ref_idx
 }
 
-/// Get left and top ref_idx neighbors for ref context derivation.
-/// Returns (ref_left, ref_top). -1 if unavailable.
-///
-/// `blk_idx` is the 8x8 partition index (0-3) mapped from scan8:
-///   0 = top-left 8x8, 1 = top-right 8x8,
-///   2 = bottom-left 8x8, 3 = bottom-right 8x8.
-///
-/// For the left neighbor of blk_idx 0 or 2 (left column), look at the
-/// right column (part 1 or 3) of the left MB. For blk_idx 1 or 3
-/// (right column), look at part 0 or 2 of the current MB (intra-MB).
-///
-/// For the top neighbor of blk_idx 0 or 1 (top row), look at the
-/// bottom row (part 2 or 3) of the top MB. For blk_idx 2 or 3
-/// (bottom row), look at part 0 or 1 of the current MB (intra-MB).
-///
-/// Reference: FFmpeg h264_cabac.c:1479-1480 via scan8-based ref_cache.
+/// Check if a cache position refers to a direct-mode neighbor MB.
+/// Col 3 → left MB, row 0 → top MB, anything else → intra-MB (not direct).
 #[allow(clippy::too_many_arguments)]
-fn get_ref_neighbors(
+fn is_cache_pos_direct(
+    pos: usize,
     cabac_nb: &CabacNeighborCtx,
     slice_table: &[u16],
     cur_slice: u16,
@@ -1034,55 +1183,34 @@ fn get_ref_neighbors(
     mb_x: u32,
     mb_y: u32,
     mb_width: u32,
-    list: usize,
-    blk_idx: usize,
-    local_ref: &[i8; 4],
-) -> (i32, i32) {
-    let ref_cache = if list == 0 {
-        &cabac_nb.ref_cache_l0
+) -> bool {
+    if pos % 8 == 3 {
+        // Left column → check left MB
+        is_neighbor_direct(
+            cabac_nb,
+            slice_table,
+            cur_slice,
+            mb_idx,
+            mb_x,
+            mb_y,
+            mb_width,
+            true,
+        )
+    } else if pos < 8 {
+        // Top row → check top MB
+        is_neighbor_direct(
+            cabac_nb,
+            slice_table,
+            cur_slice,
+            mb_idx,
+            mb_x,
+            mb_y,
+            mb_width,
+            false,
+        )
     } else {
-        &cabac_nb.ref_cache_l1
-    };
-
-    let blk_x = blk_idx & 1; // 0 = left column, 1 = right column
-    let blk_y = blk_idx >> 1; // 0 = top row, 1 = bottom row
-
-    // Left neighbor ref_idx
-    let ref_a = if blk_x == 0 {
-        // Left column → look at right column of left MB
-        if mb_x > 0 && slice_table[mb_idx - 1] == cur_slice {
-            let left_idx = mb_idx - 1;
-            // Right column partner: part 1 (if blk_y=0) or part 3 (if blk_y=1)
-            let left_part = 1 + blk_y * 2;
-            ref_cache[left_idx * 4 + left_part] as i32
-        } else {
-            -1
-        }
-    } else {
-        // Right column → look at left column of current MB (same row)
-        // Use local cache for the current MB's already-decoded partitions.
-        let cur_part = blk_y * 2;
-        local_ref[cur_part] as i32
-    };
-
-    // Top neighbor ref_idx
-    let ref_b = if blk_y == 0 {
-        // Top row → look at bottom row of top MB
-        if mb_y > 0 && slice_table[mb_idx - mb_width as usize] == cur_slice {
-            let top_idx = mb_idx - mb_width as usize;
-            // Bottom row partner: part 2 (if blk_x=0) or part 3 (if blk_x=1)
-            let top_part = 2 + blk_x;
-            ref_cache[top_idx * 4 + top_part] as i32
-        } else {
-            -1
-        }
-    } else {
-        // Bottom row → look at top row of current MB (same column)
-        // Use local cache for the current MB's already-decoded partitions.
-        local_ref[blk_x] as i32
-    };
-
-    (ref_a, ref_b)
+        false
+    }
 }
 
 /// Check if a neighbor MB is direct mode (for B-slice ref context).
@@ -1165,40 +1293,24 @@ fn decode_cabac_mb_mvd_component(
 
 /// Decode MVD for a block, returning (mvd_x, mvd_y, abs_mvd_x, abs_mvd_y).
 ///
-/// `local_mvd` is a 16-entry cache indexed by `blk_y * 4 + blk_x` within the
-/// current MB, storing `[abs_mvd_x, abs_mvd_y]` for intra-MB neighbor lookups.
+/// Decode MVD for a block, returning (mvd_x, mvd_y, abs_mvd_x, abs_mvd_y).
+///
+/// `cache_pos` is the scan8 cache position for this block. Left and top
+/// MVD neighbors are read from `cache.mvd_cache[list]` at `cache_pos - 1`
+/// and `cache_pos - 8`.
 ///
 /// Reference: FFmpeg DECODE_CABAC_MB_MVD macro, h264_cabac.c:1543-1556.
-#[allow(clippy::too_many_arguments)]
 fn decode_cabac_mb_mvd(
     reader: &mut CabacReader,
     state: &mut [u8; 1024],
-    cabac_nb: &CabacNeighborCtx,
-    slice_table: &[u16],
-    cur_slice: u16,
-    mb_idx: usize,
-    mb_x: u32,
-    mb_y: u32,
-    mb_width: u32,
+    cache: &CabacDecodeCache,
     list: usize,
-    blk_x: u32,
-    blk_y: u32,
-    local_mvd: &[[u8; 2]; 16],
+    cache_pos: usize,
 ) -> (i16, i16, u8, u8) {
-    // Compute amvd0 and amvd1 from left and top neighbor absolute MVDs
-    let (amvd0, amvd1) = get_amvd(
-        cabac_nb,
-        slice_table,
-        cur_slice,
-        mb_idx,
-        mb_x,
-        mb_y,
-        mb_width,
-        list,
-        blk_x,
-        blk_y,
-        local_mvd,
-    );
+    let left = &cache.mvd_cache[list][cache_pos - 1];
+    let top = &cache.mvd_cache[list][cache_pos - 8];
+    let amvd0 = left[0] as i32 + top[0] as i32;
+    let amvd1 = left[1] as i32 + top[1] as i32;
 
     let (mx, abs_x) = decode_cabac_mb_mvd_component(reader, state, 40, amvd0);
     let (my, abs_y) = decode_cabac_mb_mvd_component(reader, state, 47, amvd1);
@@ -1208,97 +1320,6 @@ fn decode_cabac_mb_mvd(
     }
 
     (mx as i16, my as i16, abs_x, abs_y)
-}
-
-/// Compute amvd (sum of absolute MVDs from left and top neighbors).
-///
-/// `local_mvd` provides intra-MB neighbor lookups for `blk_x > 0` or `blk_y > 0`.
-#[allow(clippy::too_many_arguments)]
-fn get_amvd(
-    cabac_nb: &CabacNeighborCtx,
-    slice_table: &[u16],
-    cur_slice: u16,
-    mb_idx: usize,
-    mb_x: u32,
-    mb_y: u32,
-    mb_width: u32,
-    list: usize,
-    blk_x: u32,
-    blk_y: u32,
-    local_mvd: &[[u8; 2]; 16],
-) -> (i32, i32) {
-    let mvd_cache = if list == 0 {
-        &cabac_nb.mvd_cache_l0
-    } else {
-        &cabac_nb.mvd_cache_l1
-    };
-
-    // Left neighbor MVD
-    let (left_mvd_x, left_mvd_y) = if blk_x > 0 {
-        // Within current MB — read from local cache
-        let idx = (blk_y * 4 + (blk_x - 1)) as usize;
-        (local_mvd[idx][0] as i32, local_mvd[idx][1] as i32)
-    } else if mb_x > 0 && slice_table[mb_idx - 1] == cur_slice {
-        let left_idx = mb_idx - 1;
-        // Right column of left MB: blk_x=3. For the corresponding blk_y row.
-        let raster_idx = blk_y * 4 + 3;
-        let cache_idx = left_idx * 16 + raster_idx as usize;
-        if cache_idx < mvd_cache.len() {
-            (
-                mvd_cache[cache_idx][0] as i32,
-                mvd_cache[cache_idx][1] as i32,
-            )
-        } else {
-            (0, 0)
-        }
-    } else {
-        (0, 0)
-    };
-
-    // Top neighbor MVD
-    let (top_mvd_x, top_mvd_y) = if blk_y > 0 {
-        // Within current MB — read from local cache
-        let idx = ((blk_y - 1) * 4 + blk_x) as usize;
-        (local_mvd[idx][0] as i32, local_mvd[idx][1] as i32)
-    } else if mb_y > 0 && slice_table[mb_idx - mb_width as usize] == cur_slice {
-        let top_idx = mb_idx - mb_width as usize;
-        // Bottom row of top MB: blk_y=3. For the corresponding blk_x column.
-        let raster_idx = 3 * 4 + blk_x;
-        let cache_idx = top_idx * 16 + raster_idx as usize;
-        if cache_idx < mvd_cache.len() {
-            (
-                mvd_cache[cache_idx][0] as i32,
-                mvd_cache[cache_idx][1] as i32,
-            )
-        } else {
-            (0, 0)
-        }
-    } else {
-        (0, 0)
-    };
-
-    (left_mvd_x + top_mvd_x, left_mvd_y + top_mvd_y)
-}
-
-/// Fill the local MVD cache for a sub-block at (blk_x, blk_y) with the given
-/// block dimensions (w x h in 4x4 units).
-fn fill_local_mvd(
-    cache: &mut [[u8; 2]; 16],
-    blk_x: u32,
-    blk_y: u32,
-    w: u32,
-    h: u32,
-    abs_x: u8,
-    abs_y: u8,
-) {
-    for dy in 0..h {
-        for dx in 0..w {
-            let idx = ((blk_y + dy) * 4 + (blk_x + dx)) as usize;
-            if idx < 16 {
-                cache[idx] = [abs_x, abs_y];
-            }
-        }
-    }
 }
 
 /// Sub-block offset within an 8x8 partition for P_8x8 sub_mb_types.
@@ -1900,6 +1921,7 @@ pub fn decode_mb_cabac(
     num_ref_idx_l0_active: u32,
     num_ref_idx_l1_active: u32,
     last_qscale_diff: i32,
+    cache: &mut CabacDecodeCache,
 ) -> Result<Macroblock> {
     let mut mb = Macroblock::default();
     let mb_idx = (mb_y * mb_width + mb_x) as usize;
@@ -2194,13 +2216,20 @@ pub fn decode_mb_cabac(
         );
     }
 
-    // 5. Inter prediction (P-slice, not intra)
-    // Local MVD caches for intra-MB neighbor context derivation.
-    let mut local_mvd_l0 = [[0u8; 2]; 16];
-    let mut local_mvd_l1 = [[0u8; 2]; 16];
-    // Local ref-idx caches for CABAC context derivation (-1 = unavailable/intra).
-    let mut local_ref_l0: [i8; 4] = [-1; 4];
-    let mut local_ref_l1: [i8; 4] = [-1; 4];
+    // 5. Inter prediction — fill scan8 cache and decode ref/mvd.
+    // The cache handles both cross-MB and intra-MB neighbor lookups via scan8.
+    if !is_intra {
+        cache.fill(
+            cabac_nb,
+            slice_table,
+            cur_slice,
+            mb_idx,
+            mb_x,
+            mb_y,
+            mb_width,
+        );
+    }
+
     if !is_intra && (slice_type == SliceType::P || slice_type == SliceType::SP) {
         match mb.mb_type {
             0 => {
@@ -2209,6 +2238,7 @@ pub fn decode_mb_cabac(
                     mb.ref_idx_l0[0] = decode_cabac_mb_ref(
                         reader,
                         state,
+                        cache,
                         cabac_nb,
                         slice_table,
                         cur_slice,
@@ -2217,39 +2247,26 @@ pub fn decode_mb_cabac(
                         mb_y,
                         mb_width,
                         0,
-                        0,
+                        SCAN8[0],
                         false,
-                        &local_ref_l0,
                     ) as i8;
-                    local_ref_l0[0] = mb.ref_idx_l0[0];
                 } else {
                     mb.ref_idx_l0[0] = 0;
                 }
-                let (mx, my, ax, ay) = decode_cabac_mb_mvd(
-                    reader,
-                    state,
-                    cabac_nb,
-                    slice_table,
-                    cur_slice,
-                    mb_idx,
-                    mb_x,
-                    mb_y,
-                    mb_width,
-                    0,
-                    0,
-                    0,
-                    &local_mvd_l0,
-                );
+                fill_rectangle(&mut cache.ref_cache[0], SCAN8[0], 4, 4, 8, mb.ref_idx_l0[0]);
+                let (mx, my, ax, ay) = decode_cabac_mb_mvd(reader, state, cache, 0, SCAN8[0]);
                 mb.mvd_l0[0] = [mx, my];
-                fill_local_mvd(&mut local_mvd_l0, 0, 0, 4, 4, ax, ay);
+                fill_rectangle(&mut cache.mvd_cache[0], SCAN8[0], 4, 4, 8, [ax, ay]);
             }
             1 => {
                 // P_L0_L0_16x8
                 for part in 0..2u32 {
+                    let scan8_n = SCAN8[part as usize * 8];
                     if num_ref_idx_l0_active > 1 {
                         mb.ref_idx_l0[part as usize] = decode_cabac_mb_ref(
                             reader,
                             state,
+                            cache,
                             cabac_nb,
                             slice_table,
                             cur_slice,
@@ -2258,43 +2275,37 @@ pub fn decode_mb_cabac(
                             mb_y,
                             mb_width,
                             0,
-                            0,
+                            scan8_n,
                             false,
-                            &local_ref_l0,
                         ) as i8;
-                        local_ref_l0[part as usize] = mb.ref_idx_l0[part as usize];
                     } else {
                         mb.ref_idx_l0[part as usize] = 0;
                     }
+                    fill_rectangle(
+                        &mut cache.ref_cache[0],
+                        scan8_n,
+                        4,
+                        2,
+                        8,
+                        mb.ref_idx_l0[part as usize],
+                    );
                 }
                 for part in 0..2u32 {
-                    let blk_y = part * 2;
-                    let (mx, my, ax, ay) = decode_cabac_mb_mvd(
-                        reader,
-                        state,
-                        cabac_nb,
-                        slice_table,
-                        cur_slice,
-                        mb_idx,
-                        mb_x,
-                        mb_y,
-                        mb_width,
-                        0,
-                        0,
-                        blk_y,
-                        &local_mvd_l0,
-                    );
+                    let scan8_n = SCAN8[part as usize * 8];
+                    let (mx, my, ax, ay) = decode_cabac_mb_mvd(reader, state, cache, 0, scan8_n);
                     mb.mvd_l0[part as usize] = [mx, my];
-                    fill_local_mvd(&mut local_mvd_l0, 0, blk_y, 4, 2, ax, ay);
+                    fill_rectangle(&mut cache.mvd_cache[0], scan8_n, 4, 2, 8, [ax, ay]);
                 }
             }
             2 => {
                 // P_L0_L0_8x16
                 for part in 0..2u32 {
+                    let scan8_n = SCAN8[part as usize * 4];
                     if num_ref_idx_l0_active > 1 {
                         mb.ref_idx_l0[part as usize] = decode_cabac_mb_ref(
                             reader,
                             state,
+                            cache,
                             cabac_nb,
                             slice_table,
                             cur_slice,
@@ -2303,34 +2314,26 @@ pub fn decode_mb_cabac(
                             mb_y,
                             mb_width,
                             0,
-                            0,
+                            scan8_n,
                             false,
-                            &local_ref_l0,
                         ) as i8;
-                        local_ref_l0[part as usize] = mb.ref_idx_l0[part as usize];
                     } else {
                         mb.ref_idx_l0[part as usize] = 0;
                     }
+                    fill_rectangle(
+                        &mut cache.ref_cache[0],
+                        scan8_n,
+                        2,
+                        4,
+                        8,
+                        mb.ref_idx_l0[part as usize],
+                    );
                 }
                 for part in 0..2u32 {
-                    let blk_x = part * 2;
-                    let (mx, my, ax, ay) = decode_cabac_mb_mvd(
-                        reader,
-                        state,
-                        cabac_nb,
-                        slice_table,
-                        cur_slice,
-                        mb_idx,
-                        mb_x,
-                        mb_y,
-                        mb_width,
-                        0,
-                        blk_x,
-                        0,
-                        &local_mvd_l0,
-                    );
+                    let scan8_n = SCAN8[part as usize * 4];
+                    let (mx, my, ax, ay) = decode_cabac_mb_mvd(reader, state, cache, 0, scan8_n);
                     mb.mvd_l0[part as usize] = [mx, my];
-                    fill_local_mvd(&mut local_mvd_l0, blk_x, 0, 2, 4, ax, ay);
+                    fill_rectangle(&mut cache.mvd_cache[0], scan8_n, 2, 4, 8, [ax, ay]);
                 }
             }
             3 | 4 => {
@@ -2348,6 +2351,7 @@ pub fn decode_mb_cabac(
                         mb.ref_idx_l0[i] = decode_cabac_mb_ref(
                             reader,
                             state,
+                            cache,
                             cabac_nb,
                             slice_table,
                             cur_slice,
@@ -2356,14 +2360,20 @@ pub fn decode_mb_cabac(
                             mb_y,
                             mb_width,
                             0,
-                            i,
+                            SCAN8[i * 4],
                             false,
-                            &local_ref_l0,
                         ) as i8;
-                        local_ref_l0[i] = mb.ref_idx_l0[i];
                     } else {
                         mb.ref_idx_l0[i] = 0;
                     }
+                    fill_rectangle(
+                        &mut cache.ref_cache[0],
+                        SCAN8[i * 4],
+                        2,
+                        2,
+                        8,
+                        mb.ref_idx_l0[i],
+                    );
                 }
                 for i in 0..4 {
                     let base_x = (i & 1) as u32 * 2;
@@ -2375,23 +2385,18 @@ pub fn decode_mb_cabac(
                             let (dx, dy, w, h) = p8x8_sub_blk(mb.sub_mb_type[i] as u32, j);
                             let blk_x = base_x + dx;
                             let blk_y = base_y + dy;
-                            let (mx, my, ax, ay) = decode_cabac_mb_mvd(
-                                reader,
-                                state,
-                                cabac_nb,
-                                slice_table,
-                                cur_slice,
-                                mb_idx,
-                                mb_x,
-                                mb_y,
-                                mb_width,
-                                0,
-                                blk_x,
-                                blk_y,
-                                &local_mvd_l0,
-                            );
+                            let cache_pos = (4 + blk_x as usize) + (1 + blk_y as usize) * 8;
+                            let (mx, my, ax, ay) =
+                                decode_cabac_mb_mvd(reader, state, cache, 0, cache_pos);
                             mb.mvd_l0[mvd_idx] = [mx, my];
-                            fill_local_mvd(&mut local_mvd_l0, blk_x, blk_y, w, h, ax, ay);
+                            fill_rectangle(
+                                &mut cache.mvd_cache[0],
+                                cache_pos,
+                                w as usize,
+                                h as usize,
+                                8,
+                                [ax, ay],
+                            );
                         }
                     }
                 }
@@ -2417,6 +2422,7 @@ pub fn decode_mb_cabac(
                     mb.ref_idx_l0[i] = decode_cabac_mb_ref(
                         reader,
                         state,
+                        cache,
                         cabac_nb,
                         slice_table,
                         cur_slice,
@@ -2425,14 +2431,20 @@ pub fn decode_mb_cabac(
                         mb_y,
                         mb_width,
                         0,
-                        i,
+                        SCAN8[i * 4],
                         true,
-                        &local_ref_l0,
                     ) as i8;
-                    local_ref_l0[i] = mb.ref_idx_l0[i];
                 } else if info.2 {
                     mb.ref_idx_l0[i] = 0;
                 }
+                fill_rectangle(
+                    &mut cache.ref_cache[0],
+                    SCAN8[i * 4],
+                    2,
+                    2,
+                    8,
+                    mb.ref_idx_l0[i],
+                );
             }
             // ref_idx L1
             for i in 0..4 {
@@ -2444,6 +2456,7 @@ pub fn decode_mb_cabac(
                     mb.ref_idx_l1[i] = decode_cabac_mb_ref(
                         reader,
                         state,
+                        cache,
                         cabac_nb,
                         slice_table,
                         cur_slice,
@@ -2452,14 +2465,20 @@ pub fn decode_mb_cabac(
                         mb_y,
                         mb_width,
                         1,
-                        i,
+                        SCAN8[i * 4],
                         true,
-                        &local_ref_l1,
                     ) as i8;
-                    local_ref_l1[i] = mb.ref_idx_l1[i];
                 } else if info.3 {
                     mb.ref_idx_l1[i] = 0;
                 }
+                fill_rectangle(
+                    &mut cache.ref_cache[1],
+                    SCAN8[i * 4],
+                    2,
+                    2,
+                    8,
+                    mb.ref_idx_l1[i],
+                );
             }
             // mvd L0
             for i in 0..4 {
@@ -2470,30 +2489,24 @@ pub fn decode_mb_cabac(
                 if info.2 {
                     let base_x = (i & 1) as u32 * 2;
                     let base_y = (i >> 1) as u32 * 2;
-                    let sub_part_count = info.0 as usize;
-                    for j in 0..sub_part_count {
+                    for j in 0..info.0 as usize {
                         let mvd_idx = i * 4 + j;
                         if mvd_idx < 16 {
                             let (dx, dy, w, h) = p8x8_sub_blk(info.1 as u32, j);
                             let blk_x = base_x + dx;
                             let blk_y = base_y + dy;
-                            let (mx, my, ax, ay) = decode_cabac_mb_mvd(
-                                reader,
-                                state,
-                                cabac_nb,
-                                slice_table,
-                                cur_slice,
-                                mb_idx,
-                                mb_x,
-                                mb_y,
-                                mb_width,
-                                0,
-                                blk_x,
-                                blk_y,
-                                &local_mvd_l0,
-                            );
+                            let cache_pos = (4 + blk_x as usize) + (1 + blk_y as usize) * 8;
+                            let (mx, my, ax, ay) =
+                                decode_cabac_mb_mvd(reader, state, cache, 0, cache_pos);
                             mb.mvd_l0[mvd_idx] = [mx, my];
-                            fill_local_mvd(&mut local_mvd_l0, blk_x, blk_y, w, h, ax, ay);
+                            fill_rectangle(
+                                &mut cache.mvd_cache[0],
+                                cache_pos,
+                                w as usize,
+                                h as usize,
+                                8,
+                                [ax, ay],
+                            );
                         }
                     }
                 }
@@ -2507,30 +2520,24 @@ pub fn decode_mb_cabac(
                 if info.3 {
                     let base_x = (i & 1) as u32 * 2;
                     let base_y = (i >> 1) as u32 * 2;
-                    let sub_part_count = info.0 as usize;
-                    for j in 0..sub_part_count {
+                    for j in 0..info.0 as usize {
                         let mvd_idx = i * 4 + j;
                         if mvd_idx < 16 {
                             let (dx, dy, w, h) = p8x8_sub_blk(info.1 as u32, j);
                             let blk_x = base_x + dx;
                             let blk_y = base_y + dy;
-                            let (mx, my, ax, ay) = decode_cabac_mb_mvd(
-                                reader,
-                                state,
-                                cabac_nb,
-                                slice_table,
-                                cur_slice,
-                                mb_idx,
-                                mb_x,
-                                mb_y,
-                                mb_width,
-                                1,
-                                blk_x,
-                                blk_y,
-                                &local_mvd_l1,
-                            );
+                            let cache_pos = (4 + blk_x as usize) + (1 + blk_y as usize) * 8;
+                            let (mx, my, ax, ay) =
+                                decode_cabac_mb_mvd(reader, state, cache, 1, cache_pos);
                             mb.mvd_l1[mvd_idx] = [mx, my];
-                            fill_local_mvd(&mut local_mvd_l1, blk_x, blk_y, w, h, ax, ay);
+                            fill_rectangle(
+                                &mut cache.mvd_cache[1],
+                                cache_pos,
+                                w as usize,
+                                h as usize,
+                                8,
+                                [ax, ay],
+                            );
                         }
                     }
                 }
@@ -2538,14 +2545,31 @@ pub fn decode_mb_cabac(
         } else {
             // Non-8x8 B-slice partitions
             let part_count = mb.partition_count as usize;
+            // Scan8 positions for B partitions
+            let ref_scan8 = |p: usize| -> usize {
+                match mb.b_part_size {
+                    1 => SCAN8[p * 8], // 16x8
+                    2 => SCAN8[p * 4], // 8x16
+                    _ => SCAN8[0],     // 16x16
+                }
+            };
+            let part_dims = |_p: usize| -> (usize, usize) {
+                match mb.b_part_size {
+                    1 => (4, 2), // 16x8
+                    2 => (2, 4), // 8x16
+                    _ => (4, 4), // 16x16
+                }
+            };
 
             // ref_idx L0
             for p in 0..part_count {
                 if mb.b_list_flags[p][0] {
+                    let scan8_n = ref_scan8(p);
                     if num_ref_idx_l0_active > 1 {
                         mb.ref_idx_l0[p] = decode_cabac_mb_ref(
                             reader,
                             state,
+                            cache,
                             cabac_nb,
                             slice_table,
                             cur_slice,
@@ -2554,23 +2578,25 @@ pub fn decode_mb_cabac(
                             mb_y,
                             mb_width,
                             0,
-                            p,
+                            scan8_n,
                             true,
-                            &local_ref_l0,
                         ) as i8;
-                        local_ref_l0[p] = mb.ref_idx_l0[p];
                     } else {
                         mb.ref_idx_l0[p] = 0;
                     }
+                    let (w, h) = part_dims(p);
+                    fill_rectangle(&mut cache.ref_cache[0], scan8_n, w, h, 8, mb.ref_idx_l0[p]);
                 }
             }
             // ref_idx L1
             for p in 0..part_count {
                 if mb.b_list_flags[p][1] {
+                    let scan8_n = ref_scan8(p);
                     if num_ref_idx_l1_active > 1 {
                         mb.ref_idx_l1[p] = decode_cabac_mb_ref(
                             reader,
                             state,
+                            cache,
                             cabac_nb,
                             slice_table,
                             cur_slice,
@@ -2579,68 +2605,34 @@ pub fn decode_mb_cabac(
                             mb_y,
                             mb_width,
                             1,
-                            p,
+                            scan8_n,
                             true,
-                            &local_ref_l1,
                         ) as i8;
-                        local_ref_l1[p] = mb.ref_idx_l1[p];
                     } else {
                         mb.ref_idx_l1[p] = 0;
                     }
+                    let (w, h) = part_dims(p);
+                    fill_rectangle(&mut cache.ref_cache[1], scan8_n, w, h, 8, mb.ref_idx_l1[p]);
                 }
             }
             // mvd L0
             for p in 0..part_count {
                 if mb.b_list_flags[p][0] {
-                    let (blk_x, blk_y, w, h) = match mb.b_part_size {
-                        1 => (0u32, p as u32 * 2, 4u32, 2u32), // 16x8
-                        2 => (p as u32 * 2, 0u32, 2u32, 4u32), // 8x16
-                        _ => (0, 0, 4, 4),                     // 16x16
-                    };
-                    let (mx, my, ax, ay) = decode_cabac_mb_mvd(
-                        reader,
-                        state,
-                        cabac_nb,
-                        slice_table,
-                        cur_slice,
-                        mb_idx,
-                        mb_x,
-                        mb_y,
-                        mb_width,
-                        0,
-                        blk_x,
-                        blk_y,
-                        &local_mvd_l0,
-                    );
+                    let scan8_n = ref_scan8(p);
+                    let (w, h) = part_dims(p);
+                    let (mx, my, ax, ay) = decode_cabac_mb_mvd(reader, state, cache, 0, scan8_n);
                     mb.mvd_l0[p] = [mx, my];
-                    fill_local_mvd(&mut local_mvd_l0, blk_x, blk_y, w, h, ax, ay);
+                    fill_rectangle(&mut cache.mvd_cache[0], scan8_n, w, h, 8, [ax, ay]);
                 }
             }
             // mvd L1
             for p in 0..part_count {
                 if mb.b_list_flags[p][1] {
-                    let (blk_x, blk_y, w, h) = match mb.b_part_size {
-                        1 => (0u32, p as u32 * 2, 4u32, 2u32),
-                        2 => (p as u32 * 2, 0u32, 2u32, 4u32),
-                        _ => (0, 0, 4, 4),
-                    };
-                    let (mx, my, ax, ay) = decode_cabac_mb_mvd(
-                        reader,
-                        state,
-                        cabac_nb,
-                        slice_table,
-                        cur_slice,
-                        mb_idx,
-                        mb_x,
-                        mb_y,
-                        mb_width,
-                        1,
-                        blk_x,
-                        blk_y,
-                        &local_mvd_l1,
-                    );
+                    let scan8_n = ref_scan8(p);
+                    let (w, h) = part_dims(p);
+                    let (mx, my, ax, ay) = decode_cabac_mb_mvd(reader, state, cache, 1, scan8_n);
                     mb.mvd_l1[p] = [mx, my];
-                    fill_local_mvd(&mut local_mvd_l1, blk_x, blk_y, w, h, ax, ay);
+                    fill_rectangle(&mut cache.mvd_cache[1], scan8_n, w, h, 8, [ax, ay]);
                 }
             }
         }
@@ -2759,7 +2751,7 @@ mod tests {
     #[test]
     fn test_cabac_init_zero() {
         let data = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-        let reader = CabacReader::new(&data, 0).unwrap();
+        let reader = CabacReader::new(&data).unwrap();
         assert_eq!(reader.range, 0x1FE);
         assert_eq!(reader.pos, 2);
         assert_eq!(reader.low, 1 << 9); // 0<<18 + 0<<10 + (1<<9)
@@ -2769,7 +2761,7 @@ mod tests {
     fn test_cabac_init_nonzero() {
         // Use values small enough to pass the validity check
         let data = [0x01, 0x02, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00];
-        let reader = CabacReader::new(&data, 0).unwrap();
+        let reader = CabacReader::new(&data).unwrap();
         assert_eq!(reader.range, 0x1FE);
         let expected_low = (0x01 << 18) | (0x02 << 10) | (1 << 9);
         assert_eq!(reader.low, expected_low);
@@ -2778,20 +2770,20 @@ mod tests {
     #[test]
     fn test_cabac_init_too_short() {
         let data = [0x00];
-        assert!(CabacReader::new(&data, 0).is_err());
+        assert!(CabacReader::new(&data).is_err());
     }
 
     #[test]
     fn test_cabac_init_invalid_range() {
         // 0xFF bytes cause low > range<<17, which is invalid
         let data = [0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00];
-        assert!(CabacReader::new(&data, 0).is_err());
+        assert!(CabacReader::new(&data).is_err());
     }
 
     #[test]
     fn test_cabac_terminate() {
         let data = vec![0x00; 32];
-        let mut reader = CabacReader::new(&data, 0).unwrap();
+        let mut reader = CabacReader::new(&data).unwrap();
         let _ = reader.get_cabac_terminate();
     }
 
@@ -2801,7 +2793,7 @@ mod tests {
         // = 0x2AA0000 + 0x2A800 + 0x200 = 0x2ACAA00
         // range<<17 = 0x3FC0000 > 0x2ACAA00, so valid
         let data = vec![0xAA; 32];
-        let mut reader = CabacReader::new(&data, 0).unwrap();
+        let mut reader = CabacReader::new(&data).unwrap();
         for _ in 0..16 {
             let bit = reader.get_cabac_bypass();
             assert!(bit <= 1);
@@ -2811,7 +2803,7 @@ mod tests {
     #[test]
     fn test_cabac_context_decode() {
         let data = vec![0x55; 32];
-        let mut reader = CabacReader::new(&data, 0).unwrap();
+        let mut reader = CabacReader::new(&data).unwrap();
         let mut state = 0u8;
         for _ in 0..16 {
             let bit = reader.get_cabac(&mut state);
@@ -2822,7 +2814,7 @@ mod tests {
     #[test]
     fn test_cabac_bypass_sign() {
         let data = vec![0x20; 32];
-        let mut reader = CabacReader::new(&data, 0).unwrap();
+        let mut reader = CabacReader::new(&data).unwrap();
         let val = reader.get_cabac_bypass_sign(42);
         assert!(val == 42 || val == -42);
     }
