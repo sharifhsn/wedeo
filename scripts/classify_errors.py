@@ -74,11 +74,14 @@ def classify_file(fpath: Path, wedeo_bin: Path) -> dict:
     pixel_str = f"Y<={max_y} U<={max_u} V<={max_v}" if plane_info else "no numpy"
 
     # Step 2: Sorted CRC comparison -- detect reorder-only
-    w_crcs = _run_framecrc_crcs([str(wedeo_bin), str(fpath)])
-    f_crcs = _run_framecrc_crcs(
-        ["ffmpeg", "-bitexact", "-i", str(fpath), "-f", "framecrc", "-"],
-    )
-    if sorted(w_crcs) == sorted(f_crcs):
+    try:
+        w_crcs = _run_framecrc_crcs([str(wedeo_bin), str(fpath)])
+        f_crcs = _run_framecrc_crcs(
+            ["ffmpeg", "-bitexact", "-i", str(fpath), "-f", "framecrc", "-"],
+        )
+    except subprocess.TimeoutExpired:
+        return {"status": "ERROR", "details": "timeout during CRC extraction"}
+    if len(w_crcs) == len(f_crcs) and sorted(w_crcs) == sorted(f_crcs):
         swapped = sum(1 for a, b in zip(w_crcs, f_crcs) if a != b)
         return {
             "status": "REORDER_ONLY",
@@ -131,13 +134,10 @@ def main():
     fate_dir = Path(args.fate_dir)
 
     if args.files:
-        file_list = [Path(f).name if Path(f).exists() else f for f in args.files]
-        # Resolve full paths
-        resolved = []
+        file_paths = []
         for f in args.files:
             p = Path(f)
-            resolved.append(p if p.exists() else fate_dir / f)
-        file_paths = resolved
+            file_paths.append(p if p.exists() else fate_dir / f)
     else:
         if args.all:
             file_list = PROGRESSIVE_CAVLC_FILES + PROGRESSIVE_CABAC_FILES

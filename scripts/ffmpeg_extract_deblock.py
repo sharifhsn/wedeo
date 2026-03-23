@@ -35,7 +35,7 @@ def extract_deblock_info(
 ) -> dict | None:
     """Use lldb to extract deblock info from FFmpeg at a specific MB.
 
-    Returns dict with qp, top_qp, qpc, top_qpc, is_intra, top_is_intra, or None on failure.
+    Returns dict with qp, mb_x, mb_y, or None on failure.
     """
     # The fast path: ff_h264_filter_mb_fast is called for each MB.
     # We break there and check mb_x, mb_y, then extract QP values.
@@ -64,7 +64,6 @@ def extract_deblock_info(
     ])
     lldb_commands.append("quit")
 
-    cmd = [str(ffmpeg_bin)]
     lldb_cmd = ["lldb", str(ffmpeg_bin), "-b"]
     for c in lldb_commands:
         lldb_cmd.extend(["-o", c])

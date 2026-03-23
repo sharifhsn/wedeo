@@ -360,6 +360,7 @@ impl H264Decoder {
         /// From H.264 Table A-1, matching FFmpeg h264_ps.c level_max_dpb_mbs.
         fn level_max_dpb_mbs(level_idc: u8) -> u32 {
             match level_idc {
+                9 => 396, // Level 1b
                 10 => 396,
                 11 => 900,
                 12 | 13 | 20 => 2376,
@@ -401,9 +402,12 @@ impl H264Decoder {
             // probe, we pre-set it from the level to avoid premature
             // output of P-frames before their B-frame successors arrive.
             let mb_count = sps.mb_width * sps.mb_height;
-            let estimated = level_max_dpb_mbs(sps.level_idc)
+            let level_dpb_frames = level_max_dpb_mbs(sps.level_idc)
                 .checked_div(mb_count)
                 .map_or(1, |v| v.min(15) as usize);
+            // Cap at max_num_ref_frames (like FFmpeg) to avoid excessive
+            // buffering for small frames at high levels.
+            let estimated = level_dpb_frames.min(sps.max_num_ref_frames as usize);
             if estimated > self.reorder_depth {
                 self.reorder_depth = estimated;
             }
@@ -696,6 +700,11 @@ impl H264Decoder {
                             .filter_map(|&i| self.dpb.get(i).map(|e| e.poc))
                             .collect();
                         fdc.cur_l0_ref_dpb = self.ref_list_l0.clone();
+                    } else {
+                        // I-slice: clear ref POC/DPB to avoid stale data
+                        // from a previous P/B-slice in the same frame.
+                        fdc.cur_l0_ref_poc.clear();
+                        fdc.cur_l0_ref_dpb.clear();
                     }
                     if hdr.slice_type.is_b() {
                         fdc.cur_l1_ref_poc = self
@@ -703,6 +712,8 @@ impl H264Decoder {
                             .iter()
                             .filter_map(|&i| self.dpb.get(i).map(|e| e.poc))
                             .collect();
+                    } else {
+                        fdc.cur_l1_ref_poc.clear();
                     }
 
                     // Populate colocated info from L1[0] for direct mode
