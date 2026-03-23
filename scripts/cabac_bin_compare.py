@@ -381,8 +381,26 @@ def run_wedeo_trace(
     input_file: str, max_bins: int, no_deblock: bool, log_file: str
 ) -> None:
     """Run wedeo-framecrc with cabac-trace and capture trace to log_file."""
-    # Build if binary doesn't exist or is older than source
     wedeo_bin = WEDEO_BIN
+    # Check if binary exists and warn if it's older than key source files
+    if wedeo_bin.exists():
+        bin_mtime = wedeo_bin.stat().st_mtime
+        src_dir = REPO_DIR / "codecs" / "wedeo-codec-h264" / "src"
+        if src_dir.exists():
+            stale_files = []
+            for src_file in src_dir.glob("*.rs"):
+                if src_file.stat().st_mtime > bin_mtime:
+                    stale_files.append(src_file.name)
+            if stale_files:
+                print(
+                    f"WARNING: trace binary is older than source files: {', '.join(stale_files[:5])}",
+                    file=sys.stderr,
+                )
+                print(
+                    "  Rebuild with: cargo build --bin wedeo-framecrc -p wedeo-fate --features cabac-trace",
+                    file=sys.stderr,
+                )
+    # Build if binary doesn't exist
     if not wedeo_bin.exists():
         print("Building wedeo-framecrc with cabac-trace feature...")
         result = subprocess.run(
@@ -489,6 +507,12 @@ examples:
         help="Only report actual bit/result differences (ignore low/range field diffs). "
         "This filters out the normal low-value divergence from FFmpeg's alignment-dependent init.",
     )
+    parser.add_argument(
+        "--state-diff",
+        action="store_true",
+        help="Report where BIN pre_state values first differ (even if decoded bits match). "
+        "This finds context derivation bugs BEFORE they cause a bit flip.",
+    )
 
     args = parser.parse_args()
 
@@ -555,6 +579,42 @@ examples:
         if idx is not None:
             any_divergence = True
             first_divergences[kind] = idx
+
+    # --state-diff: find first bin where pre_state differs (even if bits match)
+    if args.state_diff:
+        ff_b_list = ff_bins["BIN"]
+        we_b_list = we_bins["BIN"]
+        min_len = min(len(ff_b_list), len(we_b_list))
+        state_diff_idx = None
+        for i in range(min_len):
+            if ff_b_list[i].pre_state != we_b_list[i].pre_state:
+                state_diff_idx = i
+                break
+        if state_diff_idx is not None:
+            bit_div = first_divergences.get("BIN")
+            label = (
+                f"(bit flip also at BIN[{bit_div}])"
+                if bit_div is not None and bit_div == state_diff_idx
+                else "(no bit flip yet)"
+                if bit_div is None or bit_div > state_diff_idx
+                else f"(bit flip at BIN[{bit_div}])"
+            )
+            print(f"\n{'='*72}")
+            print(f"STATE DIVERGENCE {label} at BIN[{state_diff_idx}]")
+            print(f"{'='*72}")
+            start = max(0, state_diff_idx - 2)
+            for j in range(start, min(state_diff_idx + 3, min_len)):
+                marker = ">>>" if j == state_diff_idx else "   "
+                ff_b = ff_b_list[j]
+                we_b = we_b_list[j]
+                state_match = "==" if ff_b.pre_state == we_b.pre_state else "!="
+                print(
+                    f" {marker} BIN[{j}]: ff_state={ff_b.pre_state:3d} {state_match} we_state={we_b.pre_state:3d}  "
+                    f"bit={ff_b.bit}/{we_b.bit}  range={ff_b.pre_range}/{we_b.pre_range}"
+                )
+            print(f"\n  Context states diverged {min_len - state_diff_idx} bins before first bit flip (or end of trace).")
+        else:
+            print(f"\n  --state-diff: all {min_len} BIN pre_state values match.")
 
     if not any_divergence:
         print(f"\nAll CABAC bins match between FFmpeg and wedeo.")
