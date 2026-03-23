@@ -90,6 +90,16 @@ const TC0_TABLE: [[i32; 3]; 52] = [
 // Data structures
 // ---------------------------------------------------------------------------
 
+/// Per-slice deblocking filter parameters.
+/// Each slice in a frame can have different alpha/beta offsets and idc.
+#[derive(Clone, Default)]
+pub struct SliceDeblockParams {
+    pub alpha_c0_offset: i32,
+    pub beta_offset: i32,
+    pub disable_deblocking_filter_idc: u32,
+    pub chroma_qp_index_offset: [i32; 2],
+}
+
 /// Information about a decoded macroblock needed for deblocking.
 #[derive(Debug, Clone)]
 pub struct MbDeblockInfo {
@@ -761,22 +771,52 @@ fn deblock_mb(
     mb_info: &[MbDeblockInfo],
     mb_x: u32,
     mb_y: u32,
-    alpha_c0_offset: i32,
-    beta_offset: i32,
-    chroma_qp_index_offset: [i32; 2],
+    slice_table: &[u16],
+    slice_params: &[SliceDeblockParams],
 ) {
     let mb_width = pic.mb_width;
     let mb_idx = (mb_y * mb_width + mb_x) as usize;
     let cur_qp = mb_info[mb_idx].qp;
 
+    // Look up this MB's slice deblock params
+    let slice_id = slice_table[mb_idx] as usize;
+    let params = &slice_params[slice_id.min(slice_params.len() - 1)];
+    let alpha_c0_offset = params.alpha_c0_offset;
+    let beta_offset = params.beta_offset;
+    let chroma_qp_index_offset = params.chroma_qp_index_offset;
+
+    // For idc == 2, determine which neighbors are in a different slice.
+    // Neighbors in different slices are treated as unavailable (bS=0 for that edge).
+    let cur_slice = slice_table[mb_idx];
+    let left_available = if params.disable_deblocking_filter_idc == 2 && mb_x > 0 {
+        slice_table[mb_idx - 1] == cur_slice
+    } else {
+        mb_x > 0
+    };
+    let top_available = if params.disable_deblocking_filter_idc == 2 && mb_y > 0 {
+        slice_table[mb_idx - mb_width as usize] == cur_slice
+    } else {
+        mb_y > 0
+    };
+
     // Process vertical (is_vertical=true) then horizontal (is_vertical=false) edges.
     // Chroma uses the same bS as luma (derived by mapping the 4x4 luma grid to 4:2:0).
     for is_vertical in [true, false] {
+        // For idc==2, skip the MB boundary edge if the neighbor is in a different slice
+        let skip_mb_edge = if is_vertical {
+            !left_available
+        } else {
+            !top_available
+        };
         let luma_bs = compute_luma_bs(is_vertical, mb_info, mb_x, mb_y, mb_width);
 
         // --- Luma edges ---
         for (edge, &bs_edge) in luma_bs.iter().enumerate() {
             if bs_edge == [0, 0, 0, 0] {
+                continue;
+            }
+            // Skip MB boundary edge if cross-slice (idc==2)
+            if edge == 0 && skip_mb_edge {
                 continue;
             }
             let qp = if edge == 0 {
@@ -809,6 +849,10 @@ fn deblock_mb(
         let chroma_bs = derive_chroma_bs(&luma_bs);
         for (edge, &bs_edge) in chroma_bs.iter().enumerate() {
             if bs_edge == [0, 0, 0, 0] {
+                continue;
+            }
+            // Skip MB boundary edge if cross-slice (idc==2)
+            if edge == 0 && skip_mb_edge {
                 continue;
             }
 
@@ -852,33 +896,22 @@ fn deblock_mb(
 
 /// Apply the H.264 in-loop deblocking filter to an entire frame.
 ///
-/// This must be called after all macroblocks in a slice have been decoded.
-/// The filter modifies the picture buffer in-place, and the filtered output
-/// is used as the reference for inter prediction of future frames.
+/// Uses per-slice deblocking parameters: each MB is filtered with the
+/// alpha/beta offsets and idc from its own slice header.
 ///
 /// # Arguments
 ///
 /// * `pic` - the decoded picture buffer (modified in-place)
 /// * `mb_info` - per-macroblock deblocking info (mb_width * mb_height entries, raster order)
-/// * `disable_deblocking_filter_idc` - 0 = filter all edges, 1 = disable filter,
-///   2 = disable filter across slice boundaries (treated as 0 in this implementation since
-///   we don't track slice boundaries per-MB)
-/// * `alpha_c0_offset` - from slice header (already multiplied by 2)
-/// * `beta_offset` - from slice header (already multiplied by 2)
-/// * `chroma_qp_index_offset` - from PPS: \[0\] for Cb, \[1\] for Cr
+/// * `slice_table` - per-macroblock slice number (same layout as mb_info)
+/// * `slice_params` - deblocking parameters for each slice
 #[tracing::instrument(skip_all, fields(mb_width = pic.mb_width, mb_height = pic.mb_height))]
 pub fn deblock_frame(
     pic: &mut PictureBuffer,
     mb_info: &[MbDeblockInfo],
-    disable_deblocking_filter_idc: u32,
-    alpha_c0_offset: i32,
-    beta_offset: i32,
-    chroma_qp_index_offset: [i32; 2],
+    slice_table: &[u16],
+    slice_params: &[SliceDeblockParams],
 ) {
-    if disable_deblocking_filter_idc == 1 {
-        return;
-    }
-
     let mb_width = pic.mb_width;
     let mb_height = pic.mb_height;
 
@@ -893,15 +926,16 @@ pub fn deblock_frame(
     // Process macroblocks in raster order
     for mb_y in 0..mb_height {
         for mb_x in 0..mb_width {
-            deblock_mb(
-                pic,
-                mb_info,
-                mb_x,
-                mb_y,
-                alpha_c0_offset,
-                beta_offset,
-                chroma_qp_index_offset,
-            );
+            let mb_idx = (mb_y * mb_width + mb_x) as usize;
+            let slice_id = slice_table[mb_idx] as usize;
+            let params = &slice_params[slice_id.min(slice_params.len() - 1)];
+
+            // idc == 1 means disable filter for this slice's MBs
+            if params.disable_deblocking_filter_idc == 1 {
+                continue;
+            }
+
+            deblock_mb(pic, mb_info, mb_x, mb_y, slice_table, slice_params);
         }
     }
 }
@@ -1442,7 +1476,8 @@ mod tests {
             ..Default::default()
         }];
 
-        deblock_frame(&mut pic, &mb_info, 0, 0, 0, [0, 0]);
+        let st = vec![0u16; mb_info.len()];
+        deblock_frame(&mut pic, &mb_info, &st, &[SliceDeblockParams::default()]);
 
         // With bS=0 everywhere (single MB, no neighbors, inter with identical motion),
         // nothing should change.
@@ -1465,7 +1500,12 @@ mod tests {
         }];
 
         let y_before = pic.y.clone();
-        deblock_frame(&mut pic, &mb_info, 1, 0, 0, [0, 0]);
+        let disabled_params = SliceDeblockParams {
+            disable_deblocking_filter_idc: 1,
+            ..Default::default()
+        };
+        let st = vec![0u16; mb_info.len()];
+        deblock_frame(&mut pic, &mb_info, &st, &[disabled_params]);
         assert_eq!(pic.y, y_before);
     }
 
@@ -1507,7 +1547,8 @@ mod tests {
             },
         ];
 
-        deblock_frame(&mut pic, &mb_info, 0, 0, 0, [0, 0]);
+        let st = vec![0u16; mb_info.len()];
+        deblock_frame(&mut pic, &mb_info, &st, &[SliceDeblockParams::default()]);
 
         // The pixels near x=16 boundary should have been modified
         let mut boundary_changed = false;
@@ -1568,7 +1609,8 @@ mod tests {
             },
         ];
 
-        deblock_frame(&mut pic, &mb_info, 0, 0, 0, [0, 0]);
+        let st = vec![0u16; mb_info.len()];
+        deblock_frame(&mut pic, &mb_info, &st, &[SliceDeblockParams::default()]);
 
         // The pixels near y=16 boundary should have been modified
         let mut boundary_changed = false;

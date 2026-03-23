@@ -679,6 +679,22 @@ impl H264Decoder {
                         fdc.current_slice += 1;
                     }
 
+                    // Store per-slice deblocking parameters.
+                    let slice_idx = fdc.current_slice as usize;
+                    let slice_chroma_qp_offset = self.pps_list[hdr.pps_id as usize]
+                        .as_ref()
+                        .map_or([0, 0], |pps| pps.chroma_qp_index_offset);
+                    if slice_idx >= fdc.slice_deblock_params.len() {
+                        fdc.slice_deblock_params
+                            .resize(slice_idx + 1, deblock::SliceDeblockParams::default());
+                    }
+                    fdc.slice_deblock_params[slice_idx] = deblock::SliceDeblockParams {
+                        alpha_c0_offset: hdr.slice_alpha_c0_offset,
+                        beta_offset: hdr.slice_beta_offset,
+                        disable_deblocking_filter_idc: hdr.disable_deblocking_filter_idc,
+                        chroma_qp_index_offset: slice_chroma_qp_offset,
+                    };
+
                     // Build list of reference PictureBuffer pointers
                     let ref_pic_list: Vec<&PictureBuffer> = self
                         .ref_list_l0
@@ -712,8 +728,10 @@ impl H264Decoder {
                             .iter()
                             .filter_map(|&i| self.dpb.get(i).map(|e| e.poc))
                             .collect();
+                        fdc.cur_l1_ref_dpb = self.ref_list_l1.clone();
                     } else {
                         fdc.cur_l1_ref_poc.clear();
+                        fdc.cur_l1_ref_dpb.clear();
                     }
 
                     // Populate colocated info from L1[0] for direct mode
@@ -1514,16 +1532,11 @@ impl H264Decoder {
     /// Convert a completed FrameDecodeContext to a Frame.
     fn fdc_to_frame(&self, fdc: &mut FrameDecodeContext, hdr: &SliceHeader, pts: i64) -> Frame {
         if std::env::var("WEDEO_NO_DEBLOCK").is_err() {
-            let chroma_qp_index_offset = self.pps_list[hdr.pps_id as usize]
-                .as_ref()
-                .map_or([0, 0], |pps| pps.chroma_qp_index_offset);
             deblock::deblock_frame(
                 &mut fdc.pic,
                 &fdc.mb_info,
-                hdr.disable_deblocking_filter_idc,
-                hdr.slice_alpha_c0_offset,
-                hdr.slice_beta_offset,
-                chroma_qp_index_offset,
+                &fdc.slice_table,
+                &fdc.slice_deblock_params,
             );
         }
 

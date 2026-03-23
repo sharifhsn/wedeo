@@ -10,7 +10,7 @@ use wedeo_codec::bitstream::BitReadBE;
 use wedeo_core::error::Result;
 
 use crate::cavlc::{Macroblock, NeighborContext, decode_mb_cavlc};
-use crate::deblock::{MbDeblockInfo, PictureBuffer};
+use crate::deblock::{MbDeblockInfo, PictureBuffer, SliceDeblockParams};
 use crate::dequant::{self, Dequant4Table};
 use crate::idct;
 use crate::intra_pred;
@@ -109,6 +109,8 @@ pub struct FrameDecodeContext {
     pub cur_l0_ref_dpb: Vec<usize>,
     /// Current frame's L1 ref POCs (for implicit weighted bipred).
     pub cur_l1_ref_poc: Vec<i32>,
+    /// Current frame's L1 ref DPB indices (for deblocking ref identity).
+    pub cur_l1_ref_dpb: Vec<usize>,
     /// Current picture POC (for temporal direct dist_scale_factor).
     pub cur_poc: i32,
     /// Pre-computed implicit weights for weighted_bipred_idc=2.
@@ -117,6 +119,9 @@ pub struct FrameDecodeContext {
     pub implicit_weight: Vec<Vec<i32>>,
     /// Previous macroblock's qscale_diff (used by CABAC to select mb_qp_delta context).
     pub last_qscale_diff: i32,
+    /// Per-slice deblocking filter parameters.
+    /// Indexed by slice number (fdc.current_slice).
+    pub slice_deblock_params: Vec<SliceDeblockParams>,
 }
 
 impl FrameDecodeContext {
@@ -168,9 +173,11 @@ impl FrameDecodeContext {
             cur_l0_ref_poc: Vec::new(),
             cur_l0_ref_dpb: Vec::new(),
             cur_l1_ref_poc: Vec::new(),
+            cur_l1_ref_dpb: Vec::new(),
             cur_poc: 0,
             implicit_weight: Vec::new(),
             last_qscale_diff: 0,
+            slice_deblock_params: Vec::new(),
         }
     }
 
@@ -262,45 +269,27 @@ fn store_deblock_info(
     let mut deblock_ref_poc_l1 = [i32::MIN; 16];
     if !is_intra && mb_idx_base + 16 <= ctx.mv_ctx.mv.len() {
         deblock_mv.copy_from_slice(&ctx.mv_ctx.mv[mb_idx_base..mb_idx_base + 16]);
-        // Convert ref_idx to picture identity for deblocking ref comparison.
-        // B-slices: use POC (needed for cross-list L0/L1 identity comparison).
-        // P-slices: use ref_idx directly (same list, ref_idx = identity;
-        // avoids depending on POC computation which may have bugs for POC type 1).
+        // Convert ref_idx to DPB index for deblocking ref identity comparison.
+        // DPB index uniquely identifies a picture regardless of slice type,
+        // ensuring consistent bS computation at P/B slice boundaries and
+        // correct behavior with MMCO-5 (where POC can collide).
+        for (blk, id) in deblock_ref_poc.iter_mut().enumerate() {
+            let ri = ctx.mv_ctx.ref_idx[mb_idx_base + blk];
+            *id = if ri >= 0 {
+                ctx.cur_l0_ref_dpb
+                    .get(ri as usize)
+                    .map(|&dpb_idx| dpb_idx as i32)
+                    .unwrap_or(i32::MIN)
+            } else {
+                i32::MIN
+            };
+        }
         if is_b_slice {
-            for (blk, poc) in deblock_ref_poc.iter_mut().enumerate() {
-                let ri = ctx.mv_ctx.ref_idx[mb_idx_base + blk];
-                *poc = if ri >= 0 {
-                    ctx.cur_l0_ref_poc
-                        .get(ri as usize)
-                        .copied()
-                        .unwrap_or(i32::MIN)
-                } else {
-                    i32::MIN
-                };
-            }
             deblock_mv_l1.copy_from_slice(&ctx.mv_ctx.mv_l1[mb_idx_base..mb_idx_base + 16]);
-            for (blk, poc) in deblock_ref_poc_l1.iter_mut().enumerate() {
+            for (blk, id) in deblock_ref_poc_l1.iter_mut().enumerate() {
                 let ri = ctx.mv_ctx.ref_idx_l1[mb_idx_base + blk];
-                *poc = if ri >= 0 {
-                    ctx.cur_l1_ref_poc
-                        .get(ri as usize)
-                        .copied()
-                        .unwrap_or(i32::MIN)
-                } else {
-                    i32::MIN
-                };
-            }
-        } else {
-            // P-slice: convert ref_idx to DPB index for identity comparison.
-            // DPB index uniquely identifies a picture even when:
-            // - ref list has duplicates (ref_pic_list_modification) — different
-            //   ref_idx values can map to the same DPB entry
-            // - POC collides (MMCO-5 Reset can produce multiple pictures with
-            //   POC=0 in the same DPB)
-            for (blk, id) in deblock_ref_poc.iter_mut().enumerate() {
-                let ri = ctx.mv_ctx.ref_idx[mb_idx_base + blk];
                 *id = if ri >= 0 {
-                    ctx.cur_l0_ref_dpb
+                    ctx.cur_l1_ref_dpb
                         .get(ri as usize)
                         .map(|&dpb_idx| dpb_idx as i32)
                         .unwrap_or(i32::MIN)
