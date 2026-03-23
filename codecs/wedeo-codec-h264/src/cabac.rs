@@ -941,6 +941,7 @@ fn decode_cabac_mb_ref(
     list: usize,
     blk_idx: usize,
     is_b_slice: bool,
+    local_ref: &[i8; 4],
 ) -> i32 {
     // Get left and top reference indices for context
     let (ref_a, ref_b) = get_ref_neighbors(
@@ -953,6 +954,7 @@ fn decode_cabac_mb_ref(
         mb_width,
         list,
         blk_idx,
+        local_ref,
     );
 
     let mut ctx = 0usize;
@@ -1034,6 +1036,7 @@ fn get_ref_neighbors(
     mb_width: u32,
     list: usize,
     blk_idx: usize,
+    local_ref: &[i8; 4],
 ) -> (i32, i32) {
     let ref_cache = if list == 0 {
         &cabac_nb.ref_cache_l0
@@ -1057,9 +1060,9 @@ fn get_ref_neighbors(
         }
     } else {
         // Right column → look at left column of current MB (same row)
-        // part 0 (if blk_y=0) or part 2 (if blk_y=1)
+        // Use local cache for the current MB's already-decoded partitions.
         let cur_part = blk_y * 2;
-        ref_cache[mb_idx * 4 + cur_part] as i32
+        local_ref[cur_part] as i32
     };
 
     // Top neighbor ref_idx
@@ -1075,8 +1078,8 @@ fn get_ref_neighbors(
         }
     } else {
         // Bottom row → look at top row of current MB (same column)
-        // part 0 (if blk_x=0) or part 1 (if blk_x=1)
-        ref_cache[mb_idx * 4 + blk_x] as i32
+        // Use local cache for the current MB's already-decoded partitions.
+        local_ref[blk_x] as i32
     };
 
     (ref_a, ref_b)
@@ -2195,6 +2198,9 @@ pub fn decode_mb_cabac(
     // Local MVD caches for intra-MB neighbor context derivation.
     let mut local_mvd_l0 = [[0u8; 2]; 16];
     let mut local_mvd_l1 = [[0u8; 2]; 16];
+    // Local ref-idx caches for CABAC context derivation (-1 = unavailable/intra).
+    let mut local_ref_l0: [i8; 4] = [-1; 4];
+    let mut local_ref_l1: [i8; 4] = [-1; 4];
     if !is_intra && (slice_type == SliceType::P || slice_type == SliceType::SP) {
         match mb.mb_type {
             0 => {
@@ -2213,7 +2219,9 @@ pub fn decode_mb_cabac(
                         0,
                         0,
                         false,
+                        &local_ref_l0,
                     ) as i8;
+                    local_ref_l0[0] = mb.ref_idx_l0[0];
                 } else {
                     mb.ref_idx_l0[0] = 0;
                 }
@@ -2252,7 +2260,9 @@ pub fn decode_mb_cabac(
                             0,
                             0,
                             false,
+                            &local_ref_l0,
                         ) as i8;
+                        local_ref_l0[part as usize] = mb.ref_idx_l0[part as usize];
                     } else {
                         mb.ref_idx_l0[part as usize] = 0;
                     }
@@ -2295,7 +2305,9 @@ pub fn decode_mb_cabac(
                             0,
                             0,
                             false,
+                            &local_ref_l0,
                         ) as i8;
+                        local_ref_l0[part as usize] = mb.ref_idx_l0[part as usize];
                     } else {
                         mb.ref_idx_l0[part as usize] = 0;
                     }
@@ -2346,7 +2358,9 @@ pub fn decode_mb_cabac(
                             0,
                             i,
                             false,
+                            &local_ref_l0,
                         ) as i8;
+                        local_ref_l0[i] = mb.ref_idx_l0[i];
                     } else {
                         mb.ref_idx_l0[i] = 0;
                     }
@@ -2413,7 +2427,9 @@ pub fn decode_mb_cabac(
                         0,
                         i,
                         true,
+                        &local_ref_l0,
                     ) as i8;
+                    local_ref_l0[i] = mb.ref_idx_l0[i];
                 } else if info.2 {
                     mb.ref_idx_l0[i] = 0;
                 }
@@ -2438,7 +2454,9 @@ pub fn decode_mb_cabac(
                         1,
                         i,
                         true,
+                        &local_ref_l1,
                     ) as i8;
+                    local_ref_l1[i] = mb.ref_idx_l1[i];
                 } else if info.3 {
                     mb.ref_idx_l1[i] = 0;
                 }
@@ -2536,9 +2554,11 @@ pub fn decode_mb_cabac(
                             mb_y,
                             mb_width,
                             0,
-                            0,
+                            p,
                             true,
+                            &local_ref_l0,
                         ) as i8;
+                        local_ref_l0[p] = mb.ref_idx_l0[p];
                     } else {
                         mb.ref_idx_l0[p] = 0;
                     }
@@ -2559,9 +2579,11 @@ pub fn decode_mb_cabac(
                             mb_y,
                             mb_width,
                             1,
-                            0,
+                            p,
                             true,
+                            &local_ref_l1,
                         ) as i8;
+                        local_ref_l1[p] = mb.ref_idx_l1[p];
                     } else {
                         mb.ref_idx_l1[p] = 0;
                     }

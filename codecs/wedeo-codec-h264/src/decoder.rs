@@ -1592,6 +1592,40 @@ impl H264Decoder {
             }
             // else: intra or direct — MVD is 0 (already initialized)
 
+            // Propagate ref_idx to all 4 per-8x8 entries for non-8x8 partitions.
+            // P_8x8/B_8x8 already fill all 4 entries during decode.
+            let mut ref_l0 = mb.ref_idx_l0;
+            let mut ref_l1 = mb.ref_idx_l1;
+            if !mb.is_intra && mb.mb_type != 3 && mb.mb_type != 22 {
+                match mb.partition_count {
+                    1 => {
+                        // 16x16: all 4 entries get the same ref_idx
+                        ref_l0 = [ref_l0[0]; 4];
+                        ref_l1 = [ref_l1[0]; 4];
+                    }
+                    2 => {
+                        // 16x8 or 8x16
+                        let is_16x8 = match hdr.slice_type {
+                            SliceType::P | SliceType::SP => mb.mb_type == 1,
+                            SliceType::B => {
+                                mb.mb_type >= 4 && mb.mb_type <= 11 && mb.mb_type % 2 == 0
+                            }
+                            _ => true,
+                        };
+                        if is_16x8 {
+                            // Top half: parts 0,1 get ref[0]; bottom: parts 2,3 get ref[1]
+                            ref_l0 = [ref_l0[0], ref_l0[0], ref_l0[1], ref_l0[1]];
+                            ref_l1 = [ref_l1[0], ref_l1[0], ref_l1[1], ref_l1[1]];
+                        } else {
+                            // Left half: parts 0,2 get ref[0]; right: parts 1,3 get ref[1]
+                            ref_l0 = [ref_l0[0], ref_l0[1], ref_l0[0], ref_l0[1]];
+                            ref_l1 = [ref_l1[0], ref_l1[1], ref_l1[0], ref_l1[1]];
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
             // Update CABAC neighbor context
             cabac_nb.update_after_mb(
                 mb_idx,
@@ -1604,8 +1638,8 @@ impl H264Decoder {
                 &mb.non_zero_count,
                 &mvd_abs_l0,
                 &mvd_abs_l1,
-                &mb.ref_idx_l0,
-                &mb.ref_idx_l1,
+                &ref_l0,
+                &ref_l1,
             );
 
             mb_addr += 1;
