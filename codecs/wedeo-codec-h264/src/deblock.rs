@@ -170,10 +170,12 @@ fn clip_pixel(x: i32) -> u8 {
     clip3(0, 255, x) as u8
 }
 
-/// Map luma QP to chroma QP using the spec table.
+/// Map luma QP to chroma QP using the spec table, applying the PPS
+/// chroma_qp_index_offset before lookup (H.264 spec eq. 7-30).
 #[inline(always)]
-fn chroma_qp(luma_qp: u8) -> u8 {
-    CHROMA_QP_TABLE[luma_qp.min(51) as usize]
+fn chroma_qp(luma_qp: u8, chroma_qp_index_offset: i32) -> u8 {
+    let idx = (luma_qp as i32 + chroma_qp_index_offset).clamp(0, 51) as usize;
+    CHROMA_QP_TABLE[idx]
 }
 
 /// Compute the average QP between two blocks for edge filtering.
@@ -761,6 +763,7 @@ fn deblock_mb(
     mb_y: u32,
     alpha_c0_offset: i32,
     beta_offset: i32,
+    chroma_qp_index_offset: [i32; 2],
 ) {
     let mb_width = pic.mb_width;
     let mb_idx = (mb_y * mb_width + mb_x) as usize;
@@ -802,50 +805,43 @@ fn deblock_mb(
         }
 
         // --- Chroma edges (4:2:0: 2 edges per direction) ---
+        // Cb and Cr use separate chroma_qp_index_offsets (PPS [0] and [1]).
         let chroma_bs = derive_chroma_bs(&luma_bs);
         for (edge, &bs_edge) in chroma_bs.iter().enumerate() {
             if bs_edge == [0, 0, 0, 0] {
                 continue;
             }
-            let chroma_qp_cur = chroma_qp(cur_qp);
-            let qp = if edge == 0 {
-                let neighbor_chroma_qp = if is_vertical && mb_x > 0 {
-                    Some(chroma_qp(mb_info[mb_idx - 1].qp))
-                } else if !is_vertical && mb_y > 0 {
-                    Some(chroma_qp(mb_info[mb_idx - mb_width as usize].qp))
-                } else {
-                    None
-                };
-                neighbor_chroma_qp.map_or(chroma_qp_cur, |nq| avg_qp(chroma_qp_cur, nq))
-            } else {
-                chroma_qp_cur
-            };
 
             let uv_stride = pic.uv_stride;
-            filter_mb_edge_chroma(
-                is_vertical,
-                &mut pic.u,
-                uv_stride,
-                mb_x,
-                mb_y,
-                edge,
-                bs_edge,
-                qp,
-                alpha_c0_offset,
-                beta_offset,
-            );
-            filter_mb_edge_chroma(
-                is_vertical,
-                &mut pic.v,
-                uv_stride,
-                mb_x,
-                mb_y,
-                edge,
-                bs_edge,
-                qp,
-                alpha_c0_offset,
-                beta_offset,
-            );
+            for (comp, &offset) in chroma_qp_index_offset.iter().enumerate() {
+                let chroma_qp_cur = chroma_qp(cur_qp, offset);
+                let qp = if edge == 0 {
+                    let neighbor_qp = if is_vertical && mb_x > 0 {
+                        Some(chroma_qp(mb_info[mb_idx - 1].qp, offset))
+                    } else if !is_vertical && mb_y > 0 {
+                        Some(chroma_qp(mb_info[mb_idx - mb_width as usize].qp, offset))
+                    } else {
+                        None
+                    };
+                    neighbor_qp.map_or(chroma_qp_cur, |nq| avg_qp(chroma_qp_cur, nq))
+                } else {
+                    chroma_qp_cur
+                };
+
+                let plane = if comp == 0 { &mut pic.u } else { &mut pic.v };
+                filter_mb_edge_chroma(
+                    is_vertical,
+                    plane,
+                    uv_stride,
+                    mb_x,
+                    mb_y,
+                    edge,
+                    bs_edge,
+                    qp,
+                    alpha_c0_offset,
+                    beta_offset,
+                );
+            }
         }
     }
 }
@@ -869,6 +865,7 @@ fn deblock_mb(
 ///   we don't track slice boundaries per-MB)
 /// * `alpha_c0_offset` - from slice header (already multiplied by 2)
 /// * `beta_offset` - from slice header (already multiplied by 2)
+/// * `chroma_qp_index_offset` - from PPS: \[0\] for Cb, \[1\] for Cr
 #[cfg_attr(feature = "tracing-detail", tracing::instrument(skip_all, fields(mb_width = pic.mb_width, mb_height = pic.mb_height)))]
 pub fn deblock_frame(
     pic: &mut PictureBuffer,
@@ -876,6 +873,7 @@ pub fn deblock_frame(
     disable_deblocking_filter_idc: u32,
     alpha_c0_offset: i32,
     beta_offset: i32,
+    chroma_qp_index_offset: [i32; 2],
 ) {
     if disable_deblocking_filter_idc == 1 {
         return;
@@ -895,7 +893,15 @@ pub fn deblock_frame(
     // Process macroblocks in raster order
     for mb_y in 0..mb_height {
         for mb_x in 0..mb_width {
-            deblock_mb(pic, mb_info, mb_x, mb_y, alpha_c0_offset, beta_offset);
+            deblock_mb(
+                pic,
+                mb_info,
+                mb_x,
+                mb_y,
+                alpha_c0_offset,
+                beta_offset,
+                chroma_qp_index_offset,
+            );
         }
     }
 }
@@ -1436,7 +1442,7 @@ mod tests {
             ..Default::default()
         }];
 
-        deblock_frame(&mut pic, &mb_info, 0, 0, 0);
+        deblock_frame(&mut pic, &mb_info, 0, 0, 0, [0, 0]);
 
         // With bS=0 everywhere (single MB, no neighbors, inter with identical motion),
         // nothing should change.
@@ -1459,7 +1465,7 @@ mod tests {
         }];
 
         let y_before = pic.y.clone();
-        deblock_frame(&mut pic, &mb_info, 1, 0, 0);
+        deblock_frame(&mut pic, &mb_info, 1, 0, 0, [0, 0]);
         assert_eq!(pic.y, y_before);
     }
 
@@ -1501,7 +1507,7 @@ mod tests {
             },
         ];
 
-        deblock_frame(&mut pic, &mb_info, 0, 0, 0);
+        deblock_frame(&mut pic, &mb_info, 0, 0, 0, [0, 0]);
 
         // The pixels near x=16 boundary should have been modified
         let mut boundary_changed = false;
@@ -1562,7 +1568,7 @@ mod tests {
             },
         ];
 
-        deblock_frame(&mut pic, &mb_info, 0, 0, 0);
+        deblock_frame(&mut pic, &mb_info, 0, 0, 0, [0, 0]);
 
         // The pixels near y=16 boundary should have been modified
         let mut boundary_changed = false;
@@ -1583,10 +1589,14 @@ mod tests {
 
     #[test]
     fn chroma_qp_mapping() {
-        assert_eq!(chroma_qp(0), 0);
-        assert_eq!(chroma_qp(29), 29);
-        assert_eq!(chroma_qp(30), 29);
-        assert_eq!(chroma_qp(51), 39);
+        // offset=0: identity through table
+        assert_eq!(chroma_qp(0, 0), 0);
+        assert_eq!(chroma_qp(29, 0), 29);
+        assert_eq!(chroma_qp(30, 0), 29);
+        assert_eq!(chroma_qp(51, 0), 39);
+        // negative offset: shifts QP down before lookup
+        assert_eq!(chroma_qp(30, -1), 29); // 30-1=29 → table[29]=29
+        assert_eq!(chroma_qp(10, -12), 0); // 10-12=-2 → clamped to 0 → table[0]=0
     }
 
     // --- Average QP ---

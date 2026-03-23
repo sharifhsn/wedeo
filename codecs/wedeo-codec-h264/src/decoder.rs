@@ -358,6 +358,24 @@ impl H264Decoder {
 
     /// Update decoder dimensions from an SPS.
     fn apply_sps(&mut self, sps: &Sps) {
+        /// Maximum number of DPB MBs for a given level_idc.
+        /// From H.264 Table A-1, matching FFmpeg h264_ps.c level_max_dpb_mbs.
+        fn level_max_dpb_mbs(level_idc: u8) -> u32 {
+            match level_idc {
+                10 => 396,
+                11 => 900,
+                12 | 13 | 20 => 2376,
+                21 => 4752,
+                22 | 30 => 8100,
+                31 => 18000,
+                32 => 20480,
+                40 | 41 => 32768,
+                42 => 34816,
+                50..=52 => 184320,
+                _ => 184320,
+            }
+        }
+
         let w = sps.width();
         let h = sps.height();
         if w > 0 && h > 0 {
@@ -378,16 +396,18 @@ impl H264Decoder {
             }
         } else if !self.has_bitstream_restriction && sps.profile_idc != 66 {
             // When VUI bitstream_restriction is absent and the profile
-            // supports B-frames (non-Baseline), use a minimum reorder
-            // depth of 1 to prevent premature output of the first frame.
-            // Without this, streams with negative POC values (POC < IDR's
-            // POC) in the first GOP would output the IDR before frames
-            // that should display earlier. The dynamic detection at line
-            // 846 will increase this further as needed.
-            // Reference: FFmpeg h264_ps.c:538-550 estimates reorder depth
-            // from level when VUI is absent.
-            if self.reorder_depth < 1 {
-                self.reorder_depth = 1;
+            // supports B-frames (non-Baseline), estimate reorder depth
+            // from the level's max DPB capacity (matching FFmpeg
+            // h264_ps.c:538-550). FFmpeg normally discovers reorder depth
+            // via avformat_find_stream_info probing; since wedeo doesn't
+            // probe, we pre-set it from the level to avoid premature
+            // output of P-frames before their B-frame successors arrive.
+            let mb_count = sps.mb_width * sps.mb_height;
+            let estimated = level_max_dpb_mbs(sps.level_idc)
+                .checked_div(mb_count)
+                .map_or(1, |v| v.min(15) as usize);
+            if estimated > self.reorder_depth {
+                self.reorder_depth = estimated;
             }
         }
     }
@@ -1490,12 +1510,16 @@ impl H264Decoder {
     /// Convert a completed FrameDecodeContext to a Frame.
     fn fdc_to_frame(&self, fdc: &mut FrameDecodeContext, hdr: &SliceHeader, pts: i64) -> Frame {
         if std::env::var("WEDEO_NO_DEBLOCK").is_err() {
+            let chroma_qp_index_offset = self.pps_list[hdr.pps_id as usize]
+                .as_ref()
+                .map_or([0, 0], |pps| pps.chroma_qp_index_offset);
             deblock::deblock_frame(
                 &mut fdc.pic,
                 &fdc.mb_info,
                 hdr.disable_deblocking_filter_idc,
                 hdr.slice_alpha_c0_offset,
                 hdr.slice_beta_offset,
+                chroma_qp_index_offset,
             );
         }
 
