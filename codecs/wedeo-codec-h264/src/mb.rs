@@ -1410,6 +1410,18 @@ fn decode_inter_mb(
                         ctx.pic.y_stride,
                         &mut mb.luma_8x8_coeffs[i8x8],
                     );
+                    {
+                        let y_stride = ctx.pic.y_stride;
+                        let mut post_sum = 0u32;
+                        for dy in 0..8usize {
+                            for dx in 0..8usize {
+                                post_sum = post_sum.wrapping_add(
+                                    ctx.pic.y[offset + dy * y_stride + dx] as u32,
+                                );
+                            }
+                        }
+                        trace!(mb_x, mb_y, i8x8, post_sum, "POST_IDCT_8X8");
+                    }
                 }
             }
         } else {
@@ -2433,6 +2445,18 @@ fn add_b_residual(
                         ctx.pic.y_stride,
                         &mut mb.luma_8x8_coeffs[i8x8],
                     );
+                    {
+                        let y_stride = ctx.pic.y_stride;
+                        let mut post_sum = 0u32;
+                        for dy in 0..8usize {
+                            for dx in 0..8usize {
+                                post_sum = post_sum.wrapping_add(
+                                    ctx.pic.y[offset + dy * y_stride + dx] as u32,
+                                );
+                            }
+                        }
+                        trace!(mb_x, mb_y, i8x8, post_sum, "POST_IDCT_8X8");
+                    }
                 }
             }
         } else {
@@ -3467,6 +3491,16 @@ fn decode_intra8x8(
             block_has_top_left,
             block_has_top_right,
         );
+        // Prediction checksum (before residual addition)
+        {
+            let mut pred_sum = 0u32;
+            for dy in 0..8usize {
+                for dx in 0..8usize {
+                    pred_sum = pred_sum.wrapping_add(ctx.pic.y[offset + dy * stride + dx] as u32);
+                }
+            }
+            trace!(mb_x, mb_y, i8x8, mode, pred_sum, "INTRA8x8_PRED");
+        }
 
         // Dequant and IDCT residual if CBP indicates this 8x8 block is coded
         if cbp_luma & (1 << i8x8) != 0 {
@@ -3492,6 +3526,17 @@ fn decode_intra8x8(
                 stride,
                 &mut mb.luma_8x8_coeffs[i8x8],
             );
+            // Post-IDCT pixel checksum for this 8x8 block
+            {
+                let mut post_sum = 0u32;
+                for dy in 0..8usize {
+                    for dx in 0..8usize {
+                        post_sum = post_sum
+                            .wrapping_add(ctx.pic.y[offset + dy * stride + dx] as u32);
+                    }
+                }
+                trace!(mb_x, mb_y, i8x8, post_sum, "POST_IDCT_8X8");
+            }
         }
     }
 

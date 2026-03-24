@@ -1153,6 +1153,14 @@ pub fn decode_mb_cavlc(
     if dct8x8_allowed && (mb.cbp & 15) != 0 && !is_intra {
         mb.transform_size_8x8_flag = br.get_bit();
     }
+    trace!(
+        mb_x,
+        t8x8 = mb.transform_size_8x8_flag,
+        dct8x8_allowed,
+        is_intra,
+        cbp = mb.cbp,
+        "TRANSFORM_FLAG"
+    );
 
     // 6. mb_qp_delta and residual coefficients
     tracing::trace!(bits_before_qp_delta = br.consumed(), "CAVLC MB header");
@@ -1290,6 +1298,14 @@ fn decode_residual_blocks(
                         + mb.non_zero_count[SCAN_TO_RASTER[i8x8 * 4 + 3]];
                     mb.non_zero_count[r0] = nz_sum.min(16);
                 }
+                trace!(
+                    mb_x,
+                    i8x8,
+                    dc = buf[0],
+                    coeff_sum = buf.iter().map(|&c| c.unsigned_abs() as u32).sum::<u32>(),
+                    nnz = mb.non_zero_count[SCAN_TO_RASTER[i8x8 * 4]],
+                    "COEFF_8X8"
+                );
             } else {
                 for i4x4 in 0..4 {
                     let scan_idx = i8x8 * 4 + i4x4;
