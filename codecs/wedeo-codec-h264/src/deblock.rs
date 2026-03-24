@@ -947,8 +947,29 @@ pub fn deblock_frame(
             }
 
             deblock_mb(pic, mb_info, mb_x, mb_y, slice_table, slice_params);
+
+            {
+                let y_sum = deblock_plane_sum(&pic.y, pic.y_stride, mb_x, mb_y, 16);
+                let u_sum = deblock_plane_sum(&pic.u, pic.uv_stride, mb_x, mb_y, 8);
+                let v_sum = deblock_plane_sum(&pic.v, pic.uv_stride, mb_x, mb_y, 8);
+                tracing::trace!(mb_x, mb_y, y_sum, u_sum, v_sum, "MB_DEBLOCK");
+            }
         }
     }
+}
+
+/// Compute pixel sum for a macroblock region (for deblock tracing).
+fn deblock_plane_sum(plane: &[u8], stride: usize, mb_x: u32, mb_y: u32, size: u32) -> u32 {
+    let base_x = (mb_x * size) as usize;
+    let base_y = (mb_y * size) as usize;
+    let mut sum = 0u32;
+    for dy in 0..size as usize {
+        let row_start = (base_y + dy) * stride + base_x;
+        for dx in 0..size as usize {
+            sum = sum.wrapping_add(plane[row_start + dx] as u32);
+        }
+    }
+    sum
 }
 
 // ---------------------------------------------------------------------------

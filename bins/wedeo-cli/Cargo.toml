@@ -9,20 +9,6 @@ description = "CLI tools for wedeo (ffprobe/ffmpeg equivalent)"
 name = "wedeo-cli"
 path = "src/main.rs"
 
-[features]
-tracing = [
-    "dep:tracing-subscriber",
-    "wedeo-core/tracing-detail",
-    "wedeo-codec/tracing-detail",
-    "wedeo-format/tracing-detail",
-    "wedeo-codec-pcm/tracing-detail",
-    "wedeo-format-wav/tracing-detail",
-    "wedeo-format-h264/tracing-detail",
-    "wedeo-format-mp4/tracing-detail",
-    "wedeo-symphonia/tracing-detail",
-    "wedeo-rav1d/tracing-detail",
-]
-
 [dependencies]
 wedeo-core = { workspace = true }
 wedeo-codec = { workspace = true }
@@ -34,4 +20,4 @@ wedeo-format-h264 = { workspace = true }
 wedeo-format-mp4 = { workspace = true }
 wedeo-symphonia = { workspace = true }
 wedeo-rav1d = { workspace = true }
-tracing-subscriber = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true }

@@ -17,7 +17,6 @@ use wedeo_format::context::InputContext;
 use wedeo_format::registry as format_registry;
 
 fn main() {
-    #[cfg(feature = "tracing")]
     init_tracing();
 
     let args: Vec<String> = env::args().collect();
@@ -50,7 +49,6 @@ fn main() {
     }
 }
 
-#[cfg(feature = "tracing")]
 fn init_tracing() {
     tracing_subscriber::fmt()
         .with_env_filter(

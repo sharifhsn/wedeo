@@ -2802,6 +2802,36 @@ pub fn decode_mb_cabac(
             is_intra,
         );
 
+        // Per-MB coefficient summary for pipeline-stage tracing
+        {
+            let luma_sum: u32 = if mb.transform_size_8x8_flag {
+                mb.luma_8x8_coeffs
+                    .iter()
+                    .flat_map(|c| c.iter())
+                    .map(|&c| c.unsigned_abs() as u32)
+                    .sum()
+            } else {
+                mb.luma_coeffs
+                    .iter()
+                    .flat_map(|c| c.iter())
+                    .map(|&c| c.unsigned_abs() as u32)
+                    .sum()
+            };
+            let chroma_dc_cb: i16 = mb.chroma_dc[0].iter().sum();
+            let chroma_dc_cr: i16 = mb.chroma_dc[1].iter().sum();
+            trace!(
+                mb_x,
+                mb_y,
+                t8x8 = mb.transform_size_8x8_flag,
+                luma_sum,
+                chroma_dc_cb,
+                chroma_dc_cr,
+                cbp,
+                i16x16 = is_i16x16,
+                "COEFF_CABAC"
+            );
+        }
+
         // Store the luma DC coded flag if I16x16 had non-zero DC
         if is_i16x16 && mb.luma_dc.iter().any(|&c| c != 0) {
             stored_cbp |= 0x100;

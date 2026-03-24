@@ -588,13 +588,22 @@ impl H264Decoder {
 
                     debug!(
                         slice_type = ?hdr.slice_type,
+                        first_mb = hdr.first_mb_in_slice,
                         frame_num = hdr.frame_num,
-                        qp = hdr.slice_qp,
+                        poc = self.current_poc,
+                        pps_id = hdr.pps_id,
+                        slice_qp = hdr.slice_qp,
+                        num_ref_l0 = hdr.num_ref_idx_l0_active,
+                        num_ref_l1 = hdr.num_ref_idx_l1_active,
+                        deblock_idc = hdr.disable_deblocking_filter_idc,
+                        cabac_init_idc = hdr.cabac_init_idc,
+                        direct_spatial = hdr.direct_spatial_mv_pred_flag,
+                        weighted_bipred_idc = hdr.weighted_bipred_idc,
+                        mmco_count = hdr.mmco_ops.len(),
                         is_idr,
                         use_weight = hdr.use_weight,
                         use_weight_chroma = hdr.use_weight_chroma,
-                        num_luma_weights = hdr.luma_weight_l0.len(),
-                        "slice start"
+                        "SLICE"
                     );
 
                     // Start new frame context
@@ -648,8 +657,9 @@ impl H264Decoder {
                     debug!(
                         poc = self.current_poc,
                         l0_len = self.ref_list_l0.len(),
+                        l0_pocs = ?self.ref_list_l0.iter().map(|&i| self.dpb.get(i).map(|e| e.poc)).collect::<Vec<_>>(),
                         l0_frame_nums = ?self.ref_list_l0.iter().map(|&i| self.dpb.get(i).map(|e| e.frame_num)).collect::<Vec<_>>(),
-                        "P-slice ref list"
+                        "REFLIST"
                     );
                 } else if hdr.slice_type.is_b() {
                     let max_frame_num_b = 1u32 << sps.log2_max_frame_num;
@@ -661,7 +671,7 @@ impl H264Decoder {
                         l1_len = l1.len(),
                         l0_pocs = ?l0.iter().map(|&i| self.dpb.get(i).map(|e| e.poc)).collect::<Vec<_>>(),
                         l1_pocs = ?l1.iter().map(|&i| self.dpb.get(i).map(|e| e.poc)).collect::<Vec<_>>(),
-                        "B-slice ref lists"
+                        "REFLIST"
                     );
                     self.ref_list_l0 = l0;
                     self.ref_list_l1 = l1;
@@ -1104,14 +1114,24 @@ impl H264Decoder {
                         })
                     })
                     .collect();
+                let st_pocs: Vec<i32> = self
+                    .dpb
+                    .entries
+                    .iter()
+                    .filter_map(|e| {
+                        e.as_ref()
+                            .and_then(|e| (e.status == RefStatus::ShortTerm).then_some(e.poc))
+                    })
+                    .collect();
                 debug!(
-                    h264_fn = self.current_frame_num_h264,
+                    frame_num = self.current_frame_num_h264,
                     poc = self.current_poc,
-                    st_count = st_fns.len(),
-                    st_frame_nums = ?st_fns,
-                    lt_count = lt_fns.len(),
-                    lt_indices = ?lt_fns,
-                    "DPB state"
+                    short_term_count = st_fns.len(),
+                    short_term_pocs = ?st_pocs,
+                    short_term_fns = ?st_fns,
+                    long_term_count = lt_fns.len(),
+                    long_term_indices = ?lt_fns,
+                    "DPB"
                 );
             }
 

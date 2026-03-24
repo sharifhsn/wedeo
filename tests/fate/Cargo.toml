@@ -13,19 +13,6 @@ path = "src/audiogen.rs"
 name = "wedeo-framecrc"
 path = "src/framecrc.rs"
 
-[features]
-tracing = [
-    "wedeo-core/tracing-detail",
-    "wedeo-codec/tracing-detail",
-    "wedeo-format/tracing-detail",
-    "wedeo-codec-pcm/tracing-detail",
-    "wedeo-format-wav/tracing-detail",
-    "wedeo-format-h264/tracing-detail",
-    "wedeo-format-mp4/tracing-detail",
-    "wedeo-symphonia/tracing-detail",
-    "wedeo-rav1d/tracing-detail",
-]
-
 [dependencies]
 wedeo-core = { workspace = true }
 wedeo-codec = { workspace = true }

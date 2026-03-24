@@ -1353,6 +1353,35 @@ fn decode_residual_blocks(
         }
     }
 
+    // Per-MB coefficient summary for pipeline-stage tracing
+    {
+        let luma_sum: u32 = if mb.transform_size_8x8_flag {
+            mb.luma_8x8_coeffs
+                .iter()
+                .flat_map(|c| c.iter())
+                .map(|&c| c.unsigned_abs() as u32)
+                .sum()
+        } else {
+            mb.luma_coeffs
+                .iter()
+                .flat_map(|c| c.iter())
+                .map(|&c| c.unsigned_abs() as u32)
+                .sum()
+        };
+        let chroma_dc_cb: i16 = mb.chroma_dc[0].iter().sum();
+        let chroma_dc_cr: i16 = mb.chroma_dc[1].iter().sum();
+        trace!(
+            mb_x,
+            t8x8 = mb.transform_size_8x8_flag,
+            luma_sum,
+            chroma_dc_cb,
+            chroma_dc_cr,
+            cbp,
+            i16x16 = mb.is_intra16x16,
+            "COEFF"
+        );
+    }
+
     Ok(())
 }
 

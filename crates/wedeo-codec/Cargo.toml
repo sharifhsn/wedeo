@@ -5,8 +5,6 @@ edition.workspace = true
 license.workspace = true
 description = "Codec framework for wedeo (libavcodec equivalent)"
 
-[features]
-tracing-detail = ["tracing/attributes"]
 
 [dependencies]
 wedeo-core = { workspace = true }

@@ -5,7 +5,7 @@
 //
 // Reference: FFmpeg libavcodec/h264_mb.c, h264_slice.c
 
-use tracing::trace;
+use tracing::{debug, trace};
 use wedeo_codec::bitstream::BitReadBE;
 use wedeo_core::error::Result;
 
@@ -20,6 +20,25 @@ use crate::pps::Pps;
 use crate::slice::SliceHeader;
 use crate::sps::Sps;
 use crate::tables::CHROMA_QP_TABLE;
+
+// ---------------------------------------------------------------------------
+// Per-MB pixel checksum for pipeline-stage tracing
+// ---------------------------------------------------------------------------
+
+/// Compute a quick sum of all pixel values in an MB-sized block of a plane.
+/// Used for per-MB reconstruction checksums to compare against FFmpeg.
+fn mb_plane_sum(plane: &[u8], stride: usize, mb_x: u32, mb_y: u32, size: u32) -> u32 {
+    let base_x = (mb_x * size) as usize;
+    let base_y = (mb_y * size) as usize;
+    let mut sum = 0u32;
+    for dy in 0..size as usize {
+        let row_start = (base_y + dy) * stride + base_x;
+        for dx in 0..size as usize {
+            sum = sum.wrapping_add(plane[row_start + dx] as u32);
+        }
+    }
+    sum
+}
 
 // ---------------------------------------------------------------------------
 // Block scanning order
@@ -153,6 +172,28 @@ impl FrameDecodeContext {
 
         let total_mbs = (mb_width * mb_height) as usize;
 
+        // Log dequant table checksums for diagnosing scaling matrix issues
+        debug!(
+            dq4_intra_y_sum = pps.scaling_matrix4[0]
+                .iter()
+                .map(|&x| x as u32)
+                .sum::<u32>(),
+            dq4_inter_y_sum = pps.scaling_matrix4[3]
+                .iter()
+                .map(|&x| x as u32)
+                .sum::<u32>(),
+            dq8_intra_y_sum = pps.scaling_matrix8[0]
+                .iter()
+                .map(|&x| x as u32)
+                .sum::<u32>(),
+            dq8_inter_y_sum = pps.scaling_matrix8[3]
+                .iter()
+                .map(|&x| x as u32)
+                .sum::<u32>(),
+            scaling_present = pps.scaling_matrix_present,
+            "DEQUANT_TABLES"
+        );
+
         Self {
             pic,
             mb_info: vec![MbDeblockInfo::default(); total_mbs],
@@ -160,7 +201,7 @@ impl FrameDecodeContext {
             qp: 0,
             mb_width,
             mb_height,
-            dequant4: Dequant4Table::new(&sps.scaling_matrix4),
+            dequant4: Dequant4Table::new(&pps.scaling_matrix4),
             dequant8: Dequant8Table::new(&pps.scaling_matrix8),
             transform_8x8: vec![false; total_mbs],
             mv_ctx: MvContext::new(mb_width, mb_height),
@@ -501,7 +542,9 @@ fn decode_chroma(
 
         if cbp_chroma > 0 {
             // Chroma DC: inverse Hadamard + dequant (i32 output to avoid i16 overflow)
-            let qmul = dequant::dc_dequant_scale(&ctx.dequant4, 1, chroma_qp);
+            // FFmpeg uses list 1+plane for intra (1=Cb, 2=Cr)
+            let dc_cqm = 1 + plane_idx;
+            let qmul = dequant::dc_dequant_scale(&ctx.dequant4, dc_cqm, chroma_qp);
             let mut chroma_dc_out = [0i32; 4];
             idct::chroma_dc_dequant_idct(&mut chroma_dc_out, &mb.chroma_dc[plane_idx], qmul);
 
@@ -521,9 +564,13 @@ fn decode_chroma(
                     // AC coefficients present — combine DC into coeffs[0] and
                     // process everything through a single IDCT pass (matching
                     // FFmpeg, which applies one +32 rounding bias for DC+AC).
+                    let cqm = 1 + plane_idx; // intra: 1=Cb, 2=Cr
                     mb.chroma_ac[plane_idx][blk_idx][0] = dc_val as i16;
-                    dequant::dequant_4x4_flat(&mut mb.chroma_ac[plane_idx][blk_idx], chroma_qp);
-                    // dequant_4x4_flat scaled [0] by the AC dequant factor, but
+                    dequant::dequant_4x4(
+                        &mut mb.chroma_ac[plane_idx][blk_idx],
+                        &ctx.dequant4.coeffs[cqm][chroma_qp as usize],
+                    );
+                    // dequant_4x4 scaled [0] by the AC dequant factor, but
                     // DC was already fully dequantized by the Hadamard. Restore it.
                     mb.chroma_ac[plane_idx][blk_idx][0] = dc_val as i16;
                     idct::idct4x4_add(
@@ -768,6 +815,29 @@ pub fn apply_macroblock(
     ctx.neighbor_ctx
         .update_after_mb(mb_x, &mb.non_zero_count, &intra4x4_modes);
     ctx.neighbor_ctx.left_available = true;
+
+    // Per-MB pipeline-stage checksum for diffing against FFmpeg.
+    // Captures reconstruction state BEFORE deblocking. Compare with FFmpeg via:
+    //   scripts/mb_recon_compare.py <file> --frame N
+    // To enable: RUST_LOG=wedeo_codec_h264::mb=trace (appears as MB_RECON lines).
+    {
+        let y_sum = mb_plane_sum(&ctx.pic.y, ctx.pic.y_stride, mb_x, mb_y, 16);
+        let u_sum = mb_plane_sum(&ctx.pic.u, ctx.pic.uv_stride, mb_x, mb_y, 8);
+        let v_sum = mb_plane_sum(&ctx.pic.v, ctx.pic.uv_stride, mb_x, mb_y, 8);
+        trace!(
+            mb_x,
+            mb_y,
+            mb_type = mb.mb_type,
+            qp,
+            cbp = mb.cbp,
+            t8x8 = mb.transform_size_8x8_flag,
+            is_intra = mb.is_intra,
+            y_sum,
+            u_sum,
+            v_sum,
+            "MB_RECON"
+        );
+    }
 
     // Store MbDeblockInfo for the deblocking filter
     store_deblock_info(
@@ -1319,6 +1389,19 @@ fn decode_inter_mb(
                     let cqm = 3; // inter
                     let dequant_table = &ctx.dequant8.coeffs[cqm][qp as usize];
                     dequant::dequant_8x8(&mut mb.luma_8x8_coeffs[i8x8], dequant_table);
+                    trace!(
+                        mb_x,
+                        mb_y,
+                        block_idx = i8x8,
+                        qp,
+                        cqm,
+                        coeff_sum = mb.luma_8x8_coeffs[i8x8]
+                            .iter()
+                            .map(|&c| c.unsigned_abs() as u32)
+                            .sum::<u32>(),
+                        dc = mb.luma_8x8_coeffs[i8x8][0],
+                        "DEQUANT"
+                    );
                     let px = (mb_x * 16 + bx) as usize;
                     let py = (mb_y * 16 + by) as usize;
                     let offset = py * ctx.pic.y_stride + px;
@@ -1330,11 +1413,24 @@ fn decode_inter_mb(
                 }
             }
         } else {
+            let dq_table = &ctx.dequant4.coeffs[3][qp as usize]; // inter Y
             for (block, &(blk_x, blk_y)) in BLOCK_INDEX_TO_XY.iter().enumerate() {
                 let group_8x8 = (blk_y / 2) * 2 + (blk_x / 2);
                 if cbp_luma & (1 << group_8x8) != 0 {
                     let raster_idx = block_to_raster(block);
-                    dequant::dequant_4x4_flat(&mut mb.luma_coeffs[raster_idx], qp);
+                    dequant::dequant_4x4(&mut mb.luma_coeffs[raster_idx], dq_table);
+                    trace!(
+                        mb_x,
+                        mb_y,
+                        block_idx = block,
+                        qp,
+                        coeff_sum = mb.luma_coeffs[raster_idx]
+                            .iter()
+                            .map(|&c| c.unsigned_abs() as u32)
+                            .sum::<u32>(),
+                        dc = mb.luma_coeffs[raster_idx][0],
+                        "DEQUANT"
+                    );
                     let (offset, stride) = luma_block_offset(&ctx.pic, mb_x, mb_y, blk_x, blk_y);
                     idct::idct4x4_add(
                         &mut ctx.pic.y[offset..],
@@ -2316,6 +2412,19 @@ fn add_b_residual(
                     let cqm = 3; // inter
                     let dequant_table = &ctx.dequant8.coeffs[cqm][qp as usize];
                     dequant::dequant_8x8(&mut mb.luma_8x8_coeffs[i8x8], dequant_table);
+                    trace!(
+                        mb_x,
+                        mb_y,
+                        block_idx = i8x8,
+                        qp,
+                        cqm,
+                        coeff_sum = mb.luma_8x8_coeffs[i8x8]
+                            .iter()
+                            .map(|&c| c.unsigned_abs() as u32)
+                            .sum::<u32>(),
+                        dc = mb.luma_8x8_coeffs[i8x8][0],
+                        "DEQUANT"
+                    );
                     let px = (mb_x * 16 + bx) as usize;
                     let py = (mb_y * 16 + by) as usize;
                     let offset = py * ctx.pic.y_stride + px;
@@ -2327,11 +2436,24 @@ fn add_b_residual(
                 }
             }
         } else {
+            let dq_table = &ctx.dequant4.coeffs[3][qp as usize]; // inter Y
             for (block, &(blk_x, blk_y)) in BLOCK_INDEX_TO_XY.iter().enumerate() {
                 let group_8x8 = (blk_y / 2) * 2 + (blk_x / 2);
                 if cbp_luma & (1 << group_8x8) != 0 {
                     let raster_idx = block_to_raster(block);
-                    dequant::dequant_4x4_flat(&mut mb.luma_coeffs[raster_idx], qp);
+                    dequant::dequant_4x4(&mut mb.luma_coeffs[raster_idx], dq_table);
+                    trace!(
+                        mb_x,
+                        mb_y,
+                        block_idx = block,
+                        qp,
+                        coeff_sum = mb.luma_coeffs[raster_idx]
+                            .iter()
+                            .map(|&c| c.unsigned_abs() as u32)
+                            .sum::<u32>(),
+                        dc = mb.luma_coeffs[raster_idx][0],
+                        "DEQUANT"
+                    );
                     let (offset, stride) = luma_block_offset(&ctx.pic, mb_x, mb_y, blk_x, blk_y);
                     idct::idct4x4_add(
                         &mut ctx.pic.y[offset..],
@@ -3186,7 +3308,9 @@ fn decode_chroma_inter(
     if cbp_chroma > 0 {
         for plane_idx in 0..2usize {
             // Chroma DC: inverse Hadamard + dequant (i32 output to avoid i16 overflow)
-            let qmul = dequant::dc_dequant_scale(&ctx.dequant4, 1, chroma_qp);
+            // FFmpeg uses list 4+plane for inter (4=Cb, 5=Cr)
+            let dc_cqm = 4 + plane_idx;
+            let qmul = dequant::dc_dequant_scale(&ctx.dequant4, dc_cqm, chroma_qp);
             let mut chroma_dc_out = [0i32; 4];
             idct::chroma_dc_dequant_idct(&mut chroma_dc_out, &mb.chroma_dc[plane_idx], qmul);
 
@@ -3210,8 +3334,12 @@ fn decode_chroma_inter(
 
                 if cbp_chroma >= 2 {
                     // AC present: combine DC into coeffs[0] for single IDCT pass
+                    let ac_cqm = 4 + plane_idx; // inter: 4=Cb, 5=Cr
                     mb.chroma_ac[plane_idx][blk_idx][0] = dc_val as i16;
-                    dequant::dequant_4x4_flat(&mut mb.chroma_ac[plane_idx][blk_idx], chroma_qp);
+                    dequant::dequant_4x4(
+                        &mut mb.chroma_ac[plane_idx][blk_idx],
+                        &ctx.dequant4.coeffs[ac_cqm][chroma_qp as usize],
+                    );
                     mb.chroma_ac[plane_idx][blk_idx][0] = dc_val as i16;
                     idct::idct4x4_add(
                         &mut plane_data[c_offset..],
@@ -3346,6 +3474,19 @@ fn decode_intra8x8(
             let cqm = 0; // intra
             let dequant_table = &ctx.dequant8.coeffs[cqm][qp as usize];
             dequant::dequant_8x8(&mut mb.luma_8x8_coeffs[i8x8], dequant_table);
+            trace!(
+                mb_x,
+                mb_y,
+                block_idx = i8x8,
+                qp,
+                cqm,
+                coeff_sum = mb.luma_8x8_coeffs[i8x8]
+                    .iter()
+                    .map(|&c| c.unsigned_abs() as u32)
+                    .sum::<u32>(),
+                dc = mb.luma_8x8_coeffs[i8x8][0],
+                "DEQUANT"
+            );
             idct::idct8x8_add(
                 &mut ctx.pic.y[offset..],
                 stride,
@@ -3453,7 +3594,10 @@ fn decode_intra4x4(
                 trace!(mb_x, mb_y, blk_x, blk_y, coeffs = ?mb.luma_coeffs[raster_idx], "intra4x4 pre-dequant");
             }
 
-            dequant::dequant_4x4_flat(&mut mb.luma_coeffs[raster_idx], qp);
+            dequant::dequant_4x4(
+                &mut mb.luma_coeffs[raster_idx],
+                &ctx.dequant4.coeffs[0][qp as usize],
+            ); // intra Y
 
             {
                 trace!(mb_x, mb_y, blk_x, blk_y, coeffs = ?mb.luma_coeffs[raster_idx], "intra4x4 post-dequant");
@@ -3541,18 +3685,13 @@ fn decode_intra16x16(
         if cbp_luma & (1 << group_8x8) != 0 {
             // AC present: combine DC into coeffs[0] for single IDCT pass
             // (avoids double +32 rounding bias from separate DC add + IDCT).
+            // Dequant all 16 positions using pre-computed table, then restore
+            // DC from Hadamard (which was already fully dequantized).
             mb.luma_coeffs[raster_idx][0] = luma_dc_out[block] as i16;
-            let qp_per = (qp / 6) as u32;
-            let qp_rem = (qp % 6) as usize;
-            const POS_CLASS: [usize; 16] = [0, 1, 0, 1, 1, 2, 1, 2, 0, 1, 0, 1, 1, 2, 1, 2];
-            let scale = &crate::tables::DEQUANT4_COEFF_INIT[qp_rem];
-            for i in 1..16 {
-                let s = scale[POS_CLASS[i]] as i32;
-                mb.luma_coeffs[raster_idx][i] =
-                    ((mb.luma_coeffs[raster_idx][i] as i32 * s) << qp_per) as i16;
-            }
-            // Restore DC after flat dequant (dequant doesn't touch [0] since
-            // we only dequant [1..15], but be explicit):
+            dequant::dequant_4x4(
+                &mut mb.luma_coeffs[raster_idx],
+                &ctx.dequant4.coeffs[0][qp as usize],
+            ); // intra Y
             mb.luma_coeffs[raster_idx][0] = luma_dc_out[block] as i16;
             idct::idct4x4_add(
                 &mut ctx.pic.y[offset..],

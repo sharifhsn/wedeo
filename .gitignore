@@ -27,3 +27,6 @@ Thumbs.db
 .conformance-cache.json
 scripts/.conformance_snapshot.json
 scripts/.conformance_delta_*.json
+
+# Claude Code ephemeral session state
+.claude/primer.md

@@ -5,8 +5,6 @@ edition.workspace = true
 license.workspace = true
 description = "Core types for wedeo (libavutil equivalent)"
 
-[features]
-tracing-detail = ["tracing/attributes"]
 
 [dependencies]
 aligned-vec = "0.6.4"

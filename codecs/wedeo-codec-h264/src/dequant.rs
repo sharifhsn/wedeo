@@ -24,11 +24,10 @@ use crate::tables::{
 /// For each QP:
 ///   shift = qp/6 + 2
 ///   idx   = qp%6
-///   for each position x in zigzag order:
-///     raster_pos = (x >> 2) | ((x << 2) & 0xF)
+///   for each position x in raster order:
 ///     scale_idx  = (x & 1) + ((x >> 2) & 1)
-///     table[qp][raster_pos] = dequant4_coeff_init[idx][scale_idx]
-///                              * scaling_matrix4[x] << shift
+///     table[qp][x] = dequant4_coeff_init[idx][scale_idx]
+///                     * scaling_matrix4[x] << shift
 ///
 /// Maximum QP for 8-bit depth is 51.
 ///
@@ -67,11 +66,10 @@ impl Dequant4Table {
                 let shift = (q / 6) + 2;
                 let idx = q % 6;
                 for x in 0..16u32 {
-                    // Transpose: raster position from zigzag-order index
-                    let raster_pos = ((x >> 2) | ((x << 2) & 0xF)) as usize;
-                    // Scale factor index: depends on position parity
+                    // No transpose — both coefficients and scaling matrices are in raster order.
+                    // FFmpeg also stores at position x directly (init_dequant4_coeff_table, h264_ps.c).
                     let scale_idx = ((x & 1) + ((x >> 2) & 1)) as usize;
-                    table.coeffs[i][q][raster_pos] = ((DEQUANT4_COEFF_INIT[idx][scale_idx] as u32)
+                    table.coeffs[i][q][x as usize] = ((DEQUANT4_COEFF_INIT[idx][scale_idx] as u32)
                         * (sm[x as usize] as u32))
                         << shift;
                 }
@@ -147,23 +145,20 @@ impl Dequant8Table {
 /// `dequant` is the row from the pre-computed dequant table for this QP and
 /// scaling list: `dequant4_table.coeffs[list_idx][qp]`.
 ///
-/// Each coefficient is scaled: `coeffs[i] = (coeffs[i] * dequant[i]) >> 6`
-/// (the shift by 6 accounts for the 2 extra shift bits built into the table
-/// during `init_dequant4_coeff_table`, which uses `shift = qp/6 + 2`).
+/// Applies `(level * qmul + 32) >> 6` per coefficient, matching FFmpeg's
+/// inline dequant in `decode_residual` STORE_BLOCK for 4x4 blocks
+/// (h264_cavlc.c line 564).
 ///
-/// Note: The pre-computed table already includes `<< (qp/6 + 2)`, so to get
-/// the correctly scaled residual we need to right-shift by 6 (the normative
-/// scaling factor). However, the IDCT itself applies `>> 6` at the end, so
-/// the dequantized coefficients fed into the IDCT should NOT be shifted here.
-/// The table values are designed so that after dequant and IDCT `>> 6`, the
-/// result is correctly scaled.
+/// The pre-computed table includes `INIT * scaling_matrix << (qp/6 + 2)`.
+/// The `>> 6` here normalizes the extra `<< 2` shift and the scaling matrix
+/// factor (which is 16 for the default flat matrix, making the `<< 2` and
+/// `* 16` combine to `<< 6`, perfectly canceled by `>> 6`).
 ///
-/// In practice, the coefficients after dequant are simply:
-///   `level * dequant_table[pos]`
-/// and the IDCT handles the final normalization.
+/// For flat scaling (default, all entries 16), this produces exactly the
+/// same result as `dequant_4x4_flat`: `level * INIT << (qp/6)`.
 pub fn dequant_4x4(coeffs: &mut [i16; 16], dequant: &[u32; 16]) {
     for i in 0..16 {
-        coeffs[i] = (coeffs[i] as i32 * dequant[i] as i32) as i16;
+        coeffs[i] = ((coeffs[i] as i32 * dequant[i] as i32 + 32) >> 6) as i16;
     }
 }
 
@@ -320,8 +315,10 @@ mod tests {
 
         dequant_4x4(&mut coeffs, &table.coeffs[0][0]);
 
-        // coeffs[0] = 1 * 240 = 240
-        assert_eq!(coeffs[0], 240);
+        // coeffs[0] = (1 * 240 + 32) >> 6 = 272 >> 6 = 4
+        // (default intra scaling_matrix4[0][0] = 6, INIT[0][0] = 10,
+        //  table = 10 * 6 << 2 = 240, dequant applies (+32)>>6)
+        assert_eq!(coeffs[0], 4);
         // All other coefficients remain 0
         for i in 1..16 {
             assert_eq!(coeffs[i], 0, "coeff {i}");
@@ -423,7 +420,8 @@ mod tests {
 
         dequant_8x8(&mut coeffs, &table.coeffs[0][0]);
 
-        assert_eq!(coeffs[0], 120);
+        // (1 * 120 + 32) >> 6 = 152 >> 6 = 2
+        assert_eq!(coeffs[0], 2);
         for i in 1..64 {
             assert_eq!(coeffs[i], 0, "coeff {i}");
         }

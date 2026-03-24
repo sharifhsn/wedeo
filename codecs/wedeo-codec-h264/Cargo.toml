@@ -9,4 +9,4 @@ description = "H.264/AVC video codec for wedeo"
 wedeo-core = { workspace = true }
 wedeo-codec = { workspace = true }
 inventory = { workspace = true }
-tracing = { workspace = true, features = ["attributes"] }
+tracing = { workspace = true }
