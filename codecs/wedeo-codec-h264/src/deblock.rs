@@ -127,6 +127,8 @@ pub struct MbDeblockInfo {
     pub ref_poc_l1: [i32; 16],
     /// Motion vectors per 4x4 block (list 1, for B-slice MBs) [x, y].
     pub mv_l1: [[i16; 2]; 16],
+    /// True if this MB uses 8x8 transform (High profile).
+    pub transform_8x8: bool,
 }
 
 impl Default for MbDeblockInfo {
@@ -140,6 +142,7 @@ impl Default for MbDeblockInfo {
             mv: [[0; 2]; 16],
             ref_poc_l1: [i32::MIN; 16],
             mv_l1: [[0; 2]; 16],
+            transform_8x8: false,
         }
     }
 }
@@ -664,7 +667,15 @@ fn compute_luma_bs(
     // This matches FFmpeg's check_mv which uses sl->list_count (current slice).
     let list_count = cur.list_count;
 
+    // When 8x8 transform: skip internal 4-pixel edges (edges 1 and 3).
+    // Only edge 0 (MB boundary) and edge 2 (8-pixel boundary) are filtered.
+    let cur_t8x8 = cur.transform_8x8;
+
     for (edge, bs_edge) in bs.iter_mut().enumerate() {
+        // Skip internal 4-pixel edges for 8x8 transform MBs
+        if cur_t8x8 && (edge == 1 || edge == 3) {
+            continue;
+        }
         let is_mb_edge = edge == 0;
 
         // For edge 0, the P block is in the neighboring macroblock.

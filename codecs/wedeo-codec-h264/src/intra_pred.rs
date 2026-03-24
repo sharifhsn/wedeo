@@ -319,6 +319,291 @@ fn pred_4x4_horizontal_up(dst: &mut [u8], stride: usize, left: &[u8]) {
 }
 
 // ============================================================================
+// Intra 8x8 luma prediction (9 modes, High profile)
+// ============================================================================
+
+/// Predict an 8x8 luma block using the given intra prediction mode.
+///
+/// Reference samples must be raw (unfiltered) pixels. This function applies the
+/// mandatory 3-tap lowpass filter before dispatching to the mode function.
+///
+/// `top` must have at least 16 entries (8 top + 8 top-right, replicated if unavail).
+/// `left` must have at least 8 entries.
+/// `top_left` is the corner sample.
+///
+/// Reference: FFmpeg h264pred_template.c pred8x8l_* functions.
+#[allow(clippy::too_many_arguments)]
+pub fn predict_8x8l(
+    dst: &mut [u8],
+    stride: usize,
+    mode: u8,
+    top: &[u8],
+    left: &[u8],
+    top_left: u8,
+    has_top: bool,
+    has_left: bool,
+    has_top_left: bool,
+    has_top_right: bool,
+) {
+    // Filter reference samples with 3-tap lowpass: (a + 2*b + c + 2) >> 2
+    // Reference: FFmpeg h264pred_template.c PREDICT_8x8_LOAD macros
+
+    // Filtered left samples (l0..l7)
+    let mut fl = [0u8; 8];
+    if has_left {
+        let tl = if has_top_left { top_left } else { left[0] };
+        fl[0] = avg3(tl, left[0], left[1]);
+        for i in 1..7 {
+            fl[i] = avg3(left[i - 1], left[i], left[i + 1]);
+        }
+        fl[7] = ((left[6] as u16 + 3 * left[7] as u16 + 2) >> 2) as u8;
+    }
+
+    // Filtered top-left sample
+    let flt = if has_top_left {
+        avg3(left[0], top_left, top[0])
+    } else if has_top {
+        top[0]
+    } else if has_left {
+        left[0]
+    } else {
+        128
+    };
+
+    // Filtered top samples (t0..t7) and top-right extension (t8..t15)
+    let mut ft = [0u8; 16];
+    if has_top {
+        let tl = if has_top_left { top_left } else { top[0] };
+        ft[0] = avg3(tl, top[0], top[1]);
+        for i in 1..7 {
+            ft[i] = avg3(top[i - 1], top[i], top[i + 1]);
+        }
+        if has_top_right {
+            ft[7] = avg3(top[6], top[7], top[8]);
+            for i in 8..15 {
+                ft[i] = avg3(top[i - 1], top[i], top[i + 1]);
+            }
+            ft[15] = ((top[14] as u16 + 3 * top[15] as u16 + 2) >> 2) as u8;
+        } else {
+            // No top-right: filter t7 using top[7] as boundary, then replicate
+            ft[7] = ((top[8].wrapping_add(0) as u16 // top[8] is top[7] when no top-right
+                + 2 * top[7] as u16
+                + top[6] as u16
+                + 2)
+                >> 2) as u8;
+            // Actually: if no top-right, top[8..15] should be top[7] (replicated by caller).
+            // So ft[7] = avg3(top[6], top[7], top[7])
+            ft[7] = avg3(top[6], top[7], top[7]);
+            ft[8..16].fill(top[7]);
+        }
+    }
+
+    match mode {
+        INTRA_4X4_VERTICAL => pred_8x8l_vertical(dst, stride, &ft),
+        INTRA_4X4_HORIZONTAL => pred_8x8l_horizontal(dst, stride, &fl),
+        INTRA_4X4_DC => pred_8x8l_dc(dst, stride, &ft, &fl, has_top, has_left),
+        INTRA_4X4_DIAG_DOWN_LEFT => pred_8x8l_diag_down_left(dst, stride, &ft),
+        INTRA_4X4_DIAG_DOWN_RIGHT => pred_8x8l_diag_down_right(dst, stride, &ft, &fl, flt),
+        INTRA_4X4_VERT_RIGHT => pred_8x8l_vert_right(dst, stride, &ft, &fl, flt),
+        INTRA_4X4_HOR_DOWN => pred_8x8l_hor_down(dst, stride, &ft, &fl, flt),
+        INTRA_4X4_VERT_LEFT => pred_8x8l_vert_left(dst, stride, &ft),
+        INTRA_4X4_HOR_UP => pred_8x8l_hor_up(dst, stride, &fl),
+        _ => {}
+    }
+}
+
+/// 8x8 mode 0: Vertical — each row copies filtered top[0..7].
+fn pred_8x8l_vertical(dst: &mut [u8], stride: usize, t: &[u8]) {
+    for y in 0..8 {
+        dst[y * stride..y * stride + 8].copy_from_slice(&t[..8]);
+    }
+}
+
+/// 8x8 mode 1: Horizontal — each column copies filtered left[y].
+fn pred_8x8l_horizontal(dst: &mut [u8], stride: usize, l: &[u8]) {
+    for (y, &lv) in l[..8].iter().enumerate() {
+        let row = y * stride;
+        dst[row..row + 8].fill(lv);
+    }
+}
+
+/// 8x8 mode 2: DC — average of available filtered neighbors.
+fn pred_8x8l_dc(dst: &mut [u8], stride: usize, t: &[u8], l: &[u8], has_top: bool, has_left: bool) {
+    let dc = match (has_top, has_left) {
+        (true, true) => {
+            let sum: u32 = t[..8].iter().map(|&v| v as u32).sum::<u32>()
+                + l[..8].iter().map(|&v| v as u32).sum::<u32>();
+            ((sum + 8) >> 4) as u8
+        }
+        (true, false) => {
+            let sum: u32 = t[..8].iter().map(|&v| v as u32).sum();
+            ((sum + 4) >> 3) as u8
+        }
+        (false, true) => {
+            let sum: u32 = l[..8].iter().map(|&v| v as u32).sum();
+            ((sum + 4) >> 3) as u8
+        }
+        (false, false) => 128,
+    };
+    for y in 0..8 {
+        let row = y * stride;
+        dst[row..row + 8].fill(dc);
+    }
+}
+
+/// 8x8 mode 3: Diagonal down-left.
+/// Uses t[0..15] (needs top-right extension).
+fn pred_8x8l_diag_down_left(dst: &mut [u8], stride: usize, t: &[u8]) {
+    let s = stride;
+    for y in 0..8 {
+        for x in 0..8 {
+            let i = x + y;
+            if i < 14 {
+                dst[at(x, y, s)] = avg3(t[i], t[i + 1], t[i + 2]);
+            } else {
+                // i == 14: last position uses edge-biased formula
+                dst[at(x, y, s)] = ((t[14] as u16 + 3 * t[15] as u16 + 2) >> 2) as u8;
+            }
+        }
+    }
+}
+
+/// 8x8 mode 4: Diagonal down-right.
+/// Uses t[0..7], l[0..7], and lt (filtered top-left).
+fn pred_8x8l_diag_down_right(dst: &mut [u8], stride: usize, t: &[u8], l: &[u8], lt: u8) {
+    let s = stride;
+    for y in 0..8 {
+        for x in 0..8 {
+            let d = x as i32 - y as i32;
+            dst[at(x, y, s)] = if d > 1 {
+                // Upper-right: uses top samples
+                let i = (d - 2) as usize;
+                avg3(t[i], t[i + 1], t[i + 2])
+            } else if d == 1 {
+                avg3(lt, t[0], t[1])
+            } else if d == 0 {
+                // Main diagonal
+                avg3(l[0], lt, t[0])
+            } else if d == -1 {
+                avg3(lt, l[0], l[1])
+            } else {
+                // Lower-left: uses left samples
+                let i = (-d - 2) as usize;
+                avg3(l[i], l[i + 1], l[i + 2])
+            };
+        }
+    }
+}
+
+/// 8x8 mode 5: Vertical-right (~26.6° from vertical).
+/// Uses t[0..7], l[0..6], and lt.
+/// Reference: FFmpeg h264pred_template.c pred8x8l_vertical_right.
+fn pred_8x8l_vert_right(dst: &mut [u8], stride: usize, t: &[u8], l: &[u8], lt: u8) {
+    let s = stride;
+    for y in 0..8 {
+        for x in 0..8 {
+            // zVR = 2*x - y
+            let zvr = 2 * x as i32 - y as i32;
+            dst[at(x, y, s)] = if zvr >= 2 {
+                let i = (zvr / 2 - 1) as usize;
+                if zvr & 1 == 0 {
+                    avg2(t[i], t[i + 1])
+                } else {
+                    avg3(t[i], t[i + 1], t[i + 2])
+                }
+            } else if zvr == 1 {
+                avg3(lt, t[0], t[1])
+            } else if zvr == 0 {
+                avg2(lt, t[0])
+            } else if zvr == -1 {
+                avg3(l[0], lt, t[0])
+            } else {
+                // zvr < -1: uses left samples.
+                // Pattern: avg3(l[d-3], l[d-2], l[d-1]) where d = y-2*x, l[-1] = lt
+                let li = (y as i32 - 2 * x as i32 - 2) as usize;
+                if li == 0 {
+                    avg3(lt, l[0], l[1])
+                } else {
+                    avg3(l[li - 1], l[li], l[li + 1])
+                }
+            };
+        }
+    }
+}
+
+/// 8x8 mode 6: Horizontal-down (~26.6° from horizontal).
+/// Uses t[0..6], l[0..7], and lt.
+/// Reference: FFmpeg h264pred_template.c pred8x8l_horizontal_down.
+fn pred_8x8l_hor_down(dst: &mut [u8], stride: usize, t: &[u8], l: &[u8], lt: u8) {
+    let s = stride;
+    for y in 0..8 {
+        for x in 0..8 {
+            // zHD = 2*y - x
+            let zhd = 2 * y as i32 - x as i32;
+            dst[at(x, y, s)] = if zhd >= 2 {
+                let i = (zhd / 2 - 1) as usize;
+                if zhd & 1 == 0 {
+                    avg2(l[i], l[i + 1])
+                } else {
+                    avg3(l[i], l[i + 1], l[i + 2])
+                }
+            } else if zhd == 1 {
+                avg3(lt, l[0], l[1])
+            } else if zhd == 0 {
+                avg2(lt, l[0])
+            } else if zhd == -1 {
+                avg3(t[0], lt, l[0])
+            } else {
+                // zhd < -1: uses top samples.
+                // Pattern: avg3(t[d-3], t[d-2], t[d-1]) where d = x-2*y, t[-1] = lt
+                let ti = (x as i32 - 2 * y as i32 - 2) as usize;
+                if ti == 0 {
+                    avg3(lt, t[0], t[1])
+                } else {
+                    avg3(t[ti - 1], t[ti], t[ti + 1])
+                }
+            };
+        }
+    }
+}
+
+/// 8x8 mode 7: Vertical-left (mirror of diag down-left from top).
+/// Uses t[0..14].
+fn pred_8x8l_vert_left(dst: &mut [u8], stride: usize, t: &[u8]) {
+    let s = stride;
+    for y in 0..8 {
+        for x in 0..8 {
+            let i = x + y / 2;
+            if y & 1 == 0 {
+                dst[at(x, y, s)] = avg2(t[i], t[i + 1]);
+            } else {
+                dst[at(x, y, s)] = avg3(t[i], t[i + 1], t[i + 2]);
+            }
+        }
+    }
+}
+
+/// 8x8 mode 8: Horizontal-up (mirror of diag down-left from left).
+/// Uses l[0..7]. Replicates l[7] at the bottom boundary.
+/// Reference: FFmpeg h264pred_template.c pred8x8l_horizontal_up.
+fn pred_8x8l_hor_up(dst: &mut [u8], stride: usize, l: &[u8]) {
+    let s = stride;
+    for y in 0..8 {
+        for x in 0..8 {
+            let i = y + x / 2;
+            if i >= 7 {
+                dst[at(x, y, s)] = l[7];
+            } else if x & 1 == 0 {
+                dst[at(x, y, s)] = avg2(l[i], l[i + 1]);
+            } else {
+                let c = if i + 2 >= 8 { l[7] } else { l[i + 2] };
+                dst[at(x, y, s)] = avg3(l[i], l[i + 1], c);
+            }
+        }
+    }
+}
+
+// ============================================================================
 // Shared helpers
 // ============================================================================
 

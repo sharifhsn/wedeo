@@ -88,54 +88,19 @@ pub fn idct4x4_dc_add(dst: &mut [u8], stride: usize, dc: &mut i16) {
 /// The H.264 8x8 IDCT for High profile. Uses a more complex butterfly than
 /// the 4x4 version.
 ///
+/// FFmpeg stores coefficients in COLUMN-MAJOR (transposed) order and its IDCT
+/// processes columns first (which are actually rows in transposed data), then
+/// rows (which are actually columns). With wedeo's ROW-MAJOR coefficients, we
+/// swap pass order: row-first, column-second. The `>>1`/`>>2` truncations in
+/// the butterfly make pass order significant for bitexact results, so this
+/// swap is required (same approach as the 4x4 IDCT).
+///
 /// Reference: FFmpeg `ff_h264_idct8_add` in h264idct_template.c
 pub fn idct8x8_add(dst: &mut [u8], stride: usize, coeffs: &mut [i16; 64]) {
     // Add rounding bias
     coeffs[0] = coeffs[0].wrapping_add(32);
 
-    // First pass: column transform
-    for i in 0..8 {
-        let a0 = coeffs[i] as i32 + coeffs[i + 32] as i32;
-        let a2 = coeffs[i] as i32 - coeffs[i + 32] as i32;
-        let a4 = (coeffs[i + 16] as i32 >> 1) - coeffs[i + 48] as i32;
-        let a6 = (coeffs[i + 48] as i32 >> 1) + coeffs[i + 16] as i32;
-
-        let b0 = a0 + a6;
-        let b2 = a2 + a4;
-        let b4 = a2 - a4;
-        let b6 = a0 - a6;
-
-        let a1 = -(coeffs[i + 24] as i32) + coeffs[i + 40] as i32
-            - coeffs[i + 56] as i32
-            - (coeffs[i + 56] as i32 >> 1);
-        let a3 = coeffs[i + 8] as i32 + coeffs[i + 56] as i32
-            - coeffs[i + 24] as i32
-            - (coeffs[i + 24] as i32 >> 1);
-        let a5 = -(coeffs[i + 8] as i32)
-            + coeffs[i + 56] as i32
-            + coeffs[i + 40] as i32
-            + (coeffs[i + 40] as i32 >> 1);
-        let a7 = coeffs[i + 24] as i32
-            + coeffs[i + 40] as i32
-            + coeffs[i + 8] as i32
-            + (coeffs[i + 8] as i32 >> 1);
-
-        let b1 = (a7 >> 2) + a1;
-        let b3 = a3 + (a5 >> 2);
-        let b5 = (a3 >> 2) - a5;
-        let b7 = a7 - (a1 >> 2);
-
-        coeffs[i] = (b0 + b7) as i16;
-        coeffs[i + 56] = (b0 - b7) as i16;
-        coeffs[i + 8] = (b2 + b5) as i16;
-        coeffs[i + 48] = (b2 - b5) as i16;
-        coeffs[i + 16] = (b4 + b3) as i16;
-        coeffs[i + 40] = (b4 - b3) as i16;
-        coeffs[i + 24] = (b6 + b1) as i16;
-        coeffs[i + 32] = (b6 - b1) as i16;
-    }
-
-    // Second pass: row transform and add to destination
+    // First pass: row transform (iterates over rows, mixes columns within each row)
     for i in 0..8 {
         let row = i * 8;
         let a0 = coeffs[row] as i32 + coeffs[row + 4] as i32;
@@ -168,15 +133,56 @@ pub fn idct8x8_add(dst: &mut [u8], stride: usize, coeffs: &mut [i16; 64]) {
         let b5 = (a3 >> 2) - a5;
         let b7 = a7 - (a1 >> 2);
 
-        let d = i * stride;
-        dst[d] = (dst[d] as i32 + ((b0 + b7) >> 6)).clamp(0, 255) as u8;
-        dst[d + 1] = (dst[d + 1] as i32 + ((b2 + b5) >> 6)).clamp(0, 255) as u8;
-        dst[d + 2] = (dst[d + 2] as i32 + ((b4 + b3) >> 6)).clamp(0, 255) as u8;
-        dst[d + 3] = (dst[d + 3] as i32 + ((b6 + b1) >> 6)).clamp(0, 255) as u8;
-        dst[d + 4] = (dst[d + 4] as i32 + ((b6 - b1) >> 6)).clamp(0, 255) as u8;
-        dst[d + 5] = (dst[d + 5] as i32 + ((b4 - b3) >> 6)).clamp(0, 255) as u8;
-        dst[d + 6] = (dst[d + 6] as i32 + ((b2 - b5) >> 6)).clamp(0, 255) as u8;
-        dst[d + 7] = (dst[d + 7] as i32 + ((b0 - b7) >> 6)).clamp(0, 255) as u8;
+        coeffs[row] = (b0 + b7) as i16;
+        coeffs[row + 7] = (b0 - b7) as i16;
+        coeffs[row + 1] = (b2 + b5) as i16;
+        coeffs[row + 6] = (b2 - b5) as i16;
+        coeffs[row + 2] = (b4 + b3) as i16;
+        coeffs[row + 5] = (b4 - b3) as i16;
+        coeffs[row + 3] = (b6 + b1) as i16;
+        coeffs[row + 4] = (b6 - b1) as i16;
+    }
+
+    // Second pass: column transform and add to destination
+    for i in 0..8 {
+        let a0 = coeffs[i] as i32 + coeffs[i + 32] as i32;
+        let a2 = coeffs[i] as i32 - coeffs[i + 32] as i32;
+        let a4 = (coeffs[i + 16] as i32 >> 1) - coeffs[i + 48] as i32;
+        let a6 = (coeffs[i + 48] as i32 >> 1) + coeffs[i + 16] as i32;
+
+        let b0 = a0 + a6;
+        let b2 = a2 + a4;
+        let b4 = a2 - a4;
+        let b6 = a0 - a6;
+
+        let a1 = -(coeffs[i + 24] as i32) + coeffs[i + 40] as i32
+            - coeffs[i + 56] as i32
+            - (coeffs[i + 56] as i32 >> 1);
+        let a3 = coeffs[i + 8] as i32 + coeffs[i + 56] as i32
+            - coeffs[i + 24] as i32
+            - (coeffs[i + 24] as i32 >> 1);
+        let a5 = -(coeffs[i + 8] as i32)
+            + coeffs[i + 56] as i32
+            + coeffs[i + 40] as i32
+            + (coeffs[i + 40] as i32 >> 1);
+        let a7 = coeffs[i + 24] as i32
+            + coeffs[i + 40] as i32
+            + coeffs[i + 8] as i32
+            + (coeffs[i + 8] as i32 >> 1);
+
+        let b1 = (a7 >> 2) + a1;
+        let b3 = a3 + (a5 >> 2);
+        let b5 = (a3 >> 2) - a5;
+        let b7 = a7 - (a1 >> 2);
+
+        dst[i] = (dst[i] as i32 + ((b0 + b7) >> 6)).clamp(0, 255) as u8;
+        dst[stride + i] = (dst[stride + i] as i32 + ((b2 + b5) >> 6)).clamp(0, 255) as u8;
+        dst[2 * stride + i] = (dst[2 * stride + i] as i32 + ((b4 + b3) >> 6)).clamp(0, 255) as u8;
+        dst[3 * stride + i] = (dst[3 * stride + i] as i32 + ((b6 + b1) >> 6)).clamp(0, 255) as u8;
+        dst[4 * stride + i] = (dst[4 * stride + i] as i32 + ((b6 - b1) >> 6)).clamp(0, 255) as u8;
+        dst[5 * stride + i] = (dst[5 * stride + i] as i32 + ((b4 - b3) >> 6)).clamp(0, 255) as u8;
+        dst[6 * stride + i] = (dst[6 * stride + i] as i32 + ((b2 - b5) >> 6)).clamp(0, 255) as u8;
+        dst[7 * stride + i] = (dst[7 * stride + i] as i32 + ((b0 - b7) >> 6)).clamp(0, 255) as u8;
     }
 
     *coeffs = [0i16; 64];

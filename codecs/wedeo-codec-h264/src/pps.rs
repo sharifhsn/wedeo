@@ -332,7 +332,6 @@ pub fn parse_pps(data: &[u8], sps_list: &[Option<Sps>; 32]) -> Result<Pps> {
     // Check for more RBSP data (high profile extensions)
     let bits_consumed = br.consumed();
     let bits_left = bit_length.saturating_sub(bits_consumed);
-
     if bits_left > 0 && more_rbsp_data_in_pps(sps) {
         transform_8x8_mode = br.get_bit();
         let pic_scaling_matrix_present_flag = br.get_bit();

@@ -13,8 +13,8 @@ use wedeo_core::error::{Error, Result};
 
 use crate::cabac_tables::{
     COEFF_ABS_LEVEL_M1_OFFSET, COEFF_ABS_LEVEL_TRANSITION, COEFF_ABS_LEVEL1_CTX,
-    COEFF_ABS_LEVELGT1_CTX, LAST_COEFF_FLAG_OFFSET, LPS_RANGE, MLPS_STATE, NORM_SHIFT,
-    SIGNIFICANT_COEFF_FLAG_OFFSET,
+    COEFF_ABS_LEVELGT1_CTX, LAST_COEFF_FLAG_OFFSET, LAST_COEFF_FLAG_OFFSET_8X8, LPS_RANGE,
+    MLPS_STATE, NORM_SHIFT, SIGNIFICANT_COEFF_FLAG_OFFSET, SIGNIFICANT_COEFF_FLAG_OFFSET_8X8,
 };
 use crate::cavlc::{Macroblock, NeighborContext};
 use crate::pps::Pps;
@@ -438,6 +438,8 @@ pub struct CabacNeighborCtx {
     pub ref_cache_l0: Vec<i8>,
     /// Same for L1.
     pub ref_cache_l1: Vec<i8>,
+    /// Per-MB transform_size_8x8_flag for CABAC context 399 derivation.
+    pub transform_8x8: Vec<bool>,
 }
 
 impl CabacNeighborCtx {
@@ -457,6 +459,7 @@ impl CabacNeighborCtx {
             mvd_cache_l1: vec![[0; 2]; total_mbs * 16],
             ref_cache_l0: vec![-1; total_mbs * 4],
             ref_cache_l1: vec![-1; total_mbs * 4],
+            transform_8x8: vec![false; total_mbs],
         }
     }
 
@@ -527,6 +530,7 @@ impl CabacNeighborCtx {
         cbp: u32,
         chroma_pred: u8,
         nz: &[u8; 24],
+        transform_8x8_flag: bool,
     ) {
         self.mb_skip[mb_idx] = is_skip;
         self.mb_type_intra16x16_or_pcm[mb_idx] = is_intra16x16_or_pcm;
@@ -536,6 +540,7 @@ impl CabacNeighborCtx {
         self.chroma_pred_mode[mb_idx] = chroma_pred;
         let nz_base = mb_idx * 24;
         self.nz_count[nz_base..nz_base + 24].copy_from_slice(nz);
+        self.transform_8x8[mb_idx] = transform_8x8_flag;
     }
 
     /// Write skip-MB defaults for MVD and ref_idx.
@@ -777,6 +782,19 @@ const SCAN_TO_RASTER: [usize; 16] = [0, 1, 4, 5, 2, 3, 6, 7, 8, 9, 12, 13, 10, 1
 ///
 /// From FFmpeg `ff_zigzag_scan` in mathtables.c.
 const ZIGZAG_SCAN_4X4: [usize; 16] = [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15];
+
+/// 8x8 zigzag scan as usize for CABAC residual decode.
+/// Same values as tables::ZIGZAG_SCAN_8X8 but typed as usize.
+const ZIGZAG_SCAN_8X8_USIZE: [usize; 64] = {
+    let src = crate::tables::ZIGZAG_SCAN_8X8;
+    let mut out = [0usize; 64];
+    let mut i = 0;
+    while i < 64 {
+        out[i] = src[i] as usize;
+        i += 1;
+    }
+    out
+};
 
 /// P sub-macroblock type partition counts.
 pub const P_SUB_MB_PARTITION_COUNT: [u8; 4] = [1, 2, 2, 4];
@@ -1591,24 +1609,32 @@ fn decode_cabac_residual(
     let sig_ctx_base = SIGNIFICANT_COEFF_FLAG_OFFSET[cat] as usize;
     let last_ctx_base = LAST_COEFF_FLAG_OFFSET[cat] as usize;
     let abs_level_ctx_base = COEFF_ABS_LEVEL_M1_OFFSET[cat] as usize;
+    let is_8x8 = cat == 5;
 
     // Phase 1: significance map — find which positions have non-zero coefficients.
     //
     // Reference: FFmpeg DECODE_SIGNIFICANCE macro (h264_cabac.c:1669-1683).
-    // Loop over positions 0..max_coeff-2. For each:
-    //   - Decode significant_coeff_flag; if set, record position.
-    //   - Decode last_significant_coeff_flag; if set, stop.
-    // If the loop completes without the last flag, position max_coeff-1 is
-    // implicitly significant.
+    // For cat=5 (8x8 luma), context offsets are remapped via
+    // SIGNIFICANT_COEFF_FLAG_OFFSET_8X8 and LAST_COEFF_FLAG_OFFSET_8X8.
     let mut index = [0usize; 64];
     let mut coeff_count = 0usize;
     let mut terminated = false;
 
     for last in 0..max_coeff.saturating_sub(1) {
-        if reader.get_cabac(&mut state[sig_ctx_base + last]) != 0 {
+        let sig_ctx = if is_8x8 {
+            sig_ctx_base + SIGNIFICANT_COEFF_FLAG_OFFSET_8X8[last] as usize
+        } else {
+            sig_ctx_base + last
+        };
+        if reader.get_cabac(&mut state[sig_ctx]) != 0 {
             index[coeff_count] = last;
             coeff_count += 1;
-            if reader.get_cabac(&mut state[last_ctx_base + last]) != 0 {
+            let last_ctx = if is_8x8 {
+                last_ctx_base + LAST_COEFF_FLAG_OFFSET_8X8[last] as usize
+            } else {
+                last_ctx_base + last
+            };
+            if reader.get_cabac(&mut state[last_ctx]) != 0 {
                 terminated = true;
                 break;
             }
@@ -1748,6 +1774,45 @@ fn decode_cabac_luma_residual(
                         &ZIGZAG_SCAN_4X4[1..],
                     );
                     nz_cache[raster_idx] = nz as u8;
+                }
+            }
+        }
+    } else if mb.transform_size_8x8_flag {
+        // 8x8 transform (High profile CABAC): decode 64 coefficients per 8x8 block.
+        // Uses cat=5 with CABAC-specific context remapping.
+        // Reference: FFmpeg h264_cabac.c:1898-1901
+        for i8x8 in 0..4 {
+            if cbp & (1 << i8x8) != 0 {
+                // CBF context: use the first 4x4 sub-block's position
+                let raster_idx = SCAN_TO_RASTER[i8x8 * 4];
+                let cbf_ctx = get_cabac_cbf_ctx(
+                    cabac_nb,
+                    slice_table,
+                    cur_slice,
+                    mb_idx,
+                    mb_x,
+                    mb_y,
+                    mb_width,
+                    5,
+                    raster_idx,
+                    false,
+                    nz_cache,
+                    is_intra,
+                );
+                if reader.get_cabac(&mut state[cbf_ctx]) != 0 {
+                    let nz = decode_cabac_residual(
+                        reader,
+                        state,
+                        &mut mb.luma_8x8_coeffs[i8x8],
+                        5,
+                        64,
+                        &ZIGZAG_SCAN_8X8_USIZE,
+                    );
+                    // Broadcast NNZ to all 4 sub-blocks for deblocking/neighbor context.
+                    let nz_val = (nz as u8).min(16);
+                    for k in 0..4 {
+                        nz_cache[SCAN_TO_RASTER[i8x8 * 4 + k]] = nz_val;
+                    }
                 }
             }
         }
@@ -1907,6 +1972,7 @@ pub fn decode_mb_cabac(
     num_ref_idx_l1_active: u32,
     last_qscale_diff: i32,
     cache: &mut CabacDecodeCache,
+    direct_8x8_inference_flag: bool,
 ) -> Result<Macroblock> {
     let mut mb = Macroblock::default();
     let mb_idx = (mb_y * mb_width + mb_x) as usize;
@@ -2137,20 +2203,48 @@ pub fn decode_mb_cabac(
         return Ok(mb);
     }
 
+    let mut dct8x8_allowed = _pps.transform_8x8_mode;
+
     // 3. Intra prediction modes
     trace!("CABAC_SECTION intra_pred_modes");
+
+    // Compute neighbor_transform_size for CABAC context 399.
+    // Reference: FFmpeg h264_mvpred.h:928
+    let neighbor_ts = {
+        let mut ts = 0usize;
+        // Top neighbor
+        if mb_y > 0
+            && slice_table[mb_idx - mb_width as usize] == cur_slice
+            && cabac_nb.transform_8x8[mb_idx - mb_width as usize]
+        {
+            ts += 1;
+        }
+        // Left neighbor
+        if mb_x > 0 && slice_table[mb_idx - 1] == cur_slice && cabac_nb.transform_8x8[mb_idx - 1] {
+            ts += 1;
+        }
+        ts
+    };
+
     if mb.is_intra4x4 {
+        // High profile: decode transform_size_8x8_flag via CABAC context 399.
+        // Reference: FFmpeg h264_cabac.c:2077
+        if _pps.transform_8x8_mode {
+            mb.transform_size_8x8_flag = reader.get_cabac(&mut state[399 + neighbor_ts]) != 0;
+        }
+
         // Decode intra 4x4 prediction modes.
-        // Cross-MB neighbors come from the NeighborContext, matching CAVLC behavior.
-        // Reference: FFmpeg pred_intra_mode() in h264_mvpred.h.
+        // When 8x8 transform: decode 4 modes and broadcast to 2x2 sub-blocks.
         const DC_PRED: u8 = 2;
+        let di = if mb.transform_size_8x8_flag { 4 } else { 1 };
         let mut mode_cache = [-1i8; 16]; // raster order
 
-        for &raster_idx in &SCAN_TO_RASTER {
+        let mut scan_idx = 0;
+        while scan_idx < 16 {
+            let raster_idx = SCAN_TO_RASTER[scan_idx];
             let blk_x = raster_idx % 4;
             let blk_y = raster_idx / 4;
 
-            // Get left neighbor's mode
             let left_mode: i8 = if blk_x > 0 {
                 mode_cache[raster_idx - 1]
             } else if neighbor.left_available {
@@ -2159,7 +2253,6 @@ pub fn decode_mb_cabac(
                 -1
             };
 
-            // Get top neighbor's mode
             let top_mode: i8 = if blk_y > 0 {
                 mode_cache[raster_idx - 4]
             } else if neighbor.top_available {
@@ -2176,8 +2269,19 @@ pub fn decode_mb_cabac(
             };
 
             let mode = decode_cabac_mb_intra4x4_pred_mode(reader, state, predicted);
-            mode_cache[raster_idx] = mode as i8;
-            mb.intra4x4_pred_mode[raster_idx] = mode;
+
+            if di == 4 {
+                for k in 0..4 {
+                    let r = SCAN_TO_RASTER[scan_idx + k];
+                    mode_cache[r] = mode as i8;
+                    mb.intra4x4_pred_mode[r] = mode;
+                }
+            } else {
+                mode_cache[raster_idx] = mode as i8;
+                mb.intra4x4_pred_mode[raster_idx] = mode;
+            }
+
+            scan_idx += di;
         }
     }
 
@@ -2322,6 +2426,11 @@ pub fn decode_mb_cabac(
                 for i in 0..4 {
                     mb.sub_mb_type[i] = decode_cabac_p_mb_sub_type(reader, state);
                 }
+                // Restrict dct8x8_allowed: only 8x8 sub-partitions (raw type 0) allow 8x8 DCT.
+                // Reference: FFmpeg h264_mvpred.h:157 get_dct8x8_allowed()
+                if dct8x8_allowed {
+                    dct8x8_allowed = mb.sub_mb_type.iter().all(|&t| t == 0);
+                }
                 let ref_count = if mb.mb_type == 4 {
                     1
                 } else {
@@ -2392,6 +2501,14 @@ pub fn decode_mb_cabac(
             // B_8x8
             for i in 0..4 {
                 mb.sub_mb_type[i] = decode_cabac_b_mb_sub_type(reader, state);
+            }
+            // Restrict dct8x8_allowed for B_8x8: sub-8x8 partitions (raw type >= 4) disallow,
+            // and B_Direct_8x8 (raw type 0) requires direct_8x8_inference_flag.
+            // Reference: FFmpeg h264_mvpred.h:157 get_dct8x8_allowed()
+            if dct8x8_allowed {
+                let all_8x8 = mb.sub_mb_type.iter().all(|&t| t <= 3);
+                let has_direct = mb.sub_mb_type.contains(&0);
+                dct8x8_allowed = all_8x8 && (!has_direct || direct_8x8_inference_flag);
             }
             // ref_idx L0
             for i in 0..4 {
@@ -2628,6 +2745,18 @@ pub fn decode_mb_cabac(
         cbp |= decode_cabac_mb_cbp_chroma(reader, state, left_cbp, top_cbp) << 4;
     }
     mb.cbp = cbp;
+
+    // B_Direct_16x16: restrict 8x8 DCT unless direct_8x8_inference_flag.
+    // Reference: FFmpeg h264_cabac.c (same pattern as CAVLC line 917)
+    if mb.is_direct && !direct_8x8_inference_flag {
+        dct8x8_allowed = false;
+    }
+
+    // 6b. Inter transform_size_8x8_flag (after CBP, before QP delta).
+    // Reference: FFmpeg h264_cabac.c:2347-2348
+    if dct8x8_allowed && (cbp & 15) != 0 && !is_intra {
+        mb.transform_size_8x8_flag = reader.get_cabac(&mut state[399 + neighbor_ts]) != 0;
+    }
 
     // 7. QP delta and residual coefficients
     trace!("CABAC_SECTION qp_delta_and_residual cbp={}", cbp);

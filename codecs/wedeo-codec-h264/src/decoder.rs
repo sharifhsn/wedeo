@@ -1461,7 +1461,8 @@ impl H264Decoder {
                     fdc.last_qscale_diff = 0;
 
                     // Update CABAC neighbor context for skip MB
-                    cabac_nb.update_after_mb(mb_idx, true, false, false, false, 0, 0, &[0; 24]);
+                    cabac_nb
+                        .update_after_mb(mb_idx, true, false, false, false, 0, 0, &[0; 24], false);
                     cabac_nb.update_mvd_ref_skip(mb_idx);
 
                     mb_addr += 1;
@@ -1497,6 +1498,7 @@ impl H264Decoder {
                 hdr.num_ref_idx_l1_active,
                 fdc.last_qscale_diff,
                 &mut cache,
+                fdc.direct_8x8_inference_flag,
             )?;
 
             // Apply entropy-agnostic processing (dequant, IDCT, pred, MC, neighbor update)
@@ -1513,6 +1515,7 @@ impl H264Decoder {
                 mb.cbp,
                 mb.chroma_pred_mode,
                 &mb.non_zero_count,
+                mb.transform_size_8x8_flag,
             );
 
             mb_addr += 1;

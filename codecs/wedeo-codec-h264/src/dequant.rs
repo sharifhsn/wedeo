@@ -112,12 +112,13 @@ impl Dequant8Table {
                 let shift = q / 6;
                 let idx = q % 6;
                 for x in 0..64u32 {
-                    // Transpose: raster position from zigzag-order index
-                    let raster_pos = ((x >> 3) | ((x & 7) << 3)) as usize;
-                    // Scale factor index via scan table
+                    // FFmpeg stores dequant values at transposed positions because
+                    // its coefficients are in transposed (column-major) order.
+                    // Wedeo's coefficients are in standard row-major order, so we
+                    // store at the standard position x directly (no transpose).
                     let scan_idx =
                         DEQUANT8_COEFF_INIT_SCAN[(((x >> 1) & 12) | (x & 3)) as usize] as usize;
-                    table.coeffs[i][q][raster_pos] = ((DEQUANT8_COEFF_INIT[idx][scan_idx] as u32)
+                    table.coeffs[i][q][x as usize] = ((DEQUANT8_COEFF_INIT[idx][scan_idx] as u32)
                         * (sm[x as usize] as u32))
                         << shift;
                 }
@@ -168,10 +169,18 @@ pub fn dequant_4x4(coeffs: &mut [i16; 16], dequant: &[u32; 16]) {
 
 /// Dequantize an 8x8 block of coefficients in-place using a pre-computed table.
 ///
-/// Same principle as `dequant_4x4` but for 8x8 transform blocks (High profile).
+/// Applies `(level * qmul + 32) >> 6` per coefficient, matching FFmpeg's
+/// inline dequant in `decode_residual` for 8x8 blocks (h264_cavlc.c STORE_BLOCK).
+///
+/// The pre-computed table includes `INIT * scaling_matrix << (qp/6)`. The
+/// `>> 6` normalization here reduces the coefficient magnitude to the range
+/// expected by the IDCT (which applies its own `>> 6` at the output).
+///
+/// Without this normalization, coefficients would be 64x too large, causing
+/// massive overflow in the IDCT and garbled output.
 pub fn dequant_8x8(coeffs: &mut [i16; 64], dequant: &[u32; 64]) {
     for i in 0..64 {
-        coeffs[i] = (coeffs[i] as i32 * dequant[i] as i32) as i16;
+        coeffs[i] = ((coeffs[i] as i32 * dequant[i] as i32 + 32) >> 6) as i16;
     }
 }
 

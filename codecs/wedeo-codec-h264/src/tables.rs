@@ -36,6 +36,25 @@ pub const FIELD_SCAN_8X8: [u8; 64] = [
     53, 61, 30, 7, 15, 38, 46, 54, 62, 23, 31, 39, 47, 55, 63,
 ];
 
+/// CAVLC sub-scan table for 8x8 blocks: 4 sub-scans of 16 positions each.
+///
+/// CAVLC decodes 8x8 blocks as 4 sequential sub-blocks of 16 coefficients.
+/// Each sub-scan maps coefficient scan position (0..15) to raster position
+/// within the 8x8 block (row * 8 + col, 0..63).
+///
+/// From FFmpeg `zigzag_scan8x8_cavlc` in h264_slice.c (non-transposed variant).
+/// Formula: `zigzag_scan8x8_cavlc[i] = zigzag_scan8x8[(i/4) + 16*(i%4)]`.
+pub const ZIGZAG_SCAN_8X8_CAVLC: [[usize; 16]; 4] = [
+    // Sub-scan 0 (indices 0-15)
+    [0, 9, 17, 18, 12, 40, 27, 7, 35, 57, 29, 30, 58, 38, 53, 47],
+    // Sub-scan 1 (indices 16-31)
+    [1, 2, 24, 11, 19, 48, 20, 14, 42, 50, 22, 37, 59, 31, 60, 55],
+    // Sub-scan 2 (indices 32-47)
+    [8, 3, 32, 4, 26, 41, 13, 21, 49, 43, 15, 44, 52, 39, 61, 62],
+    // Sub-scan 3 (indices 48-63)
+    [16, 10, 25, 5, 33, 34, 6, 28, 56, 36, 23, 51, 45, 46, 54, 63],
+];
+
 /// QP-to-chroma-QP mapping for 8-bit depth (H.264 spec Table 8-15).
 ///
 /// Maps luma QP (0-51) to chroma QP. Used for chroma deblocking and
@@ -392,5 +411,19 @@ mod tests {
         assert_eq!(FIELD_SCAN_8X8[0], 0); // (0,0)
         assert_eq!(FIELD_SCAN_8X8[1], 8); // (0,1)
         assert_eq!(FIELD_SCAN_8X8[63], 63); // (7,7)
+    }
+
+    #[test]
+    fn zigzag_scan_8x8_cavlc_covers_all_64() {
+        // All 4 sub-scans together must cover positions 0..63 exactly once.
+        let mut seen = [false; 64];
+        for sub in &ZIGZAG_SCAN_8X8_CAVLC {
+            for &pos in sub {
+                assert!(pos < 64, "position {pos} out of range");
+                assert!(!seen[pos], "position {pos} appears twice");
+                seen[pos] = true;
+            }
+        }
+        assert!(seen.iter().all(|&s| s), "not all positions covered");
     }
 }

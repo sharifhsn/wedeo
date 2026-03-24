@@ -11,7 +11,7 @@ use wedeo_core::error::Result;
 
 use crate::cavlc::{Macroblock, NeighborContext, decode_mb_cavlc};
 use crate::deblock::{MbDeblockInfo, PictureBuffer, SliceDeblockParams};
-use crate::dequant::{self, Dequant4Table};
+use crate::dequant::{self, Dequant4Table, Dequant8Table};
 use crate::idct;
 use crate::intra_pred;
 use crate::mc;
@@ -73,6 +73,10 @@ pub struct FrameDecodeContext {
     pub mb_height: u32,
     /// Pre-computed dequantization tables.
     pub dequant4: Dequant4Table,
+    /// Pre-computed 8x8 dequantization tables (High profile).
+    pub dequant8: Dequant8Table,
+    /// Per-MB transform_size_8x8_flag for deblocking edge selection.
+    pub transform_8x8: Vec<bool>,
     /// Motion vector context for inter prediction across MBs.
     pub mv_ctx: MvContext,
     /// Per-MB slice number for cross-slice neighbor availability.
@@ -157,6 +161,8 @@ impl FrameDecodeContext {
             mb_width,
             mb_height,
             dequant4: Dequant4Table::new(&sps.scaling_matrix4),
+            dequant8: Dequant8Table::new(&pps.scaling_matrix8),
+            transform_8x8: vec![false; total_mbs],
             mv_ctx: MvContext::new(mb_width, mb_height),
             slice_table: vec![u16::MAX; total_mbs],
             current_slice: 0,
@@ -308,6 +314,7 @@ fn store_deblock_info(
         mv: deblock_mv,
         ref_poc_l1: deblock_ref_poc_l1,
         mv_l1: deblock_mv_l1,
+        transform_8x8: ctx.transform_8x8[mb_idx],
     };
 }
 
@@ -584,6 +591,7 @@ pub fn decode_macroblock(
         ctx.mb_width,
         slice_hdr.num_ref_idx_l0_active,
         slice_hdr.num_ref_idx_l1_active,
+        ctx.direct_8x8_inference_flag,
     )?;
 
     // 2. Apply entropy-agnostic processing
@@ -657,6 +665,7 @@ pub fn apply_macroblock(
         cbp = mb.cbp,
         is_intra4x4 = mb.is_intra4x4,
         is_intra16x16 = mb.is_intra16x16,
+        t8x8 = mb.transform_size_8x8_flag,
         "decoded MB"
     );
 
@@ -695,7 +704,11 @@ pub fn apply_macroblock(
             }
         }
     } else if mb.is_intra4x4 {
-        decode_intra4x4(ctx, mb, mb_x, mb_y, qp, c_qp, has_top, has_left);
+        if mb.transform_size_8x8_flag {
+            decode_intra8x8(ctx, mb, mb_x, mb_y, qp, c_qp, has_top, has_left);
+        } else {
+            decode_intra4x4(ctx, mb, mb_x, mb_y, qp, c_qp, has_top, has_left);
+        }
     } else if mb.is_intra16x16 {
         decode_intra16x16(ctx, mb, mb_x, mb_y, qp, c_qp, has_top, has_left);
     }
@@ -751,6 +764,7 @@ pub fn apply_macroblock(
         [2i8; 16] // DC_PRED for I_16x16, I_PCM, and inter MBs
     };
     ctx.slice_table[mb_idx] = ctx.current_slice;
+    ctx.transform_8x8[mb_idx] = mb.transform_size_8x8_flag;
     ctx.neighbor_ctx
         .update_after_mb(mb_x, &mb.non_zero_count, &intra4x4_modes);
     ctx.neighbor_ctx.left_available = true;
@@ -1298,17 +1312,36 @@ fn decode_inter_mb(
     // Add residual on top of the motion-compensated prediction
     let cbp_luma = mb.cbp & 0x0F;
     if cbp_luma != 0 {
-        for (block, &(blk_x, blk_y)) in BLOCK_INDEX_TO_XY.iter().enumerate() {
-            let group_8x8 = (blk_y / 2) * 2 + (blk_x / 2);
-            if cbp_luma & (1 << group_8x8) != 0 {
-                let raster_idx = block_to_raster(block);
-                dequant::dequant_4x4_flat(&mut mb.luma_coeffs[raster_idx], qp);
-                let (offset, stride) = luma_block_offset(&ctx.pic, mb_x, mb_y, blk_x, blk_y);
-                idct::idct4x4_add(
-                    &mut ctx.pic.y[offset..],
-                    stride,
-                    &mut mb.luma_coeffs[raster_idx],
-                );
+        if mb.transform_size_8x8_flag {
+            // 8x8 transform inter residual (High profile)
+            for (i8x8, &(bx, by)) in BLOCK_8X8_OFFSET.iter().enumerate() {
+                if cbp_luma & (1 << i8x8) != 0 {
+                    let cqm = 3; // inter
+                    let dequant_table = &ctx.dequant8.coeffs[cqm][qp as usize];
+                    dequant::dequant_8x8(&mut mb.luma_8x8_coeffs[i8x8], dequant_table);
+                    let px = (mb_x * 16 + bx) as usize;
+                    let py = (mb_y * 16 + by) as usize;
+                    let offset = py * ctx.pic.y_stride + px;
+                    idct::idct8x8_add(
+                        &mut ctx.pic.y[offset..],
+                        ctx.pic.y_stride,
+                        &mut mb.luma_8x8_coeffs[i8x8],
+                    );
+                }
+            }
+        } else {
+            for (block, &(blk_x, blk_y)) in BLOCK_INDEX_TO_XY.iter().enumerate() {
+                let group_8x8 = (blk_y / 2) * 2 + (blk_x / 2);
+                if cbp_luma & (1 << group_8x8) != 0 {
+                    let raster_idx = block_to_raster(block);
+                    dequant::dequant_4x4_flat(&mut mb.luma_coeffs[raster_idx], qp);
+                    let (offset, stride) = luma_block_offset(&ctx.pic, mb_x, mb_y, blk_x, blk_y);
+                    idct::idct4x4_add(
+                        &mut ctx.pic.y[offset..],
+                        stride,
+                        &mut mb.luma_coeffs[raster_idx],
+                    );
+                }
             }
         }
     }
@@ -2276,17 +2309,36 @@ fn add_b_residual(
 ) {
     let cbp_luma = mb.cbp & 0x0F;
     if cbp_luma != 0 {
-        for (block, &(blk_x, blk_y)) in BLOCK_INDEX_TO_XY.iter().enumerate() {
-            let group_8x8 = (blk_y / 2) * 2 + (blk_x / 2);
-            if cbp_luma & (1 << group_8x8) != 0 {
-                let raster_idx = block_to_raster(block);
-                dequant::dequant_4x4_flat(&mut mb.luma_coeffs[raster_idx], qp);
-                let (offset, stride) = luma_block_offset(&ctx.pic, mb_x, mb_y, blk_x, blk_y);
-                idct::idct4x4_add(
-                    &mut ctx.pic.y[offset..],
-                    stride,
-                    &mut mb.luma_coeffs[raster_idx],
-                );
+        if mb.transform_size_8x8_flag {
+            // 8x8 transform inter residual (High profile)
+            for (i8x8, &(bx, by)) in BLOCK_8X8_OFFSET.iter().enumerate() {
+                if cbp_luma & (1 << i8x8) != 0 {
+                    let cqm = 3; // inter
+                    let dequant_table = &ctx.dequant8.coeffs[cqm][qp as usize];
+                    dequant::dequant_8x8(&mut mb.luma_8x8_coeffs[i8x8], dequant_table);
+                    let px = (mb_x * 16 + bx) as usize;
+                    let py = (mb_y * 16 + by) as usize;
+                    let offset = py * ctx.pic.y_stride + px;
+                    idct::idct8x8_add(
+                        &mut ctx.pic.y[offset..],
+                        ctx.pic.y_stride,
+                        &mut mb.luma_8x8_coeffs[i8x8],
+                    );
+                }
+            }
+        } else {
+            for (block, &(blk_x, blk_y)) in BLOCK_INDEX_TO_XY.iter().enumerate() {
+                let group_8x8 = (blk_y / 2) * 2 + (blk_x / 2);
+                if cbp_luma & (1 << group_8x8) != 0 {
+                    let raster_idx = block_to_raster(block);
+                    dequant::dequant_4x4_flat(&mut mb.luma_coeffs[raster_idx], qp);
+                    let (offset, stride) = luma_block_offset(&ctx.pic, mb_x, mb_y, blk_x, blk_y);
+                    idct::idct4x4_add(
+                        &mut ctx.pic.y[offset..],
+                        stride,
+                        &mut mb.luma_coeffs[raster_idx],
+                    );
+                }
             }
         }
     }
@@ -3186,6 +3238,128 @@ fn decode_chroma_inter(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// I_8x8 decode (High profile)
+// ---------------------------------------------------------------------------
+
+/// Maps 8x8 block index (0..3) to top-left pixel offset within the macroblock.
+const BLOCK_8X8_OFFSET: [(u32, u32); 4] = [(0, 0), (8, 0), (0, 8), (8, 8)];
+
+/// Decode an intra 8x8 macroblock (High profile, transform_size_8x8_flag=1).
+#[allow(clippy::too_many_arguments)]
+fn decode_intra8x8(
+    ctx: &mut FrameDecodeContext,
+    mb: &mut Macroblock,
+    mb_x: u32,
+    mb_y: u32,
+    qp: u8,
+    chroma_qp: u8,
+    has_top: bool,
+    has_left: bool,
+) {
+    let cbp_luma = mb.cbp & 0x0F;
+
+    for i8x8 in 0..4usize {
+        let (bx, by) = BLOCK_8X8_OFFSET[i8x8];
+        let px = (mb_x * 16 + bx) as usize;
+        let py = (mb_y * 16 + by) as usize;
+
+        // Neighbor availability for this 8x8 block
+        let block_has_top = by > 0 || has_top;
+        let block_has_left = bx > 0 || has_left;
+        let block_has_top_left = (by > 0 || has_top) && (bx > 0 || has_left);
+        let block_has_top_right = if by > 0 {
+            // Within the MB: top-right 8x8 block is available if bx==0
+            bx == 0
+        } else if has_top {
+            // First row: depends on neighbor MB availability
+            if bx == 0 {
+                true // top[8..15] from this MB or right part of top MB
+            } else {
+                // Top-right of the right 8x8 block = top-right MB
+                let tr_available = mb_x + 1 < ctx.mb_width;
+                if tr_available && ctx.constrained_intra_pred {
+                    let tr_idx = ((mb_y - 1) * ctx.mb_width + mb_x + 1) as usize;
+                    ctx.mb_info[tr_idx].is_intra
+                } else {
+                    tr_available
+                }
+            }
+        } else {
+            false
+        };
+
+        // Gather reference samples (raw, unfiltered)
+        let stride = ctx.pic.y_stride;
+
+        // Top: 16 samples (8 top + 8 top-right, replicated if unavailable)
+        let mut top = [128u8; 16];
+        if block_has_top && py > 0 {
+            let row_above = (py - 1) * stride + px;
+            top[..8].copy_from_slice(&ctx.pic.y[row_above..row_above + 8]);
+            if block_has_top_right {
+                top[8..16].copy_from_slice(&ctx.pic.y[row_above + 8..row_above + 16]);
+            } else {
+                let v = top[7];
+                top[8..16].fill(v);
+            }
+        }
+
+        // Left: 8 samples
+        let mut left = [128u8; 8];
+        if block_has_left && px > 0 {
+            for (i, lv) in left.iter_mut().enumerate() {
+                *lv = ctx.pic.y[(py + i) * stride + px - 1];
+            }
+        }
+
+        // Top-left: 1 sample
+        let top_left = if block_has_top_left && px > 0 && py > 0 {
+            ctx.pic.y[(py - 1) * stride + px - 1]
+        } else {
+            128
+        };
+
+        // Get prediction mode — stored per 8x8 block (first 4x4 sub-block within each)
+        let raster_for_mode = SCAN_TO_RASTER[i8x8 * 4];
+        let mode = mb.intra4x4_pred_mode[raster_for_mode];
+
+        // Apply 8x8 intra prediction (filtering is done inside predict_8x8l)
+        let offset = py * stride + px;
+        intra_pred::predict_8x8l(
+            &mut ctx.pic.y[offset..],
+            stride,
+            mode,
+            &top,
+            &left,
+            top_left,
+            block_has_top,
+            block_has_left,
+            block_has_top_left,
+            block_has_top_right,
+        );
+
+        // Dequant and IDCT residual if CBP indicates this 8x8 block is coded
+        if cbp_luma & (1 << i8x8) != 0 {
+            // Determine CQM index: 0 for intra, 3 for inter
+            let cqm = 0; // intra
+            let dequant_table = &ctx.dequant8.coeffs[cqm][qp as usize];
+            dequant::dequant_8x8(&mut mb.luma_8x8_coeffs[i8x8], dequant_table);
+            idct::idct8x8_add(
+                &mut ctx.pic.y[offset..],
+                stride,
+                &mut mb.luma_8x8_coeffs[i8x8],
+            );
+        }
+    }
+
+    // Decode chroma (same as 4x4)
+    decode_chroma(ctx, mb, mb_x, mb_y, chroma_qp, has_top, has_left);
+}
+
+// Scan-to-raster mapping constant (re-exported from cavlc.rs for local use)
+const SCAN_TO_RASTER: [usize; 16] = [0, 1, 4, 5, 2, 3, 6, 7, 8, 9, 12, 13, 10, 11, 14, 15];
 
 // ---------------------------------------------------------------------------
 // I_4x4 decode

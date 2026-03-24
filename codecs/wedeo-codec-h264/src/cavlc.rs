@@ -16,6 +16,7 @@ use crate::pps::Pps;
 use crate::slice::SliceType;
 use crate::tables::{
     B_MB_TYPE_INFO, B_SUB_MB_TYPE_INFO, GOLOMB_TO_INTER_CBP, GOLOMB_TO_INTRA4X4_CBP,
+    ZIGZAG_SCAN_8X8_CAVLC,
 };
 
 // ---------------------------------------------------------------------------
@@ -599,6 +600,11 @@ pub struct Macroblock {
     pub b_list_flags: [[bool; 2]; 2],
     /// Partition size for B-slices: 0=16x16, 1=16x8, 2=8x16, 3=8x8.
     pub b_part_size: u8,
+    /// True if this MB uses 8x8 transform (High profile).
+    pub transform_size_8x8_flag: bool,
+    /// Luma coefficients for 8x8 blocks (4 blocks × 64 coeffs).
+    /// Only used when transform_size_8x8_flag = true.
+    pub luma_8x8_coeffs: [[i16; 64]; 4],
 }
 
 impl Default for Macroblock {
@@ -628,6 +634,8 @@ impl Default for Macroblock {
             is_direct: false,
             b_list_flags: [[false; 2]; 2],
             b_part_size: 0,
+            transform_size_8x8_flag: false,
+            luma_8x8_coeffs: [[0; 64]; 4],
         }
     }
 }
@@ -743,13 +751,14 @@ const P_SUB_MB_PARTITION_COUNT: [u8; 4] = [1, 2, 2, 4];
 pub fn decode_mb_cavlc(
     br: &mut BitReadBE<'_>,
     slice_type: SliceType,
-    _pps: &Pps,
+    pps: &Pps,
     neighbor: &NeighborContext,
     mb_x: u32,
     _mb_y: u32,
     _mb_width: u32,
     num_ref_idx_l0_active: u32,
     _num_ref_idx_l1_active: u32,
+    direct_8x8_inference_flag: bool,
 ) -> Result<Macroblock> {
     let mut mb = Macroblock::default();
 
@@ -808,6 +817,7 @@ pub fn decode_mb_cavlc(
         }
     }
     mb.is_intra = is_intra;
+    let mut dct8x8_allowed = pps.transform_8x8_mode;
 
     trace!(
         raw_mb_type,
@@ -858,25 +868,26 @@ pub fn decode_mb_cavlc(
         "intra4x4 modes start"
     );
     if mb.is_intra4x4 {
-        // Parse and resolve intra4x4 prediction modes for each 4x4 block.
+        // High profile: read transform_size_8x8_flag before prediction modes.
+        // Reference: FFmpeg h264_cavlc.c:773-775
+        if pps.transform_8x8_mode {
+            mb.transform_size_8x8_flag = br.get_bit();
+        }
+
+        // Parse and resolve intra4x4 prediction modes.
+        // When transform_size_8x8_flag: decode 4 modes (one per 8x8 block, step=4)
+        // and broadcast to all four 4x4 sub-blocks within each 8x8 block.
+        // Otherwise: decode 16 modes (one per 4x4 block, step=1).
         //
-        // Block scan order maps (i8x8*4 + i4x4) -> (blk_x, blk_y) via BLOCK_INDEX_TO_XY
-        // from mb.rs, which is equivalent to SCAN_TO_RASTER converting to raster order.
-        //
-        // For each block, the predicted mode is min(left_mode, top_mode), defaulting
-        // to DC_PRED (2) if a neighbor is unavailable.
-        //
-        // If prev_intra4x4_pred_mode_flag == 1: use predicted mode.
-        // If prev_intra4x4_pred_mode_flag == 0: actual = rem_mode + (rem_mode >= predicted).
-        //
-        // Reference: FFmpeg pred_intra_mode() in h264_mvpred.h
+        // Reference: FFmpeg h264_cavlc.c:779-791, pred_intra_mode() in h264_mvpred.h
         const DC_PRED: u8 = 2;
+        let di = if mb.transform_size_8x8_flag { 4 } else { 1 };
 
-        // Temporary raster-order mode cache for resolving predictions within the MB.
-        // -1 (as i8) means unavailable.
-        let mut mode_cache = [-1i8; 16]; // indexed in raster order (blk_y * 4 + blk_x)
+        let mut mode_cache = [-1i8; 16]; // raster order (blk_y * 4 + blk_x)
 
-        for &raster_idx in &SCAN_TO_RASTER {
+        let mut scan_idx = 0;
+        while scan_idx < 16 {
+            let raster_idx = SCAN_TO_RASTER[scan_idx];
             let blk_x = raster_idx % 4;
             let blk_y = raster_idx / 4;
 
@@ -884,7 +895,6 @@ pub fn decode_mb_cavlc(
             let left_mode: i8 = if blk_x > 0 {
                 mode_cache[raster_idx - 1]
             } else if neighbor.left_available {
-                // Left neighbor is from the previous MB's right column.
                 neighbor.left_intra4x4_mode[blk_y]
             } else {
                 -1
@@ -894,14 +904,12 @@ pub fn decode_mb_cavlc(
             let top_mode: i8 = if blk_y > 0 {
                 mode_cache[raster_idx - 4]
             } else if neighbor.top_available {
-                // Top neighbor is from the MB above's bottom row.
                 let abs_blk_x = mb_x as usize * 4 + blk_x;
                 neighbor.top_intra4x4_mode[abs_blk_x]
             } else {
                 -1
             };
 
-            // Predicted mode = min(left, top), or DC_PRED if either unavailable
             let predicted = if left_mode < 0 || top_mode < 0 {
                 DC_PRED
             } else {
@@ -920,8 +928,20 @@ pub fn decode_mb_cavlc(
                 }
             };
 
-            mode_cache[raster_idx] = mode as i8;
-            mb.intra4x4_pred_mode[raster_idx] = mode;
+            if di == 4 {
+                // Broadcast to all 4 sub-blocks within this 8x8 block.
+                // SCAN_TO_RASTER[scan_idx..scan_idx+4] gives the 4 raster positions.
+                for k in 0..4 {
+                    let r = SCAN_TO_RASTER[scan_idx + k];
+                    mode_cache[r] = mode as i8;
+                    mb.intra4x4_pred_mode[r] = mode;
+                }
+            } else {
+                mode_cache[raster_idx] = mode as i8;
+                mb.intra4x4_pred_mode[raster_idx] = mode;
+            }
+
+            scan_idx += di;
         }
     }
 
@@ -964,6 +984,12 @@ pub fn decode_mb_cavlc(
                     mb.sub_mb_type[i] = sub_mt as u8;
                 }
 
+                // Restrict dct8x8_allowed: only 8x8 sub-partitions (raw type 0) allow 8x8 DCT.
+                // Reference: FFmpeg h264_mvpred.h:157 get_dct8x8_allowed()
+                if dct8x8_allowed {
+                    dct8x8_allowed = mb.sub_mb_type.iter().all(|&t| t == 0);
+                }
+
                 // ref_idx for each 8x8 partition
                 let ref_count = if mb.mb_type == 4 {
                     1 // P_8x8ref0: all refs forced to 0
@@ -1003,6 +1029,15 @@ pub fn decode_mb_cavlc(
                     return Err(Error::InvalidData);
                 }
                 mb.sub_mb_type[i] = sub_mt as u8;
+            }
+
+            // Restrict dct8x8_allowed for B_8x8: sub-8x8 partitions (raw type >= 4) disallow,
+            // and B_Direct_8x8 (raw type 0) requires direct_8x8_inference_flag.
+            // Reference: FFmpeg h264_mvpred.h:157 get_dct8x8_allowed()
+            if dct8x8_allowed {
+                let all_8x8 = mb.sub_mb_type.iter().all(|&t| t <= 3);
+                let has_direct = mb.sub_mb_type.contains(&0);
+                dct8x8_allowed = all_8x8 && (!has_direct || direct_8x8_inference_flag);
             }
 
             // Parse ref_idx L0 for each 8x8 partition that uses L0.
@@ -1107,6 +1142,18 @@ pub fn decode_mb_cavlc(
     }
     // For I_16x16, cbp was already set from mb_type.
 
+    // B_Direct_16x16: restrict 8x8 DCT unless direct_8x8_inference_flag.
+    // Reference: FFmpeg h264_cavlc.c:917
+    if mb.is_direct && !direct_8x8_inference_flag {
+        dct8x8_allowed = false;
+    }
+
+    // 5b. Inter 8x8 transform flag — read after CBP, before QP delta.
+    // Reference: FFmpeg h264_cavlc.c:1059-1061
+    if dct8x8_allowed && (mb.cbp & 15) != 0 && !is_intra {
+        mb.transform_size_8x8_flag = br.get_bit();
+    }
+
     // 6. mb_qp_delta and residual coefficients
     tracing::trace!(bits_before_qp_delta = br.consumed(), "CAVLC MB header");
     if mb.cbp > 0 || mb.is_intra16x16 {
@@ -1116,7 +1163,7 @@ pub fn decode_mb_cavlc(
             mb_qp_delta = mb.mb_qp_delta,
             "CAVLC MB header"
         );
-        decode_residual_blocks(br, &mut mb, neighbor, mb_x)?;
+        decode_residual_blocks(br, &mut mb, neighbor, mb_x, pps)?;
     }
 
     Ok(mb)
@@ -1183,6 +1230,7 @@ fn decode_residual_blocks(
     mb: &mut Macroblock,
     neighbor: &NeighborContext,
     mb_x: u32,
+    _pps: &Pps,
 ) -> Result<()> {
     let cbp = mb.cbp;
 
@@ -1208,6 +1256,45 @@ fn decode_residual_blocks(
                             ac_coeffs_scan[scan_pos];
                     }
                     mb.non_zero_count[raster_idx] = nz;
+                }
+            }
+        }
+    } else if mb.transform_size_8x8_flag {
+        // 8x8 transform (High profile CAVLC): decode 4 sub-blocks of 16 coefficients
+        // per 8x8 block, placing into the 64-element buffer via sub-scan table.
+        // Reference: FFmpeg h264_cavlc.c:634-645 (decode_luma_residual, IS_8x8DCT path)
+        for i8x8 in 0..4 {
+            if cbp & (1 << i8x8) != 0 {
+                let buf = &mut mb.luma_8x8_coeffs[i8x8];
+                for (i4x4, sub_scan) in ZIGZAG_SCAN_8X8_CAVLC.iter().enumerate() {
+                    let scan_idx = i8x8 * 4 + i4x4;
+                    let raster_idx = SCAN_TO_RASTER[scan_idx];
+                    let nc = compute_nc(raster_idx, mb_x, neighbor, &mb.non_zero_count);
+                    let (block_coeffs_scan, nz) = decode_residual(br, nc, 16)?;
+                    mb.non_zero_count[raster_idx] = nz;
+                    // Place coefficients into the 8x8 block using sub-scan table.
+                    for scan_pos in 0..16 {
+                        buf[sub_scan[scan_pos]] = block_coeffs_scan[scan_pos];
+                    }
+                }
+                // FFmpeg sums all 4 sub-block NNZ into the FIRST one only:
+                // nnz[0] += nnz[1] + nnz[8] + nnz[9]
+                // The other 3 sub-blocks keep their individual NNZ values.
+                // This is used for NC context propagation to subsequent 8x8 blocks.
+                // Reference: h264_cavlc.c:643-644
+                {
+                    let r0 = SCAN_TO_RASTER[i8x8 * 4];
+                    let nz_sum = mb.non_zero_count[r0]
+                        + mb.non_zero_count[SCAN_TO_RASTER[i8x8 * 4 + 1]]
+                        + mb.non_zero_count[SCAN_TO_RASTER[i8x8 * 4 + 2]]
+                        + mb.non_zero_count[SCAN_TO_RASTER[i8x8 * 4 + 3]];
+                    mb.non_zero_count[r0] = nz_sum.min(16);
+                }
+            } else {
+                for i4x4 in 0..4 {
+                    let scan_idx = i8x8 * 4 + i4x4;
+                    let raster_idx = SCAN_TO_RASTER[scan_idx];
+                    mb.non_zero_count[raster_idx] = 0;
                 }
             }
         }
