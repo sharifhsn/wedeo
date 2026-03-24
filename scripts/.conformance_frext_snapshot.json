@@ -1,6 +1,9 @@
 {
   "passing": [
-    "HPCVNL_BRCM_A.264"
+    "Freh1_B.264",
+    "HPCVMOLQ_BRCM_B.264",
+    "HPCVNL_BRCM_A.264",
+    "HPCV_BRCM_A.264"
   ],
-  "count": 1
+  "count": 4
 }

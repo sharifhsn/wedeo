@@ -15,8 +15,8 @@ use crate::cavlc_tables::{
 use crate::pps::Pps;
 use crate::slice::SliceType;
 use crate::tables::{
-    B_MB_TYPE_INFO, B_SUB_MB_TYPE_INFO, GOLOMB_TO_INTER_CBP, GOLOMB_TO_INTRA4X4_CBP,
-    ZIGZAG_SCAN_8X8_CAVLC,
+    B_MB_TYPE_INFO, B_SUB_MB_TYPE_INFO, GOLOMB_TO_INTER_CBP, GOLOMB_TO_INTER_CBP_GRAY,
+    GOLOMB_TO_INTRA4X4_CBP, GOLOMB_TO_INTRA4X4_CBP_GRAY, ZIGZAG_SCAN_8X8_CAVLC,
 };
 
 // ---------------------------------------------------------------------------
@@ -759,6 +759,7 @@ pub fn decode_mb_cavlc(
     num_ref_idx_l0_active: u32,
     _num_ref_idx_l1_active: u32,
     direct_8x8_inference_flag: bool,
+    decode_chroma: bool,
 ) -> Result<Macroblock> {
     let mut mb = Macroblock::default();
 
@@ -845,18 +846,28 @@ pub fn decode_mb_cavlc(
             }
         }
 
-        // Read 64 Cb then 64 Cr samples (8x8 each)
-        for plane_idx in 0..2usize {
-            for y in 0..8u32 {
-                for x in 0..8u32 {
-                    let blk = ((y / 4) * 2 + (x / 4)) as usize;
-                    let sub = ((y % 4) * 4 + (x % 4)) as usize;
-                    mb.chroma_ac[plane_idx][blk][sub] = br.get_bits_32(8) as i16;
+        // Read 64 Cb then 64 Cr samples (8x8 each) — absent for monochrome.
+        if decode_chroma {
+            for plane_idx in 0..2usize {
+                for y in 0..8u32 {
+                    for x in 0..8u32 {
+                        let blk = ((y / 4) * 2 + (x / 4)) as usize;
+                        let sub = ((y % 4) * 4 + (x % 4)) as usize;
+                        mb.chroma_ac[plane_idx][blk][sub] = br.get_bits_32(8) as i16;
+                    }
                 }
             }
         }
 
-        mb.non_zero_count = [16; 24];
+        // Monochrome: only luma NNZ (256 bytes); 4:2:0: all 384 bytes.
+        if decode_chroma {
+            mb.non_zero_count = [16; 24];
+        } else {
+            mb.non_zero_count = [0; 24];
+            for i in 0..16 {
+                mb.non_zero_count[i] = 16;
+            }
+        }
         return Ok(mb);
     }
 
@@ -946,8 +957,8 @@ pub fn decode_mb_cavlc(
     }
 
     tracing::trace!(bits_after_pred_modes = br.consumed(), "CAVLC MB header");
-    if is_intra {
-        // Parse chroma intra prediction mode.
+    if is_intra && decode_chroma {
+        // Parse chroma intra prediction mode (absent for monochrome).
         mb.chroma_pred_mode = get_ue_golomb(br)? as u8;
         if mb.chroma_pred_mode > 3 {
             trace!(bits_consumed = br.consumed(), "CAVLC error site 915");
@@ -1130,17 +1141,32 @@ pub fn decode_mb_cavlc(
     tracing::trace!(bits_before_cbp = br.consumed(), "CAVLC MB header");
     if !mb.is_intra16x16 {
         let cbp_code = get_ue_golomb(br)?;
-        if cbp_code > 47 {
-            trace!(bits_consumed = br.consumed(), "CAVLC error site 1077");
-            return Err(Error::InvalidData);
-        }
-        mb.cbp = if mb.is_intra4x4 || (is_intra && !mb.is_intra16x16) {
-            GOLOMB_TO_INTRA4X4_CBP[cbp_code as usize] as u32
+        if decode_chroma {
+            if cbp_code > 47 {
+                trace!(bits_consumed = br.consumed(), "CAVLC error site 1077");
+                return Err(Error::InvalidData);
+            }
+            mb.cbp = if mb.is_intra4x4 || (is_intra && !mb.is_intra16x16) {
+                GOLOMB_TO_INTRA4X4_CBP[cbp_code as usize] as u32
+            } else {
+                GOLOMB_TO_INTER_CBP[cbp_code as usize] as u32
+            };
         } else {
-            GOLOMB_TO_INTER_CBP[cbp_code as usize] as u32
-        };
+            // Monochrome: 16-entry gray tables, no chroma CBP bits.
+            if cbp_code > 15 {
+                trace!(bits_consumed = br.consumed(), "CAVLC error: gray cbp > 15");
+                return Err(Error::InvalidData);
+            }
+            mb.cbp = if mb.is_intra4x4 || (is_intra && !mb.is_intra16x16) {
+                GOLOMB_TO_INTRA4X4_CBP_GRAY[cbp_code as usize] as u32
+            } else {
+                GOLOMB_TO_INTER_CBP_GRAY[cbp_code as usize] as u32
+            };
+        }
+    } else if !decode_chroma && mb.cbp > 15 {
+        // I16x16 with chroma CBP in monochrome stream — invalid.
+        return Err(Error::InvalidData);
     }
-    // For I_16x16, cbp was already set from mb_type.
 
     // B_Direct_16x16: restrict 8x8 DCT unless direct_8x8_inference_flag.
     // Reference: FFmpeg h264_cavlc.c:917

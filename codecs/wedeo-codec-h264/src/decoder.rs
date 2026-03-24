@@ -1519,6 +1519,7 @@ impl H264Decoder {
                 fdc.last_qscale_diff,
                 &mut cache,
                 fdc.direct_8x8_inference_flag,
+                fdc.decode_chroma,
             )?;
 
             // Apply entropy-agnostic processing (dequant, IDCT, pred, MC, neighbor update)

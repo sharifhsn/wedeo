@@ -138,6 +138,16 @@ pub const GOLOMB_TO_INTER_CBP: [u8; 48] = [
     36, 40, 39, 43, 45, 46, 17, 18, 20, 24, 19, 21, 26, 28, 23, 27, 29, 30, 22, 25, 38, 41,
 ];
 
+/// CBP mapping for monochrome (chroma_format_idc=0) Intra_4x4 macroblocks.
+/// 16 entries (luma-only, no chroma bits). From FFmpeg h264_cavlc.c:43.
+pub const GOLOMB_TO_INTRA4X4_CBP_GRAY: [u8; 16] =
+    [15, 0, 7, 11, 13, 14, 3, 5, 10, 12, 1, 2, 4, 8, 6, 9];
+
+/// CBP mapping for monochrome (chroma_format_idc=0) Inter macroblocks.
+/// 16 entries (luma-only, no chroma bits). From FFmpeg h264_cavlc.c:39.
+pub const GOLOMB_TO_INTER_CBP_GRAY: [u8; 16] =
+    [0, 1, 2, 4, 8, 3, 5, 10, 12, 15, 7, 11, 13, 14, 6, 9];
+
 /// Chroma DC scan order for 4:2:0 (2x2 block).
 ///
 /// From FFmpeg `ff_h264_chroma_dc_scan` in h264data.c.

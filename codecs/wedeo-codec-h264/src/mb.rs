@@ -145,6 +145,9 @@ pub struct FrameDecodeContext {
     /// Per-slice deblocking filter parameters.
     /// Indexed by slice number (fdc.current_slice).
     pub slice_deblock_params: Vec<SliceDeblockParams>,
+    /// True if chroma planes exist (chroma_format_idc != 0).
+    /// When false (monochrome), chroma bitstream data is absent and U/V planes are 128-filled.
+    pub decode_chroma: bool,
 }
 
 impl FrameDecodeContext {
@@ -155,13 +158,18 @@ impl FrameDecodeContext {
         let width = mb_width * 16;
         let height = mb_height * 16;
 
+        let decode_chroma = sps.chroma_format_idc != 0;
         let y_stride = width as usize;
         let uv_stride = (width / 2) as usize;
+        // Monochrome: fill U/V with 128 (mid-gray). FFmpeg outputs monochrome as
+        // yuv420p with U/V=128, not gray8. Chroma prediction/MC on 128-filled planes
+        // naturally produces 128, so no additional guards needed in reconstruction.
+        let uv_fill = if decode_chroma { 0u8 } else { 128u8 };
 
         let pic = PictureBuffer {
             y: vec![0u8; y_stride * height as usize],
-            u: vec![0u8; uv_stride * (height / 2) as usize],
-            v: vec![0u8; uv_stride * (height / 2) as usize],
+            u: vec![uv_fill; uv_stride * (height / 2) as usize],
+            v: vec![uv_fill; uv_stride * (height / 2) as usize],
             y_stride,
             uv_stride,
             width,
@@ -225,6 +233,7 @@ impl FrameDecodeContext {
             implicit_weight: Vec::new(),
             last_qscale_diff: 0,
             slice_deblock_params: Vec::new(),
+            decode_chroma,
         }
     }
 
@@ -644,6 +653,7 @@ pub fn decode_macroblock(
         slice_hdr.num_ref_idx_l0_active,
         slice_hdr.num_ref_idx_l1_active,
         ctx.direct_8x8_inference_flag,
+        ctx.decode_chroma,
     )?;
 
     // 2. Apply entropy-agnostic processing
@@ -736,25 +746,27 @@ pub fn apply_macroblock(
                     mb.luma_coeffs[blk][sub_y * 4 + sub_x] as u8;
             }
         }
-        // Copy chroma samples (8x8 each)
-        for plane_idx in 0..2usize {
-            let plane = if plane_idx == 0 {
-                &mut ctx.pic.u
-            } else {
-                &mut ctx.pic.v
-            };
-            for y in 0..8u32 {
-                for x in 0..8u32 {
-                    let px = (mb_x * 8 + x) as usize;
-                    let py = (mb_y * 8 + y) as usize;
-                    let blk = ((y / 4) * 2 + (x / 4)) as usize;
-                    let sub_y = (y % 4) as usize;
-                    let sub_x = (x % 4) as usize;
-                    plane[py * ctx.pic.uv_stride + px] =
-                        mb.chroma_ac[plane_idx][blk][sub_y * 4 + sub_x] as u8;
+        // Copy chroma samples (8x8 each) — skip for monochrome (U/V stay 128).
+        if ctx.decode_chroma {
+            for plane_idx in 0..2usize {
+                let plane = if plane_idx == 0 {
+                    &mut ctx.pic.u
+                } else {
+                    &mut ctx.pic.v
+                };
+                for y in 0..8u32 {
+                    for x in 0..8u32 {
+                        let px = (mb_x * 8 + x) as usize;
+                        let py = (mb_y * 8 + y) as usize;
+                        let blk = ((y / 4) * 2 + (x / 4)) as usize;
+                        let sub_y = (y % 4) as usize;
+                        let sub_x = (x % 4) as usize;
+                        plane[py * ctx.pic.uv_stride + px] =
+                            mb.chroma_ac[plane_idx][blk][sub_y * 4 + sub_x] as u8;
+                    }
                 }
             }
-        }
+        } // if ctx.decode_chroma
     } else if mb.is_intra4x4 {
         if mb.transform_size_8x8_flag {
             decode_intra8x8(ctx, mb, mb_x, mb_y, qp, c_qp, has_top, has_left);

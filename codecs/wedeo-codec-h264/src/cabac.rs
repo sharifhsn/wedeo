@@ -1973,6 +1973,7 @@ pub fn decode_mb_cabac(
     last_qscale_diff: i32,
     cache: &mut CabacDecodeCache,
     direct_8x8_inference_flag: bool,
+    decode_chroma: bool,
 ) -> Result<Macroblock> {
     let mut mb = Macroblock::default();
     let mb_idx = (mb_y * mb_width + mb_x) as usize;
@@ -2152,7 +2153,8 @@ pub fn decode_mb_cabac(
         // We use skip_bytes which: (1) recovers the true byte position from
         // the CABAC engine state, (2) skips N bytes, (3) re-inits the engine.
         // First, recover the byte position and read the raw PCM bytes.
-        let mb_size = 384usize; // 8-bit 4:2:0: 256 + 64 + 64
+        // 8-bit: 256 luma + 128 chroma (4:2:0) or 256 luma-only (monochrome).
+        let mb_size = if decode_chroma { 384usize } else { 256usize };
 
         // Recover actual byte position (engine may have read ahead)
         let mut ptr = reader.pos();
@@ -2179,14 +2181,16 @@ pub fn decode_mb_cabac(
                 byte_pos += 1;
             }
         }
-        // Read 64 Cb then 64 Cr
-        for plane_idx in 0..2usize {
-            for y in 0..8u32 {
-                for x in 0..8u32 {
-                    let blk = ((y / 4) * 2 + (x / 4)) as usize;
-                    let sub = ((y % 4) * 4 + (x % 4)) as usize;
-                    mb.chroma_ac[plane_idx][blk][sub] = pcm_data[byte_pos] as i16;
-                    byte_pos += 1;
+        // Read 64 Cb then 64 Cr — absent for monochrome.
+        if decode_chroma {
+            for plane_idx in 0..2usize {
+                for y in 0..8u32 {
+                    for x in 0..8u32 {
+                        let blk = ((y / 4) * 2 + (x / 4)) as usize;
+                        let sub = ((y % 4) * 4 + (x % 4)) as usize;
+                        mb.chroma_ac[plane_idx][blk][sub] = pcm_data[byte_pos] as i16;
+                        byte_pos += 1;
+                    }
                 }
             }
         }
@@ -2194,7 +2198,14 @@ pub fn decode_mb_cabac(
         // Re-init CABAC engine from after the PCM data
         reader.skip_bytes(mb_size)?;
 
-        mb.non_zero_count = [16; 24];
+        if decode_chroma {
+            mb.non_zero_count = [16; 24];
+        } else {
+            mb.non_zero_count = [0; 24];
+            for i in 0..16 {
+                mb.non_zero_count[i] = 16;
+            }
+        }
         mb.mb_qp_delta = 0;
         // I_PCM: all blocks are coded. Set CBP so neighbor context derivation
         // sees correct values. Matches FFmpeg's h->cbp_table[mb_xy] = 0xf7ef.
@@ -2287,7 +2298,7 @@ pub fn decode_mb_cabac(
 
     // 4. Chroma prediction mode (for intra MBs)
     trace!("CABAC_SECTION chroma_pred_mode");
-    if is_intra {
+    if is_intra && decode_chroma {
         mb.chroma_pred_mode = decode_cabac_mb_chroma_pre_mode(
             reader,
             state,
@@ -2742,7 +2753,12 @@ pub fn decode_mb_cabac(
         let left_cbp = cabac_nb.left_cbp(mb_idx, mb_x, slice_table, cur_slice, is_intra);
         let top_cbp = cabac_nb.top_cbp(mb_idx, mb_y, mb_width, slice_table, cur_slice, is_intra);
         cbp = decode_cabac_mb_cbp_luma(reader, state, left_cbp, top_cbp);
-        cbp |= decode_cabac_mb_cbp_chroma(reader, state, left_cbp, top_cbp) << 4;
+        if decode_chroma {
+            cbp |= decode_cabac_mb_cbp_chroma(reader, state, left_cbp, top_cbp) << 4;
+        }
+    } else if !decode_chroma && cbp > 15 {
+        // I16x16 with chroma CBP in monochrome stream — invalid.
+        return Err(Error::InvalidData);
     }
     mb.cbp = cbp;
 
