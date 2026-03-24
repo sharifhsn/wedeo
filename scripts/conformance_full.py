@@ -87,24 +87,28 @@ PROGRESSIVE_CABAC_FILES = [
 ]
 
 SNAPSHOT_PATH = Path(__file__).resolve().parent / ".conformance_snapshot.json"
+CABAC_SNAPSHOT_PATH = Path(__file__).resolve().parent / ".conformance_cabac_snapshot.json"
 
 
-def load_snapshot() -> set[str]:
+def load_snapshot(cabac: bool = False) -> set[str]:
     """Load the set of known-passing files from the snapshot."""
-    if SNAPSHOT_PATH.exists():
-        data = json.loads(SNAPSHOT_PATH.read_text())
+    path = CABAC_SNAPSHOT_PATH if cabac else SNAPSHOT_PATH
+    if path.exists():
+        data = json.loads(path.read_text())
         return set(data.get("passing", []))
     return set()
 
 
-def save_snapshot(passing: list[str]) -> None:
+def save_snapshot(passing: list[str], cabac: bool = False) -> None:
     """Save the current passing files as a snapshot."""
-    SNAPSHOT_PATH.write_text(json.dumps({
+    path = CABAC_SNAPSHOT_PATH if cabac else SNAPSHOT_PATH
+    file_list = PROGRESSIVE_CABAC_FILES if cabac else PROGRESSIVE_CAVLC_FILES
+    path.write_text(json.dumps({
         "passing": sorted(passing),
         "count": len(passing),
-        "total": len(PROGRESSIVE_CAVLC_FILES),
+        "total": len(file_list),
     }, indent=2) + "\n")
-    print(f"Snapshot saved: {len(passing)}/{len(PROGRESSIVE_CAVLC_FILES)} passing")
+    print(f"Snapshot saved: {len(passing)}/{len(file_list)} passing")
 
 
 def run_full(
@@ -116,7 +120,7 @@ def run_full(
 ) -> tuple[list[str], list[tuple[str, int, int]]]:
     """Run conformance on all files. Returns (passing, diffs)."""
     wedeo_bin = find_wedeo_binary()
-    known_passing = load_snapshot() if quick else set()
+    known_passing = load_snapshot(cabac=cabac) if quick else set()
 
     passing = []
     diffs = []
@@ -208,7 +212,7 @@ def main():
     print(f"{'='*60}")
 
     if args.save_snapshot:
-        save_snapshot(passing)
+        save_snapshot(passing, cabac=args.cabac)
 
     sys.exit(0 if not diffs else 1)
 
