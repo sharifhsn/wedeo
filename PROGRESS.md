@@ -4,9 +4,9 @@
 
 See `CLAUDE.md` and `H264.md` for detailed status.
 
-- H.264 CAVLC: 50/51 progressive conformance files BITEXACT (98%)
+- H.264 CAVLC: 50/50 progressive conformance files BITEXACT (100%)
 - H.264 CABAC: 27/27 progressive conformance files BITEXACT (100%)
-- H.264 FRext CAVLC: **3/6 BITEXACT** (HPCVNL, HPCV_BRCM_A, Freh1_B; 3 out-of-scope: PAFF/monochrome)
+- H.264 FRext CAVLC: **4/6 BITEXACT** (HPCVNL, HPCV_BRCM_A, Freh1_B, HPCVMOLQ; 2 out-of-scope: PAFF)
 - WAV/PCM pipeline: byte-identical to FFmpeg 8.0.1 across all FATE suite samples
 - Audio via symphonia: 28 decoders, 10 demuxers, SNR-verified lossy codecs
 
@@ -43,7 +43,7 @@ All structural code is in place (entropy decode, intra pred, dequant/IDCT, deblo
 3. All `dequant_4x4_flat` replaced with table-based `dequant_4x4` using correct CQM indices
 4. Chroma DC dequant now uses per-plane list (Cb vs Cr, intra vs inter)
 
-**Result:** Zero regression (50/51 CAVLC, 27/27 CABAC, HPCVNL_BRCM_A still BITEXACT).
+**Result:** Zero regression (50/50 CAVLC, 27/27 CABAC, HPCVNL_BRCM_A still BITEXACT).
 Dequant fix is necessary but not sufficient for Freh1_B (was 0/100).
 
 ### Dequant4 Transpose Fix (2026-03-24)

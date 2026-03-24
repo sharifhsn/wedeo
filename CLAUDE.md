@@ -177,7 +177,7 @@ See `H264.md` for detailed architecture, module map, and conformance parity repo
 - Access unit grouping (AUD, SPS, first_mb_in_slice boundaries)
 - File extensions: .264, .h264, .h26l, .avc
 
-**FATE conformance: 50/51 progressive CAVLC tests BITEXACT (98%), all 17/17 Baseline** (2026-03-21):
+**FATE conformance: 50/50 progressive CAVLC tests BITEXACT (100%), all 17/17 Baseline** (2026-03-24):
 
 | Test | Status | Notes |
 |------|--------|-------|
@@ -194,7 +194,8 @@ See `H264.md` for detailed architecture, module map, and conformance parity repo
 | cvmp_mot_frm0_full_B | **BITEXACT** | direct_8x8_inference=0, B_8x8 MC |
 | MR3, MR4, MR5 | **BITEXACT** | POC type 2, MMCO-5, gap fill, complex MMCO |
 | CVFC1 | **BITEXACT** | Multi-slice + frame crop, non-row-aligned slice boundaries |
-| FM1_FT_E, FM1_BT_B | 119/305, 0/0 | FMO (out of scope) |
+| FM1_BT_B | **BITEXACT** | FMO file, both decoders produce 0 frames |
+| FM1_FT_E | Excluded | FMO unimplemented in FFmpeg (h264_ps.c:758), not in FATE |
 | MR6-9_BT_B, FI1_Sony_E | Gap | Interlaced (PAFF) / CABAC |
 
 ### FFmpeg audio parity via symphonia
@@ -262,7 +263,7 @@ symphonia wrappers (priority 50) when both exist (e.g., WAV/PCM always uses nati
 - **Error**: No error context (where/why), no codec-specific error codes.
 
 ### In progress
-- **H.264 decoder** — I+P+B frame decode with deblocking, 50/51 progressive CAVLC conformance files BITEXACT (98%). Only FM1_FT_E (FMO) remains. See `H264.md`.
+- **H.264 decoder** — I+P+B frame decode with deblocking, 50/50 progressive CAVLC conformance files BITEXACT (100%). See `H264.md`.
 
 ### Not yet started
 - Video codecs (HEVC, VP9) — native Rust implementations
