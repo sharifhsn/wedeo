@@ -6,7 +6,7 @@ See `CLAUDE.md` and `H264.md` for detailed status.
 
 - H.264 CAVLC: 50/51 progressive conformance files BITEXACT (98%)
 - H.264 CABAC: 27/27 progressive conformance files BITEXACT (100%)
-- H.264 FRext (High Profile 8x8): **1/26 BITEXACT** (HPCVNL_BRCM_A 300/300)
+- H.264 FRext CAVLC: **3/6 BITEXACT** (HPCVNL, HPCV_BRCM_A, Freh1_B; 3 out-of-scope: PAFF/monochrome)
 - WAV/PCM pipeline: byte-identical to FFmpeg 8.0.1 across all FATE suite samples
 - Audio via symphonia: 28 decoders, 10 demuxers, SNR-verified lossy codecs
 
@@ -71,10 +71,30 @@ Dequant fix is necessary but not sufficient for Freh1_B (was 0/100).
 - `scripts/audit_dequant_cqm.py` — Audit dequant CQM indices at all call sites
 - `scripts/shodh_watchdog.sh` — Auto-restart shodh server on ONNX re-init panic
 
+## CAVLC 8x8 Deblock NNZ Override Fix (2026-03-24)
+
+**Bug:** CAVLC 8x8 DCT MBs used individual 4x4 sub-block NNZ for deblocking bS,
+but FFmpeg's `fill_filter_caches` (h264_slice.c:2396) overrides these with
+CBP-based values. If the 8x8 block was coded, ALL sub-blocks are treated as
+NNZ>0. Individual sub-block NNZ can be 0 even when the 8x8 block is coded.
+
+**Fix:** Added `deblock_nnz()` helper in `deblock.rs` + `cbp` field in `MbDeblockInfo`.
+
+**Result:** HPCV_BRCM_A 300/300 BITEXACT (was 21/300), Freh1_B 100/100 BITEXACT (was 7/100).
+FRext CAVLC: 3/6 BITEXACT. Precommit: 39/39 passing.
+
+**New scripts:**
+- `scripts/nnz_compare.py` — Compare stored NNZ arrays between wedeo and FFmpeg via lldb
+- `scripts/bs_compare.py` — Compare deblock bS values between wedeo and FFmpeg
+
+## Deferred Automation
+
+- **Per-pixel deblock attribution** — Given a pixel diff, trace back to which specific
+  deblock edge/pair/filter caused it (covering both vertical AND horizontal edges).
+  Would have saved ~30 min of manual pixel tracing in this session.
+
 ## Next Steps
 
-- Diagnose Freh1_B frame 0 failure using new traces (COEFF/DEQUANT vs FFmpeg)
-- Investigate HPCV_BRCM_A P/B frame diffs (21/300 match)
-- Remaining FRext DIFF files
+- Expand FRext to CABAC files
 - Interlaced (PAFF) support
 - Additional video codecs (HEVC, VP9)
