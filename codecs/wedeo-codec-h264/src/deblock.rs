@@ -129,6 +129,13 @@ pub struct MbDeblockInfo {
     pub mv_l1: [[i16; 2]; 16],
     /// True if this MB uses 8x8 transform (High profile).
     pub transform_8x8: bool,
+    /// Coded block pattern (luma bits 0-3) for deblocking NNZ override.
+    /// For CAVLC 8x8 DCT: derived from NNZ sums (!!nnz_sum per 8x8 block),
+    /// matching FFmpeg's cbp_table bits 12-15. NOT the bitstream CBP.
+    pub cbp: u8,
+    /// True if this MB was decoded with CABAC entropy coding.
+    /// FFmpeg gates the 8x8 NNZ override on `!CABAC` (h264_slice.c:2396).
+    pub is_cabac: bool,
 }
 
 impl Default for MbDeblockInfo {
@@ -143,6 +150,8 @@ impl Default for MbDeblockInfo {
             ref_poc_l1: [i32::MIN; 16],
             mv_l1: [[0; 2]; 16],
             transform_8x8: false,
+            cbp: 0,
+            is_cabac: false,
         }
     }
 }
@@ -648,6 +657,29 @@ fn filter_mb_edge_chroma(
 // Per-macroblock deblocking
 // ---------------------------------------------------------------------------
 
+/// Get the effective NNZ for deblocking at a 4x4 block position.
+///
+/// For CAVLC 8x8 DCT MBs, individual sub-block NNZ values are not meaningful
+/// for deblocking. FFmpeg replaces them with CBP-derived values: if the
+/// containing 8x8 block was coded, ALL sub-blocks are treated as having
+/// non-zero coefficients.
+///
+/// Reference: FFmpeg h264_slice.c:2396-2432 (fill_filter_caches).
+#[inline]
+fn deblock_nnz(info: &MbDeblockInfo, block_idx: usize) -> u8 {
+    if info.transform_8x8 && !info.is_cabac {
+        // CAVLC 8x8 DCT: use CBP-based NNZ (whether the 8x8 block has non-zero
+        // coefficients). FFmpeg gates this on `!CABAC` (h264_slice.c:2396).
+        // CABAC uses raw per-4x4 NNZ which is already broadcast for 8x8 blocks.
+        let bx = block_idx % 4;
+        let by = block_idx / 4;
+        let i8x8 = (by / 2) * 2 + (bx / 2);
+        if info.cbp & (1 << i8x8) != 0 { 1 } else { 0 }
+    } else {
+        info.non_zero_count[block_idx]
+    }
+}
+
 /// Compute boundary strengths for all 4 luma edges of a macroblock.
 ///
 /// `is_vertical`: true = vertical edges (left neighbor), false = horizontal edges (above neighbor).
@@ -694,7 +726,7 @@ fn compute_luma_bs(
             };
             let q_idx = luma_block_idx(q_bx, q_by);
             let q_intra = cur.is_intra;
-            let q_nnz = cur.non_zero_count[q_idx];
+            let q_nnz = deblock_nnz(cur, q_idx);
             let q_ref = cur.ref_poc[q_idx];
             let q_mv = cur.mv[q_idx];
             let q_ref_l1 = cur.ref_poc_l1[q_idx];
@@ -708,7 +740,7 @@ fn compute_luma_bs(
                     let p_idx = luma_block_idx(3, q_by);
                     (
                         left.is_intra,
-                        left.non_zero_count[p_idx],
+                        deblock_nnz(left, p_idx),
                         left.ref_poc[p_idx],
                         left.mv[p_idx],
                         left.ref_poc_l1[p_idx],
@@ -720,7 +752,7 @@ fn compute_luma_bs(
                     let p_idx = luma_block_idx(q_bx, 3);
                     (
                         above.is_intra,
-                        above.non_zero_count[p_idx],
+                        deblock_nnz(above, p_idx),
                         above.ref_poc[p_idx],
                         above.mv[p_idx],
                         above.ref_poc_l1[p_idx],
@@ -735,7 +767,7 @@ fn compute_luma_bs(
                 };
                 (
                     cur.is_intra,
-                    cur.non_zero_count[p_idx],
+                    deblock_nnz(cur, p_idx),
                     cur.ref_poc[p_idx],
                     cur.mv[p_idx],
                     cur.ref_poc_l1[p_idx],

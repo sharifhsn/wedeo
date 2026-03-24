@@ -291,15 +291,16 @@ fn finalize_skip_mb(ctx: &mut FrameDecodeContext, mb_x: u32, mb_y: u32, is_b_sli
     ctx.neighbor_ctx.update_after_mb(mb_x, &nz, &modes);
     ctx.neighbor_ctx.left_available = true;
     let qp = ctx.qp;
-    store_deblock_info(ctx, mb_idx, false, is_b_slice, qp, [0; 24]);
+    store_deblock_info(ctx, mb_idx, false, is_b_slice, qp, [0; 24], 0, false);
 }
 
 /// Store `MbDeblockInfo` for the deblocking filter after decoding a macroblock.
 ///
 /// Copies the current MV and ref_idx from `mv_ctx` into `mb_info[mb_idx]`,
 /// converting list-relative ref_idx to picture POC for identity comparison.
-/// Called from `decode_macroblock`, `decode_skip_mb`, and `decode_b_skip_mb`.
+/// Called from `apply_macroblock` and `finalize_skip_mb`.
 /// `is_b_slice`: true for B-slice MBs (copies L1 data for two-permutation BS check).
+#[allow(clippy::too_many_arguments)] // all parameters are logically required
 #[inline]
 fn store_deblock_info(
     ctx: &mut FrameDecodeContext,
@@ -308,6 +309,8 @@ fn store_deblock_info(
     is_b_slice: bool,
     qp: u8,
     non_zero_count: [u8; 24],
+    cbp: u8,
+    is_cabac: bool,
 ) {
     let mb_idx_base = mb_idx * 16;
     let mut deblock_mv = [[0i16; 2]; 16];
@@ -356,6 +359,8 @@ fn store_deblock_info(
         ref_poc_l1: deblock_ref_poc_l1,
         mv_l1: deblock_mv_l1,
         transform_8x8: ctx.transform_8x8[mb_idx],
+        cbp,
+        is_cabac,
     };
 }
 
@@ -839,7 +844,25 @@ pub fn apply_macroblock(
         );
     }
 
-    // Store MbDeblockInfo for the deblocking filter
+    // Store MbDeblockInfo for the deblocking filter.
+    // For CAVLC 8x8 DCT, compute CBP from NNZ sums (matching FFmpeg's cbp_table
+    // bits 12-15 = !!nnz_sum per 8x8 block) rather than bitstream CBP.
+    // A block can be "coded" in CBP but have all-zero coefficients.
+    let is_cabac = pps.entropy_coding_mode_flag;
+    let deblock_cbp = if ctx.transform_8x8[mb_idx] && !is_cabac {
+        // First raster position of each 8x8 block holds the NNZ sum after
+        // CAVLC broadcast (cavlc.rs: nnz[r0] += nnz[r1] + nnz[r2] + nnz[r3]).
+        const FIRST_RASTER: [usize; 4] = [0, 2, 8, 10];
+        let mut cbp: u8 = 0;
+        for (i, &r0) in FIRST_RASTER.iter().enumerate() {
+            if mb.non_zero_count[r0] > 0 {
+                cbp |= 1 << i;
+            }
+        }
+        cbp
+    } else {
+        (mb.cbp & 0x0F) as u8
+    };
     store_deblock_info(
         ctx,
         mb_idx,
@@ -847,6 +870,8 @@ pub fn apply_macroblock(
         slice_hdr.slice_type.is_b(),
         qp,
         mb.non_zero_count,
+        deblock_cbp,
+        is_cabac,
     );
 
     Ok(())
@@ -1415,9 +1440,8 @@ fn decode_inter_mb(
                         let mut post_sum = 0u32;
                         for dy in 0..8usize {
                             for dx in 0..8usize {
-                                post_sum = post_sum.wrapping_add(
-                                    ctx.pic.y[offset + dy * y_stride + dx] as u32,
-                                );
+                                post_sum = post_sum
+                                    .wrapping_add(ctx.pic.y[offset + dy * y_stride + dx] as u32);
                             }
                         }
                         trace!(mb_x, mb_y, i8x8, post_sum, "POST_IDCT_8X8");
@@ -2450,9 +2474,8 @@ fn add_b_residual(
                         let mut post_sum = 0u32;
                         for dy in 0..8usize {
                             for dx in 0..8usize {
-                                post_sum = post_sum.wrapping_add(
-                                    ctx.pic.y[offset + dy * y_stride + dx] as u32,
-                                );
+                                post_sum = post_sum
+                                    .wrapping_add(ctx.pic.y[offset + dy * y_stride + dx] as u32);
                             }
                         }
                         trace!(mb_x, mb_y, i8x8, post_sum, "POST_IDCT_8X8");
@@ -3531,8 +3554,8 @@ fn decode_intra8x8(
                 let mut post_sum = 0u32;
                 for dy in 0..8usize {
                     for dx in 0..8usize {
-                        post_sum = post_sum
-                            .wrapping_add(ctx.pic.y[offset + dy * stride + dx] as u32);
+                        post_sum =
+                            post_sum.wrapping_add(ctx.pic.y[offset + dy * stride + dx] as u32);
                     }
                 }
                 trace!(mb_x, mb_y, i8x8, post_sum, "POST_IDCT_8X8");
