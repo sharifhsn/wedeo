@@ -515,13 +515,13 @@ fn decode_chroma(
     mb: &mut Macroblock,
     mb_x: u32,
     mb_y: u32,
-    chroma_qp: u8,
+    chroma_qp: [u8; 2],
     has_top: bool,
     has_left: bool,
 ) {
     let cbp_chroma = (mb.cbp >> 4) & 3;
 
-    for plane_idx in 0..2usize {
+    for (plane_idx, &c_qp) in chroma_qp.iter().enumerate() {
         // Select the correct chroma plane
         let (plane_data, stride) = if plane_idx == 0 {
             (&mut ctx.pic.u as &mut Vec<u8>, ctx.pic.uv_stride)
@@ -558,7 +558,7 @@ fn decode_chroma(
             // Chroma DC: inverse Hadamard + dequant (i32 output to avoid i16 overflow)
             // FFmpeg uses list 1+plane for intra (1=Cb, 2=Cr)
             let dc_cqm = 1 + plane_idx;
-            let qmul = dequant::dc_dequant_scale(&ctx.dequant4, dc_cqm, chroma_qp);
+            let qmul = dequant::dc_dequant_scale(&ctx.dequant4, dc_cqm, c_qp);
             let mut chroma_dc_out = [0i32; 4];
             idct::chroma_dc_dequant_idct(&mut chroma_dc_out, &mb.chroma_dc[plane_idx], qmul);
 
@@ -582,7 +582,7 @@ fn decode_chroma(
                     mb.chroma_ac[plane_idx][blk_idx][0] = dc_val as i16;
                     dequant::dequant_4x4(
                         &mut mb.chroma_ac[plane_idx][blk_idx],
-                        &ctx.dequant4.coeffs[cqm][chroma_qp as usize],
+                        &ctx.dequant4.coeffs[cqm][c_qp as usize],
                     );
                     // dequant_4x4 scaled [0] by the AC dequant factor, but
                     // DC was already fully dequantized by the Hadamard. Restore it.
@@ -698,9 +698,11 @@ pub fn apply_macroblock(
     ctx.last_qscale_diff = mb.mb_qp_delta;
     let qp = if mb.is_pcm { 0 } else { ctx.qp };
 
-    // Compute chroma QP
-    let chroma_qp_idx = (qp as i32 + pps.chroma_qp_index_offset[0]).clamp(0, 51) as usize;
-    let c_qp = CHROMA_QP_TABLE[chroma_qp_idx];
+    // Compute per-plane chroma QP (Cb uses offset[0], Cr uses offset[1])
+    let c_qp = [
+        CHROMA_QP_TABLE[(qp as i32 + pps.chroma_qp_index_offset[0]).clamp(0, 51) as usize],
+        CHROMA_QP_TABLE[(qp as i32 + pps.chroma_qp_index_offset[1]).clamp(0, 51) as usize],
+    ];
 
     // Check neighbor availability with slice boundary awareness.
     // H.264 spec: neighbors from different slices are unavailable.
@@ -906,7 +908,7 @@ fn decode_inter_mb(
     mb_x: u32,
     mb_y: u32,
     qp: u8,
-    chroma_qp: u8,
+    chroma_qp: [u8; 2],
     ref_pics: &[&PictureBuffer],
     ref_pics_l1: &[&PictureBuffer],
 ) {
@@ -1801,7 +1803,7 @@ fn decode_b_inter_mb(
     mb_x: u32,
     mb_y: u32,
     qp: u8,
-    chroma_qp: u8,
+    chroma_qp: [u8; 2],
     ref_pics: &[&PictureBuffer],
     ref_pics_l1: &[&PictureBuffer],
 ) {
@@ -2449,7 +2451,7 @@ fn add_b_residual(
     mb_x: u32,
     mb_y: u32,
     qp: u8,
-    chroma_qp: u8,
+    chroma_qp: [u8; 2],
 ) {
     let cbp_luma = mb.cbp & 0x0F;
     if cbp_luma != 0 {
@@ -3360,16 +3362,16 @@ fn decode_chroma_inter(
     mb: &mut Macroblock,
     mb_x: u32,
     mb_y: u32,
-    chroma_qp: u8,
+    chroma_qp: [u8; 2],
 ) {
     let cbp_chroma = (mb.cbp >> 4) & 3;
 
     if cbp_chroma > 0 {
-        for plane_idx in 0..2usize {
+        for (plane_idx, &c_qp) in chroma_qp.iter().enumerate() {
             // Chroma DC: inverse Hadamard + dequant (i32 output to avoid i16 overflow)
             // FFmpeg uses list 4+plane for inter (4=Cb, 5=Cr)
             let dc_cqm = 4 + plane_idx;
-            let qmul = dequant::dc_dequant_scale(&ctx.dequant4, dc_cqm, chroma_qp);
+            let qmul = dequant::dc_dequant_scale(&ctx.dequant4, dc_cqm, c_qp);
             let mut chroma_dc_out = [0i32; 4];
             idct::chroma_dc_dequant_idct(&mut chroma_dc_out, &mb.chroma_dc[plane_idx], qmul);
 
@@ -3377,7 +3379,7 @@ fn decode_chroma_inter(
                 let plane_name = if plane_idx == 0 { "U" } else { "V" };
                 trace!(mb_x, mb_y, plane = plane_name,
                     dc_in = ?mb.chroma_dc[plane_idx], dc_out = ?chroma_dc_out,
-                    qmul, chroma_qp, "inter chroma DC");
+                    qmul, c_qp, "inter chroma DC");
             }
 
             for (blk_idx, &dc_val) in chroma_dc_out.iter().enumerate() {
@@ -3397,7 +3399,7 @@ fn decode_chroma_inter(
                     mb.chroma_ac[plane_idx][blk_idx][0] = dc_val as i16;
                     dequant::dequant_4x4(
                         &mut mb.chroma_ac[plane_idx][blk_idx],
-                        &ctx.dequant4.coeffs[ac_cqm][chroma_qp as usize],
+                        &ctx.dequant4.coeffs[ac_cqm][c_qp as usize],
                     );
                     mb.chroma_ac[plane_idx][blk_idx][0] = dc_val as i16;
                     idct::idct4x4_add(
@@ -3441,7 +3443,7 @@ fn decode_intra8x8(
     mb_x: u32,
     mb_y: u32,
     qp: u8,
-    chroma_qp: u8,
+    chroma_qp: [u8; 2],
     has_top: bool,
     has_left: bool,
 ) {
@@ -3593,7 +3595,7 @@ fn decode_intra4x4(
     mb_x: u32,
     mb_y: u32,
     qp: u8,
-    chroma_qp: u8,
+    chroma_qp: [u8; 2],
     has_top: bool,
     has_left: bool,
 ) {
@@ -3716,7 +3718,7 @@ fn decode_intra16x16(
     mb_x: u32,
     mb_y: u32,
     qp: u8,
-    chroma_qp: u8,
+    chroma_qp: [u8; 2],
     has_top: bool,
     has_left: bool,
 ) {

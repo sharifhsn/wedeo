@@ -109,6 +109,7 @@ wedeo/
 - **Pipeline-stage tracing tags** — use `scripts/verify_traces.py` to verify all tags are reachable. Tags: `SLICE`, `DPB`, `REFLIST` (debug), `PPS_SCALING`, `DEQUANT_TABLES` (debug), `COEFF`/`COEFF_CABAC`, `DEQUANT`, `MB_RECON`, `MB_DEBLOCK` (trace). Diagnosis tree: SLICE→PPS_SCALING→DEQUANT_TABLES→COEFF→DEQUANT→MB_RECON→MB_DEBLOCK.
 - **Dequant CQM indices** — intra Y=0, inter Y=3, intra Cb=1, intra Cr=2, inter Cb=4, inter Cr=5. Use `scripts/audit_dequant_cqm.py` to verify all call sites.
 - **Deblock NNZ for 8x8 DCT** — FFmpeg's `fill_filter_caches` (h264_slice.c:2396) overrides per-4x4 NNZ with CBP-based values for CAVLC 8x8 blocks only (`!CABAC && transform_8x8_mode`). Two rules: (1) the CBP must be NNZ-sum-derived (`!!nnz_sum` per 8x8 block, FFmpeg's `cbp_table` bits 12-15), NOT the bitstream CBP — a coded block with all-zero coefficients must produce bS=0; (2) CABAC 8x8 blocks use raw per-4x4 NNZ (already broadcast), not the CBP override. See `deblock_nnz()` in `deblock.rs`.
+- **CABAC cat=5 (8x8 luma) has NO coded_block_flag** — FFmpeg h264_cabac.c:1859 skips CBF for cat=5 in non-chroma-4:4:4: `(cat != 5 || CHROMA444(h)) && get_cabac(...)`. The CBP check is the only gate. Reading a phantom CBF bin desyncs the CABAC engine for all subsequent symbols. When adding new CABAC block categories, always read FFmpeg's `decode_cabac_residual_nondc` wrapper to check which cats have CBF.
 
 ### Code Quality
 - Fix all clippy warnings unless there's a documented reason not to

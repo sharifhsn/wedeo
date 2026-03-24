@@ -1780,39 +1780,25 @@ fn decode_cabac_luma_residual(
     } else if mb.transform_size_8x8_flag {
         // 8x8 transform (High profile CABAC): decode 64 coefficients per 8x8 block.
         // Uses cat=5 with CABAC-specific context remapping.
+        //
+        // IMPORTANT: For cat=5 (8x8 luma) in non-chroma-4:4:4, there is NO
+        // coded_block_flag in the bitstream — the CBP check is the only gate.
+        // FFmpeg h264_cabac.c:1859: `(cat != 5 || CHROMA444(h)) && get_cabac(...)`.
         // Reference: FFmpeg h264_cabac.c:1898-1901
         for i8x8 in 0..4 {
             if cbp & (1 << i8x8) != 0 {
-                // CBF context: use the first 4x4 sub-block's position
-                let raster_idx = SCAN_TO_RASTER[i8x8 * 4];
-                let cbf_ctx = get_cabac_cbf_ctx(
-                    cabac_nb,
-                    slice_table,
-                    cur_slice,
-                    mb_idx,
-                    mb_x,
-                    mb_y,
-                    mb_width,
+                let nz = decode_cabac_residual(
+                    reader,
+                    state,
+                    &mut mb.luma_8x8_coeffs[i8x8],
                     5,
-                    raster_idx,
-                    false,
-                    nz_cache,
-                    is_intra,
+                    64,
+                    &ZIGZAG_SCAN_8X8_USIZE,
                 );
-                if reader.get_cabac(&mut state[cbf_ctx]) != 0 {
-                    let nz = decode_cabac_residual(
-                        reader,
-                        state,
-                        &mut mb.luma_8x8_coeffs[i8x8],
-                        5,
-                        64,
-                        &ZIGZAG_SCAN_8X8_USIZE,
-                    );
-                    // Broadcast NNZ to all 4 sub-blocks for deblocking/neighbor context.
-                    let nz_val = (nz as u8).min(16);
-                    for k in 0..4 {
-                        nz_cache[SCAN_TO_RASTER[i8x8 * 4 + k]] = nz_val;
-                    }
+                // Broadcast NNZ to all 4 sub-blocks for deblocking/neighbor context.
+                let nz_val = (nz as u8).min(16);
+                for k in 0..4 {
+                    nz_cache[SCAN_TO_RASTER[i8x8 * 4 + k]] = nz_val;
                 }
             }
         }
