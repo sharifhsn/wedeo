@@ -650,11 +650,15 @@ impl Default for Macroblock {
 /// From FFmpeg `ff_zigzag_scan` in mathtables.c.
 const ZIGZAG_SCAN_4X4: [usize; 16] = [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15];
 
-/// Apply zigzag descan: convert coefficients from scan order to raster order.
-fn zigzag_descan_4x4(scan_order: &[i16; 16], max_coeff: usize) -> [i16; 16] {
+/// Field scan order for 4x4 blocks (column-first, for interlaced/MBAFF field MBs).
+/// From FFmpeg `field_scan` in h264_slice.c.
+const FIELD_SCAN_4X4: [usize; 16] = [0, 4, 1, 8, 12, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15];
+
+/// Apply zigzag/field descan: convert coefficients from scan order to raster order.
+fn descan_4x4(scan_order: &[i16; 16], max_coeff: usize, scan_table: &[usize; 16]) -> [i16; 16] {
     let mut raster = [0i16; 16];
     for scan_pos in 0..max_coeff {
-        raster[ZIGZAG_SCAN_4X4[scan_pos]] = scan_order[scan_pos];
+        raster[scan_table[scan_pos]] = scan_order[scan_pos];
     }
     raster
 }
@@ -760,6 +764,7 @@ pub fn decode_mb_cavlc(
     _num_ref_idx_l1_active: u32,
     direct_8x8_inference_flag: bool,
     decode_chroma: bool,
+    mb_field: bool,
 ) -> Result<Macroblock> {
     let mut mb = Macroblock::default();
 
@@ -1197,7 +1202,7 @@ pub fn decode_mb_cavlc(
             mb_qp_delta = mb.mb_qp_delta,
             "CAVLC MB header"
         );
-        decode_residual_blocks(br, &mut mb, neighbor, mb_x, pps)?;
+        decode_residual_blocks(br, &mut mb, neighbor, mb_x, pps, mb_field)?;
     }
 
     Ok(mb)
@@ -1265,7 +1270,15 @@ fn decode_residual_blocks(
     neighbor: &NeighborContext,
     mb_x: u32,
     _pps: &Pps,
+    mb_field: bool,
 ) -> Result<()> {
+    // Select scan table based on interlace mode (field vs frame).
+    // Field MBs use column-first scan; frame MBs use standard zigzag.
+    let scan_4x4: &[usize; 16] = if mb_field {
+        &FIELD_SCAN_4X4
+    } else {
+        &ZIGZAG_SCAN_4X4
+    };
     let cbp = mb.cbp;
 
     if mb.is_intra16x16 {
@@ -1273,7 +1286,7 @@ fn decode_residual_blocks(
         let nc = compute_nc(0, mb_x, neighbor, &mb.non_zero_count);
         let (dc_coeffs_scan, _dc_nz) = decode_residual(br, nc, 16)?;
         // Descan from zigzag to raster order for the Hadamard input.
-        mb.luma_dc = zigzag_descan_4x4(&dc_coeffs_scan, 16);
+        mb.luma_dc = descan_4x4(&dc_coeffs_scan, 16, scan_4x4);
 
         // Luma AC: 15 coefficients per block (DC is separate), only if luma CBP is non-zero.
         if cbp & 0x0F != 0 {
@@ -1286,7 +1299,7 @@ fn decode_residual_blocks(
                     // Descan AC coefficients: scan positions 0..14 map to
                     // raster positions via zigzag_scan[1..16] (shifted by 1 since DC is separate).
                     for scan_pos in 0..15 {
-                        mb.luma_coeffs[raster_idx][ZIGZAG_SCAN_4X4[scan_pos + 1]] =
+                        mb.luma_coeffs[raster_idx][scan_4x4[scan_pos + 1]] =
                             ac_coeffs_scan[scan_pos];
                     }
                     mb.non_zero_count[raster_idx] = nz;
@@ -1350,7 +1363,7 @@ fn decode_residual_blocks(
                     let nc = compute_nc(raster_idx, mb_x, neighbor, &mb.non_zero_count);
                     let (block_coeffs_scan, nz) = decode_residual(br, nc, 16)?;
                     // Descan from zigzag to raster order.
-                    mb.luma_coeffs[raster_idx] = zigzag_descan_4x4(&block_coeffs_scan, 16);
+                    mb.luma_coeffs[raster_idx] = descan_4x4(&block_coeffs_scan, 16, scan_4x4);
                     mb.non_zero_count[raster_idx] = nz;
                 }
             } else {
@@ -1382,7 +1395,7 @@ fn decode_residual_blocks(
                 let (ac_coeffs_scan, nz) = decode_residual(br, nc, 15)?;
                 // Descan AC coefficients: scan positions 0..14 -> raster via zigzag_scan[1..16].
                 for scan_pos in 0..15 {
-                    mb.chroma_ac[chroma_idx][blk][ZIGZAG_SCAN_4X4[scan_pos + 1]] =
+                    mb.chroma_ac[chroma_idx][blk][scan_4x4[scan_pos + 1]] =
                         ac_coeffs_scan[scan_pos];
                 }
                 mb.non_zero_count[block_idx] = nz;
