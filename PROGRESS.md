@@ -13,6 +13,22 @@ See `CLAUDE.md` and `H264.md` for detailed status.
 - WAV/PCM pipeline: byte-identical to FFmpeg 8.0.1 across all FATE suite samples
 - Audio via symphonia: 28 decoders, 10 demuxers, SNR-verified lossy codecs
 
+## MBAFF CABAC Field-Mode Context Fix (2026-03-25)
+
+**Root cause found and fixed:** MBAFF CABAC desync was caused by three issues:
+1. Field-coded MBs (mb_field_decoding_flag=1) need separate CABAC context offset tables
+   for sig/last_coeff flags. FFmpeg uses `significant_coeff_flag_offset[MB_FIELD(sl)][cat]`
+   (2D table: frame=105+, field=277+). Wedeo always used frame-mode offsets.
+2. Field-coded MBs need field scan tables (column-first) for coefficient placement.
+3. `decode_cabac_field_decoding_flag` context depends on above pair's actual field flag,
+   not a hardcoded false. This caused cascading wrong field flag values.
+
+CABAC engine (pos/low/range) now matches FFmpeg exactly for all MBAFF pairs.
+All 9 MBAFF files produce correct frame counts. Pixel output still differs
+(field stride interleaving in reconstruction not yet implemented).
+
+Updated `verify_cabac_tables.py`: now checks 19 tables (was 16), including field-mode variants.
+
 ## MBAFF Frame-Mode Implementation (2026-03-25)
 
 Implemented MB pair decode loops for MBAFF (`!frame_mbs_only_flag`):
@@ -20,10 +36,6 @@ Implemented MB pair decode loops for MBAFF (`!frame_mbs_only_flag`):
 - `decode_cabac_field_decoding_flag()`: reads mb_field_decoding_flag from CABAC context 70
 - Dual left-side NeighborContext (top_left/bot_left) for correct pair-interleaved neighbor addressing
 - All 9 progressive MBAFF conformance files now produce decoded frames (was 0 before)
-
-**Blocker:** CABAC engine desyncs at pair 107 in CAMA1_Sony_C.jsv. CABAC state matches FFmpeg
-for first 106 pairs then diverges. Root cause under investigation — the NeighborContext fix is
-correct for pixel reconstruction but doesn't affect CABAC context derivation (uses CabacNeighborCtx).
 
 **Fixed:** framecrc_compare.py 0-frame false positive bug. Removed FM1_BT_B.h264 (false positive).
 Added CI_MW_D.264 and LS_SVA_D.264 to conformance.
@@ -35,9 +47,7 @@ New scripts:
 
 ## Deferred Automation
 
-- Per-syntax-element CABAC divergence tracer: instrument decode_mb_cabac to log CABAC state after
-  each syntax element (mb_type, intra modes, CBP, each residual block). Compare with FFmpeg at
-  matching points. Needed to find root cause of MBAFF CABAC desync.
+- MBAFF field stride interleaving for pixel reconstruction (field-coded pairs need doubled stride)
 
 ## Conformance Expansion + PPS/Reorder Fixes (2026-03-25)
 

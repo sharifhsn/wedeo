@@ -12,6 +12,8 @@ Checks tables from:
                        CABAC_CONTEXT_INIT_I, CABAC_CONTEXT_INIT_PB0/1/2,
                        SIGNIFICANT_COEFF_FLAG_OFFSET, LAST_COEFF_FLAG_OFFSET,
                        COEFF_ABS_LEVEL_M1_OFFSET, SIGNIFICANT_COEFF_FLAG_OFFSET_8X8,
+                       SIGNIFICANT_COEFF_FLAG_FIELD_OFFSET, LAST_COEFF_FLAG_FIELD_OFFSET,
+                       SIGNIFICANT_COEFF_FLAG_FIELD_OFFSET_8X8,
                        SIG_COEFF_OFFSET_DC, COEFF_ABS_LEVEL1_CTX,
                        COEFF_ABS_LEVELGT1_CTX, COEFF_ABS_LEVEL_TRANSITION,
                        init_cabac_states (functional)
@@ -127,6 +129,20 @@ def _parse_c_residual_table_2d_row0(content: str, name: str) -> list[int]:
         raise ValueError(f"Could not find rows in '{name}'")
     # Parse row 0 with expression evaluation
     parts = [p.strip() for p in rows[0].split(',') if p.strip()]
+    return [_eval_c_expr(p) for p in parts]
+
+
+def _parse_c_residual_table_2d_row1(content: str, name: str) -> list[int]:
+    """Parse a static 2D C array inside a function and return row [1] (field mode)."""
+    pattern = rf'static\s+const\s+\w+\s+{re.escape(name)}\s*\[\s*2\s*\]\s*\[\s*\d+\s*\]\s*=\s*\{{(.*?)\}};'
+    match = re.search(pattern, content, re.DOTALL)
+    if not match:
+        raise ValueError(f"Could not find static array '{name}' in source")
+    body = match.group(1)
+    rows = re.findall(r'\{([^}]+)\}', body)
+    if len(rows) < 2:
+        raise ValueError(f"Could not find row [1] in '{name}'")
+    parts = [p.strip() for p in rows[1].split(',') if p.strip()]
     return [_eval_c_expr(p) for p in parts]
 
 
@@ -384,6 +400,73 @@ def check_significant_coeff_flag_offset_8x8(ffmpeg_dir: Path, wedeo_dir: Path) -
     if errors == 0:
         print(
             f"  \u2713 SIGNIFICANT_COEFF_FLAG_OFFSET_8X8 ({len(wedeo_vals)} entries)"
+        )
+    return errors
+
+
+def check_significant_coeff_flag_field_offset(ffmpeg_dir: Path, wedeo_dir: Path) -> int:
+    """Verify SIGNIFICANT_COEFF_FLAG_FIELD_OFFSET (14 entries, field mode = row [1])."""
+    print("Checking SIGNIFICANT_COEFF_FLAG_FIELD_OFFSET...")
+    h264_cabac_c = read_file(ffmpeg_dir / "libavcodec" / "h264_cabac.c")
+    cabac_tables_rs = read_file(
+        wedeo_dir / "codecs" / "wedeo-codec-h264" / "src" / "cabac_tables.rs"
+    )
+
+    ffmpeg_vals = _parse_c_residual_table_2d_row1(
+        h264_cabac_c, "significant_coeff_flag_offset"
+    )
+    wedeo_vals = parse_rust_array_1d(
+        cabac_tables_rs, "SIGNIFICANT_COEFF_FLAG_FIELD_OFFSET"
+    )
+
+    errors = compare_arrays(
+        "SIGNIFICANT_COEFF_FLAG_FIELD_OFFSET", ffmpeg_vals, wedeo_vals
+    )
+    if errors == 0:
+        print(f"  \u2713 SIGNIFICANT_COEFF_FLAG_FIELD_OFFSET ({len(wedeo_vals)} entries)")
+    return errors
+
+
+def check_last_coeff_flag_field_offset(ffmpeg_dir: Path, wedeo_dir: Path) -> int:
+    """Verify LAST_COEFF_FLAG_FIELD_OFFSET (14 entries, field mode = row [1])."""
+    print("Checking LAST_COEFF_FLAG_FIELD_OFFSET...")
+    h264_cabac_c = read_file(ffmpeg_dir / "libavcodec" / "h264_cabac.c")
+    cabac_tables_rs = read_file(
+        wedeo_dir / "codecs" / "wedeo-codec-h264" / "src" / "cabac_tables.rs"
+    )
+
+    ffmpeg_vals = _parse_c_residual_table_2d_row1(
+        h264_cabac_c, "last_coeff_flag_offset"
+    )
+    wedeo_vals = parse_rust_array_1d(cabac_tables_rs, "LAST_COEFF_FLAG_FIELD_OFFSET")
+
+    errors = compare_arrays("LAST_COEFF_FLAG_FIELD_OFFSET", ffmpeg_vals, wedeo_vals)
+    if errors == 0:
+        print(f"  \u2713 LAST_COEFF_FLAG_FIELD_OFFSET ({len(wedeo_vals)} entries)")
+    return errors
+
+
+def check_significant_coeff_flag_field_offset_8x8(ffmpeg_dir: Path, wedeo_dir: Path) -> int:
+    """Verify SIGNIFICANT_COEFF_FLAG_FIELD_OFFSET_8X8 (63 entries, field mode = row [1])."""
+    print("Checking SIGNIFICANT_COEFF_FLAG_FIELD_OFFSET_8X8...")
+    h264_cabac_c = read_file(ffmpeg_dir / "libavcodec" / "h264_cabac.c")
+    cabac_tables_rs = read_file(
+        wedeo_dir / "codecs" / "wedeo-codec-h264" / "src" / "cabac_tables.rs"
+    )
+
+    ffmpeg_vals = _parse_c_residual_table_2d_row1(
+        h264_cabac_c, "significant_coeff_flag_offset_8x8"
+    )
+    wedeo_vals = parse_rust_array_1d(
+        cabac_tables_rs, "SIGNIFICANT_COEFF_FLAG_FIELD_OFFSET_8X8"
+    )
+
+    errors = compare_arrays(
+        "SIGNIFICANT_COEFF_FLAG_FIELD_OFFSET_8X8", ffmpeg_vals, wedeo_vals
+    )
+    if errors == 0:
+        print(
+            f"  \u2713 SIGNIFICANT_COEFF_FLAG_FIELD_OFFSET_8X8 ({len(wedeo_vals)} entries)"
         )
     return errors
 
@@ -649,6 +732,10 @@ def main():
         check_last_coeff_flag_offset,
         check_coeff_abs_level_m1_offset,
         check_significant_coeff_flag_offset_8x8,
+        # Section 3b: Field-mode (MBAFF) residual offset tables
+        check_significant_coeff_flag_field_offset,
+        check_last_coeff_flag_field_offset,
+        check_significant_coeff_flag_field_offset_8x8,
         check_sig_coeff_offset_dc,
         check_coeff_abs_level1_ctx,
         check_coeff_abs_levelgt1_ctx,
