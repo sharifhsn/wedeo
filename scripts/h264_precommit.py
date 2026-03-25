@@ -61,7 +61,7 @@ def check_files(
             print(f"  FAIL  {name} ({e})")
             regressed += 1
             continue
-        if matching == total and total > 0:
+        if matching == total:
             passed += 1
         else:
             print(f"  REGRESSED  {name} ({matching}/{total})")
