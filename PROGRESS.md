@@ -13,6 +13,27 @@ See `CLAUDE.md` and `H264.md` for detailed status.
 - WAV/PCM pipeline: byte-identical to FFmpeg 8.0.1 across all FATE suite samples
 - Audio via symphonia: 28 decoders, 10 demuxers, SNR-verified lossy codecs
 
+## MBAFF Conformance Plan Triage + Top-Right Fix (2026-03-25)
+
+**Plan triage:** All 5 WP-1 "progressive FRext" files (FREXT01, FREXT02, FRExt2,
+FRExt4, Freh7) are MBAFF/PAFF (frame_mbs_only=false), not progressive. WP-1 as
+scoped is not actionable without MBAFF/PAFF decode. Only 1 of 8 CAMA* files
+(CAMA1_Sony_C) is I-only; rest use I+P+B. All 6 FRext DIFF files are PAFF.
+
+**Fix: Intra 4x4/8x8 top-right availability (mb.rs)**
+The rightmost block column's top-right availability only checked bounds
+(`mb_x + 1 < mb_width`). In MBAFF, the above-right MB may not be decoded yet.
+Now checks `slice_table[tr_idx] == current_slice`. Fixes pre-deblock pixel diffs
+for frame-mode pair rows 0-1 of CAMA1. Both 4x4 and 8x8 paths fixed.
+
+**Open:** CABAC state[70] probability diverges at pair (17, 4-5) in CAMA1 pair
+row 2, causing wrong field flag decode and cascading errors to all subsequent rows.
+
+New scripts:
+- `sps_flags.py` — dump SPS flags (frame_mbs_only, mb_aff) for conformance files
+- `cabac_pair_compare.py` — compare CABAC byte positions at pair-row boundaries
+- `pair_row_diff.py` — per-pair-row pixel diff summary for MBAFF files
+
 ## MBAFF CABAC Field-Mode Context Fix (2026-03-25)
 
 **Root cause found and fixed:** MBAFF CABAC desync was caused by three issues:

@@ -547,6 +547,8 @@ impl H264Decoder {
                         sps_id = id,
                         width = sps.width(),
                         height = sps.height(),
+                        frame_mbs_only = sps.frame_mbs_only_flag,
+                        mb_aff = sps.mb_aff,
                         "SPS parsed"
                     );
                     self.apply_sps(&sps);

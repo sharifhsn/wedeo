@@ -3527,13 +3527,20 @@ fn decode_intra8x8(
             if bx == 0 {
                 true // top[8..15] from this MB or right part of top MB
             } else {
-                // Top-right of the right 8x8 block = top-right MB
-                let tr_available = mb_x + 1 < ctx.mb_width;
-                if tr_available && ctx.constrained_intra_pred {
+                // Top-right of the right 8x8 block = top-right MB.
+                // Must check slice_table to ensure the above-right MB has
+                // been decoded. In MBAFF, MB(x+1, y-1) may not be decoded
+                // yet when processing the bottom MB of pair x.
+                if mb_x + 1 < ctx.mb_width && mb_y > 0 {
                     let tr_idx = ((mb_y - 1) * ctx.mb_width + mb_x + 1) as usize;
-                    ctx.mb_info[tr_idx].is_intra
+                    let decoded = ctx.slice_table[tr_idx] == ctx.current_slice;
+                    if decoded && ctx.constrained_intra_pred {
+                        ctx.mb_info[tr_idx].is_intra
+                    } else {
+                        decoded
+                    }
                 } else {
-                    tr_available
+                    false
                 }
             }
         } else {
@@ -3680,14 +3687,19 @@ fn decode_intra4x4(
             if blk_x < 3 {
                 true
             } else {
-                // blk_x == 3: top-right is from the MB to the upper-right
-                let tr_available = mb_x + 1 < ctx.mb_width;
-                if tr_available && ctx.constrained_intra_pred {
-                    // Upper-right MB must be intra for constrained intra pred
+                // blk_x == 3: top-right is from the MB to the upper-right.
+                // Must check slice_table (not just bounds) to handle MBAFF
+                // decode order where MB(x+1, y-1) may not be decoded yet.
+                if mb_x + 1 < ctx.mb_width && mb_y > 0 {
                     let tr_idx = ((mb_y - 1) * ctx.mb_width + mb_x + 1) as usize;
-                    ctx.mb_info[tr_idx].is_intra
+                    let decoded = ctx.slice_table[tr_idx] == ctx.current_slice;
+                    if decoded && ctx.constrained_intra_pred {
+                        ctx.mb_info[tr_idx].is_intra
+                    } else {
+                        decoded
+                    }
                 } else {
-                    tr_available
+                    false
                 }
             }
         } else {
