@@ -43,7 +43,13 @@ CONFORMANCE_FILES = [
 
 
 def compare_one(input_path, wedeo_bin, no_deblock=False, pixel_detail=False):
-    """Compare framecrc for a single file. Returns (total, matching, diff_frame_indices, plane_info)."""
+    """Compare framecrc for a single file. Returns (total, matching, diff_frame_indices, plane_info).
+
+    'total' is the number of frames compared (min of both counts).
+    When frame counts differ, the extra frames from the longer output are
+    counted as diffs so that 0-wedeo-frame / N-ffmpeg-frame mismatches are
+    never silently reported as BITEXACT.
+    """
     env = {"WEDEO_NO_DEBLOCK": "1"} if no_deblock else {}
 
     wedeo_crcs = run_framecrc([str(wedeo_bin), str(input_path)], env=env)
@@ -54,22 +60,30 @@ def compare_one(input_path, wedeo_bin, no_deblock=False, pixel_detail=False):
     ffmpeg_cmd += ["-i", str(input_path), "-f", "framecrc", "-"]
     ffmpeg_crcs = run_framecrc(ffmpeg_cmd)
 
-    total = min(len(wedeo_crcs), len(ffmpeg_crcs))
+    # Use max so that a frame-count mismatch is always visible.
+    total = max(len(wedeo_crcs), len(ffmpeg_crcs))
+    comparable = min(len(wedeo_crcs), len(ffmpeg_crcs))
     matching = 0
     diffs = []
 
-    for i in range(total):
+    for i in range(comparable):
         if wedeo_crcs[i] == ffmpeg_crcs[i]:
             matching += 1
         else:
             diffs.append(i)
 
-    # Optional pixel-level analysis
+    # Frames present in one decoder but not the other are diffs.
+    for i in range(comparable, total):
+        diffs.append(i)
+
+    # Optional pixel-level analysis (only for frames both decoders produced)
     plane_info = None
     if pixel_detail and diffs:
-        plane_info = pixel_plane_analysis(
-            input_path, wedeo_bin, no_deblock, diffs
-        )
+        pixel_diffs = [i for i in diffs if i < comparable]
+        if pixel_diffs:
+            plane_info = pixel_plane_analysis(
+                input_path, wedeo_bin, no_deblock, pixel_diffs
+            )
 
     return total, matching, diffs, plane_info
 
