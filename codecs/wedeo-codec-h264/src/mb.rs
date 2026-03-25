@@ -95,6 +95,9 @@ pub struct FrameDecodeContext {
     pub dequant8: Dequant8Table,
     /// Per-MB transform_size_8x8_flag for deblocking edge selection.
     pub transform_8x8: Vec<bool>,
+    /// Per-MB interlace flag for MBAFF. True if the MB was decoded in field mode.
+    /// Used for neighbor lookups across field/frame pair boundaries.
+    pub mb_field_flag: Vec<bool>,
     /// Motion vector context for inter prediction across MBs.
     pub mv_ctx: MvContext,
     /// Per-MB slice number for cross-slice neighbor availability.
@@ -220,6 +223,7 @@ impl FrameDecodeContext {
             dequant4: Dequant4Table::new(&pps.scaling_matrix4),
             dequant8: Dequant8Table::new(&pps.scaling_matrix8),
             transform_8x8: vec![false; total_mbs],
+            mb_field_flag: vec![false; total_mbs],
             mv_ctx: MvContext::new(mb_width, mb_height),
             slice_table: vec![u16::MAX; total_mbs],
             current_slice: 0,
@@ -301,6 +305,7 @@ impl FrameDecodeContext {
 fn finalize_skip_mb(ctx: &mut FrameDecodeContext, mb_x: u32, mb_y: u32, is_b_slice: bool) {
     let mb_idx = (mb_y * ctx.mb_width + mb_x) as usize;
     ctx.slice_table[mb_idx] = ctx.current_slice;
+    ctx.mb_field_flag[mb_idx] = ctx.mb_field;
     let nz = [0u8; 24];
     let modes = if ctx.constrained_intra_pred {
         [-1i8; 16] // unavailable for constrained intra prediction
@@ -896,6 +901,7 @@ pub fn apply_macroblock(
     };
     ctx.slice_table[mb_idx] = ctx.current_slice;
     ctx.transform_8x8[mb_idx] = mb.transform_size_8x8_flag;
+    ctx.mb_field_flag[mb_idx] = ctx.mb_field;
     ctx.neighbor_ctx
         .update_after_mb(mb_x, &mb.non_zero_count, &intra4x4_modes);
     ctx.neighbor_ctx.left_available = true;
