@@ -34,7 +34,7 @@ from ffmpeg_debug import find_wedeo_binary
 from framecrc_compare import compare_one
 
 
-# All 50 progressive CAVLC conformance files (excludes interlaced, CABAC, FRExt, FMO)
+# All 51 progressive CAVLC conformance files (excludes interlaced, CABAC, FRExt, FMO)
 PROGRESSIVE_CAVLC_FILES = [
     # Baseline (17)
     "BA1_Sony_D.jsv", "SVA_BA1_B.264", "SVA_NL1_B.264", "BAMQ1_JVC_C.264",
@@ -60,6 +60,8 @@ PROGRESSIVE_CAVLC_FILES = [
     "MR4_TANDBERG_C.264", "MR5_TANDBERG_C.264",
     # Hierarchical / crop (2)
     "HCMP1_HHI_A.264", "CVFC1_Sony_C.jsv",
+    # Constrained intra (1)
+    "CI1_FT_B.264",
     # FMO (1) — FM1_BT_B is BITEXACT (both produce 0 frames)
     # FM1_FT_E.264 excluded: FMO is unimplemented in FFmpeg (h264_ps.c:758,
     # "FMO is not implemented"). FFmpeg's own FATE excludes it. Both decoders

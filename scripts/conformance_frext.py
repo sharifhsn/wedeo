@@ -37,9 +37,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ffmpeg_debug import find_wedeo_binary
 from framecrc_compare import compare_one
 
-# Progressive High Profile (4:2:0 8-bit) FRext files with transform_8x8_mode=1.
+# Progressive FRext CAVLC files (4:2:0 8-bit).
 # Excludes interlaced, 4:2:2, 10-bit, and High444 files.
-# Regenerate with: python3 scripts/probe_h264_features.py fate-suite/h264-conformance/FRext/ --progressive --8x8
 FREXT_CAVLC_FILES = [
     "Freh1_B.264",
     "HPCV_BRCM_A.264",
@@ -47,9 +46,12 @@ FREXT_CAVLC_FILES = [
     "HPCVFLNL_BRCM_A.264",
     "HPCVMOLQ_BRCM_B.264",
     "HPCVNL_BRCM_A.264",
+    "test8b43.264",
 ]
 
 FREXT_CABAC_FILES = [
+    "FRExt1_Panasonic.avc",
+    "FRExt3_Panasonic.avc",
     "Freh12_B.264",
     "Freh2_B.264",
     "Freh7_B.264",

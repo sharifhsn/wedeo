@@ -1,5 +1,8 @@
 {
   "passing": [
+    "FRExt1_Panasonic.avc",
+    "FRExt3_Panasonic.avc",
+    "FRExt_MMCO4_Sony_B.264",
     "Freh12_B.264",
     "Freh1_B.264",
     "Freh2_B.264",
@@ -18,7 +21,8 @@
     "HPCV_BRCM_A.264",
     "freh3.264",
     "freh8.264",
-    "freh9.264"
+    "freh9.264",
+    "test8b43.264"
   ],
-  "count": 19
+  "count": 23
 }
