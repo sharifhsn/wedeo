@@ -4,12 +4,25 @@
 
 See `CLAUDE.md` and `H264.md` for detailed status.
 
-- H.264 CAVLC: 50/50 progressive conformance files BITEXACT (100%)
+- H.264 CAVLC: **51/51** progressive conformance files BITEXACT (100%) — added CI1_FT_B
 - H.264 CABAC: 27/27 progressive conformance files BITEXACT (100%)
-- H.264 FRext CAVLC: **4/6 BITEXACT** (HPCVNL, HPCV_BRCM_A, Freh1_B, HPCVMOLQ; 2 out-of-scope: PAFF)
-- H.264 FRext CABAC: **16/20 BITEXACT** (4 PAFF out-of-scope)
+- H.264 FRext CAVLC: **5/7 BITEXACT** (added test8b43; 2 out-of-scope: PAFF)
+- H.264 FRext CABAC: **18/22 BITEXACT** (added FRExt1/3 Panasonic; 4 PAFF out-of-scope)
+- Precommit total: **101 passing, 0 regressed**
 - WAV/PCM pipeline: byte-identical to FFmpeg 8.0.1 across all FATE suite samples
 - Audio via symphonia: 28 decoders, 10 demuxers, SNR-verified lossy codecs
+
+## Conformance Expansion + PPS/Reorder Fixes (2026-03-25)
+
+Added 4 new conformance files:
+- **test8b43.264** (Main CAVLC, 960x544, 43 frames): PPS parsing failed because `bit_length` included RBSP stop bit. Added `rbsp_bit_length()` matching FFmpeg's `get_bit_length`.
+- **FRExt1_Panasonic.avc** (High CABAC, 8 frames): Output reorder bug — second IDR (poc=0) was output before first-period frames. Fixed by making mid-stream IDRs barriers in delayed_pics.
+- **FRExt3_Panasonic.avc** (High CABAC, 11 frames): Already BITEXACT.
+- **CI1_FT_B.264** (Constrained Baseline, 291 frames): Already BITEXACT.
+
+Also: SPS/PPS parse failures now log warn!, precommit handles 0-frame files correctly.
+
+New script: `check_dirty_tree.sh` — warns about uncommitted decoder changes at session start.
 
 ## Spatial Direct Long-Term Ref Fix (2026-03-25)
 
