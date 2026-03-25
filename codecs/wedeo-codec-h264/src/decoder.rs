@@ -1265,6 +1265,14 @@ impl H264Decoder {
         let first_mb = hdr.first_mb_in_slice;
         let mut mbs_decoded = 0u32;
         let is_inter_slice = hdr.slice_type.is_p() || hdr.slice_type.is_b();
+        let is_mbaff = !sps.frame_mbs_only_flag;
+
+        if is_mbaff {
+            return self.decode_slice_cavlc_mbaff(
+                &mut br, rbsp_bits, hdr, sps, pps, fdc, ref_pics, ref_pics_l1, is_inter_slice,
+            );
+        }
+
         let mut mb_addr = first_mb;
 
         while mb_addr < total_mbs {
@@ -1394,6 +1402,165 @@ impl H264Decoder {
         Ok(mbs_decoded)
     }
 
+    /// Decode a CAVLC-coded slice in MBAFF mode (MB pairs).
+    ///
+    /// Processes MBs in pairs: top (even mb_y) then bottom (odd mb_y).
+    /// Reads mb_field_decoding_flag from bitstream at the top MB of each pair.
+    /// Skip run persists across pair members.
+    ///
+    /// Reference: FFmpeg h264_slice.c:2681-2755 (CAVLC MBAFF pair loop),
+    ///            h264_cavlc.c:689-701 (MBAFF skip/field flag logic).
+    #[allow(clippy::too_many_arguments)]
+    fn decode_slice_cavlc_mbaff(
+        &self,
+        br: &mut BitReadBE<'_>,
+        rbsp_bits: usize,
+        hdr: &SliceHeader,
+        sps: &Sps,
+        pps: &Pps,
+        fdc: &mut FrameDecodeContext,
+        ref_pics: &[&PictureBuffer],
+        ref_pics_l1: &[&PictureBuffer],
+        is_inter_slice: bool,
+    ) -> Result<u32> {
+        let mb_width = sps.mb_width;
+        let mb_height = sps.mb_height;
+        let total_mbs = mb_width * mb_height;
+        let first_mb = hdr.first_mb_in_slice;
+
+        // For MBAFF, first_mb_in_slice is in pair units.
+        let mut mb_x = first_mb % mb_width;
+        let mut mb_y = (first_mb / mb_width) * 2;
+        let first_mb_flat = mb_x + mb_y * mb_width;
+
+        let mut mbs_decoded = 0u32;
+        // mb_skip_run persists across both MBs of a pair and across pairs.
+        // -1 means "not yet read for this coded region".
+        let mut mb_skip_run: i32 = -1;
+
+        'pair_loop: loop {
+            if mb_y >= mb_height {
+                break;
+            }
+
+            // Save/restore left-side neighbor context between top and bottom MBs.
+            let mut saved_left_nz = [0u8; 8];
+            let mut saved_left_modes = [-1i8; 4];
+            let mut saved_left_available = false;
+
+            for pair_pos in 0..2u32 {
+                let cur_y = mb_y + pair_pos;
+                let mb_addr = mb_x + cur_y * mb_width;
+
+                if mb_addr >= total_mbs {
+                    break 'pair_loop;
+                }
+
+                // Update neighbor context
+                if pair_pos == 0 {
+                    if mb_x == 0 {
+                        fdc.neighbor_ctx.new_row();
+                    }
+                } else {
+                    // Save top MB's left context before bottom MB overwrites it
+                    saved_left_nz = fdc.neighbor_ctx.left_nz;
+                    saved_left_modes = fdc.neighbor_ctx.left_intra4x4_mode;
+                    saved_left_available = fdc.neighbor_ctx.left_available;
+                    if mb_x == 0 {
+                        fdc.neighbor_ctx.new_row();
+                    }
+                }
+                fdc.neighbor_ctx.top_available = cur_y > 0
+                    && fdc.slice_table[(mb_addr - mb_width) as usize] == fdc.current_slice;
+                if mb_addr == first_mb_flat && mb_x == 0 {
+                    fdc.neighbor_ctx.left_available = false;
+                }
+
+                if is_inter_slice {
+                    // Read skip run if we haven't yet
+                    if mb_skip_run < 0 {
+                        mb_skip_run = match get_ue_golomb(br) {
+                            Ok(v) => v as i32,
+                            Err(_) if br.consumed() + 8 >= rbsp_bits => break 'pair_loop,
+                            Err(e) => return Err(e),
+                        };
+                        trace!(mb_x, cur_y, mb_skip_run, "MBAFF mb_skip_run");
+                    }
+
+                    if mb_skip_run > 0 {
+                        mb_skip_run -= 1;
+
+                        // MBAFF: read mb_field_decoding_flag at top MB when this
+                        // is the last skip of the run.
+                        // Reference: FFmpeg h264_cavlc.c:690-692.
+                        if pair_pos == 0 && mb_skip_run == 0 {
+                            let _mb_field_flag = br.get_bit(); // consume, discard for frame-mode
+                        }
+
+                        // Decode skip MB
+                        if hdr.slice_type.is_b() {
+                            mb::decode_b_skip_mb(fdc, hdr, mb_x, cur_y, ref_pics, ref_pics_l1);
+                        } else {
+                            mb::decode_skip_mb(fdc, hdr, mb_x, cur_y, ref_pics, ref_pics_l1);
+                        }
+                        mbs_decoded += 1;
+                        continue; // next pair_pos
+                    }
+
+                    // mb_skip_run == 0: this MB is coded. Reset for next read.
+                    mb_skip_run = -1;
+
+                    if br.consumed() + 1 >= rbsp_bits {
+                        break 'pair_loop;
+                    }
+                } else if br.consumed() + 8 >= rbsp_bits {
+                    break 'pair_loop;
+                }
+
+                // Coded MB: read mb_field_decoding_flag on top MB
+                // Reference: FFmpeg h264_cavlc.c:698-701.
+                if pair_pos == 0 {
+                    let _mb_field_flag = br.get_bit(); // consume, discard for frame-mode
+                }
+
+                fdc.neighbor_ctx.top_available = cur_y > 0
+                    && fdc.slice_table[(mb_addr - mb_width) as usize] == fdc.current_slice;
+
+                mb::decode_macroblock(
+                    fdc, br, hdr, sps, pps, mb_x, cur_y, ref_pics, ref_pics_l1,
+                )?;
+                mbs_decoded += 1;
+            }
+
+            // Restore top MB's left context for the next pair's top MB.
+            fdc.neighbor_ctx.left_nz = saved_left_nz;
+            fdc.neighbor_ctx.left_intra4x4_mode = saved_left_modes;
+            fdc.neighbor_ctx.left_available = saved_left_available;
+
+            // Advance to next pair
+            mb_x += 1;
+            if mb_x >= mb_width {
+                mb_x = 0;
+                mb_y += 2;
+            }
+        }
+
+        // Validate bitstream position
+        let bits_remaining = rbsp_bits.saturating_sub(br.consumed());
+        if bits_remaining > 16 {
+            warn!(
+                first_mb,
+                bits_remaining,
+                consumed = br.consumed(),
+                rbsp_bits,
+                mbs_decoded,
+                "CAVLC MBAFF desync: slice ended with excess bits remaining"
+            );
+        }
+
+        Ok(mbs_decoded)
+    }
+
     /// Decode a CABAC-coded slice.
     ///
     /// The CABAC slice loop differs from CAVLC:
@@ -1446,122 +1613,385 @@ impl H264Decoder {
         let first_mb = hdr.first_mb_in_slice;
         let mut mbs_decoded = 0u32;
         let is_inter_slice = hdr.slice_type.is_p() || hdr.slice_type.is_b();
-        let mut mb_addr = first_mb;
+        let is_mbaff = !sps.frame_mbs_only_flag;
 
-        while mb_addr < total_mbs {
-            let mb_x = mb_addr % mb_width;
-            let mb_y = mb_addr / mb_width;
-            let mb_idx = mb_addr as usize;
+        if is_mbaff {
+            mbs_decoded = self.decode_slice_cabac_mbaff(
+                &mut reader,
+                &mut cabac_state,
+                &mut cabac_nb,
+                hdr,
+                sps,
+                pps,
+                fdc,
+                ref_pics,
+                ref_pics_l1,
+                is_inter_slice,
+            )?;
+        } else {
+            let mut mb_addr = first_mb;
 
-            // Update CAVLC neighbor context at the start of each row
-            if mb_x == 0 {
-                fdc.neighbor_ctx.new_row();
-                fdc.neighbor_ctx.top_available =
-                    mb_y > 0 && fdc.slice_table[(mb_addr - mb_width) as usize] == fdc.current_slice;
-            } else if mb_addr == first_mb {
-                fdc.neighbor_ctx.left_available = false;
-                fdc.neighbor_ctx.top_available =
-                    mb_y > 0 && fdc.slice_table[(mb_addr - mb_width) as usize] == fdc.current_slice;
-            }
+            while mb_addr < total_mbs {
+                let mb_x = mb_addr % mb_width;
+                let mb_y = mb_addr / mb_width;
+                let mb_idx = mb_addr as usize;
 
-            // For inter slices: decode skip flag
-            if is_inter_slice {
-                trace!(
-                    "CABAC_SKIP_DECODE mb_x={} mb_y={} is_b={}",
-                    mb_x,
-                    mb_y,
-                    hdr.slice_type.is_b()
-                );
-                let skip = decode_cabac_mb_skip(
+                // Update neighbor context at the start of each row
+                if mb_x == 0 {
+                    fdc.neighbor_ctx.new_row();
+                    fdc.neighbor_ctx.top_available = mb_y > 0
+                        && fdc.slice_table[(mb_addr - mb_width) as usize] == fdc.current_slice;
+                } else if mb_addr == first_mb {
+                    fdc.neighbor_ctx.left_available = false;
+                    fdc.neighbor_ctx.top_available = mb_y > 0
+                        && fdc.slice_table[(mb_addr - mb_width) as usize] == fdc.current_slice;
+                }
+
+                // For inter slices: decode skip flag
+                if is_inter_slice {
+                    trace!(
+                        "CABAC_SKIP_DECODE mb_x={} mb_y={} is_b={}",
+                        mb_x,
+                        mb_y,
+                        hdr.slice_type.is_b()
+                    );
+                    let skip = decode_cabac_mb_skip(
+                        &mut reader,
+                        &mut cabac_state,
+                        &cabac_nb,
+                        &fdc.slice_table,
+                        fdc.current_slice,
+                        mb_x,
+                        mb_y,
+                        mb_width,
+                        hdr.slice_type.is_b(),
+                    );
+
+                    if skip != 0 {
+                        // Handle skip MB
+                        if hdr.slice_type.is_b() {
+                            mb::decode_b_skip_mb(fdc, hdr, mb_x, mb_y, ref_pics, ref_pics_l1);
+                        } else {
+                            mb::decode_skip_mb(fdc, hdr, mb_x, mb_y, ref_pics, ref_pics_l1);
+                        }
+                        fdc.last_qscale_diff = 0;
+
+                        // Update CABAC neighbor context for skip MB
+                        cabac_nb.update_after_mb(
+                            mb_idx, true, false, false, false, 0, 0, &[0; 24], false,
+                        );
+                        cabac_nb.update_mvd_ref_skip(mb_idx);
+
+                        mb_addr += 1;
+                        mbs_decoded += 1;
+
+                        // Check terminate after skip
+                        if reader.get_cabac_terminate() {
+                            break;
+                        }
+                        continue;
+                    }
+                }
+
+                // Update per-MB neighbor availability (slice-boundary aware)
+                fdc.neighbor_ctx.top_available = mb_y > 0
+                    && fdc.slice_table[(mb_addr - mb_width) as usize] == fdc.current_slice;
+
+                // Decode coded MB via CABAC
+                let mut cache = CabacDecodeCache::new();
+                let mut mb = decode_mb_cabac(
                     &mut reader,
                     &mut cabac_state,
+                    hdr.slice_type,
+                    pps,
                     &cabac_nb,
+                    &fdc.neighbor_ctx,
                     &fdc.slice_table,
                     fdc.current_slice,
                     mb_x,
                     mb_y,
                     mb_width,
-                    hdr.slice_type.is_b(),
+                    hdr.num_ref_idx_l0_active,
+                    hdr.num_ref_idx_l1_active,
+                    fdc.last_qscale_diff,
+                    &mut cache,
+                    fdc.direct_8x8_inference_flag,
+                    fdc.decode_chroma,
+                )?;
+
+                // Apply entropy-agnostic processing (dequant, IDCT, pred, MC, neighbor update)
+                mb::apply_macroblock(
+                    fdc,
+                    &mut mb,
+                    hdr,
+                    pps,
+                    mb_x,
+                    mb_y,
+                    ref_pics,
+                    ref_pics_l1,
+                )?;
+
+                // Write back MVD/ref from scan8 cache to flat storage, then update scalar fields
+                cache.write_back(&mut cabac_nb, mb_idx);
+                cabac_nb.update_after_mb(
+                    mb_idx,
+                    false,
+                    mb.is_intra16x16 || mb.is_pcm,
+                    mb.is_intra,
+                    mb.is_direct,
+                    mb.cbp,
+                    mb.chroma_pred_mode,
+                    &mb.non_zero_count,
+                    mb.transform_size_8x8_flag,
                 );
 
-                if skip != 0 {
-                    // Handle skip MB
-                    if hdr.slice_type.is_b() {
-                        mb::decode_b_skip_mb(fdc, hdr, mb_x, mb_y, ref_pics, ref_pics_l1);
-                    } else {
-                        mb::decode_skip_mb(fdc, hdr, mb_x, mb_y, ref_pics, ref_pics_l1);
-                    }
-                    fdc.last_qscale_diff = 0;
+                mb_addr += 1;
+                mbs_decoded += 1;
 
-                    // Update CABAC neighbor context for skip MB
-                    cabac_nb
-                        .update_after_mb(mb_idx, true, false, false, false, 0, 0, &[0; 24], false);
-                    cabac_nb.update_mvd_ref_skip(mb_idx);
-
-                    mb_addr += 1;
-                    mbs_decoded += 1;
-
-                    // Check terminate after skip
-                    if reader.get_cabac_terminate() {
-                        break;
-                    }
-                    continue;
+                // Check terminate
+                if reader.get_cabac_terminate() {
+                    break;
                 }
-            }
-
-            // Update per-MB neighbor availability (slice-boundary aware)
-            fdc.neighbor_ctx.top_available =
-                mb_y > 0 && fdc.slice_table[(mb_addr - mb_width) as usize] == fdc.current_slice;
-
-            // Decode coded MB via CABAC
-            let mut cache = CabacDecodeCache::new();
-            let mut mb = decode_mb_cabac(
-                &mut reader,
-                &mut cabac_state,
-                hdr.slice_type,
-                pps,
-                &cabac_nb,
-                &fdc.neighbor_ctx,
-                &fdc.slice_table,
-                fdc.current_slice,
-                mb_x,
-                mb_y,
-                mb_width,
-                hdr.num_ref_idx_l0_active,
-                hdr.num_ref_idx_l1_active,
-                fdc.last_qscale_diff,
-                &mut cache,
-                fdc.direct_8x8_inference_flag,
-                fdc.decode_chroma,
-            )?;
-
-            // Apply entropy-agnostic processing (dequant, IDCT, pred, MC, neighbor update)
-            mb::apply_macroblock(fdc, &mut mb, hdr, pps, mb_x, mb_y, ref_pics, ref_pics_l1)?;
-
-            // Write back MVD/ref from scan8 cache to flat storage, then update scalar fields
-            cache.write_back(&mut cabac_nb, mb_idx);
-            cabac_nb.update_after_mb(
-                mb_idx,
-                false,
-                mb.is_intra16x16 || mb.is_pcm,
-                mb.is_intra,
-                mb.is_direct,
-                mb.cbp,
-                mb.chroma_pred_mode,
-                &mb.non_zero_count,
-                mb.transform_size_8x8_flag,
-            );
-
-            mb_addr += 1;
-            mbs_decoded += 1;
-
-            // Check terminate
-            if reader.get_cabac_terminate() {
-                break;
             }
         }
 
         debug!(first_mb, mbs_decoded, "CABAC slice decoded");
+
+        Ok(mbs_decoded)
+    }
+
+    /// Decode a CABAC-coded slice in MBAFF mode (MB pairs).
+    ///
+    /// Processes MBs in pairs: top (even mb_y) then bottom (odd mb_y).
+    /// Reads mb_field_decoding_flag from CABAC at the top MB of each pair.
+    ///
+    /// Reference: FFmpeg h264_slice.c:2612-2680 (CABAC MBAFF pair loop),
+    ///            h264_cabac.c:1935-1962 (MBAFF skip/field flag logic).
+    #[allow(clippy::too_many_arguments)]
+    fn decode_slice_cabac_mbaff(
+        &self,
+        reader: &mut crate::cabac::CabacReader<'_>,
+        cabac_state: &mut [u8; 1024],
+        cabac_nb: &mut crate::cabac::CabacNeighborCtx,
+        hdr: &SliceHeader,
+        sps: &Sps,
+        pps: &Pps,
+        fdc: &mut FrameDecodeContext,
+        ref_pics: &[&PictureBuffer],
+        ref_pics_l1: &[&PictureBuffer],
+        is_inter_slice: bool,
+    ) -> Result<u32> {
+        use crate::cabac::{
+            CabacDecodeCache, decode_cabac_field_decoding_flag, decode_cabac_mb_skip,
+            decode_mb_cabac,
+        };
+
+        let mb_width = sps.mb_width;
+        let mb_height = sps.mb_height;
+        let first_mb = hdr.first_mb_in_slice;
+
+        // For MBAFF, first_mb_in_slice is in pair units.
+        // Convert to (mb_x, pair_row_y):
+        let mut mb_x = first_mb % mb_width;
+        let mut mb_y = (first_mb / mb_width) * 2; // pair row → even mb_y
+        let first_mb_flat = mb_x + mb_y * mb_width;
+
+        let mut mbs_decoded = 0u32;
+        let mut mb_field_decoding_flag = false;
+
+        loop {
+            if mb_y >= mb_height {
+                break;
+            }
+
+            // --- Process MB pair: top (mb_y) and bottom (mb_y + 1) ---
+
+            // MBAFF skip state for pair interaction (FFmpeg: prev_mb_skipped, next_mb_skipped)
+            let mut top_was_skipped = false;
+            let mut bot_skip_preread = false;
+            let mut bot_skip_value = false;
+
+            // Save/restore left-side neighbor context between top and bottom MBs.
+            // In MBAFF pair decode order, the bottom MB overwrites left_nz and
+            // left_intra4x4_mode. The next pair's top MB needs the TOP MB's
+            // left values, not the bottom MB's. Save after top MB, restore
+            // before next pair's top MB.
+            let mut saved_left_nz = [0u8; 8];
+            let mut saved_left_modes = [-1i8; 4];
+            let mut saved_left_available = false;
+
+            for pair_pos in 0..2u32 {
+                let cur_y = mb_y + pair_pos;
+                let mb_addr = mb_x + cur_y * mb_width;
+                let mb_idx = mb_addr as usize;
+
+                // Update neighbor context
+                if pair_pos == 0 {
+                    // Top MB: restore saved left context from previous pair's top
+                    if mb_x == 0 {
+                        fdc.neighbor_ctx.new_row();
+                    }
+                } else {
+                    // Bottom MB: save top MB's left context, then set up for bottom
+                    saved_left_nz = fdc.neighbor_ctx.left_nz;
+                    saved_left_modes = fdc.neighbor_ctx.left_intra4x4_mode;
+                    saved_left_available = fdc.neighbor_ctx.left_available;
+                    if mb_x == 0 {
+                        fdc.neighbor_ctx.new_row();
+                    }
+                }
+                fdc.neighbor_ctx.top_available = cur_y > 0
+                    && fdc.slice_table[(mb_addr - mb_width) as usize] == fdc.current_slice;
+                // First MB of slice may lack left neighbor
+                if mb_addr == first_mb_flat && mb_x == 0 {
+                    fdc.neighbor_ctx.left_available = false;
+                }
+
+                // For inter slices: decode skip flag
+                if is_inter_slice {
+                    // Bottom MB of pair: if top was skipped, use pre-decoded skip value
+                    let skip = if pair_pos == 1 && top_was_skipped && bot_skip_preread {
+                        bot_skip_value
+                    } else {
+                        decode_cabac_mb_skip(
+                            reader,
+                            cabac_state,
+                            cabac_nb,
+                            &fdc.slice_table,
+                            fdc.current_slice,
+                            mb_x,
+                            cur_y,
+                            mb_width,
+                            hdr.slice_type.is_b(),
+                        ) != 0
+                    };
+
+                    if skip {
+                        if pair_pos == 0 {
+                            // Top MB is skip. Also decode bottom MB skip flag.
+                            top_was_skipped = true;
+                            let bot_skip = decode_cabac_mb_skip(
+                                reader,
+                                cabac_state,
+                                cabac_nb,
+                                &fdc.slice_table,
+                                fdc.current_slice,
+                                mb_x,
+                                cur_y + 1,
+                                mb_width,
+                                hdr.slice_type.is_b(),
+                            ) != 0;
+                            bot_skip_preread = true;
+                            bot_skip_value = bot_skip;
+                            if !bot_skip {
+                                // Bottom is coded: read mb_field_decoding_flag
+                                mb_field_decoding_flag = decode_cabac_field_decoding_flag(
+                                    reader,
+                                    cabac_state,
+                                    mb_field_decoding_flag,
+                                    mb_x,
+                                    false, // above pair interlaced flag (frame-mode: false)
+                                );
+                            }
+                        }
+
+                        // Decode skip MB
+                        if hdr.slice_type.is_b() {
+                            mb::decode_b_skip_mb(fdc, hdr, mb_x, cur_y, ref_pics, ref_pics_l1);
+                        } else {
+                            mb::decode_skip_mb(fdc, hdr, mb_x, cur_y, ref_pics, ref_pics_l1);
+                        }
+                        fdc.last_qscale_diff = 0;
+
+                        cabac_nb.update_after_mb(
+                            mb_idx, true, false, false, false, 0, 0, &[0; 24], false,
+                        );
+                        cabac_nb.update_mvd_ref_skip(mb_idx);
+                        mbs_decoded += 1;
+                        continue; // next pair_pos
+                    }
+                }
+
+                // Coded MB (or intra slice): read mb_field_decoding_flag on top MB
+                if pair_pos == 0 {
+                    mb_field_decoding_flag = decode_cabac_field_decoding_flag(
+                        reader,
+                        cabac_state,
+                        mb_field_decoding_flag,
+                        mb_x,
+                        false, // above pair interlaced flag (frame-mode: false)
+                    );
+                    top_was_skipped = false;
+                }
+
+                // Update per-MB top availability
+                fdc.neighbor_ctx.top_available = cur_y > 0
+                    && fdc.slice_table[(mb_addr - mb_width) as usize] == fdc.current_slice;
+
+                // Decode coded MB via CABAC
+                let mut cache = CabacDecodeCache::new();
+                let mut mb = decode_mb_cabac(
+                    reader,
+                    cabac_state,
+                    hdr.slice_type,
+                    pps,
+                    cabac_nb,
+                    &fdc.neighbor_ctx,
+                    &fdc.slice_table,
+                    fdc.current_slice,
+                    mb_x,
+                    cur_y,
+                    mb_width,
+                    hdr.num_ref_idx_l0_active,
+                    hdr.num_ref_idx_l1_active,
+                    fdc.last_qscale_diff,
+                    &mut cache,
+                    fdc.direct_8x8_inference_flag,
+                    fdc.decode_chroma,
+                )?;
+
+                mb::apply_macroblock(
+                    fdc, &mut mb, hdr, pps, mb_x, cur_y, ref_pics, ref_pics_l1,
+                )?;
+
+                cache.write_back(cabac_nb, mb_idx);
+                cabac_nb.update_after_mb(
+                    mb_idx,
+                    false,
+                    mb.is_intra16x16 || mb.is_pcm,
+                    mb.is_intra,
+                    mb.is_direct,
+                    mb.cbp,
+                    mb.chroma_pred_mode,
+                    &mb.non_zero_count,
+                    mb.transform_size_8x8_flag,
+                );
+                mbs_decoded += 1;
+            }
+
+            // Restore top MB's left context for the next pair's top MB.
+            fdc.neighbor_ctx.left_nz = saved_left_nz;
+            fdc.neighbor_ctx.left_intra4x4_mode = saved_left_modes;
+            fdc.neighbor_ctx.left_available = saved_left_available;
+
+            // Trace CABAC state after each pair for divergence detection
+            trace!(
+                "MBAFF_PAIR_DONE mb_x={} mb_y={} pos={} low={} range={}",
+                mb_x, mb_y, reader.pos(), reader.low(), reader.range()
+            );
+
+            // Check terminate after both MBs of pair
+            if reader.get_cabac_terminate() {
+                break;
+            }
+
+            // Advance to next pair
+            mb_x += 1;
+            if mb_x >= mb_width {
+                mb_x = 0;
+                mb_y += 2; // Skip to next pair row
+            }
+        }
 
         Ok(mbs_decoded)
     }

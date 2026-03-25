@@ -805,6 +805,33 @@ pub const P_SUB_MB_PARTITION_COUNT: [u8; 4] = [1, 2, 2, 4];
 
 /// Decode the mb_skip_flag for CABAC.
 ///
+/// Decode mb_field_decoding_flag from CABAC for MBAFF frames.
+///
+/// Called on the top MB of each MB pair (mb_y even) when `!frame_mbs_only_flag`.
+/// The context depends on:
+///   - Left pair's mb_field_decoding_flag (if mb_x > 0)
+///   - Above pair's interlaced flag (if in same slice)
+///
+/// Reference: FFmpeg h264_cabac.c:1292-1302 (decode_cabac_field_decoding_flag).
+pub fn decode_cabac_field_decoding_flag(
+    reader: &mut CabacReader,
+    state: &mut [u8; 1024],
+    prev_mb_field_decoding_flag: bool,
+    mb_x: u32,
+    above_pair_is_field: bool,
+) -> bool {
+    let mut ctx = 0usize;
+    // Left context: previous pair's field flag (only if not at column 0)
+    if mb_x > 0 && prev_mb_field_decoding_flag {
+        ctx += 1;
+    }
+    // Top context: above pair's interlaced flag (if available and in same slice)
+    if above_pair_is_field {
+        ctx += 1;
+    }
+    reader.get_cabac(&mut state[70 + ctx]) != 0
+}
+
 /// Context base: 11 for P-slices, 24 for B-slices.
 /// Left/top non-skip neighbors add to the context index.
 ///
