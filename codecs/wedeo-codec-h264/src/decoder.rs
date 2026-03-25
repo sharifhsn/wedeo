@@ -756,6 +756,8 @@ impl H264Decoder {
                             fdc.col_poc = entry.poc;
                             fdc.col_ref_poc_l0 = entry.ref_poc_l0.clone();
                             fdc.col_ref_poc_l1 = entry.ref_poc_l1.clone();
+                            fdc.col_l1_is_long_term =
+                                entry.status == crate::dpb::RefStatus::LongTerm;
                         }
                         fdc.cur_poc = self.current_poc;
 

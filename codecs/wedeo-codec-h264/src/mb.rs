@@ -119,6 +119,10 @@ pub struct FrameDecodeContext {
     pub direct_8x8_inference_flag: bool,
     /// POC of colocated frame (L1[0]), for temporal direct mode.
     pub col_poc: i32,
+    /// True if the colocated picture (L1[0]) is a long-term reference.
+    /// When true, FFmpeg disables the col_zero_flag optimization in spatial
+    /// direct mode (h264_direct.c:374,405,443).
+    pub col_l1_is_long_term: bool,
     /// L0 ref POCs stored from the colocated frame, for temporal direct mode.
     /// Maps col_ref[blk] → ref_poc_l0[col_ref[blk]] → POC.
     pub col_ref_poc_l0: Vec<i32>,
@@ -220,6 +224,7 @@ impl FrameDecodeContext {
             col_mv_l1: Vec::new(),
             col_ref_l1: Vec::new(),
             col_mb_intra: Vec::new(),
+            col_l1_is_long_term: false,
             constrained_intra_pred: pps.constrained_intra_pred,
             direct_8x8_inference_flag: sps.direct_8x8_inference_flag,
             col_poc: 0,
@@ -2610,7 +2615,10 @@ fn pred_spatial_direct(
 
     let mut results = [base; 16];
 
-    if !col_is_intra && !ctx.col_ref.is_empty() {
+    // FFmpeg h264_direct.c:374,405,443: col_zero_flag is only applied when
+    // L1[0] is NOT a long-term reference. When it IS long-term, skip the
+    // col_zero_flag optimization entirely (keep the spatial MV as-is).
+    if !col_is_intra && !ctx.col_ref.is_empty() && !ctx.col_l1_is_long_term {
         let blk_base = mb_idx * 16;
 
         if ctx.direct_8x8_inference_flag {

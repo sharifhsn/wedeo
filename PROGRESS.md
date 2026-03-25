@@ -7,9 +7,19 @@ See `CLAUDE.md` and `H264.md` for detailed status.
 - H.264 CAVLC: 50/50 progressive conformance files BITEXACT (100%)
 - H.264 CABAC: 27/27 progressive conformance files BITEXACT (100%)
 - H.264 FRext CAVLC: **4/6 BITEXACT** (HPCVNL, HPCV_BRCM_A, Freh1_B, HPCVMOLQ; 2 out-of-scope: PAFF)
-- H.264 FRext CABAC: **15/20 BITEXACT** (4 PAFF out-of-scope, 1 MMCO4 near-miss 59/60)
+- H.264 FRext CABAC: **16/20 BITEXACT** (4 PAFF out-of-scope)
 - WAV/PCM pipeline: byte-identical to FFmpeg 8.0.1 across all FATE suite samples
 - Audio via symphonia: 28 decoders, 10 demuxers, SNR-verified lossy codecs
+
+## Spatial Direct Long-Term Ref Fix (2026-03-25)
+
+**Spatial direct col_zero_flag must skip when L1[0] is long-term.** FFmpeg h264_direct.c lines 374, 405, 443 gate col_zero_flag with `!sl->ref_list[1][0].parent->long_ref`. Without this, the zero-MV suppression is applied incorrectly when the colocated picture is a long-term reference.
+
+Fix: added `col_l1_is_long_term` field to `FrameDecodeContext`, set from DPB entry status, gated col_zero_flag condition. Impact: FRExt_MMCO4_Sony_B.264 59/60 → 60/60 BITEXACT.
+
+New scripts: `check_direct_mode.py`, `ffmpeg_dpb_at_poc.py`, `fix_stale_tracing_features.py`.
+
+Total FRext CABAC: **16/20 BITEXACT**. Remaining: 4 PAFF interlaced.
 
 ## CABAC 8x8 + Per-Plane Chroma QP Fix (2026-03-24)
 
@@ -17,8 +27,7 @@ Two bugs fixed:
 1. **CABAC CBF skip for cat=5** — For 8x8 luma blocks (cat=5) in non-chroma-4:4:4, there is NO coded_block_flag in the bitstream. We were reading a phantom CBF bin, desyncing the CABAC engine. Fix: skip CBF for cat=5 (FFmpeg h264_cabac.c:1859). Impact: 0/20 → 14/20 FRext CABAC BITEXACT.
 2. **Per-plane chroma QP** — `second_chroma_qp_index_offset` (PPS) gives a separate QP offset for Cr. We used offset[0] for both Cb and Cr. Fix: compute `chroma_qp: [u8; 2]` per-plane. Impact: +1 BITEXACT (HPCAQ2LQ_BRCM_B).
 
-Total FRext CABAC: **15/20 BITEXACT**. Remaining: 4 PAFF interlaced + 1 MMCO4 (59/60).
-Precommit expanded from 40 → 55 files.
+Total FRext CABAC: **15/20 BITEXACT** at time of fix. Precommit expanded from 40 → 55 files.
 
 ## High Profile 8x8 Transform (2026-03-23)
 

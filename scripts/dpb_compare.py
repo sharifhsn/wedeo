@@ -72,7 +72,7 @@ class DpbState:
 
 def extract_wedeo_dpb(input_path: str, max_frames: int = 0) -> list[DpbState]:
     """Extract per-frame DPB state from wedeo via tracing."""
-    wedeo_bin = find_wedeo_binary(prefer_debug=True, features=["tracing"])
+    wedeo_bin = find_wedeo_binary(prefer_debug=True)
     full_env = {
         **os.environ,
         "RUST_LOG": "wedeo_codec_h264::decoder=debug,wedeo_codec_h264::refs=debug",
