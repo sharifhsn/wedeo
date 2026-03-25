@@ -8,7 +8,7 @@ See `CLAUDE.md` and `H264.md` for detailed status.
 - H.264 CABAC: 27/27 progressive conformance files BITEXACT (100%)
 - H.264 FRext CAVLC: **5/7 BITEXACT** (2 out-of-scope: PAFF)
 - H.264 FRext CABAC: **18/22 BITEXACT** (4 PAFF out-of-scope)
-- H.264 MBAFF: frame-mode decode loops implemented (CABAC+CAVLC), 9 files produce frames, BITEXACT pending
+- H.264 MBAFF: deblocking infrastructure complete (Phases 1-7), field/frame pixel addressing, mixed-interlace edge handling. 0/16 BITEXACT yet — remaining diffs from deblock behavior + inter prediction gaps.
 - Precommit total: **102 passing, 0 regressed**
 - WAV/PCM pipeline: byte-identical to FFmpeg 8.0.1 across all FATE suite samples
 - Audio via symphonia: 28 decoders, 10 demuxers, SNR-verified lossy codecs
@@ -45,9 +45,26 @@ New scripts:
 - `audit_conformance_snapshots.py` — detect false positives in conformance snapshots
 - `mbaff_cabac_compare.py` — binary search CABAC desync location via lldb + trace comparison
 
+## MBAFF Deblocking Infrastructure (2026-03-25)
+
+Implemented Phases 1-7 of the MBAFF deblocking plan:
+- `mb_field: bool` in `MbDeblockInfo` — populated from decode context
+- `mvy_limit` (2 for field, 4 for frame) threaded through check_mv/compute_bs
+- Field-mode pixel addressing: `deblock_luma_offset`/`deblock_chroma_offset` (doubled stride + field Y offset)
+- bS=3 for horizontal interlaced intra MB boundary edges (not vertical — vertical always bS=4 in MBAFF)
+- Field-aware above-neighbor: `mb_idx - 2*mb_width` for field MBs (same field of pair above)
+- Mixed-interlace first vertical edge: 8 bS values, MBAFF filter (2px/bS luma, 1px/bS chroma)
+- Mixed-interlace horizontal edge 0: doubled stride, per-field bS/QP
+- CAVLC field scan table selection: `FIELD_SCAN_4X4` for field-mode MBs
+
+102/102 progressive tests remain BITEXACT. CAMA1_Sony_C (MBAFF, mixed field/frame) still DIFF —
+remaining diffs come from frame-mode pair deblocking behavior differences (possibly backup_mb_border).
+
+New script: `mbaff_field_map.py` — shows per-MB field/frame mode grid for MBAFF files.
+
 ## Deferred Automation
 
-- MBAFF field stride interleaving for pixel reconstruction (field-coded pairs need doubled stride)
+- Deblock trace comparison script (compare MB_DEBLOCK sums between wedeo and FFmpeg)
 
 ## Conformance Expansion + PPS/Reorder Fixes (2026-03-25)
 
