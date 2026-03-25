@@ -385,6 +385,7 @@ fn store_deblock_info(
         transform_8x8: ctx.transform_8x8[mb_idx],
         cbp,
         is_cabac,
+        mb_field: ctx.mb_field,
     };
 }
 
@@ -726,6 +727,7 @@ pub fn decode_macroblock(
         slice_hdr.num_ref_idx_l1_active,
         ctx.direct_8x8_inference_flag,
         ctx.decode_chroma,
+        ctx.mb_field,
     )?;
 
     // 2. Apply entropy-agnostic processing

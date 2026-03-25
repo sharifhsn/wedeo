@@ -136,6 +136,9 @@ pub struct MbDeblockInfo {
     /// True if this MB was decoded with CABAC entropy coding.
     /// FFmpeg gates the 8x8 NNZ override on `!CABAC` (h264_slice.c:2396).
     pub is_cabac: bool,
+    /// True if this MB was decoded in field mode (MBAFF).
+    /// Controls mvy_limit (2 vs 4), pixel stride doubling, and bS for interlaced edges.
+    pub mb_field: bool,
 }
 
 impl Default for MbDeblockInfo {
@@ -152,6 +155,7 @@ impl Default for MbDeblockInfo {
             transform_8x8: false,
             cbp: 0,
             is_cabac: false,
+            mb_field: false,
         }
     }
 }
@@ -255,18 +259,21 @@ fn check_mv(
     p_mv_l1: [i16; 2],
     q_mv_l1: [i16; 2],
     list_count: u8,
+    mvy_limit: u16,
 ) -> bool {
     // Step 1: Check L0 ref and MV (same for P and B slices)
+    // X threshold is always 4 (FFmpeg: `+ 3 >= 7U`); Y threshold is mvy_limit
+    // (2 for field MBs, 4 for frame MBs — FFmpeg h264_loopfilter.c:723).
     let mut v = p_ref != q_ref
         || (p_mv[0] - q_mv[0]).unsigned_abs() >= 4
-        || (p_mv[1] - q_mv[1]).unsigned_abs() >= 4;
+        || (p_mv[1] - q_mv[1]).unsigned_abs() >= mvy_limit;
 
     if list_count == 2 {
         // Step 2: If L0 passed (v==false), also check L1
         if !v {
             v = p_ref_l1 != q_ref_l1
                 || (p_mv_l1[0] - q_mv_l1[0]).unsigned_abs() >= 4
-                || (p_mv_l1[1] - q_mv_l1[1]).unsigned_abs() >= 4;
+                || (p_mv_l1[1] - q_mv_l1[1]).unsigned_abs() >= mvy_limit;
         }
         // Step 3: If either same-list check failed, try cross-list permutation.
         // Blocks might use opposite lists with the same prediction.
@@ -275,9 +282,9 @@ fn check_mv(
                 return true;
             }
             return (p_mv[0] - q_mv_l1[0]).unsigned_abs() >= 4
-                || (p_mv[1] - q_mv_l1[1]).unsigned_abs() >= 4
+                || (p_mv[1] - q_mv_l1[1]).unsigned_abs() >= mvy_limit
                 || (p_mv_l1[0] - q_mv[0]).unsigned_abs() >= 4
-                || (p_mv_l1[1] - q_mv[1]).unsigned_abs() >= 4;
+                || (p_mv_l1[1] - q_mv[1]).unsigned_abs() >= mvy_limit;
         }
     }
 
@@ -308,13 +315,21 @@ pub fn compute_bs(
     p_mv_l1: [i16; 2],
     q_mv_l1: [i16; 2],
     list_count: u8,
+    mvy_limit: u16,
+    is_interlaced_edge: bool,
 ) -> u8 {
     if p_intra || q_intra {
-        if is_mb_edge { 4 } else { 3 }
+        // FFmpeg h264_loopfilter.c:547-552: bS=3 when IS_INTERLACED(mb_type|mbm_type)
+        // for MB boundary edges; internal intra edges are always bS=3.
+        if is_mb_edge && !is_interlaced_edge {
+            4
+        } else {
+            3
+        }
     } else if p_nnz != 0 || q_nnz != 0 {
         2
     } else if check_mv(
-        p_ref, q_ref, p_mv, q_mv, p_ref_l1, q_ref_l1, p_mv_l1, q_mv_l1, list_count,
+        p_ref, q_ref, p_mv, q_mv, p_ref_l1, q_ref_l1, p_mv_l1, q_mv_l1, list_count, mvy_limit,
     ) {
         1
     } else {
@@ -505,12 +520,14 @@ fn filter_strong_chroma(
 /// `is_vertical`: true = vertical edge (filter across columns), false = horizontal (filter across rows).
 /// `edge`: 0 = MB boundary, 1..3 = internal edges.
 /// `bs`: boundary strength for each of the 4 pixel pairs along the edge.
+/// `mb_base_offset`: pre-computed byte offset of the MB's top-left pixel in the Y plane.
+/// `stride`: row stride (doubled for field-mode MBs in MBAFF).
 #[allow(clippy::too_many_arguments)] // edge filtering requires position, bS, QP, and offsets
 fn filter_mb_edge_luma(
     is_vertical: bool,
-    pic: &mut PictureBuffer,
-    mb_x: u32,
-    mb_y: u32,
+    plane: &mut [u8],
+    stride: usize,
+    mb_base_offset: usize,
     edge: usize,
     bs: [u8; 4],
     qp: u8,
@@ -522,13 +539,14 @@ fn filter_mb_edge_luma(
         return;
     }
 
-    let stride = pic.y_stride;
-    // For vertical edges the fixed coordinate is x; for horizontal it is y.
-    let (x_base, y_base) = if is_vertical {
-        (mb_x as usize * 16 + edge * 4, mb_y as usize * 16)
+    // For vertical edges: fixed x = edge*4, varying y.
+    // For horizontal edges: fixed y = edge*4, varying x.
+    let edge_pixel_offset = if is_vertical {
+        edge * 4 // x offset within MB
     } else {
-        (mb_x as usize * 16, mb_y as usize * 16 + edge * 4)
+        edge * 4 * stride // y offset within MB
     };
+    let base = mb_base_offset + edge_pixel_offset;
 
     for i in 0..4u8 {
         let cur_bs = bs[i as usize];
@@ -539,43 +557,43 @@ fn filter_mb_edge_luma(
         for d in 0..4usize {
             // Walk along the edge: for vertical, y varies; for horizontal, x varies.
             let off = if is_vertical {
-                (y_base + i as usize * 4 + d) * stride + x_base
+                base + (i as usize * 4 + d) * stride
             } else {
-                y_base * stride + x_base + i as usize * 4 + d
+                base + i as usize * 4 + d
             };
 
             // Step size across the edge boundary.
             let step = if is_vertical { 1 } else { stride };
 
-            let p0 = pic.y[off - step] as i32;
-            let p1 = pic.y[off - 2 * step] as i32;
-            let p2 = pic.y[off - 3 * step] as i32;
-            let q0 = pic.y[off] as i32;
-            let q1 = pic.y[off + step] as i32;
-            let q2 = pic.y[off + 2 * step] as i32;
+            let p0 = plane[off - step] as i32;
+            let p1 = plane[off - 2 * step] as i32;
+            let p2 = plane[off - 3 * step] as i32;
+            let q0 = plane[off] as i32;
+            let q1 = plane[off + step] as i32;
+            let q2 = plane[off + 2 * step] as i32;
 
             if cur_bs < 4 {
                 let tc0 = get_tc0(qp, alpha_offset, cur_bs);
                 if let Some((new_p0, new_p1, new_q0, new_q1)) =
                     filter_normal_luma(p0, p1, p2, q0, q1, q2, alpha, beta, tc0)
                 {
-                    pic.y[off - step] = new_p0;
-                    pic.y[off - 2 * step] = new_p1;
-                    pic.y[off] = new_q0;
-                    pic.y[off + step] = new_q1;
+                    plane[off - step] = new_p0;
+                    plane[off - 2 * step] = new_p1;
+                    plane[off] = new_q0;
+                    plane[off + step] = new_q1;
                 }
             } else {
-                let p3 = pic.y[off - 4 * step] as i32;
-                let q3 = pic.y[off + 3 * step] as i32;
+                let p3 = plane[off - 4 * step] as i32;
+                let q3 = plane[off + 3 * step] as i32;
                 if let Some((new_p0, new_p1, new_p2, new_q0, new_q1, new_q2)) =
                     filter_strong_luma(p0, p1, p2, p3, q0, q1, q2, q3, alpha, beta)
                 {
-                    pic.y[off - step] = new_p0;
-                    pic.y[off - 2 * step] = new_p1;
-                    pic.y[off - 3 * step] = new_p2;
-                    pic.y[off] = new_q0;
-                    pic.y[off + step] = new_q1;
-                    pic.y[off + 2 * step] = new_q2;
+                    plane[off - step] = new_p0;
+                    plane[off - 2 * step] = new_p1;
+                    plane[off - 3 * step] = new_p2;
+                    plane[off] = new_q0;
+                    plane[off + step] = new_q1;
+                    plane[off + 2 * step] = new_q2;
                 }
             }
         }
@@ -592,13 +610,14 @@ fn filter_mb_edge_luma(
 /// (0 = MB boundary, 1 = internal). Each edge spans 4 pixel pairs
 /// (2 sub-blocks of 2 pixels each).
 /// `is_vertical`: true = vertical edge (step=1), false = horizontal (step=stride).
+/// `mb_base_offset`: pre-computed byte offset of the MB's top-left chroma pixel.
+/// `stride`: row stride (doubled for field-mode MBs in MBAFF).
 #[allow(clippy::too_many_arguments)] // edge filtering requires plane, stride, position, bS, QP, and offsets
 fn filter_mb_edge_chroma(
     is_vertical: bool,
     plane: &mut [u8],
     stride: usize,
-    mb_x: u32,
-    mb_y: u32,
+    mb_base_offset: usize,
     edge: usize,
     bs: [u8; 4],
     qp: u8,
@@ -610,11 +629,12 @@ fn filter_mb_edge_chroma(
         return;
     }
 
-    let (x_base, y_base) = if is_vertical {
-        (mb_x as usize * 8 + edge * 4, mb_y as usize * 8)
+    let edge_pixel_offset = if is_vertical {
+        edge * 4
     } else {
-        (mb_x as usize * 8, mb_y as usize * 8 + edge * 4)
+        edge * 4 * stride
     };
+    let base = mb_base_offset + edge_pixel_offset;
     let step = if is_vertical { 1 } else { stride };
 
     for i in 0..4u8 {
@@ -626,9 +646,9 @@ fn filter_mb_edge_chroma(
         for d in 0..2usize {
             // Walk along the edge: for vertical, y varies; for horizontal, x varies.
             let off = if is_vertical {
-                (y_base + i as usize * 2 + d) * stride + x_base
+                base + (i as usize * 2 + d) * stride
             } else {
-                y_base * stride + x_base + i as usize * 2 + d
+                base + i as usize * 2 + d
             };
 
             let p0 = plane[off - step] as i32;
@@ -699,6 +719,18 @@ fn compute_luma_bs(
     // This matches FFmpeg's check_mv which uses sl->list_count (current slice).
     let list_count = cur.list_count;
 
+    // FFmpeg h264_loopfilter.c:723: mvy_limit = IS_INTERLACED(mb_type) ? 2 : 4
+    let mvy_limit: u16 = if cur.mb_field { 2 } else { 4 };
+
+    // For field MBs in MBAFF, the above neighbor is 2*mb_width away (same field
+    // of the pair above), not 1*mb_width (other field of same pair).
+    // FFmpeg: top_xy = mb_xy - (mb_stride << MB_FIELD(sl))
+    let above_stride = if cur.mb_field {
+        2 * mb_width as usize
+    } else {
+        mb_width as usize
+    };
+
     // When 8x8 transform: skip internal 4-pixel edges (edges 1 and 3).
     // Only edge 0 (MB boundary) and edge 2 (8-pixel boundary) are filtered.
     let cur_t8x8 = cur.transform_8x8;
@@ -712,7 +744,8 @@ fn compute_luma_bs(
 
         // For edge 0, the P block is in the neighboring macroblock.
         // Skip if there is no such neighbor.
-        if is_mb_edge && (if is_vertical { mb_x == 0 } else { mb_y == 0 }) {
+        let has_above = if cur.mb_field { mb_y >= 2 } else { mb_y > 0 };
+        if is_mb_edge && (if is_vertical { mb_x == 0 } else { !has_above }) {
             continue;
         }
 
@@ -747,8 +780,9 @@ fn compute_luma_bs(
                         left.mv_l1[p_idx],
                     )
                 } else {
-                    // P is in the above macroblock, bottom row
-                    let above = &mb_info[mb_idx - mb_width as usize];
+                    // P is in the above macroblock, bottom row.
+                    // For field MBs: above = same field of pair above (2*mb_width away).
+                    let above = &mb_info[mb_idx - above_stride];
                     let p_idx = luma_block_idx(q_bx, 3);
                     (
                         above.is_intra,
@@ -775,9 +809,34 @@ fn compute_luma_bs(
                 )
             };
 
+            // FFmpeg h264_loopfilter.c:547-552: intra MB boundary bS=3 when
+            // IS_INTERLACED(mb_type|mbm_type) AND NOT (FRAME_MBAFF && dir==0).
+            // In MBAFF: vertical (dir=0) edges always get bS=4; horizontal (dir=1)
+            // edges get bS=3 when either MB is interlaced.
+            let is_interlaced_edge = if is_mb_edge && !is_vertical {
+                let neighbor_field = mb_info[mb_idx - above_stride].mb_field;
+                cur.mb_field || neighbor_field
+            } else {
+                false
+            };
+
             *bs_val = compute_bs(
-                is_mb_edge, p_intra, q_intra, p_nnz, q_nnz, p_ref, q_ref, p_mv, q_mv, p_ref_l1,
-                q_ref_l1, p_mv_l1, q_mv_l1, list_count,
+                is_mb_edge,
+                p_intra,
+                q_intra,
+                p_nnz,
+                q_nnz,
+                p_ref,
+                q_ref,
+                p_mv,
+                q_mv,
+                p_ref_l1,
+                q_ref_l1,
+                p_mv_l1,
+                q_mv_l1,
+                list_count,
+                mvy_limit,
+                is_interlaced_edge,
             );
         }
     }
@@ -808,6 +867,552 @@ fn derive_chroma_bs(luma_bs: &[[u8; 4]; 4]) -> [[u8; 4]; 2] {
     [luma_bs[0], luma_bs[2]]
 }
 
+// ---------------------------------------------------------------------------
+// MBAFF mixed-interlace first vertical edge filter
+// ---------------------------------------------------------------------------
+
+/// Filter 8 pixels on the first vertical edge when adjacent pairs have different
+/// interlace modes (one field, one frame). This is the MBAFF special case from
+/// FFmpeg h264_loopfilter.c:730-832.
+///
+/// `pix_offset`: byte offset of the leftmost Q pixel (column 0 of current MB).
+/// `stride`: row stride for the pixel walk.
+/// `bs`: 4 boundary strengths for this half-edge.
+/// `inner_iters`: 2 for luma, 1 for chroma.
+#[allow(clippy::too_many_arguments)]
+fn filter_mbaff_edge_luma(
+    plane: &mut [u8],
+    pix_offset: usize,
+    stride: usize,
+    bs: &[u8],
+    qp: u8,
+    alpha_offset: i32,
+    beta_offset: i32,
+) {
+    let (alpha, beta) = get_thresholds(qp, alpha_offset, beta_offset);
+    if alpha == 0 || beta == 0 {
+        return;
+    }
+
+    // MBAFF luma: 4 bS groups × 2 pixels each = 8 pixels
+    let mut off = pix_offset;
+    for &cur_bs in bs.iter() {
+        for _d in 0..2usize {
+            if cur_bs == 0 {
+                off += stride;
+                continue;
+            }
+            let p0 = plane[off - 1] as i32;
+            let p1 = plane[off - 2] as i32;
+            let p2 = plane[off - 3] as i32;
+            let q0 = plane[off] as i32;
+            let q1 = plane[off + 1] as i32;
+            let q2 = plane[off + 2] as i32;
+
+            if cur_bs < 4 {
+                let tc0 = get_tc0(qp, alpha_offset, cur_bs);
+                if let Some((new_p0, new_p1, new_q0, new_q1)) =
+                    filter_normal_luma(p0, p1, p2, q0, q1, q2, alpha, beta, tc0)
+                {
+                    plane[off - 1] = new_p0;
+                    plane[off - 2] = new_p1;
+                    plane[off] = new_q0;
+                    plane[off + 1] = new_q1;
+                }
+            } else {
+                let p3 = plane[off - 4] as i32;
+                let q3 = plane[off + 3] as i32;
+                if let Some((new_p0, new_p1, new_p2, new_q0, new_q1, new_q2)) =
+                    filter_strong_luma(p0, p1, p2, p3, q0, q1, q2, q3, alpha, beta)
+                {
+                    plane[off - 1] = new_p0;
+                    plane[off - 2] = new_p1;
+                    plane[off - 3] = new_p2;
+                    plane[off] = new_q0;
+                    plane[off + 1] = new_q1;
+                    plane[off + 2] = new_q2;
+                }
+            }
+            off += stride;
+        }
+    }
+}
+
+/// MBAFF chroma edge filter (1 pixel per bS group × 4 groups = 4 pixels per call).
+#[allow(clippy::too_many_arguments)]
+fn filter_mbaff_edge_chroma(
+    plane: &mut [u8],
+    pix_offset: usize,
+    stride: usize,
+    bs: &[u8],
+    qp: u8,
+    alpha_offset: i32,
+    beta_offset: i32,
+) {
+    let (alpha, beta) = get_thresholds(qp, alpha_offset, beta_offset);
+    if alpha == 0 || beta == 0 {
+        return;
+    }
+
+    // MBAFF chroma: 4 bS groups × 1 pixel each = 4 pixels
+    let mut off = pix_offset;
+    for &cur_bs in bs.iter() {
+        if cur_bs == 0 {
+            off += stride;
+            continue;
+        }
+        let p0 = plane[off - 1] as i32;
+        let p1 = plane[off - 2] as i32;
+        let q0 = plane[off] as i32;
+        let q1 = plane[off + 1] as i32;
+
+        if cur_bs < 4 {
+            let tc = get_tc0(qp, alpha_offset, cur_bs) + 1;
+            if let Some((new_p0, new_q0)) = filter_normal_chroma(p0, p1, q0, q1, alpha, beta, tc) {
+                plane[off - 1] = new_p0;
+                plane[off] = new_q0;
+            }
+        } else if let Some((new_p0, new_q0)) = filter_strong_chroma(p0, p1, q0, q1, alpha, beta) {
+            plane[off - 1] = new_p0;
+            plane[off] = new_q0;
+        }
+        off += stride;
+    }
+}
+
+/// Compute 8 bS values for the mixed-interlace first vertical edge.
+///
+/// Returns `[bS0..bS7]` — 8 boundary strengths mapping 8 pixel-pair positions
+/// along the 16-pixel edge. The mapping depends on field/frame mode of current MB.
+///
+/// FFmpeg ref: h264_loopfilter.c:746-774
+fn compute_mbaff_vert_bs(
+    mb_info: &[MbDeblockInfo],
+    mb_idx: usize,
+    mb_y: u32,
+    mb_width: u32,
+    cur_mb_field: bool,
+) -> [u8; 8] {
+    let cur = &mb_info[mb_idx];
+    let mut bs = [0u8; 8];
+
+    if cur.is_intra {
+        // All intra: bS = 4 for all 8 positions
+        bs = [4; 8];
+        return bs;
+    }
+
+    // Offset table: maps pixel position i to the neighbor sub-block row.
+    // offset[MB_FIELD][mb_y&1][i] gives the left neighbor's NNZ block index (row within MB).
+    // FFmpeg h264_loopfilter.c:750-757
+    //
+    // When current is field (MB_FIELD=1):
+    //   row 0: offsets into left_top  (rows 0,1,2,3,0,1,2,3)
+    //   row 1: offsets into left_top  (rows 0,1,2,3,0,1,2,3)
+    // When current is frame (MB_FIELD=0):
+    //   row 0: offsets into left_top  (rows 0,0,0,0,1,1,1,1)
+    //   row 1: offsets into left_top  (rows 2,2,2,2,3,3,3,3)
+
+    // The neighbor 4x4 block row for each of the 8 bS positions
+    let neighbor_block_row: [usize; 8] = if cur_mb_field {
+        [0, 1, 2, 3, 0, 1, 2, 3]
+    } else if mb_y & 1 == 0 {
+        [0, 0, 0, 0, 1, 1, 1, 1]
+    } else {
+        [2, 2, 2, 2, 3, 3, 3, 3]
+    };
+
+    // j selects which neighbor MB (top=0 or bottom=1 of the left pair)
+    // FFmpeg: j = MB_FIELD ? i>>2 : i&1
+    for i in 0..8usize {
+        let j = if cur_mb_field { i >> 2 } else { i & 1 };
+
+        // Left neighbor MB: top (j=0) or bottom (j=1) of the left pair
+        let left_mb_idx = if j == 0 {
+            // Top of left pair: (mb_y & !1) * mb_width + (mb_x - 1)
+            ((mb_y & !1) * mb_width + (mb_idx as u32 % mb_width) - 1) as usize
+        } else {
+            // Bottom of left pair: (mb_y | 1) * mb_width + (mb_x - 1)
+            ((mb_y | 1) * mb_width + (mb_idx as u32 % mb_width) - 1) as usize
+        };
+
+        let left = &mb_info[left_mb_idx];
+
+        if left.is_intra {
+            bs[i] = 4;
+            continue;
+        }
+
+        // Current side NNZ: leftmost column (block_x=0), row = i>>1 in 4x4 units
+        let cur_block_row = i >> 1;
+        let cur_nnz = deblock_nnz(cur, luma_block_idx(0, cur_block_row));
+
+        // Neighbor side NNZ: rightmost column (block_x=3), row from offset table
+        let nbr_row = neighbor_block_row[i];
+        let nbr_nnz = deblock_nnz(left, luma_block_idx(3, nbr_row));
+
+        if cur_nnz != 0 || nbr_nnz != 0 {
+            bs[i] = 2;
+        } else {
+            // MV check — use NNZ-based bS=1 minimum, skip MV check for simplicity
+            // The MV check is complex for mixed-mode and rarely matters vs NNZ.
+            // Use bS=1 conservatively for non-zero MV difference.
+            let cur_blk = luma_block_idx(0, cur_block_row);
+            let nbr_blk = luma_block_idx(3, nbr_row);
+            let mvy_limit: u16 = if cur.mb_field { 2 } else { 4 };
+            if check_mv(
+                cur.ref_poc[cur_blk],
+                left.ref_poc[nbr_blk],
+                cur.mv[cur_blk],
+                left.mv[nbr_blk],
+                cur.ref_poc_l1[cur_blk],
+                left.ref_poc_l1[nbr_blk],
+                cur.mv_l1[cur_blk],
+                left.mv_l1[nbr_blk],
+                cur.list_count,
+                mvy_limit,
+            ) {
+                bs[i] = 1;
+            }
+        }
+    }
+
+    bs
+}
+
+/// Apply the MBAFF mixed-interlace first vertical edge filter for a macroblock.
+///
+/// When the current pair and left pair have different interlace modes,
+/// the first vertical edge uses 8 bS values, 2 QPs, and the MBAFF filter
+/// (2 pixels per bS for luma, 1 pixel per bS for chroma).
+///
+/// Returns true if the edge was handled (caller should skip normal edge 0).
+#[allow(clippy::too_many_arguments)]
+fn deblock_mbaff_first_vert_edge(
+    pic: &mut PictureBuffer,
+    mb_info: &[MbDeblockInfo],
+    mb_x: u32,
+    mb_y: u32,
+    mb_width: u32,
+    alpha_c0_offset: i32,
+    beta_offset: i32,
+    chroma_qp_index_offset: [i32; 2],
+) -> bool {
+    let mb_idx = (mb_y * mb_width + mb_x) as usize;
+    let cur = &mb_info[mb_idx];
+
+    // Only applies when current and left pairs have different interlace modes
+    if mb_x == 0 {
+        return false;
+    }
+    let left_top_idx = ((mb_y & !1) * mb_width + mb_x - 1) as usize;
+    let left_bot_idx = ((mb_y | 1) * mb_width + mb_x - 1) as usize;
+
+    // Check if left pair has a different interlace mode
+    // (use top-of-left-pair's field flag as representative of the pair)
+    let left_field = mb_info[left_top_idx].mb_field;
+    if !(cur.mb_field ^ left_field) {
+        return false; // Same interlace mode, no special handling needed
+    }
+
+    // Compute 8 bS values
+    let bs8 = compute_mbaff_vert_bs(mb_info, mb_idx, mb_y, mb_width, cur.mb_field);
+
+    // Compute 2 QP values: one for each half (top and bottom of left pair)
+    let mb_qp = cur.qp;
+    let left_top_qp = mb_info[left_top_idx].qp;
+    let left_bot_qp = mb_info[left_bot_idx].qp;
+    let qp0 = avg_qp(mb_qp, left_top_qp);
+    let qp1 = avg_qp(mb_qp, left_bot_qp);
+
+    // Compute the base pixel offset for this MB's top-left in the frame buffer.
+    // For MBAFF, img_y points to the MB's first pixel including field offset.
+    let frame_y_stride = pic.y_stride;
+    let frame_uv_stride = pic.uv_stride;
+
+    // The pixel base is always at the pair's position using the current MB's
+    // field-aware addressing.
+    let (luma_base, luma_stride) = deblock_luma_offset(frame_y_stride, mb_x, mb_y, cur.mb_field);
+    let (chroma_base_u, chroma_stride) =
+        deblock_chroma_offset(frame_uv_stride, mb_x, mb_y, cur.mb_field);
+    let (chroma_base_v, _) = deblock_chroma_offset(frame_uv_stride, mb_x, mb_y, cur.mb_field);
+
+    // --- Luma ---
+    // FFmpeg h264_loopfilter.c:794-831
+    // Field mode: bsi=1, two 8-row strips → bS[0..3] and bS[4..7]
+    // Frame mode: bsi=2, even/odd rows → bS[0,2,4,6] and bS[1,3,5,7]
+    let (bs_half0, bs_half1): ([u8; 4], [u8; 4]) = if cur.mb_field {
+        (
+            [bs8[0], bs8[1], bs8[2], bs8[3]],
+            [bs8[4], bs8[5], bs8[6], bs8[7]],
+        )
+    } else {
+        (
+            [bs8[0], bs8[2], bs8[4], bs8[6]],
+            [bs8[1], bs8[3], bs8[5], bs8[7]],
+        )
+    };
+
+    if cur.mb_field {
+        // Current is field: two 8-row strips with field stride.
+        filter_mbaff_edge_luma(
+            &mut pic.y,
+            luma_base,
+            luma_stride,
+            &bs_half0,
+            qp0,
+            alpha_c0_offset,
+            beta_offset,
+        );
+        filter_mbaff_edge_luma(
+            &mut pic.y,
+            luma_base + 8 * luma_stride,
+            luma_stride,
+            &bs_half1,
+            qp1,
+            alpha_c0_offset,
+            beta_offset,
+        );
+    } else {
+        // Current is frame: even/odd rows interleaved with 2x stride.
+        let double_stride = 2 * luma_stride;
+        filter_mbaff_edge_luma(
+            &mut pic.y,
+            luma_base,
+            double_stride,
+            &bs_half0,
+            qp0,
+            alpha_c0_offset,
+            beta_offset,
+        );
+        filter_mbaff_edge_luma(
+            &mut pic.y,
+            luma_base + luma_stride,
+            double_stride,
+            &bs_half1,
+            qp1,
+            alpha_c0_offset,
+            beta_offset,
+        );
+    }
+
+    // --- Chroma (4:2:0) ---
+    for (comp, &offset) in chroma_qp_index_offset.iter().enumerate() {
+        let chroma_qp_cur = chroma_qp(mb_qp, offset);
+        let cqp0 = avg_qp(chroma_qp_cur, chroma_qp(left_top_qp, offset));
+        let cqp1 = avg_qp(chroma_qp_cur, chroma_qp(left_bot_qp, offset));
+
+        let (plane, base) = if comp == 0 {
+            (&mut pic.u, chroma_base_u)
+        } else {
+            (&mut pic.v, chroma_base_v)
+        };
+
+        if cur.mb_field {
+            filter_mbaff_edge_chroma(
+                plane,
+                base,
+                chroma_stride,
+                &bs_half0,
+                cqp0,
+                alpha_c0_offset,
+                beta_offset,
+            );
+            filter_mbaff_edge_chroma(
+                plane,
+                base + 4 * chroma_stride,
+                chroma_stride,
+                &bs_half1,
+                cqp1,
+                alpha_c0_offset,
+                beta_offset,
+            );
+        } else {
+            let double_stride = 2 * chroma_stride;
+            filter_mbaff_edge_chroma(
+                plane,
+                base,
+                double_stride,
+                &bs_half0,
+                cqp0,
+                alpha_c0_offset,
+                beta_offset,
+            );
+            filter_mbaff_edge_chroma(
+                plane,
+                base + chroma_stride,
+                double_stride,
+                &bs_half1,
+                cqp1,
+                alpha_c0_offset,
+                beta_offset,
+            );
+        }
+    }
+
+    true
+}
+
+/// Handle the MBAFF mixed-mode horizontal edge 0 special case.
+///
+/// Applies when: MBAFF, horizontal edge (dir=1), top of pair (mb_y & 1 == 0),
+/// and the pair above is interlaced while the current is NOT interlaced.
+/// FFmpeg h264_loopfilter.c:494-542.
+///
+/// The filter runs twice (once per field) with doubled stride, using separate
+/// bS and QP for each field pass.
+///
+/// Returns true if the edge was handled.
+#[allow(clippy::too_many_arguments)]
+fn deblock_mbaff_horiz_edge0(
+    pic: &mut PictureBuffer,
+    mb_info: &[MbDeblockInfo],
+    mb_x: u32,
+    mb_y: u32,
+    mb_width: u32,
+    alpha_c0_offset: i32,
+    beta_offset: i32,
+    chroma_qp_index_offset: [i32; 2],
+) -> bool {
+    // Only applies at top of pair when above pair is field and current is frame
+    if mb_y & 1 != 0 || mb_y < 2 {
+        return false;
+    }
+    let mb_idx = (mb_y * mb_width + mb_x) as usize;
+    let cur = &mb_info[mb_idx];
+    if cur.mb_field {
+        return false; // Current must be frame-mode for this special case
+    }
+
+    // Above pair: top at mb_y-2, bottom at mb_y-1
+    let above_top_idx = ((mb_y - 2) * mb_width + mb_x) as usize;
+    let above_bot_idx = ((mb_y - 1) * mb_width + mb_x) as usize;
+
+    // The above pair must be interlaced (field-mode)
+    if !mb_info[above_top_idx].mb_field {
+        return false;
+    }
+
+    let frame_y_stride = pic.y_stride;
+    let frame_uv_stride = pic.uv_stride;
+    let (luma_base, luma_stride) = deblock_luma_offset(frame_y_stride, mb_x, mb_y, cur.mb_field);
+    let (chroma_base_u, chroma_stride) =
+        deblock_chroma_offset(frame_uv_stride, mb_x, mb_y, cur.mb_field);
+    let (chroma_base_v, _) = deblock_chroma_offset(frame_uv_stride, mb_x, mb_y, cur.mb_field);
+
+    let double_luma_stride = 2 * luma_stride;
+    let double_chroma_stride = 2 * chroma_stride;
+
+    // Two passes: j=0 for even field (top of above pair), j=1 for odd field (bottom)
+    for j in 0..2usize {
+        let above_idx = if j == 0 { above_top_idx } else { above_bot_idx };
+        let above = &mb_info[above_idx];
+
+        // Compute bS for this field pass
+        let mut bs = [0u8; 4];
+        if cur.is_intra || above.is_intra {
+            bs = [3; 4]; // bS=3 for interlaced intra edges
+        } else {
+            for (i, bs_val) in bs.iter_mut().enumerate() {
+                // Current: top row, block column i
+                let cur_nnz = deblock_nnz(cur, luma_block_idx(i, 0));
+                // Above: bottom row (row 3), block column i
+                let above_nnz = deblock_nnz(above, luma_block_idx(i, 3));
+                if cur_nnz != 0 || above_nnz != 0 {
+                    *bs_val = 2;
+                } else {
+                    let cur_blk = luma_block_idx(i, 0);
+                    let above_blk = luma_block_idx(i, 3);
+                    let mvy_limit: u16 = if cur.mb_field { 2 } else { 4 };
+                    if check_mv(
+                        cur.ref_poc[cur_blk],
+                        above.ref_poc[above_blk],
+                        cur.mv[cur_blk],
+                        above.mv[above_blk],
+                        cur.ref_poc_l1[cur_blk],
+                        above.ref_poc_l1[above_blk],
+                        cur.mv_l1[cur_blk],
+                        above.mv_l1[above_blk],
+                        cur.list_count,
+                        mvy_limit,
+                    ) {
+                        *bs_val = 1;
+                    }
+                }
+            }
+        }
+
+        // QP: average of current and the above-field MB
+        let qp = avg_qp(cur.qp, above.qp);
+
+        // Luma: filter at j*single_stride offset, using doubled stride
+        filter_mb_edge_luma(
+            false, // horizontal
+            &mut pic.y,
+            double_luma_stride,
+            luma_base + j * luma_stride,
+            0,
+            bs,
+            qp,
+            alpha_c0_offset,
+            beta_offset,
+        );
+
+        // Chroma
+        for (comp, &offset) in chroma_qp_index_offset.iter().enumerate() {
+            let cqp = avg_qp(chroma_qp(cur.qp, offset), chroma_qp(above.qp, offset));
+            let (plane, base) = if comp == 0 {
+                (&mut pic.u, chroma_base_u)
+            } else {
+                (&mut pic.v, chroma_base_v)
+            };
+            filter_mb_edge_chroma(
+                false, // horizontal
+                plane,
+                double_chroma_stride,
+                base + j * chroma_stride,
+                0,
+                bs,
+                cqp,
+                alpha_c0_offset,
+                beta_offset,
+            );
+        }
+    }
+
+    true
+}
+
+/// Compute the byte offset and stride for a macroblock's luma plane.
+///
+/// For field-mode MBs (MBAFF), the stride is doubled and the bottom field
+/// (mb_y & 1 == 1) starts one frame-row below the pair's top-left corner.
+/// This matches FFmpeg h264_slice.c:2473-2484.
+#[inline]
+fn deblock_luma_offset(y_stride: usize, mb_x: u32, mb_y: u32, mb_field: bool) -> (usize, usize) {
+    let x = mb_x as usize * 16;
+    if mb_field {
+        let pair_base_y = (mb_y & !1) as usize * 16;
+        let field_offset = if mb_y & 1 == 1 { y_stride } else { 0 };
+        (pair_base_y * y_stride + field_offset + x, y_stride * 2)
+    } else {
+        (mb_y as usize * 16 * y_stride + x, y_stride)
+    }
+}
+
+/// Compute the byte offset and stride for a macroblock's chroma plane.
+#[inline]
+fn deblock_chroma_offset(uv_stride: usize, mb_x: u32, mb_y: u32, mb_field: bool) -> (usize, usize) {
+    let x = mb_x as usize * 8;
+    if mb_field {
+        let pair_base_y = (mb_y & !1) as usize * 8;
+        let field_offset = if mb_y & 1 == 1 { uv_stride } else { 0 };
+        (pair_base_y * uv_stride + field_offset + x, uv_stride * 2)
+    } else {
+        (mb_y as usize * 8 * uv_stride + x, uv_stride)
+    }
+}
+
 /// Deblock a single macroblock (all luma and chroma edges).
 fn deblock_mb(
     pic: &mut PictureBuffer,
@@ -820,6 +1425,7 @@ fn deblock_mb(
     let mb_width = pic.mb_width;
     let mb_idx = (mb_y * mb_width + mb_x) as usize;
     let cur_qp = mb_info[mb_idx].qp;
+    let cur_mb_field = mb_info[mb_idx].mb_field;
 
     // Look up this MB's slice deblock params
     let slice_id = slice_table[mb_idx] as usize;
@@ -827,6 +1433,21 @@ fn deblock_mb(
     let alpha_c0_offset = params.alpha_c0_offset;
     let beta_offset = params.beta_offset;
     let chroma_qp_index_offset = params.chroma_qp_index_offset;
+
+    // Compute field-aware pixel offsets and strides for this MB.
+    let (luma_base, luma_stride) = deblock_luma_offset(pic.y_stride, mb_x, mb_y, cur_mb_field);
+    let (chroma_base_u, chroma_stride) =
+        deblock_chroma_offset(pic.uv_stride, mb_x, mb_y, cur_mb_field);
+    let (chroma_base_v, _) = deblock_chroma_offset(pic.uv_stride, mb_x, mb_y, cur_mb_field);
+
+    // For field MBs in MBAFF, the above neighbor is 2*mb_width away (same field
+    // of pair above). For frame MBs, it's 1*mb_width (standard).
+    let above_stride = if cur_mb_field {
+        2 * mb_width as usize
+    } else {
+        mb_width as usize
+    };
+    let has_above = if cur_mb_field { mb_y >= 2 } else { mb_y > 0 };
 
     // For idc == 2, determine which neighbors are in a different slice.
     // Neighbors in different slices are treated as unavailable (bS=0 for that edge).
@@ -836,11 +1457,37 @@ fn deblock_mb(
     } else {
         mb_x > 0
     };
-    let top_available = if params.disable_deblocking_filter_idc == 2 && mb_y > 0 {
-        slice_table[mb_idx - mb_width as usize] == cur_slice
+    let top_available = if params.disable_deblocking_filter_idc == 2 && has_above {
+        slice_table[mb_idx - above_stride] == cur_slice
     } else {
-        mb_y > 0
+        has_above
     };
+
+    // MBAFF mixed-interlace horizontal edge 0: handled separately before normal edges.
+    let first_horiz_edge_done = top_available
+        && deblock_mbaff_horiz_edge0(
+            pic,
+            mb_info,
+            mb_x,
+            mb_y,
+            mb_width,
+            alpha_c0_offset,
+            beta_offset,
+            chroma_qp_index_offset,
+        );
+
+    // MBAFF mixed-interlace first vertical edge: handled separately before normal edges.
+    let first_vert_edge_done = left_available
+        && deblock_mbaff_first_vert_edge(
+            pic,
+            mb_info,
+            mb_x,
+            mb_y,
+            mb_width,
+            alpha_c0_offset,
+            beta_offset,
+            chroma_qp_index_offset,
+        );
 
     // Process vertical (is_vertical=true) then horizontal (is_vertical=false) edges.
     // Chroma uses the same bS as luma (derived by mapping the 4x4 luma grid to 4:2:0).
@@ -858,15 +1505,21 @@ fn deblock_mb(
             if bs_edge == [0, 0, 0, 0] {
                 continue;
             }
-            // Skip MB boundary edge if cross-slice (idc==2)
+            // Skip MB boundary edge if cross-slice (idc==2) or already handled by MBAFF
             if edge == 0 && skip_mb_edge {
+                continue;
+            }
+            if edge == 0 && is_vertical && first_vert_edge_done {
+                continue;
+            }
+            if edge == 0 && !is_vertical && first_horiz_edge_done {
                 continue;
             }
             let qp = if edge == 0 {
                 let neighbor_qp = if is_vertical && mb_x > 0 {
                     Some(mb_info[mb_idx - 1].qp)
-                } else if !is_vertical && mb_y > 0 {
-                    Some(mb_info[mb_idx - mb_width as usize].qp)
+                } else if !is_vertical && has_above {
+                    Some(mb_info[mb_idx - above_stride].qp)
                 } else {
                     None
                 };
@@ -876,9 +1529,9 @@ fn deblock_mb(
             };
             filter_mb_edge_luma(
                 is_vertical,
-                pic,
-                mb_x,
-                mb_y,
+                &mut pic.y,
+                luma_stride,
+                luma_base,
                 edge,
                 bs_edge,
                 qp,
@@ -894,19 +1547,24 @@ fn deblock_mb(
             if bs_edge == [0, 0, 0, 0] {
                 continue;
             }
-            // Skip MB boundary edge if cross-slice (idc==2)
+            // Skip MB boundary edge if cross-slice (idc==2) or already handled by MBAFF
             if edge == 0 && skip_mb_edge {
                 continue;
             }
+            if edge == 0 && is_vertical && first_vert_edge_done {
+                continue;
+            }
+            if edge == 0 && !is_vertical && first_horiz_edge_done {
+                continue;
+            }
 
-            let uv_stride = pic.uv_stride;
             for (comp, &offset) in chroma_qp_index_offset.iter().enumerate() {
                 let chroma_qp_cur = chroma_qp(cur_qp, offset);
                 let qp = if edge == 0 {
                     let neighbor_qp = if is_vertical && mb_x > 0 {
                         Some(chroma_qp(mb_info[mb_idx - 1].qp, offset))
-                    } else if !is_vertical && mb_y > 0 {
-                        Some(chroma_qp(mb_info[mb_idx - mb_width as usize].qp, offset))
+                    } else if !is_vertical && has_above {
+                        Some(chroma_qp(mb_info[mb_idx - above_stride].qp, offset))
                     } else {
                         None
                     };
@@ -915,13 +1573,16 @@ fn deblock_mb(
                     chroma_qp_cur
                 };
 
-                let plane = if comp == 0 { &mut pic.u } else { &mut pic.v };
+                let (plane, base) = if comp == 0 {
+                    (&mut pic.u, chroma_base_u)
+                } else {
+                    (&mut pic.v, chroma_base_v)
+                };
                 filter_mb_edge_chroma(
                     is_vertical,
                     plane,
-                    uv_stride,
-                    mb_x,
-                    mb_y,
+                    chroma_stride,
+                    base,
                     edge,
                     bs_edge,
                     qp,
@@ -981,9 +1642,14 @@ pub fn deblock_frame(
             deblock_mb(pic, mb_info, mb_x, mb_y, slice_table, slice_params);
 
             {
-                let y_sum = deblock_plane_sum(&pic.y, pic.y_stride, mb_x, mb_y, 16);
-                let u_sum = deblock_plane_sum(&pic.u, pic.uv_stride, mb_x, mb_y, 8);
-                let v_sum = deblock_plane_sum(&pic.v, pic.uv_stride, mb_x, mb_y, 8);
+                let mb_field = mb_info[mb_idx].mb_field;
+                let (y_base, y_stride) = deblock_luma_offset(pic.y_stride, mb_x, mb_y, mb_field);
+                let (u_base, uv_stride) =
+                    deblock_chroma_offset(pic.uv_stride, mb_x, mb_y, mb_field);
+                let (v_base, _) = deblock_chroma_offset(pic.uv_stride, mb_x, mb_y, mb_field);
+                let y_sum = deblock_plane_sum(&pic.y, y_base, y_stride, 16);
+                let u_sum = deblock_plane_sum(&pic.u, u_base, uv_stride, 8);
+                let v_sum = deblock_plane_sum(&pic.v, v_base, uv_stride, 8);
                 tracing::trace!(mb_x, mb_y, y_sum, u_sum, v_sum, "MB_DEBLOCK");
             }
         }
@@ -991,12 +1657,11 @@ pub fn deblock_frame(
 }
 
 /// Compute pixel sum for a macroblock region (for deblock tracing).
-fn deblock_plane_sum(plane: &[u8], stride: usize, mb_x: u32, mb_y: u32, size: u32) -> u32 {
-    let base_x = (mb_x * size) as usize;
-    let base_y = (mb_y * size) as usize;
+/// Uses pre-computed base offset and stride (field-aware for MBAFF).
+fn deblock_plane_sum(plane: &[u8], base_offset: usize, stride: usize, size: u32) -> u32 {
     let mut sum = 0u32;
     for dy in 0..size as usize {
-        let row_start = (base_y + dy) * stride + base_x;
+        let row_start = base_offset + dy * stride;
         for dx in 0..size as usize {
             sum = sum.wrapping_add(plane[row_start + dx] as u32);
         }
@@ -1088,6 +1753,8 @@ mod tests {
             [0, 0],
             [0, 0],
             1,
+            4,     // mvy_limit: frame mode default
+            false, // is_interlaced_edge: non-MBAFF default
         )
     }
 
@@ -1162,6 +1829,8 @@ mod tests {
                 [2, 0],
                 [0, 0],
                 2,
+                4,
+                false,
             ),
             0
         );
@@ -1183,6 +1852,8 @@ mod tests {
                 [1, 1],
                 [1, 1],
                 2,
+                4,
+                false,
             ),
             0
         );
@@ -1204,6 +1875,8 @@ mod tests {
                 [0, 0],
                 [0, 0],
                 2,
+                4,
+                false,
             ),
             1
         );
