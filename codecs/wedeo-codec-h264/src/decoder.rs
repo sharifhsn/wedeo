@@ -540,8 +540,8 @@ impl H264Decoder {
     #[tracing::instrument(skip_all, fields(nal_type = ?nalu.nal_type))]
     fn process_nal(&mut self, nalu: &NalUnit, _pkt_pts: i64) -> Result<()> {
         match nalu.nal_type {
-            NalUnitType::Sps => {
-                if let Ok(sps) = parse_sps(&nalu.data) {
+            NalUnitType::Sps => match parse_sps(&nalu.data) {
+                Ok(sps) => {
                     let id = sps.sps_id as usize;
                     debug!(
                         sps_id = id,
@@ -552,14 +552,20 @@ impl H264Decoder {
                     self.apply_sps(&sps);
                     self.sps_list[id] = Some(sps);
                 }
-            }
-            NalUnitType::Pps => {
-                if let Ok(pps) = parse_pps(&nalu.data, &self.sps_list) {
+                Err(e) => {
+                    warn!(error = ?e, "SPS parse failed");
+                }
+            },
+            NalUnitType::Pps => match parse_pps(&nalu.data, &self.sps_list) {
+                Ok(pps) => {
                     let id = pps.pps_id as usize;
                     debug!(pps_id = id, sps_id = pps.sps_id, "PPS parsed");
                     self.pps_list[id] = Some(pps);
                 }
-            }
+                Err(e) => {
+                    warn!(error = ?e, "PPS parse failed");
+                }
+            },
             NalUnitType::Idr | NalUnitType::Slice => {
                 // Parse slice header
                 let hdr = parse_slice_header(
@@ -922,7 +928,12 @@ impl H264Decoder {
             // buffer, preventing min-POC search from mixing frames across
             // POC sequence boundaries.
             // Reference: FFmpeg h264_slice.c:1301, 1327, 1346-1353.
-            let frame_mmco_reset = has_mmco5 || (out_of_order == 16 && !self.current_is_idr);
+            // IDR frames that arrive when the delayed_pics buffer is
+            // non-empty are barriers: they prevent the min-POC search from
+            // mixing frames across POC sequence boundaries. The first IDR
+            // (empty buffer) is not a barrier since there are no prior frames.
+            let mid_stream_idr = self.current_is_idr && !self.delayed_pics.is_empty();
+            let frame_mmco_reset = has_mmco5 || out_of_order == 16 || mid_stream_idr;
 
             // Add current frame to the delayed_pics buffer.
             // Use the original POC (not the MMCO-5 reset value) since

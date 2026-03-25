@@ -247,6 +247,27 @@ fn decode_scaling_matrices(
     Ok(())
 }
 
+/// Compute the RBSP bit length, stripping trailing zero bytes and the RBSP stop bit.
+///
+/// Matches FFmpeg's `get_bit_length` in h2645_parse.c: strips trailing zero
+/// bytes, then subtracts the stop bit (1) and its trailing alignment zeros
+/// from the last non-zero byte.
+fn rbsp_bit_length(data: &[u8]) -> usize {
+    // Strip trailing zero bytes
+    let mut size = data.len();
+    while size > 0 && data[size - 1] == 0 {
+        size -= 1;
+    }
+    if size == 0 {
+        return 0;
+    }
+    // Remove the stop bit and trailing alignment zeros from the last byte.
+    // The stop bit is the lowest set bit; trailing_padding = ctz(last_byte) + 1.
+    let last = data[size - 1];
+    let trailing_padding = last.trailing_zeros() as usize + 1;
+    (8 * size).saturating_sub(trailing_padding)
+}
+
 /// Parse a Picture Parameter Set from raw RBSP data.
 ///
 /// `data` is the PPS NAL unit payload after emulation prevention byte removal
@@ -263,7 +284,7 @@ pub fn parse_pps(data: &[u8], sps_list: &[Option<Sps>; 32]) -> Result<Pps> {
     padded.resize(data.len() + 8, 0);
     let mut br = BitReadBE::new(&padded);
 
-    let bit_length = data.len() * 8;
+    let bit_length = rbsp_bit_length(data);
 
     // pps_id
     let pps_id = get_ue_golomb(&mut br)?;
