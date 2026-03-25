@@ -1269,7 +1269,15 @@ impl H264Decoder {
 
         if is_mbaff {
             return self.decode_slice_cavlc_mbaff(
-                &mut br, rbsp_bits, hdr, sps, pps, fdc, ref_pics, ref_pics_l1, is_inter_slice,
+                &mut br,
+                rbsp_bits,
+                hdr,
+                sps,
+                pps,
+                fdc,
+                ref_pics,
+                ref_pics_l1,
+                is_inter_slice,
             );
         }
 
@@ -1535,9 +1543,7 @@ impl H264Decoder {
                 fdc.neighbor_ctx.top_available = cur_y > 0
                     && fdc.slice_table[(mb_addr - mb_width) as usize] == fdc.current_slice;
 
-                mb::decode_macroblock(
-                    fdc, br, hdr, sps, pps, mb_x, cur_y, ref_pics, ref_pics_l1,
-                )?;
+                mb::decode_macroblock(fdc, br, hdr, sps, pps, mb_x, cur_y, ref_pics, ref_pics_l1)?;
                 mbs_decoded += 1;
             }
 
@@ -1703,8 +1709,8 @@ impl H264Decoder {
                 }
 
                 // Update per-MB neighbor availability (slice-boundary aware)
-                fdc.neighbor_ctx.top_available = mb_y > 0
-                    && fdc.slice_table[(mb_addr - mb_width) as usize] == fdc.current_slice;
+                fdc.neighbor_ctx.top_available =
+                    mb_y > 0 && fdc.slice_table[(mb_addr - mb_width) as usize] == fdc.current_slice;
 
                 // Decode coded MB via CABAC
                 let mut cache = CabacDecodeCache::new();
@@ -1726,19 +1732,11 @@ impl H264Decoder {
                     &mut cache,
                     fdc.direct_8x8_inference_flag,
                     fdc.decode_chroma,
+                    false, // non-MBAFF: always frame mode
                 )?;
 
                 // Apply entropy-agnostic processing (dequant, IDCT, pred, MC, neighbor update)
-                mb::apply_macroblock(
-                    fdc,
-                    &mut mb,
-                    hdr,
-                    pps,
-                    mb_x,
-                    mb_y,
-                    ref_pics,
-                    ref_pics_l1,
-                )?;
+                mb::apply_macroblock(fdc, &mut mb, hdr, pps, mb_x, mb_y, ref_pics, ref_pics_l1)?;
 
                 // Write back MVD/ref from scan8 cache to flat storage, then update scalar fields
                 cache.write_back(&mut cabac_nb, mb_idx);
@@ -1905,12 +1903,22 @@ impl H264Decoder {
                             bot_skip_value = bot_skip;
                             if !bot_skip {
                                 // Bottom is coded: read mb_field_decoding_flag
+                                let above_pair_field = if mb_y >= 2 {
+                                    let above_idx = (mb_x + (mb_y - 2) * mb_width) as usize;
+                                    if fdc.slice_table[above_idx] == fdc.current_slice {
+                                        cabac_nb.mb_field_flag[above_idx]
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    false
+                                };
                                 mb_field_decoding_flag = decode_cabac_field_decoding_flag(
                                     reader,
                                     cabac_state,
                                     mb_field_decoding_flag,
                                     mb_x,
-                                    false, // above pair interlaced flag (frame-mode: false)
+                                    above_pair_field,
                                 );
                             }
                         }
@@ -1927,6 +1935,7 @@ impl H264Decoder {
                             mb_idx, true, false, false, false, 0, 0, &[0; 24], false,
                         );
                         cabac_nb.update_mvd_ref_skip(mb_idx);
+                        cabac_nb.mb_field_flag[mb_idx] = mb_field_decoding_flag;
                         mbs_decoded += 1;
                         continue; // next pair_pos
                     }
@@ -1934,12 +1943,24 @@ impl H264Decoder {
 
                 // Coded MB (or intra slice): read mb_field_decoding_flag on top MB
                 if pair_pos == 0 {
+                    // Look up above pair's mb_field_decoding_flag for CABAC context.
+                    // Above pair is at (mb_x, mb_y-2). Check slice boundary.
+                    let above_pair_field = if mb_y >= 2 {
+                        let above_idx = (mb_x + (mb_y - 2) * mb_width) as usize;
+                        if fdc.slice_table[above_idx] == fdc.current_slice {
+                            cabac_nb.mb_field_flag[above_idx]
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
                     mb_field_decoding_flag = decode_cabac_field_decoding_flag(
                         reader,
                         cabac_state,
                         mb_field_decoding_flag,
                         mb_x,
-                        false, // above pair interlaced flag (frame-mode: false)
+                        above_pair_field,
                     );
                     top_was_skipped = false;
                 }
@@ -1950,8 +1971,13 @@ impl H264Decoder {
 
                 // Decode coded MB via CABAC
                 trace!(
-                    "MBAFF_MB_START mb_x={} mb_y={} pos={} low={} range={}",
-                    mb_x, cur_y, reader.pos(), reader.low(), reader.range()
+                    "MBAFF_MB_START mb_x={} mb_y={} mb_field={} pos={} low={} range={}",
+                    mb_x,
+                    cur_y,
+                    mb_field_decoding_flag,
+                    reader.pos(),
+                    reader.low(),
+                    reader.range()
                 );
                 let mut cache = CabacDecodeCache::new();
                 let mut mb = decode_mb_cabac(
@@ -1972,11 +1998,10 @@ impl H264Decoder {
                     &mut cache,
                     fdc.direct_8x8_inference_flag,
                     fdc.decode_chroma,
+                    mb_field_decoding_flag,
                 )?;
 
-                mb::apply_macroblock(
-                    fdc, &mut mb, hdr, pps, mb_x, cur_y, ref_pics, ref_pics_l1,
-                )?;
+                mb::apply_macroblock(fdc, &mut mb, hdr, pps, mb_x, cur_y, ref_pics, ref_pics_l1)?;
 
                 cache.write_back(cabac_nb, mb_idx);
                 cabac_nb.update_after_mb(
@@ -1990,6 +2015,7 @@ impl H264Decoder {
                     &mb.non_zero_count,
                     mb.transform_size_8x8_flag,
                 );
+                cabac_nb.mb_field_flag[mb_idx] = mb_field_decoding_flag;
                 mbs_decoded += 1;
             }
 
@@ -2001,7 +2027,11 @@ impl H264Decoder {
             // Trace CABAC state after each pair for divergence detection
             trace!(
                 "MBAFF_PAIR_DONE mb_x={} mb_y={} pos={} low={} range={}",
-                mb_x, mb_y, reader.pos(), reader.low(), reader.range()
+                mb_x,
+                mb_y,
+                reader.pos(),
+                reader.low(),
+                reader.range()
             );
 
             // Check terminate after both MBs of pair

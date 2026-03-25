@@ -13,8 +13,10 @@ use wedeo_core::error::{Error, Result};
 
 use crate::cabac_tables::{
     COEFF_ABS_LEVEL_M1_OFFSET, COEFF_ABS_LEVEL_TRANSITION, COEFF_ABS_LEVEL1_CTX,
-    COEFF_ABS_LEVELGT1_CTX, LAST_COEFF_FLAG_OFFSET, LAST_COEFF_FLAG_OFFSET_8X8, LPS_RANGE,
-    MLPS_STATE, NORM_SHIFT, SIGNIFICANT_COEFF_FLAG_OFFSET, SIGNIFICANT_COEFF_FLAG_OFFSET_8X8,
+    COEFF_ABS_LEVELGT1_CTX, LAST_COEFF_FLAG_FIELD_OFFSET, LAST_COEFF_FLAG_OFFSET,
+    LAST_COEFF_FLAG_OFFSET_8X8, LPS_RANGE, MLPS_STATE, NORM_SHIFT,
+    SIGNIFICANT_COEFF_FLAG_FIELD_OFFSET, SIGNIFICANT_COEFF_FLAG_FIELD_OFFSET_8X8,
+    SIGNIFICANT_COEFF_FLAG_OFFSET, SIGNIFICANT_COEFF_FLAG_OFFSET_8X8,
 };
 use crate::cavlc::{Macroblock, NeighborContext};
 use crate::pps::Pps;
@@ -440,6 +442,9 @@ pub struct CabacNeighborCtx {
     pub ref_cache_l1: Vec<i8>,
     /// Per-MB transform_size_8x8_flag for CABAC context 399 derivation.
     pub transform_8x8: Vec<bool>,
+    /// Per-MB mb_field_decoding_flag for MBAFF field context derivation.
+    /// Used by decode_cabac_field_decoding_flag to check the above pair's state.
+    pub mb_field_flag: Vec<bool>,
 }
 
 impl CabacNeighborCtx {
@@ -460,6 +465,7 @@ impl CabacNeighborCtx {
             ref_cache_l0: vec![-1; total_mbs * 4],
             ref_cache_l1: vec![-1; total_mbs * 4],
             transform_8x8: vec![false; total_mbs],
+            mb_field_flag: vec![false; total_mbs],
         }
     }
 
@@ -783,10 +789,28 @@ const SCAN_TO_RASTER: [usize; 16] = [0, 1, 4, 5, 2, 3, 6, 7, 8, 9, 12, 13, 10, 1
 /// From FFmpeg `ff_zigzag_scan` in mathtables.c.
 const ZIGZAG_SCAN_4X4: [usize; 16] = [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15];
 
+/// Field scan order for 4x4 blocks (MBAFF interlaced MBs).
+/// Column-first scan used for field-coded macroblocks.
+/// Reference: FFmpeg h264_slice.c field_scan initialization.
+const FIELD_SCAN_4X4: [usize; 16] = [0, 4, 1, 8, 12, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15];
+
 /// 8x8 zigzag scan as usize for CABAC residual decode.
 /// Same values as tables::ZIGZAG_SCAN_8X8 but typed as usize.
 const ZIGZAG_SCAN_8X8_USIZE: [usize; 64] = {
     let src = crate::tables::ZIGZAG_SCAN_8X8;
+    let mut out = [0usize; 64];
+    let mut i = 0;
+    while i < 64 {
+        out[i] = src[i] as usize;
+        i += 1;
+    }
+    out
+};
+
+/// 8x8 field scan as usize for CABAC residual decode (MBAFF).
+/// Reference: FFmpeg h264_slice.c field_scan8x8 initialization.
+const FIELD_SCAN_8X8_USIZE: [usize; 64] = {
+    let src = crate::tables::FIELD_SCAN_8X8;
     let mut out = [0usize; 64];
     let mut i = 0;
     while i < 64 {
@@ -1632,9 +1656,20 @@ fn decode_cabac_residual(
     cat: usize,
     max_coeff: usize,
     scantable: &[usize],
+    mb_field: bool,
 ) -> usize {
-    let sig_ctx_base = SIGNIFICANT_COEFF_FLAG_OFFSET[cat] as usize;
-    let last_ctx_base = LAST_COEFF_FLAG_OFFSET[cat] as usize;
+    // MBAFF field-mode MBs use separate context offset tables for the
+    // significance map. Reference: FFmpeg h264_cabac.c:1661-1664.
+    let sig_ctx_base = if mb_field {
+        SIGNIFICANT_COEFF_FLAG_FIELD_OFFSET[cat] as usize
+    } else {
+        SIGNIFICANT_COEFF_FLAG_OFFSET[cat] as usize
+    };
+    let last_ctx_base = if mb_field {
+        LAST_COEFF_FLAG_FIELD_OFFSET[cat] as usize
+    } else {
+        LAST_COEFF_FLAG_OFFSET[cat] as usize
+    };
     let abs_level_ctx_base = COEFF_ABS_LEVEL_M1_OFFSET[cat] as usize;
     let is_8x8 = cat == 5;
 
@@ -1649,7 +1684,12 @@ fn decode_cabac_residual(
 
     for last in 0..max_coeff.saturating_sub(1) {
         let sig_ctx = if is_8x8 {
-            sig_ctx_base + SIGNIFICANT_COEFF_FLAG_OFFSET_8X8[last] as usize
+            let sig_off = if mb_field {
+                SIGNIFICANT_COEFF_FLAG_FIELD_OFFSET_8X8[last] as usize
+            } else {
+                SIGNIFICANT_COEFF_FLAG_OFFSET_8X8[last] as usize
+            };
+            sig_ctx_base + sig_off
         } else {
             sig_ctx_base + last
         };
@@ -1739,6 +1779,7 @@ fn decode_cabac_luma_residual(
     state: &mut [u8; 1024],
     mb: &mut Macroblock,
     cabac_nb: &CabacNeighborCtx,
+    mb_field: bool,
     slice_table: &[u16],
     cur_slice: u16,
     mb_idx: usize,
@@ -1750,6 +1791,18 @@ fn decode_cabac_luma_residual(
     is_intra: bool,
 ) {
     let nz_cache = &mut mb.non_zero_count;
+    // MBAFF field-mode MBs use field scan tables for coefficient placement.
+    // Reference: FFmpeg h264_cabac.c:2428-2434 (IS_INTERLACED scan selection).
+    let scan_4x4 = if mb_field {
+        &FIELD_SCAN_4X4
+    } else {
+        &ZIGZAG_SCAN_4X4
+    };
+    let scan_8x8 = if mb_field {
+        &FIELD_SCAN_8X8_USIZE
+    } else {
+        &ZIGZAG_SCAN_8X8_USIZE
+    };
 
     if is_intra16x16 {
         // Luma DC (cat=0): 16 coefficients
@@ -1770,7 +1823,8 @@ fn decode_cabac_luma_residual(
         if reader.get_cabac(&mut state[cbf_ctx]) != 0 {
             // Store DC coded flag in cbp (bit 8)
             // (We'll set this in the caller's cbp tracking)
-            let nz = decode_cabac_residual(reader, state, &mut mb.luma_dc, 0, 16, &ZIGZAG_SCAN_4X4);
+            let nz =
+                decode_cabac_residual(reader, state, &mut mb.luma_dc, 0, 16, scan_4x4, mb_field);
             let _ = nz; // nz used for DC coded flag
         }
 
@@ -1798,7 +1852,8 @@ fn decode_cabac_luma_residual(
                         &mut mb.luma_coeffs[raster_idx],
                         1,
                         15,
-                        &ZIGZAG_SCAN_4X4[1..],
+                        &scan_4x4[1..],
+                        mb_field,
                     );
                     nz_cache[raster_idx] = nz as u8;
                 }
@@ -1820,7 +1875,8 @@ fn decode_cabac_luma_residual(
                     &mut mb.luma_8x8_coeffs[i8x8],
                     5,
                     64,
-                    &ZIGZAG_SCAN_8X8_USIZE,
+                    scan_8x8,
+                    mb_field,
                 );
                 // Broadcast NNZ to all 4 sub-blocks for deblocking/neighbor context.
                 let nz_val = (nz as u8).min(16);
@@ -1851,14 +1907,16 @@ fn decode_cabac_luma_residual(
                         nz_cache,
                         is_intra,
                     );
-                    if reader.get_cabac(&mut state[cbf_ctx]) != 0 {
+                    let cbf = reader.get_cabac(&mut state[cbf_ctx]);
+                    if cbf != 0 {
                         let nz = decode_cabac_residual(
                             reader,
                             state,
                             &mut mb.luma_coeffs[raster_idx],
                             2,
                             16,
-                            &ZIGZAG_SCAN_4X4,
+                            scan_4x4,
+                            mb_field,
                         );
                         nz_cache[raster_idx] = nz as u8;
                     }
@@ -1877,6 +1935,7 @@ fn decode_cabac_chroma_residual(
     state: &mut [u8; 1024],
     mb: &mut Macroblock,
     cabac_nb: &CabacNeighborCtx,
+    mb_field: bool,
     slice_table: &[u16],
     cur_slice: u16,
     mb_idx: usize,
@@ -1888,6 +1947,11 @@ fn decode_cabac_chroma_residual(
     is_intra: bool,
 ) {
     let nz_cache = &mut mb.non_zero_count;
+    let scan_4x4 = if mb_field {
+        &FIELD_SCAN_4X4
+    } else {
+        &ZIGZAG_SCAN_4X4
+    };
 
     // Chroma DC (cat=3): 4 coefficients per plane
     if cbp & 0x30 != 0 {
@@ -1917,6 +1981,7 @@ fn decode_cabac_chroma_residual(
                     3,
                     4,
                     &CHROMA_DC_SCAN,
+                    mb_field,
                 );
                 // Set chroma DC coded flag in cbp (bits 6..7)
                 *stored_cbp |= 0x40 << c;
@@ -1951,7 +2016,8 @@ fn decode_cabac_chroma_residual(
                         &mut mb.chroma_ac[c][i],
                         4,
                         15,
-                        &ZIGZAG_SCAN_4X4[1..],
+                        &scan_4x4[1..],
+                        mb_field,
                     );
                     nz_cache[nz_idx] = nz as u8;
                 }
@@ -1987,6 +2053,7 @@ pub fn decode_mb_cabac(
     cache: &mut CabacDecodeCache,
     direct_8x8_inference_flag: bool,
     decode_chroma: bool,
+    mb_field: bool,
 ) -> Result<Macroblock> {
     let mut mb = Macroblock::default();
     let mb_idx = (mb_y * mb_width + mb_x) as usize;
@@ -2802,6 +2869,7 @@ pub fn decode_mb_cabac(
             state,
             &mut mb,
             cabac_nb,
+            mb_field,
             slice_table,
             cur_slice,
             mb_idx,
@@ -2820,6 +2888,7 @@ pub fn decode_mb_cabac(
             state,
             &mut mb,
             cabac_nb,
+            mb_field,
             slice_table,
             cur_slice,
             mb_idx,

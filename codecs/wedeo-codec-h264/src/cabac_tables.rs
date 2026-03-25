@@ -1247,10 +1247,24 @@ pub const SIGNIFICANT_COEFF_FLAG_OFFSET: [u16; 14] = [
     105, 120, 134, 149, 152, 402, 484, 499, 513, 660, 528, 543, 557, 718,
 ];
 
+/// significant_coeff_flag context base offsets per block category (field mode / MBAFF).
+/// Reference: FFmpeg h264_cabac.c:1599 significant_coeff_flag_offset[1].
+#[rustfmt::skip]
+pub const SIGNIFICANT_COEFF_FLAG_FIELD_OFFSET: [u16; 14] = [
+    277, 292, 306, 321, 324, 436, 776, 791, 805, 675, 820, 835, 849, 733,
+];
+
 /// last_coeff_flag context base offsets per block category (frame mode).
 #[rustfmt::skip]
 pub const LAST_COEFF_FLAG_OFFSET: [u16; 14] = [
     166, 181, 195, 210, 213, 417, 572, 587, 601, 690, 616, 631, 645, 748,
+];
+
+/// last_coeff_flag context base offsets per block category (field mode / MBAFF).
+/// Reference: FFmpeg h264_cabac.c:1603 last_coeff_flag_offset[1].
+#[rustfmt::skip]
+pub const LAST_COEFF_FLAG_FIELD_OFFSET: [u16; 14] = [
+    338, 353, 367, 382, 385, 451, 864, 879, 893, 699, 908, 923, 937, 757,
 ];
 
 /// coeff_abs_level_m1 context base offsets per block category.
@@ -1266,6 +1280,16 @@ pub const SIGNIFICANT_COEFF_FLAG_OFFSET_8X8: [u8; 63] = [
      4,  4,  4,  4,  3,  3,  6,  7,  7,  7,  8,  9, 10,  9,  8,  7,
      7,  6, 11, 12, 13, 11,  6,  7,  8,  9, 14, 10,  9,  8,  6, 11,
     12, 13, 11,  6,  9, 14, 10,  9, 11, 12, 13, 11, 14, 10, 12,
+];
+
+/// significant_coeff_flag scan-position-to-context-offset for 8x8 blocks (field mode / MBAFF).
+/// Reference: FFmpeg h264_cabac.c:1613 significant_coeff_flag_offset_8x8[1].
+#[rustfmt::skip]
+pub const SIGNIFICANT_COEFF_FLAG_FIELD_OFFSET_8X8: [u8; 63] = [
+     0,  1,  1,  2,  2,  3,  3,  4,  5,  6,  7,  7,  7,  8,  4,  5,
+     6,  9, 10, 10,  8, 11, 12, 11,  9,  9, 10, 10,  8, 11, 12, 11,
+     9,  9, 10, 10,  8, 11, 12, 11,  9,  9, 10, 10,  8, 13, 13,  9,
+     9, 10, 10,  8, 13, 13,  9,  9, 10, 10, 14, 14, 14, 14, 14,
 ];
 
 /// DC coefficient significant flag context offsets.
