@@ -1445,6 +1445,8 @@ impl H264Decoder {
         // mb_skip_run persists across both MBs of a pair and across pairs.
         // -1 means "not yet read for this coded region".
         let mut mb_skip_run: i32 = -1;
+        // MBAFF field decoding flag: true when the current pair is field-coded.
+        let mut mb_field_decoding_flag = false;
 
         // Two separate left-side contexts for top and bottom MB rows.
         let mut top_left_nz = [0u8; 8];
@@ -1511,8 +1513,11 @@ impl H264Decoder {
                         // is the last skip of the run.
                         // Reference: FFmpeg h264_cavlc.c:690-692.
                         if pair_pos == 0 && mb_skip_run == 0 {
-                            let _mb_field_flag = br.get_bit(); // consume, discard for frame-mode
+                            mb_field_decoding_flag = br.get_bit();
                         }
+
+                        // Set field mode for pixel reconstruction
+                        fdc.mb_field = mb_field_decoding_flag;
 
                         // Decode skip MB
                         if hdr.slice_type.is_b() {
@@ -1537,8 +1542,11 @@ impl H264Decoder {
                 // Coded MB: read mb_field_decoding_flag on top MB
                 // Reference: FFmpeg h264_cavlc.c:698-701.
                 if pair_pos == 0 {
-                    let _mb_field_flag = br.get_bit(); // consume, discard for frame-mode
+                    mb_field_decoding_flag = br.get_bit();
                 }
+
+                // Set field mode for pixel reconstruction
+                fdc.mb_field = mb_field_decoding_flag;
 
                 fdc.neighbor_ctx.top_available = cur_y > 0
                     && fdc.slice_table[(mb_addr - mb_width) as usize] == fdc.current_slice;
@@ -1923,6 +1931,9 @@ impl H264Decoder {
                             }
                         }
 
+                        // Set field mode for pixel reconstruction
+                        fdc.mb_field = mb_field_decoding_flag;
+
                         // Decode skip MB
                         if hdr.slice_type.is_b() {
                             mb::decode_b_skip_mb(fdc, hdr, mb_x, cur_y, ref_pics, ref_pics_l1);
@@ -1964,6 +1975,9 @@ impl H264Decoder {
                     );
                     top_was_skipped = false;
                 }
+
+                // Set field mode for pixel reconstruction
+                fdc.mb_field = mb_field_decoding_flag;
 
                 // Update per-MB top availability
                 fdc.neighbor_ctx.top_available = cur_y > 0

@@ -27,12 +27,11 @@ use crate::tables::CHROMA_QP_TABLE;
 
 /// Compute a quick sum of all pixel values in an MB-sized block of a plane.
 /// Used for per-MB reconstruction checksums to compare against FFmpeg.
-fn mb_plane_sum(plane: &[u8], stride: usize, mb_x: u32, mb_y: u32, size: u32) -> u32 {
-    let base_x = (mb_x * size) as usize;
-    let base_y = (mb_y * size) as usize;
+/// Uses (offset, stride) for MBAFF field-mode compatibility.
+fn mb_plane_sum(plane: &[u8], offset: usize, stride: usize, size: u32) -> u32 {
     let mut sum = 0u32;
     for dy in 0..size as usize {
-        let row_start = (base_y + dy) * stride + base_x;
+        let row_start = offset + dy * stride;
         for dx in 0..size as usize {
             sum = sum.wrapping_add(plane[row_start + dx] as u32);
         }
@@ -152,6 +151,11 @@ pub struct FrameDecodeContext {
     /// True if chroma planes exist (chroma_format_idc != 0).
     /// When false (monochrome), chroma bitstream data is absent and U/V planes are 128-filled.
     pub decode_chroma: bool,
+    /// MBAFF field-coded MB flag. When true, this MB is part of a field-coded pair:
+    /// stride is doubled (writes to every other row), and the bottom field (mb_y & 1 == 1)
+    /// starts one row below the pair's top-left corner.
+    /// Set by the decoder loop before calling apply_macroblock/decode_macroblock.
+    pub mb_field: bool,
 }
 
 impl FrameDecodeContext {
@@ -239,6 +243,7 @@ impl FrameDecodeContext {
             last_qscale_diff: 0,
             slice_deblock_params: Vec::new(),
             decode_chroma,
+            mb_field: false,
         }
     }
 
@@ -383,6 +388,10 @@ fn store_deblock_info(
 // ---------------------------------------------------------------------------
 
 /// Get the offset and stride for a 4x4 luma block within the picture buffer.
+///
+/// In MBAFF field mode (`mb_field=true`), the stride is doubled and the
+/// bottom field (mb_y & 1 == 1) starts one frame-row below the pair's top-left.
+/// Reference: FFmpeg h264_mb_template.c:65-96 (MB_FIELD linesize adjustment).
 #[inline]
 fn luma_block_offset(
     pic: &PictureBuffer,
@@ -390,14 +399,27 @@ fn luma_block_offset(
     mb_y: u32,
     blk_x: u32,
     blk_y: u32,
+    mb_field: bool,
 ) -> (usize, usize) {
     let x = (mb_x * 16 + blk_x * 4) as usize;
-    let y = (mb_y * 16 + blk_y * 4) as usize;
     let stride = pic.y_stride;
-    (y * stride + x, stride)
+    if mb_field {
+        let pair_base_y = ((mb_y & !1) * 16) as usize;
+        let field_offset = if mb_y & 1 == 1 { stride } else { 0 };
+        let y_in_mb = (blk_y * 4) as usize;
+        (
+            pair_base_y * stride + field_offset + y_in_mb * stride * 2 + x,
+            stride * 2,
+        )
+    } else {
+        let y = (mb_y * 16 + blk_y * 4) as usize;
+        (y * stride + x, stride)
+    }
 }
 
 /// Get the offset and stride for a 4x4 chroma block within the picture buffer.
+///
+/// Same MBAFF field-mode adjustment as `luma_block_offset` but for chroma planes.
 #[inline]
 fn chroma_block_offset(
     pic: &PictureBuffer,
@@ -405,31 +427,56 @@ fn chroma_block_offset(
     mb_y: u32,
     blk_x: u32,
     blk_y: u32,
+    mb_field: bool,
 ) -> (usize, usize) {
     let x = (mb_x * 8 + blk_x * 4) as usize;
-    let y = (mb_y * 8 + blk_y * 4) as usize;
     let stride = pic.uv_stride;
-    (y * stride + x, stride)
+    if mb_field {
+        let pair_base_y = ((mb_y & !1) * 8) as usize;
+        let field_offset = if mb_y & 1 == 1 { stride } else { 0 };
+        let y_in_mb = (blk_y * 4) as usize;
+        (
+            pair_base_y * stride + field_offset + y_in_mb * stride * 2 + x,
+            stride * 2,
+        )
+    } else {
+        let y = (mb_y * 8 + blk_y * 4) as usize;
+        (y * stride + x, stride)
+    }
+}
+
+/// Get the offset and stride for the top-left of a luma MB.
+#[inline]
+fn luma_mb_offset(pic: &PictureBuffer, mb_x: u32, mb_y: u32, mb_field: bool) -> (usize, usize) {
+    luma_block_offset(pic, mb_x, mb_y, 0, 0, mb_field)
+}
+
+/// Get the offset and stride for the top-left of a chroma MB.
+#[inline]
+fn chroma_mb_offset(pic: &PictureBuffer, mb_x: u32, mb_y: u32, mb_field: bool) -> (usize, usize) {
+    chroma_block_offset(pic, mb_x, mb_y, 0, 0, mb_field)
 }
 
 /// Gather the top 4 neighbor pixels for a 4x4 luma block.
 /// Returns up to 8 values (4 top + 4 top-right for diagonal modes).
+///
+/// Uses offset/stride addressing for MBAFF field-mode compatibility.
+/// `offset` is the block's top-left position in the luma buffer.
+/// `stride` is the field-adjusted stride (doubled in field mode).
 fn gather_top_luma(
-    pic: &PictureBuffer,
-    px: usize,
-    py: usize,
+    plane: &[u8],
+    offset: usize,
+    stride: usize,
     has_top: bool,
     has_top_right: bool,
 ) -> [u8; 8] {
-    let stride = pic.y_stride;
     let mut top = [128u8; 8];
-    if has_top && py > 0 {
-        let row_above = (py - 1) * stride + px;
-        top[..4].copy_from_slice(&pic.y[row_above..row_above + 4]);
+    if has_top && offset >= stride {
+        let row_above = offset - stride;
+        top[..4].copy_from_slice(&plane[row_above..row_above + 4]);
         if has_top_right {
-            top[4..8].copy_from_slice(&pic.y[row_above + 4..row_above + 8]);
+            top[4..8].copy_from_slice(&plane[row_above + 4..row_above + 8]);
         } else {
-            // Replicate last top pixel for modes that need top-right
             let v = top[3];
             top[4..8].fill(v);
         }
@@ -438,69 +485,85 @@ fn gather_top_luma(
 }
 
 /// Gather the left 4 neighbor pixels for a 4x4 luma block.
-fn gather_left_luma(pic: &PictureBuffer, px: usize, py: usize, has_left: bool) -> [u8; 4] {
-    let stride = pic.y_stride;
+///
+/// Uses offset/stride addressing. `offset` is the block's top-left.
+fn gather_left_luma(plane: &[u8], offset: usize, stride: usize, has_left: bool) -> [u8; 4] {
     let mut left = [128u8; 4];
-    if has_left && px > 0 {
+    if has_left {
         for (i, l) in left.iter_mut().enumerate() {
-            *l = pic.y[(py + i) * stride + px - 1];
+            *l = plane[offset + i * stride - 1];
         }
     }
     left
 }
 
 /// Gather the top-left corner pixel.
+///
+/// Uses offset/stride addressing.
 fn gather_top_left_luma(
-    pic: &PictureBuffer,
-    px: usize,
-    py: usize,
+    plane: &[u8],
+    offset: usize,
+    stride: usize,
     has_top: bool,
     has_left: bool,
 ) -> u8 {
-    if has_top && has_left && px > 0 && py > 0 {
-        pic.y[(py - 1) * pic.y_stride + px - 1]
+    if has_top && has_left && offset >= stride {
+        plane[offset - stride - 1]
     } else {
         128
     }
 }
 
-/// Gather N pixels from the row above `(px, py)`.
+/// Gather N pixels from the row above a block.
 ///
-/// Used for top-neighbor gathering in 16x16 luma and 8x8 chroma prediction.
-/// Returns `[128; N]` if `py == 0`.
+/// Uses offset/stride addressing for MBAFF field-mode compatibility.
+/// `offset` is the block's top-left position in the plane buffer.
+/// Returns `[128; N]` if no row above (offset < stride).
 #[inline]
-fn gather_top<const N: usize>(plane: &[u8], stride: usize, px: usize, py: usize) -> [u8; N] {
+fn gather_top<const N: usize>(plane: &[u8], offset: usize, stride: usize) -> [u8; N] {
     let mut top = [128u8; N];
-    if py > 0 {
-        let row_above = (py - 1) * stride + px;
+    if offset >= stride {
+        let row_above = offset - stride;
         top.copy_from_slice(&plane[row_above..row_above + N]);
     }
     top
 }
 
-/// Gather N pixels from the column left of `(px, py)`.
+/// Gather N pixels from the column left of a block.
 ///
-/// Used for left-neighbor gathering in 16x16 luma and 8x8 chroma prediction.
-/// Returns `[128; N]` if `px == 0`.
+/// Uses offset/stride addressing for MBAFF field-mode compatibility.
+/// `offset` is the block's top-left position in the plane buffer.
+/// Returns `[128; N]` if `has_left` is false.
 #[inline]
-fn gather_left<const N: usize>(plane: &[u8], stride: usize, px: usize, py: usize) -> [u8; N] {
+fn gather_left<const N: usize>(
+    plane: &[u8],
+    offset: usize,
+    stride: usize,
+    has_left: bool,
+) -> [u8; N] {
     let mut left = [128u8; N];
-    if px > 0 {
+    if has_left {
         for (i, l) in left.iter_mut().enumerate() {
-            *l = plane[(py + i) * stride + px - 1];
+            *l = plane[offset + i * stride - 1];
         }
     }
     left
 }
 
-/// Gather the top-left corner pixel at `(px-1, py-1)`.
+/// Gather the top-left corner pixel.
 ///
-/// Used in 16x16 luma and 8x8 chroma prediction.
-/// Returns `128` if `px == 0` or `py == 0`.
+/// Uses offset/stride addressing for MBAFF field-mode compatibility.
+/// Returns `128` if `has_top` or `has_left` is false.
 #[inline]
-fn gather_top_left(plane: &[u8], stride: usize, px: usize, py: usize) -> u8 {
-    if px > 0 && py > 0 {
-        plane[(py - 1) * stride + px - 1]
+fn gather_top_left(
+    plane: &[u8],
+    offset: usize,
+    stride: usize,
+    has_top: bool,
+    has_left: bool,
+) -> u8 {
+    if has_top && has_left && offset >= stride {
+        plane[offset - stride - 1]
     } else {
         128
     }
@@ -527,23 +590,21 @@ fn decode_chroma(
     let cbp_chroma = (mb.cbp >> 4) & 3;
 
     for (plane_idx, &c_qp) in chroma_qp.iter().enumerate() {
-        // Select the correct chroma plane
-        let (plane_data, stride) = if plane_idx == 0 {
-            (&mut ctx.pic.u as &mut Vec<u8>, ctx.pic.uv_stride)
-        } else {
-            (&mut ctx.pic.v as &mut Vec<u8>, ctx.pic.uv_stride)
-        };
+        // Compute field-aware offset before borrowing plane data mutably
+        let (offset, c_stride) = chroma_mb_offset(&ctx.pic, mb_x, mb_y, ctx.mb_field);
 
-        // Gather neighbors for chroma prediction
-        let px = (mb_x * 8) as usize;
-        let py = (mb_y * 8) as usize;
-        let top: [u8; 8] = gather_top(plane_data, stride, px, py);
-        let left: [u8; 8] = gather_left(plane_data, stride, px, py);
-        let top_left = gather_top_left(plane_data, stride, px, py);
-        let offset = py * stride + px;
+        // Select the correct chroma plane
+        let plane_data = if plane_idx == 0 {
+            &mut ctx.pic.u as &mut Vec<u8>
+        } else {
+            &mut ctx.pic.v as &mut Vec<u8>
+        };
+        let top: [u8; 8] = gather_top(plane_data, offset, c_stride);
+        let left: [u8; 8] = gather_left(plane_data, offset, c_stride, has_left);
+        let top_left = gather_top_left(plane_data, offset, c_stride, has_top, has_left);
         intra_pred::predict_chroma_8x8(
             &mut plane_data[offset..],
-            stride,
+            c_stride,
             mb.chroma_pred_mode,
             &top,
             &left,
@@ -572,7 +633,8 @@ fn decode_chroma(
                 let blk_x = (blk_idx & 1) as u32;
                 let blk_y = (blk_idx >> 1) as u32;
 
-                let (c_offset, c_stride) = chroma_block_offset(&ctx.pic, mb_x, mb_y, blk_x, blk_y);
+                let (c_offset, c_stride) =
+                    chroma_block_offset(&ctx.pic, mb_x, mb_y, blk_x, blk_y, ctx.mb_field);
                 let plane_data = if plane_idx == 0 {
                     &mut ctx.pic.u
                 } else {
@@ -741,20 +803,20 @@ pub fn apply_macroblock(
     // Decode based on macroblock type
     if mb.is_pcm {
         // I_PCM: raw samples already in the entropy coder output
-        // Copy luma samples (16x16)
+        // Copy luma samples (16x16) with field-aware addressing
+        let (luma_base, luma_stride) = luma_mb_offset(&ctx.pic, mb_x, mb_y, ctx.mb_field);
         for y in 0..16u32 {
             for x in 0..16u32 {
-                let px = (mb_x * 16 + x) as usize;
-                let py = (mb_y * 16 + y) as usize;
                 let blk = ((y / 4) * 4 + (x / 4)) as usize;
                 let sub_y = (y % 4) as usize;
                 let sub_x = (x % 4) as usize;
-                ctx.pic.y[py * ctx.pic.y_stride + px] =
+                ctx.pic.y[luma_base + y as usize * luma_stride + x as usize] =
                     mb.luma_coeffs[blk][sub_y * 4 + sub_x] as u8;
             }
         }
         // Copy chroma samples (8x8 each) — skip for monochrome (U/V stay 128).
         if ctx.decode_chroma {
+            let (chroma_base, chroma_stride) = chroma_mb_offset(&ctx.pic, mb_x, mb_y, ctx.mb_field);
             for plane_idx in 0..2usize {
                 let plane = if plane_idx == 0 {
                     &mut ctx.pic.u
@@ -763,12 +825,10 @@ pub fn apply_macroblock(
                 };
                 for y in 0..8u32 {
                     for x in 0..8u32 {
-                        let px = (mb_x * 8 + x) as usize;
-                        let py = (mb_y * 8 + y) as usize;
                         let blk = ((y / 4) * 2 + (x / 4)) as usize;
                         let sub_y = (y % 4) as usize;
                         let sub_x = (x % 4) as usize;
-                        plane[py * ctx.pic.uv_stride + px] =
+                        plane[chroma_base + y as usize * chroma_stride + x as usize] =
                             mb.chroma_ac[plane_idx][blk][sub_y * 4 + sub_x] as u8;
                     }
                 }
@@ -845,9 +905,11 @@ pub fn apply_macroblock(
     //   scripts/mb_recon_compare.py <file> --frame N
     // To enable: RUST_LOG=wedeo_codec_h264::mb=trace (appears as MB_RECON lines).
     {
-        let y_sum = mb_plane_sum(&ctx.pic.y, ctx.pic.y_stride, mb_x, mb_y, 16);
-        let u_sum = mb_plane_sum(&ctx.pic.u, ctx.pic.uv_stride, mb_x, mb_y, 8);
-        let v_sum = mb_plane_sum(&ctx.pic.v, ctx.pic.uv_stride, mb_x, mb_y, 8);
+        let (y_off, y_stride) = luma_mb_offset(&ctx.pic, mb_x, mb_y, ctx.mb_field);
+        let (uv_off, uv_stride) = chroma_mb_offset(&ctx.pic, mb_x, mb_y, ctx.mb_field);
+        let y_sum = mb_plane_sum(&ctx.pic.y, y_off, y_stride, 16);
+        let u_sum = mb_plane_sum(&ctx.pic.u, uv_off, uv_stride, 8);
+        let v_sum = mb_plane_sum(&ctx.pic.v, uv_off, uv_stride, 8);
         trace!(
             mb_x,
             mb_y,
@@ -1415,11 +1477,9 @@ fn decode_inter_mb(
     }
 
     {
-        let lx = (mb_x * 16) as usize;
-        let ly = (mb_y * 16) as usize;
-        let stride = ctx.pic.y_stride;
+        let (luma_off, _stride) = luma_mb_offset(&ctx.pic, mb_x, mb_y, ctx.mb_field);
         let mut mc_row0 = [0u8; 16];
-        mc_row0.copy_from_slice(&ctx.pic.y[ly * stride + lx..ly * stride + lx + 16]);
+        mc_row0.copy_from_slice(&ctx.pic.y[luma_off..luma_off + 16]);
         trace!(mb_x, mb_y, row0 = ?mc_row0, "inter MC luma");
     }
 
@@ -1446,21 +1506,23 @@ fn decode_inter_mb(
                         dc = mb.luma_8x8_coeffs[i8x8][0],
                         "DEQUANT"
                     );
-                    let px = (mb_x * 16 + bx) as usize;
-                    let py = (mb_y * 16 + by) as usize;
-                    let offset = py * ctx.pic.y_stride + px;
+                    // bx/by are pixel offsets within MB (0 or 8)
+                    let blk_x_4 = bx / 4; // 0 or 2 in 4x4-block units
+                    let blk_y_4 = by / 4;
+                    let (offset, field_stride) =
+                        luma_block_offset(&ctx.pic, mb_x, mb_y, blk_x_4, blk_y_4, ctx.mb_field);
                     idct::idct8x8_add(
                         &mut ctx.pic.y[offset..],
-                        ctx.pic.y_stride,
+                        field_stride,
                         &mut mb.luma_8x8_coeffs[i8x8],
                     );
                     {
-                        let y_stride = ctx.pic.y_stride;
                         let mut post_sum = 0u32;
                         for dy in 0..8usize {
                             for dx in 0..8usize {
-                                post_sum = post_sum
-                                    .wrapping_add(ctx.pic.y[offset + dy * y_stride + dx] as u32);
+                                post_sum = post_sum.wrapping_add(
+                                    ctx.pic.y[offset + dy * field_stride + dx] as u32,
+                                );
                             }
                         }
                         trace!(mb_x, mb_y, i8x8, post_sum, "POST_IDCT_8X8");
@@ -1486,7 +1548,8 @@ fn decode_inter_mb(
                         dc = mb.luma_coeffs[raster_idx][0],
                         "DEQUANT"
                     );
-                    let (offset, stride) = luma_block_offset(&ctx.pic, mb_x, mb_y, blk_x, blk_y);
+                    let (offset, stride) =
+                        luma_block_offset(&ctx.pic, mb_x, mb_y, blk_x, blk_y, ctx.mb_field);
                     idct::idct4x4_add(
                         &mut ctx.pic.y[offset..],
                         stride,
@@ -1498,11 +1561,9 @@ fn decode_inter_mb(
     }
 
     {
-        let lx = (mb_x * 16) as usize;
-        let ly = (mb_y * 16) as usize;
-        let stride = ctx.pic.y_stride;
+        let (luma_off, _stride) = luma_mb_offset(&ctx.pic, mb_x, mb_y, ctx.mb_field);
         let mut final_row0 = [0u8; 16];
-        final_row0.copy_from_slice(&ctx.pic.y[ly * stride + lx..ly * stride + lx + 16]);
+        final_row0.copy_from_slice(&ctx.pic.y[luma_off..luma_off + 16]);
         trace!(mb_x, mb_y, row0 = ?final_row0, "inter final luma");
     }
 
@@ -1526,20 +1587,16 @@ fn apply_mc_partition(
     block_h: usize,
     mv: [i16; 2],
 ) {
+    // Compute field-aware destination offset and stride.
+    // In field mode, the dst stride is doubled and the offset is adjusted for bottom field.
+    // The reference picture is always frame-mode (full-frame stride), so ref addressing is unchanged.
+    let mb_field = ctx.mb_field;
+    let (luma_mb_off, luma_dst_stride) = luma_mb_offset(&ctx.pic, mb_x, mb_y, mb_field);
+    let luma_offset = luma_mb_off + px_offset_y as usize * luma_dst_stride + px_offset_x as usize;
+
+    // For MV-based reference lookup, use frame-mode coordinates (not field-adjusted).
     let dst_x = (mb_x * 16 + px_offset_x) as i32;
     let dst_y = (mb_y * 16 + px_offset_y) as i32;
-
-    // Temporary debug trace for SVA_Base_B MB(10,2) investigation
-    if mb_x == 10 && mb_y == 2 {
-        let ref_val = ref_pic.y[32 * ref_pic.y_stride + 160];
-        let ref_val2 = ref_pic.y[32 * ref_pic.y_stride + 162];
-        trace!(mb_x, mb_y, px_offset_y, mv = ?mv,
-            ref_y_ptr = ?ref_pic.y.as_ptr(),
-            ref_stride = ref_pic.y_stride,
-            ref_at_160_32 = ref_val,
-            ref_at_162_32 = ref_val2,
-            "MC ref check");
-    }
 
     // Quarter-pixel MV components
     let mvx = mv[0] as i32;
@@ -1551,30 +1608,9 @@ fn apply_mc_partition(
     let luma_dx = (mvx & 3) as u8;
     let luma_dy = (mvy & 3) as u8;
 
-    let luma_offset = dst_y as usize * ctx.pic.y_stride + dst_x as usize;
-
-    if mb_x == 10 && mb_y == 2 {
-        // Print first row of ref data that the MC will read
-        let ry = luma_ref_y.clamp(0, ref_pic.height as i32 - 1) as usize;
-        let stride = ref_pic.y_stride;
-        let ref_ptr = ref_pic.y.as_ptr();
-        let cur_ptr = ctx.pic.y.as_ptr();
-        let same_buf = std::ptr::eq(ref_ptr, cur_ptr);
-        let ref_row: Vec<u8> = (0..21)
-            .map(|i| {
-                let rx = (luma_ref_x - 2 + i).clamp(0, ref_pic.width as i32 - 1) as usize;
-                ref_pic.y[ry * stride + rx]
-            })
-            .collect();
-        trace!(mb_x, mb_y, luma_ref_x, luma_ref_y, luma_dx, luma_dy,
-               ref_ptr = ?ref_ptr, cur_ptr = ?cur_ptr, same_buf,
-               ref_pic_width = ref_pic.width, ref_pic_height = ref_pic.height,
-               ref_row = ?ref_row, "MC ref row");
-    }
-
     mc::mc_luma(
         &mut ctx.pic.y[luma_offset..],
-        ctx.pic.y_stride,
+        luma_dst_stride,
         &ref_pic.y,
         ref_pic.y_stride,
         luma_ref_x,
@@ -1594,11 +1630,14 @@ fn apply_mc_partition(
         return; // Partitions smaller than 4 pixels wide don't have separate chroma
     }
 
+    let (chroma_mb_off, chroma_dst_stride) = chroma_mb_offset(&ctx.pic, mb_x, mb_y, mb_field);
+    let chroma_offset =
+        chroma_mb_off + (px_offset_y / 2) as usize * chroma_dst_stride + (px_offset_x / 2) as usize;
+
+    // For MV-based reference lookup, use frame-mode coordinates.
     let chroma_dst_x = (mb_x * 8 + px_offset_x / 2) as i32;
     let chroma_dst_y = (mb_y * 8 + px_offset_y / 2) as i32;
 
-    // Chroma MV is luma MV / 2 at eighth-pixel precision
-    // Spec: chroma MV = (luma_mv / 2) with rounding toward zero for the fractional part
     let cmvx = mvx;
     let cmvy = mvy;
     let chroma_ref_x = chroma_dst_x + (cmvx >> 3);
@@ -1606,10 +1645,9 @@ fn apply_mc_partition(
     let chroma_dx = (cmvx & 7) as u8;
     let chroma_dy = (cmvy & 7) as u8;
 
-    let chroma_offset_u = chroma_dst_y as usize * ctx.pic.uv_stride + chroma_dst_x as usize;
     mc::mc_chroma(
-        &mut ctx.pic.u[chroma_offset_u..],
-        ctx.pic.uv_stride,
+        &mut ctx.pic.u[chroma_offset..],
+        chroma_dst_stride,
         &ref_pic.u,
         ref_pic.uv_stride,
         chroma_ref_x,
@@ -1622,10 +1660,9 @@ fn apply_mc_partition(
         ref_pic.height / 2,
     );
 
-    let chroma_offset_v = chroma_dst_y as usize * ctx.pic.uv_stride + chroma_dst_x as usize;
     mc::mc_chroma(
-        &mut ctx.pic.v[chroma_offset_v..],
-        ctx.pic.uv_stride,
+        &mut ctx.pic.v[chroma_offset..],
+        chroma_dst_stride,
         &ref_pic.v,
         ref_pic.uv_stride,
         chroma_ref_x,
@@ -2480,21 +2517,23 @@ fn add_b_residual(
                         dc = mb.luma_8x8_coeffs[i8x8][0],
                         "DEQUANT"
                     );
-                    let px = (mb_x * 16 + bx) as usize;
-                    let py = (mb_y * 16 + by) as usize;
-                    let offset = py * ctx.pic.y_stride + px;
+                    // bx/by are pixel offsets within MB (0 or 8)
+                    let blk_x_4 = bx / 4; // 0 or 2 in 4x4-block units
+                    let blk_y_4 = by / 4;
+                    let (offset, field_stride) =
+                        luma_block_offset(&ctx.pic, mb_x, mb_y, blk_x_4, blk_y_4, ctx.mb_field);
                     idct::idct8x8_add(
                         &mut ctx.pic.y[offset..],
-                        ctx.pic.y_stride,
+                        field_stride,
                         &mut mb.luma_8x8_coeffs[i8x8],
                     );
                     {
-                        let y_stride = ctx.pic.y_stride;
                         let mut post_sum = 0u32;
                         for dy in 0..8usize {
                             for dx in 0..8usize {
-                                post_sum = post_sum
-                                    .wrapping_add(ctx.pic.y[offset + dy * y_stride + dx] as u32);
+                                post_sum = post_sum.wrapping_add(
+                                    ctx.pic.y[offset + dy * field_stride + dx] as u32,
+                                );
                             }
                         }
                         trace!(mb_x, mb_y, i8x8, post_sum, "POST_IDCT_8X8");
@@ -2520,7 +2559,8 @@ fn add_b_residual(
                         dc = mb.luma_coeffs[raster_idx][0],
                         "DEQUANT"
                     );
-                    let (offset, stride) = luma_block_offset(&ctx.pic, mb_x, mb_y, blk_x, blk_y);
+                    let (offset, stride) =
+                        luma_block_offset(&ctx.pic, mb_x, mb_y, blk_x, blk_y, ctx.mb_field);
                     idct::idct4x4_add(
                         &mut ctx.pic.y[offset..],
                         stride,
@@ -2941,12 +2981,12 @@ fn apply_weight_list(
         &hdr.chroma_weight_l1
     };
 
-    let lx = (mb_x * 16 + px_x) as usize;
-    let ly = (mb_y * 16 + px_y) as usize;
+    // Field-aware destination offsets
+    let (luma_mb_off, luma_stride) = luma_mb_offset(&ctx.pic, mb_x, mb_y, ctx.mb_field);
+    let luma_off = luma_mb_off + px_y as usize * luma_stride + px_x as usize;
 
     // Luma — fall back to default weight (1<<denom, 0) when ref_idx exceeds
-    // the parsed weight table. FFmpeg applies this implicitly; without it,
-    // refs beyond the explicit table get no weighting at all.
+    // the parsed weight table.
     if hdr.use_weight {
         let (w, o) = if ref_idx < luma_weights.len() {
             luma_weights[ref_idx]
@@ -2961,11 +3001,10 @@ fn apply_weight_list(
             denom = hdr.luma_log2_weight_denom,
             "weighted pred luma"
         );
-        apply_weight_uni(
+        apply_weight_uni_at(
             &mut ctx.pic.y,
-            ctx.pic.y_stride,
-            lx,
-            ly,
+            luma_off,
+            luma_stride,
             pw,
             ph,
             hdr.luma_log2_weight_denom,
@@ -2976,8 +3015,8 @@ fn apply_weight_list(
 
     // Chroma — same default fallback for chroma weights.
     if hdr.use_weight_chroma {
-        let cx = lx / 2;
-        let cy = ly / 2;
+        let (chroma_mb_off, chroma_stride) = chroma_mb_offset(&ctx.pic, mb_x, mb_y, ctx.mb_field);
+        let chroma_off = chroma_mb_off + (px_y / 2) as usize * chroma_stride + (px_x / 2) as usize;
         let cw = pw / 2;
         let ch = ph / 2;
         let cw_entry = if ref_idx < chroma_weights.len() {
@@ -2989,11 +3028,10 @@ fn apply_weight_list(
             ]
         };
         // Cb
-        apply_weight_uni(
+        apply_weight_uni_at(
             &mut ctx.pic.u,
-            ctx.pic.uv_stride,
-            cx,
-            cy,
+            chroma_off,
+            chroma_stride,
             cw,
             ch,
             hdr.chroma_log2_weight_denom,
@@ -3001,11 +3039,10 @@ fn apply_weight_list(
             cw_entry[0].1,
         );
         // Cr
-        apply_weight_uni(
+        apply_weight_uni_at(
             &mut ctx.pic.v,
-            ctx.pic.uv_stride,
-            cx,
-            cy,
+            chroma_off,
+            chroma_stride,
             cw,
             ch,
             hdr.chroma_log2_weight_denom,
@@ -3017,30 +3054,30 @@ fn apply_weight_list(
 
 /// Apply uni-directional weighted prediction to pixels already written by MC.
 ///
+/// Uses offset-based addressing for MBAFF field-mode compatibility.
+/// `base_offset` is the top-left of the block in the buffer, `stride` is field-adjusted.
+///
 /// For each pixel: `clip((pixel * weight + offset_scaled) >> log2_denom)`
-/// where `offset_scaled = offset << log2_denom` (with rounding for denom > 0).
 ///
 /// Reference: FFmpeg h264dsp_template.c:30-61
 #[allow(clippy::too_many_arguments)]
-fn apply_weight_uni(
+fn apply_weight_uni_at(
     buf: &mut [u8],
+    base_offset: usize,
     stride: usize,
-    x: usize,
-    y: usize,
     w: usize,
     h: usize,
     log2_denom: u32,
     weight: i32,
     offset: i32,
 ) {
-    // For 8-bit: offset_scaled = offset; if log2_denom > 0, add rounding
     let offset_scaled = if log2_denom > 0 {
         (offset << log2_denom) + (1 << (log2_denom - 1))
     } else {
         offset
     };
     for row in 0..h {
-        let base = (y + row) * stride + x;
+        let base = base_offset + row * stride;
         for col in 0..w {
             let idx = base + col;
             if idx < buf.len() {
@@ -3095,9 +3132,11 @@ fn apply_mc_bi_partition(
         mv_l0,
     );
 
-    // MC L1 into temp buffers, then average with destination
+    // MC L1 into temp buffers, then average with destination.
+    // Use frame-mode coordinates for reference lookup, field-aware offsets for destination.
     let dst_x = (mb_x * 16 + px_offset_x) as i32;
     let dst_y = (mb_y * 16 + px_offset_y) as i32;
+    let mb_field = ctx.mb_field;
 
     // Luma L1
     let mvx1 = mv_l1[0] as i32;
@@ -3123,8 +3162,9 @@ fn apply_mc_bi_partition(
         ref_l1.height,
     );
 
-    // Average or weighted-average luma
-    let luma_offset = dst_y as usize * ctx.pic.y_stride + dst_x as usize;
+    // Average or weighted-average luma (field-aware destination stride)
+    let (luma_mb_off, luma_dst_stride) = luma_mb_offset(&ctx.pic, mb_x, mb_y, mb_field);
+    let luma_offset = luma_mb_off + px_offset_y as usize * luma_dst_stride + px_offset_x as usize;
     let l0_idx = ref_idx_l0.max(0) as usize;
     let l1_idx = ref_idx_l1.max(0) as usize;
 
@@ -3132,12 +3172,11 @@ fn apply_mc_bi_partition(
         && l0_idx < ctx.implicit_weight.len()
         && l1_idx < ctx.implicit_weight.get(l0_idx).map_or(0, |v| v.len())
     {
-        // Implicit weighted bipred: weights from POC distances, denom=5, offset=0
         let w0 = ctx.implicit_weight[l0_idx][l1_idx];
         let w1 = 64 - w0;
         biweight_pixels(
             &mut ctx.pic.y[luma_offset..],
-            ctx.pic.y_stride,
+            luma_dst_stride,
             &tmp_y,
             block_w,
             block_w,
@@ -3156,7 +3195,7 @@ fn apply_mc_bi_partition(
         let denom = slice_hdr.luma_log2_weight_denom;
         biweight_pixels(
             &mut ctx.pic.y[luma_offset..],
-            ctx.pic.y_stride,
+            luma_dst_stride,
             &tmp_y,
             block_w,
             block_w,
@@ -3169,7 +3208,7 @@ fn apply_mc_bi_partition(
     } else {
         mc::avg_pixels_inplace(
             &mut ctx.pic.y[luma_offset..],
-            ctx.pic.y_stride,
+            luma_dst_stride,
             &tmp_y,
             block_w,
             block_w,
@@ -3184,6 +3223,7 @@ fn apply_mc_bi_partition(
         return;
     }
 
+    // Frame-mode coordinates for reference lookup
     let chroma_dst_x = (mb_x * 8 + px_offset_x / 2) as i32;
     let chroma_dst_y = (mb_y * 8 + px_offset_y / 2) as i32;
     let chroma_ref_x = chroma_dst_x + (mvx1 >> 3);
@@ -3206,7 +3246,10 @@ fn apply_mc_bi_partition(
         ref_l1.width / 2,
         ref_l1.height / 2,
     );
-    let chroma_off = chroma_dst_y as usize * ctx.pic.uv_stride + chroma_dst_x as usize;
+    // Field-aware destination offset
+    let (chroma_mb_off, chroma_dst_stride) = chroma_mb_offset(&ctx.pic, mb_x, mb_y, mb_field);
+    let chroma_off =
+        chroma_mb_off + (px_offset_y / 2) as usize * chroma_dst_stride + (px_offset_x / 2) as usize;
 
     let mut tmp_v = vec![0u8; chroma_w * chroma_h];
     mc::mc_chroma(
@@ -3228,12 +3271,11 @@ fn apply_mc_bi_partition(
         && l0_idx < ctx.implicit_weight.len()
         && l1_idx < ctx.implicit_weight.get(l0_idx).map_or(0, |v| v.len())
     {
-        // Implicit weighted bipred: same weight for luma and chroma, denom=5, offset=0
         let w0 = ctx.implicit_weight[l0_idx][l1_idx];
         let w1 = 64 - w0;
         biweight_pixels(
             &mut ctx.pic.u[chroma_off..],
-            ctx.pic.uv_stride,
+            chroma_dst_stride,
             &tmp_u,
             chroma_w,
             chroma_w,
@@ -3245,7 +3287,7 @@ fn apply_mc_bi_partition(
         );
         biweight_pixels(
             &mut ctx.pic.v[chroma_off..],
-            ctx.pic.uv_stride,
+            chroma_dst_stride,
             &tmp_v,
             chroma_w,
             chroma_w,
@@ -3264,7 +3306,7 @@ fn apply_mc_bi_partition(
         let denom = slice_hdr.chroma_log2_weight_denom;
         biweight_pixels(
             &mut ctx.pic.u[chroma_off..],
-            ctx.pic.uv_stride,
+            chroma_dst_stride,
             &tmp_u,
             chroma_w,
             chroma_w,
@@ -3276,7 +3318,7 @@ fn apply_mc_bi_partition(
         );
         biweight_pixels(
             &mut ctx.pic.v[chroma_off..],
-            ctx.pic.uv_stride,
+            chroma_dst_stride,
             &tmp_v,
             chroma_w,
             chroma_w,
@@ -3289,7 +3331,7 @@ fn apply_mc_bi_partition(
     } else {
         mc::avg_pixels_inplace(
             &mut ctx.pic.u[chroma_off..],
-            ctx.pic.uv_stride,
+            chroma_dst_stride,
             &tmp_u,
             chroma_w,
             chroma_w,
@@ -3297,7 +3339,7 @@ fn apply_mc_bi_partition(
         );
         mc::avg_pixels_inplace(
             &mut ctx.pic.v[chroma_off..],
-            ctx.pic.uv_stride,
+            chroma_dst_stride,
             &tmp_v,
             chroma_w,
             chroma_w,
@@ -3344,17 +3386,15 @@ fn biweight_pixels(
 /// Used when no reference frame is available for inter prediction.
 fn fill_mb_gray(ctx: &mut FrameDecodeContext, mb_x: u32, mb_y: u32) {
     // Luma
-    let luma_x = (mb_x * 16) as usize;
-    let luma_y = (mb_y * 16) as usize;
+    let (luma_base, luma_stride) = luma_mb_offset(&ctx.pic, mb_x, mb_y, ctx.mb_field);
     for y in 0..16 {
-        let offset = (luma_y + y) * ctx.pic.y_stride + luma_x;
+        let offset = luma_base + y * luma_stride;
         ctx.pic.y[offset..offset + 16].fill(128);
     }
     // Chroma
-    let chroma_x = (mb_x * 8) as usize;
-    let chroma_y = (mb_y * 8) as usize;
+    let (chroma_base, chroma_stride) = chroma_mb_offset(&ctx.pic, mb_x, mb_y, ctx.mb_field);
     for y in 0..8 {
-        let uv_offset = (chroma_y + y) * ctx.pic.uv_stride + chroma_x;
+        let uv_offset = chroma_base + y * chroma_stride;
         ctx.pic.u[uv_offset..uv_offset + 8].fill(128);
         ctx.pic.v[uv_offset..uv_offset + 8].fill(128);
     }
@@ -3394,7 +3434,8 @@ fn decode_chroma_inter(
                 let blk_x = (blk_idx & 1) as u32;
                 let blk_y = (blk_idx >> 1) as u32;
 
-                let (c_offset, c_stride) = chroma_block_offset(&ctx.pic, mb_x, mb_y, blk_x, blk_y);
+                let (c_offset, c_stride) =
+                    chroma_block_offset(&ctx.pic, mb_x, mb_y, blk_x, blk_y, ctx.mb_field);
                 let plane_data = if plane_idx == 0 {
                     &mut ctx.pic.u
                 } else {
@@ -3459,8 +3500,12 @@ fn decode_intra8x8(
 
     for i8x8 in 0..4usize {
         let (bx, by) = BLOCK_8X8_OFFSET[i8x8];
-        let px = (mb_x * 16 + bx) as usize;
-        let py = (mb_y * 16 + by) as usize;
+        // Compute field-aware offset and stride for this 8x8 block.
+        // bx/by are pixel offsets (0 or 8) → convert to 4x4-block units.
+        let blk_x_4 = bx / 4; // 0 or 2
+        let blk_y_4 = by / 4;
+        let (offset, stride) =
+            luma_block_offset(&ctx.pic, mb_x, mb_y, blk_x_4, blk_y_4, ctx.mb_field);
 
         // Neighbor availability for this 8x8 block
         let block_has_top = by > 0 || has_top;
@@ -3487,13 +3532,11 @@ fn decode_intra8x8(
             false
         };
 
-        // Gather reference samples (raw, unfiltered)
-        let stride = ctx.pic.y_stride;
-
+        // Gather reference samples using offset/stride (field-mode aware)
         // Top: 16 samples (8 top + 8 top-right, replicated if unavailable)
         let mut top = [128u8; 16];
-        if block_has_top && py > 0 {
-            let row_above = (py - 1) * stride + px;
+        if block_has_top && offset >= stride {
+            let row_above = offset - stride;
             top[..8].copy_from_slice(&ctx.pic.y[row_above..row_above + 8]);
             if block_has_top_right {
                 top[8..16].copy_from_slice(&ctx.pic.y[row_above + 8..row_above + 16]);
@@ -3505,15 +3548,15 @@ fn decode_intra8x8(
 
         // Left: 8 samples
         let mut left = [128u8; 8];
-        if block_has_left && px > 0 {
+        if block_has_left {
             for (i, lv) in left.iter_mut().enumerate() {
-                *lv = ctx.pic.y[(py + i) * stride + px - 1];
+                *lv = ctx.pic.y[offset + i * stride - 1];
             }
         }
 
         // Top-left: 1 sample
-        let top_left = if block_has_top_left && px > 0 && py > 0 {
-            ctx.pic.y[(py - 1) * stride + px - 1]
+        let top_left = if block_has_top_left && offset >= stride {
+            ctx.pic.y[offset - stride - 1]
         } else {
             128
         };
@@ -3523,7 +3566,6 @@ fn decode_intra8x8(
         let mode = mb.intra4x4_pred_mode[raster_for_mode];
 
         // Apply 8x8 intra prediction (filtering is done inside predict_8x8l)
-        let offset = py * stride + px;
         intra_pred::predict_8x8l(
             &mut ctx.pic.y[offset..],
             stride,
@@ -3611,8 +3653,7 @@ fn decode_intra4x4(
 
     // Decode each of the 16 4x4 luma blocks in block scan order
     for (block, &(blk_x, blk_y)) in BLOCK_INDEX_TO_XY.iter().enumerate() {
-        let px = (mb_x * 16 + blk_x * 4) as usize;
-        let py = (mb_y * 16 + blk_y * 4) as usize;
+        let (offset, stride) = luma_block_offset(&ctx.pic, mb_x, mb_y, blk_x, blk_y, ctx.mb_field);
 
         // Determine neighbor availability for this 4x4 block
         let block_has_top = blk_y > 0 || has_top;
@@ -3645,15 +3686,21 @@ fn decode_intra4x4(
             false
         };
 
-        // Gather neighbor pixels
-        let top = gather_top_luma(&ctx.pic, px, py, block_has_top, block_has_top_right);
-        let left = gather_left_luma(&ctx.pic, px, py, block_has_left);
-        let top_left = gather_top_left_luma(&ctx.pic, px, py, block_has_top, block_has_left);
+        // Gather neighbor pixels using offset/stride (field-mode aware)
+        let top = gather_top_luma(
+            &ctx.pic.y,
+            offset,
+            stride,
+            block_has_top,
+            block_has_top_right,
+        );
+        let left = gather_left_luma(&ctx.pic.y, offset, stride, block_has_left);
+        let top_left =
+            gather_top_left_luma(&ctx.pic.y, offset, stride, block_has_top, block_has_left);
 
         // Apply intra 4x4 prediction (modes stored in raster order)
         let raster_for_mode = block_to_raster(block);
         let mode = mb.intra4x4_pred_mode[raster_for_mode];
-        let (offset, stride) = luma_block_offset(&ctx.pic, mb_x, mb_y, blk_x, blk_y);
         intra_pred::predict_4x4(
             &mut ctx.pic.y[offset..],
             stride,
@@ -3693,7 +3740,8 @@ fn decode_intra4x4(
                 trace!(mb_x, mb_y, blk_x, blk_y, coeffs = ?mb.luma_coeffs[raster_idx], "intra4x4 post-dequant");
             }
 
-            let (offset, stride) = luma_block_offset(&ctx.pic, mb_x, mb_y, blk_x, blk_y);
+            let (offset, stride) =
+                luma_block_offset(&ctx.pic, mb_x, mb_y, blk_x, blk_y, ctx.mb_field);
             idct::idct4x4_add(
                 &mut ctx.pic.y[offset..],
                 stride,
@@ -3731,15 +3779,13 @@ fn decode_intra16x16(
     has_left: bool,
 ) {
     // Apply 16x16 intra prediction
-    let px = (mb_x * 16) as usize;
-    let py = (mb_y * 16) as usize;
-    let top: [u8; 16] = gather_top(&ctx.pic.y, ctx.pic.y_stride, px, py);
-    let left: [u8; 16] = gather_left(&ctx.pic.y, ctx.pic.y_stride, px, py);
-    let top_left = gather_top_left(&ctx.pic.y, ctx.pic.y_stride, px, py);
-    let offset = py * ctx.pic.y_stride + px;
+    let (offset, stride) = luma_mb_offset(&ctx.pic, mb_x, mb_y, ctx.mb_field);
+    let top: [u8; 16] = gather_top(&ctx.pic.y, offset, stride);
+    let left: [u8; 16] = gather_left(&ctx.pic.y, offset, stride, has_left);
+    let top_left = gather_top_left(&ctx.pic.y, offset, stride, has_top, has_left);
     intra_pred::predict_16x16(
         &mut ctx.pic.y[offset..],
-        ctx.pic.y_stride,
+        stride,
         mb.intra16x16_mode,
         &top,
         &left,
@@ -3770,7 +3816,7 @@ fn decode_intra16x16(
         let raster_idx = block_to_raster(block);
 
         let group_8x8 = (blk_y / 2) * 2 + (blk_x / 2);
-        let (offset, stride) = luma_block_offset(&ctx.pic, mb_x, mb_y, blk_x, blk_y);
+        let (offset, stride) = luma_block_offset(&ctx.pic, mb_x, mb_y, blk_x, blk_y, ctx.mb_field);
 
         if cbp_luma & (1 << group_8x8) != 0 {
             // AC present: combine DC into coeffs[0] for single IDCT pass
