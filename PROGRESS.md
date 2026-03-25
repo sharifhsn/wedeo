@@ -4,13 +4,40 @@
 
 See `CLAUDE.md` and `H264.md` for detailed status.
 
-- H.264 CAVLC: **51/51** progressive conformance files BITEXACT (100%) — added CI1_FT_B
+- H.264 CAVLC: **52/52** progressive conformance files BITEXACT (100%) — added CI_MW_D, LS_SVA_D
 - H.264 CABAC: 27/27 progressive conformance files BITEXACT (100%)
-- H.264 FRext CAVLC: **5/7 BITEXACT** (added test8b43; 2 out-of-scope: PAFF)
-- H.264 FRext CABAC: **18/22 BITEXACT** (added FRExt1/3 Panasonic; 4 PAFF out-of-scope)
-- Precommit total: **101 passing, 0 regressed**
+- H.264 FRext CAVLC: **5/7 BITEXACT** (2 out-of-scope: PAFF)
+- H.264 FRext CABAC: **18/22 BITEXACT** (4 PAFF out-of-scope)
+- H.264 MBAFF: frame-mode decode loops implemented (CABAC+CAVLC), 9 files produce frames, BITEXACT pending
+- Precommit total: **102 passing, 0 regressed**
 - WAV/PCM pipeline: byte-identical to FFmpeg 8.0.1 across all FATE suite samples
 - Audio via symphonia: 28 decoders, 10 demuxers, SNR-verified lossy codecs
+
+## MBAFF Frame-Mode Implementation (2026-03-25)
+
+Implemented MB pair decode loops for MBAFF (`!frame_mbs_only_flag`):
+- `decode_slice_cabac_mbaff()` and `decode_slice_cavlc_mbaff()`: pair iteration
+- `decode_cabac_field_decoding_flag()`: reads mb_field_decoding_flag from CABAC context 70
+- Dual left-side NeighborContext (top_left/bot_left) for correct pair-interleaved neighbor addressing
+- All 9 progressive MBAFF conformance files now produce decoded frames (was 0 before)
+
+**Blocker:** CABAC engine desyncs at pair 107 in CAMA1_Sony_C.jsv. CABAC state matches FFmpeg
+for first 106 pairs then diverges. Root cause under investigation — the NeighborContext fix is
+correct for pixel reconstruction but doesn't affect CABAC context derivation (uses CabacNeighborCtx).
+
+**Fixed:** framecrc_compare.py 0-frame false positive bug. Removed FM1_BT_B.h264 (false positive).
+Added CI_MW_D.264 and LS_SVA_D.264 to conformance.
+
+New scripts:
+- `classify_stream_features.py` — report profile, entropy, MBAFF, resolution, frame count per file
+- `audit_conformance_snapshots.py` — detect false positives in conformance snapshots
+- `mbaff_cabac_compare.py` — binary search CABAC desync location via lldb + trace comparison
+
+## Deferred Automation
+
+- Per-syntax-element CABAC divergence tracer: instrument decode_mb_cabac to log CABAC state after
+  each syntax element (mb_type, intra modes, CBP, each residual block). Compare with FFmpeg at
+  matching points. Needed to find root cause of MBAFF CABAC desync.
 
 ## Conformance Expansion + PPS/Reorder Fixes (2026-03-25)
 
