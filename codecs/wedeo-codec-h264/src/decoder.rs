@@ -1438,15 +1438,18 @@ impl H264Decoder {
         // -1 means "not yet read for this coded region".
         let mut mb_skip_run: i32 = -1;
 
+        // Two separate left-side contexts for top and bottom MB rows.
+        let mut top_left_nz = [0u8; 8];
+        let mut top_left_modes = [-1i8; 4];
+        let mut top_left_avail = false;
+        let mut bot_left_nz = [0u8; 8];
+        let mut bot_left_modes = [-1i8; 4];
+        let mut bot_left_avail = false;
+
         'pair_loop: loop {
             if mb_y >= mb_height {
                 break;
             }
-
-            // Save/restore left-side neighbor context between top and bottom MBs.
-            let mut saved_left_nz = [0u8; 8];
-            let mut saved_left_modes = [-1i8; 4];
-            let mut saved_left_available = false;
 
             for pair_pos in 0..2u32 {
                 let cur_y = mb_y + pair_pos;
@@ -1456,16 +1459,22 @@ impl H264Decoder {
                     break 'pair_loop;
                 }
 
-                // Update neighbor context
+                // MBAFF left-side neighbor: load the correct row's context.
                 if pair_pos == 0 {
+                    fdc.neighbor_ctx.left_nz = top_left_nz;
+                    fdc.neighbor_ctx.left_intra4x4_mode = top_left_modes;
+                    fdc.neighbor_ctx.left_available = top_left_avail;
                     if mb_x == 0 {
                         fdc.neighbor_ctx.new_row();
                     }
                 } else {
-                    // Save top MB's left context before bottom MB overwrites it
-                    saved_left_nz = fdc.neighbor_ctx.left_nz;
-                    saved_left_modes = fdc.neighbor_ctx.left_intra4x4_mode;
-                    saved_left_available = fdc.neighbor_ctx.left_available;
+                    // Save top's right edge, load bottom's left.
+                    top_left_nz = fdc.neighbor_ctx.left_nz;
+                    top_left_modes = fdc.neighbor_ctx.left_intra4x4_mode;
+                    top_left_avail = fdc.neighbor_ctx.left_available;
+                    fdc.neighbor_ctx.left_nz = bot_left_nz;
+                    fdc.neighbor_ctx.left_intra4x4_mode = bot_left_modes;
+                    fdc.neighbor_ctx.left_available = bot_left_avail;
                     if mb_x == 0 {
                         fdc.neighbor_ctx.new_row();
                     }
@@ -1532,10 +1541,10 @@ impl H264Decoder {
                 mbs_decoded += 1;
             }
 
-            // Restore top MB's left context for the next pair's top MB.
-            fdc.neighbor_ctx.left_nz = saved_left_nz;
-            fdc.neighbor_ctx.left_intra4x4_mode = saved_left_modes;
-            fdc.neighbor_ctx.left_available = saved_left_available;
+            // After the pair, save bottom MB's right edge as next pair's bottom-row left.
+            bot_left_nz = fdc.neighbor_ctx.left_nz;
+            bot_left_modes = fdc.neighbor_ctx.left_intra4x4_mode;
+            bot_left_avail = fdc.neighbor_ctx.left_available;
 
             // Advance to next pair
             mb_x += 1;
@@ -1799,6 +1808,16 @@ impl H264Decoder {
         let mut mbs_decoded = 0u32;
         let mut mb_field_decoding_flag = false;
 
+        // Two separate left-side contexts for MBAFF: one for top MBs, one for bottom MBs.
+        // After each pair, the top row's left context holds the top MB's right edge,
+        // and the bottom row's holds the bottom MB's right edge.
+        let mut top_left_nz = [0u8; 8];
+        let mut top_left_modes = [-1i8; 4];
+        let mut top_left_avail = false;
+        let mut bot_left_nz = [0u8; 8];
+        let mut bot_left_modes = [-1i8; 4];
+        let mut bot_left_avail = false;
+
         loop {
             if mb_y >= mb_height {
                 break;
@@ -1811,31 +1830,32 @@ impl H264Decoder {
             let mut bot_skip_preread = false;
             let mut bot_skip_value = false;
 
-            // Save/restore left-side neighbor context between top and bottom MBs.
-            // In MBAFF pair decode order, the bottom MB overwrites left_nz and
-            // left_intra4x4_mode. The next pair's top MB needs the TOP MB's
-            // left values, not the bottom MB's. Save after top MB, restore
-            // before next pair's top MB.
-            let mut saved_left_nz = [0u8; 8];
-            let mut saved_left_modes = [-1i8; 4];
-            let mut saved_left_available = false;
-
             for pair_pos in 0..2u32 {
                 let cur_y = mb_y + pair_pos;
                 let mb_addr = mb_x + cur_y * mb_width;
                 let mb_idx = mb_addr as usize;
 
-                // Update neighbor context
+                // MBAFF left-side neighbor context:
+                // The top MB's left neighbor is the TOP MB of the previous pair.
+                // The bottom MB's left neighbor is the BOTTOM MB of the previous pair.
+                // We maintain separate left contexts for top and bottom rows.
                 if pair_pos == 0 {
-                    // Top MB: restore saved left context from previous pair's top
+                    // Top MB: load top-row left context.
+                    fdc.neighbor_ctx.left_nz = top_left_nz;
+                    fdc.neighbor_ctx.left_intra4x4_mode = top_left_modes;
+                    fdc.neighbor_ctx.left_available = top_left_avail;
                     if mb_x == 0 {
                         fdc.neighbor_ctx.new_row();
                     }
                 } else {
-                    // Bottom MB: save top MB's left context, then set up for bottom
-                    saved_left_nz = fdc.neighbor_ctx.left_nz;
-                    saved_left_modes = fdc.neighbor_ctx.left_intra4x4_mode;
-                    saved_left_available = fdc.neighbor_ctx.left_available;
+                    // Bottom MB: save top MB's right edge as the next pair's top-row left.
+                    top_left_nz = fdc.neighbor_ctx.left_nz;
+                    top_left_modes = fdc.neighbor_ctx.left_intra4x4_mode;
+                    top_left_avail = fdc.neighbor_ctx.left_available;
+                    // Load bottom-row left context.
+                    fdc.neighbor_ctx.left_nz = bot_left_nz;
+                    fdc.neighbor_ctx.left_intra4x4_mode = bot_left_modes;
+                    fdc.neighbor_ctx.left_available = bot_left_avail;
                     if mb_x == 0 {
                         fdc.neighbor_ctx.new_row();
                     }
@@ -1929,6 +1949,10 @@ impl H264Decoder {
                     && fdc.slice_table[(mb_addr - mb_width) as usize] == fdc.current_slice;
 
                 // Decode coded MB via CABAC
+                trace!(
+                    "MBAFF_MB_START mb_x={} mb_y={} pos={} low={} range={}",
+                    mb_x, cur_y, reader.pos(), reader.low(), reader.range()
+                );
                 let mut cache = CabacDecodeCache::new();
                 let mut mb = decode_mb_cabac(
                     reader,
@@ -1969,10 +1993,10 @@ impl H264Decoder {
                 mbs_decoded += 1;
             }
 
-            // Restore top MB's left context for the next pair's top MB.
-            fdc.neighbor_ctx.left_nz = saved_left_nz;
-            fdc.neighbor_ctx.left_intra4x4_mode = saved_left_modes;
-            fdc.neighbor_ctx.left_available = saved_left_available;
+            // After the pair, save bottom MB's right edge as next pair's bottom-row left.
+            bot_left_nz = fdc.neighbor_ctx.left_nz;
+            bot_left_modes = fdc.neighbor_ctx.left_intra4x4_mode;
+            bot_left_avail = fdc.neighbor_ctx.left_available;
 
             // Trace CABAC state after each pair for divergence detection
             trace!(
