@@ -77,6 +77,292 @@ fn block_to_raster(block: usize) -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// MBAFF neighbor indices
+// ---------------------------------------------------------------------------
+
+/// Pre-computed MBAFF neighbor MB indices for context derivation.
+///
+/// Matches FFmpeg's `fill_decode_neighbors()` output: `left_mb_xy[LTOP]`,
+/// `left_mb_xy[LBOT]`, and `top_mb_xy`. For non-MBAFF (progressive) frames,
+/// these are just `mb_idx - 1` / `mb_idx - mb_width`. For MBAFF with mixed
+/// field/frame pairs, the indices are adjusted per spec Table 6-4.
+///
+/// `None` means the neighbor is unavailable (out of bounds or different slice).
+///
+/// Reference: FFmpeg h264_mvpred.h:487-574 (`fill_decode_neighbors`).
+#[derive(Clone, Debug)]
+pub struct MbaffNeighbors {
+    /// Left neighbor MB index (LTOP). Used by most left-context lookups.
+    pub left_idx: Option<usize>,
+    /// Left neighbor MB index (LBOT). May differ from `left_idx` when
+    /// the current MB is field-mode and the left pair has different mode.
+    pub left_idx_bot: Option<usize>,
+    /// Top neighbor MB index.
+    pub top_idx: Option<usize>,
+    /// Left block remapping option (0-3) for MBAFF field/frame mode mismatch.
+    ///
+    /// Selects which sub-blocks of the left neighbor MB are used for NNZ,
+    /// CBP, and intra4x4 mode context. See FFmpeg `left_block_options[4][32]`
+    /// in h264_mvpred.h:491-496.
+    ///
+    /// - 0: default (same mode or non-MBAFF)
+    /// - 1: bottom pair, curr frame, left field
+    /// - 2: top pair, curr frame, left field
+    /// - 3: curr field, left frame
+    pub left_block_option: u8,
+}
+
+/// Compute MBAFF-aware neighbor MB indices for context derivation.
+///
+/// For progressive (`!is_mbaff`), returns simple indices.
+/// For MBAFF, adjusts based on current/neighbor field/frame mode.
+///
+/// Reference: FFmpeg h264_mvpred.h:487-574 (`fill_decode_neighbors`).
+#[allow(clippy::too_many_arguments)] // mirrors FFmpeg fill_decode_neighbors parameter set
+pub fn compute_mbaff_neighbors(
+    mb_x: u32,
+    mb_y: u32,
+    mb_width: u32,
+    is_mbaff: bool,
+    curr_field: bool,
+    mb_field_flags: &[bool],
+    slice_table: &[u16],
+    current_slice: u16,
+) -> MbaffNeighbors {
+    let mb_idx = (mb_y * mb_width + mb_x) as usize;
+    let mb_stride = mb_width as usize;
+
+    if !is_mbaff {
+        // Progressive: simple indices with slice boundary check
+        let left = if mb_x > 0 {
+            let li = mb_idx - 1;
+            if slice_table[li] == current_slice {
+                Some(li)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let top = if mb_y > 0 {
+            let ti = mb_idx - mb_stride;
+            if slice_table[ti] == current_slice {
+                Some(ti)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        return MbaffNeighbors {
+            left_idx: left,
+            left_idx_bot: left,
+            top_idx: top,
+            left_block_option: 0,
+        };
+    }
+
+    // --- MBAFF ---
+    // Default: same as progressive but top uses field-adjusted stride
+    // FFmpeg: top_xy = mb_xy - (mb_stride << MB_FIELD)
+    let top_stride = if curr_field { 2 * mb_stride } else { mb_stride };
+    let mut top_xy = if mb_idx >= top_stride {
+        mb_idx - top_stride
+    } else {
+        usize::MAX
+    };
+
+    let mut left_xy_top = if mb_x > 0 { mb_idx - 1 } else { usize::MAX };
+    let mut left_xy_bot = left_xy_top;
+    let mut left_block_option = 0u8;
+
+    if mb_x > 0 {
+        let left_is_field = mb_field_flags.get(mb_idx - 1).copied().unwrap_or(false);
+        let mode_mismatch = left_is_field != curr_field;
+
+        if mb_y & 1 == 1 {
+            // Bottom of pair
+            if mode_mismatch {
+                // Left = top of left pair
+                let top_of_left = if mb_idx > mb_stride {
+                    mb_idx - mb_stride - 1
+                } else {
+                    usize::MAX
+                };
+                left_xy_top = top_of_left;
+                left_xy_bot = top_of_left;
+                if curr_field && top_of_left != usize::MAX {
+                    // Current is field: LBOT = bottom of left pair
+                    left_xy_bot = top_of_left + mb_stride;
+                    left_block_option = 3;
+                } else {
+                    left_block_option = 1;
+                }
+            }
+        } else if mode_mismatch {
+            // Top of pair
+            if curr_field {
+                // Current field, left frame: LBOT = bottom of left pair
+                left_xy_bot = left_xy_top + mb_stride;
+                left_block_option = 3;
+            } else {
+                // Current frame, left field: no index change
+                left_block_option = 2;
+            }
+        }
+    }
+
+    // Top adjustment for top-of-pair field-mode current
+    if curr_field && mb_y & 1 == 0 && top_xy != usize::MAX && top_xy < mb_field_flags.len() {
+        // If above neighbor pair is frame-mode, adjust top to bottom of above pair
+        let above_is_field = mb_field_flags.get(top_xy).copied().unwrap_or(false);
+        if !above_is_field {
+            top_xy += mb_stride;
+        }
+    }
+
+    // Apply slice boundary checks
+    let left_top = if left_xy_top != usize::MAX
+        && left_xy_top < slice_table.len()
+        && slice_table[left_xy_top] == current_slice
+    {
+        Some(left_xy_top)
+    } else {
+        None
+    };
+    let left_bot = if left_xy_bot != usize::MAX
+        && left_xy_bot < slice_table.len()
+        && slice_table[left_xy_bot] == current_slice
+    {
+        Some(left_xy_bot)
+    } else {
+        None
+    };
+    let top = if top_xy != usize::MAX
+        && top_xy < slice_table.len()
+        && slice_table[top_xy] == current_slice
+    {
+        Some(top_xy)
+    } else {
+        None
+    };
+
+    MbaffNeighbors {
+        left_idx: left_top,
+        left_idx_bot: left_bot,
+        top_idx: top,
+        left_block_option,
+    }
+}
+
+/// Compute MBAFF-aware neighbor indices for CABAC skip context.
+///
+/// The skip function uses DIFFERENT neighbor logic from `fill_decode_neighbors`:
+/// it works at the pair level and has its own field/frame adjustment.
+///
+/// Reference: FFmpeg h264_cabac.c:1336-1371 (`decode_cabac_mb_skip`).
+#[allow(clippy::too_many_arguments)] // mirrors FFmpeg decode_cabac_mb_skip parameter set
+pub fn mbaff_skip_neighbors(
+    mb_x: u32,
+    mb_y: u32,
+    mb_width: u32,
+    is_mbaff: bool,
+    curr_field: bool,
+    mb_field_flags: &[bool],
+    slice_table: &[u16],
+    current_slice: u16,
+) -> (Option<usize>, Option<usize>) {
+    let mb_stride = mb_width as usize;
+
+    if !is_mbaff {
+        let mb_idx = (mb_y * mb_width + mb_x) as usize;
+        let left = if mb_x > 0 {
+            let li = mb_idx - 1;
+            if slice_table[li] == current_slice {
+                Some(li)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let top = if mb_y > 0 {
+            let ti = mb_idx - mb_stride;
+            if slice_table[ti] == current_slice {
+                Some(ti)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        return (left, top);
+    }
+
+    // MBAFF skip: mb_xy = mb_x + (mb_y & ~1) * mb_stride (top of pair)
+    let pair_top_xy = mb_x as usize + ((mb_y & !1) as usize) * mb_stride;
+
+    // Left (mba_xy): starts at top of left pair
+    let mba = if mb_x > 0 {
+        let mut mba_xy = pair_top_xy - 1;
+        if mb_y & 1 == 1 {
+            // Bottom MB: if left is same slice and same field/frame mode, go to bottom
+            if mba_xy < slice_table.len()
+                && slice_table[mba_xy] == current_slice
+                && curr_field == mb_field_flags.get(mba_xy).copied().unwrap_or(false)
+            {
+                mba_xy += mb_stride;
+            }
+        }
+        if mba_xy < slice_table.len() && slice_table[mba_xy] == current_slice {
+            Some(mba_xy)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Top (mbb_xy)
+    let mbb = if curr_field {
+        // Field mode: mbb = pair_top - stride (= bottom of above pair)
+        if pair_top_xy >= mb_stride {
+            let mut mbb_xy = pair_top_xy - mb_stride;
+            // If top of current pair and above is field-mode, go to top of above pair
+            if mb_y & 1 == 0
+                && mbb_xy < slice_table.len()
+                && slice_table[mbb_xy] == current_slice
+                && mb_field_flags.get(mbb_xy).copied().unwrap_or(false)
+                && mbb_xy >= mb_stride
+            {
+                mbb_xy -= mb_stride;
+            }
+            if mbb_xy < slice_table.len() && slice_table[mbb_xy] == current_slice {
+                Some(mbb_xy)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        // Frame mode: mbb = mb_x + (mb_y - 1) * stride
+        if mb_y > 0 {
+            let mbb_xy = mb_x as usize + (mb_y as usize - 1) * mb_stride;
+            if mbb_xy < slice_table.len() && slice_table[mbb_xy] == current_slice {
+                Some(mbb_xy)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+
+    (mba, mbb)
+}
+
+// ---------------------------------------------------------------------------
 // Frame-level decode context
 // ---------------------------------------------------------------------------
 
@@ -154,6 +440,9 @@ pub struct FrameDecodeContext {
     /// True if chroma planes exist (chroma_format_idc != 0).
     /// When false (monochrome), chroma bitstream data is absent and U/V planes are 128-filled.
     pub decode_chroma: bool,
+    /// True if the SPS has frame_mbs_only_flag=false (MBAFF capable).
+    /// Used by `compute_mbaff_neighbors` to decide neighbor addressing.
+    pub is_mbaff: bool,
     /// MBAFF field-coded MB flag. When true, this MB is part of a field-coded pair:
     /// stride is doubled (writes to every other row), and the bottom field (mb_y & 1 == 1)
     /// starts one row below the pair's top-left corner.
@@ -247,6 +536,7 @@ impl FrameDecodeContext {
             last_qscale_diff: 0,
             slice_deblock_params: Vec::new(),
             decode_chroma,
+            is_mbaff: !sps.frame_mbs_only_flag,
             mb_field: false,
         }
     }
@@ -780,17 +1070,31 @@ pub fn apply_macroblock(
 
     // Check neighbor availability with slice boundary awareness.
     // H.264 spec: neighbors from different slices are unavailable.
-    let cur_slice = ctx.current_slice;
-    let mut has_top = mb_y > 0 && ctx.slice_table[mb_idx - ctx.mb_width as usize] == cur_slice;
-    let mut has_left = mb_x > 0 && ctx.slice_table[mb_idx - 1] == cur_slice;
+    // For MBAFF, use adjusted neighbor indices from fill_decode_neighbors logic.
+    let nb = compute_mbaff_neighbors(
+        mb_x,
+        mb_y,
+        ctx.mb_width,
+        ctx.is_mbaff,
+        ctx.mb_field,
+        &ctx.mb_field_flag,
+        &ctx.slice_table,
+        ctx.current_slice,
+    );
+    let mut has_top = nb.top_idx.is_some();
+    let mut has_left = nb.left_idx.is_some();
 
     // Constrained intra prediction: inter neighbor pixels are unavailable
     // for intra prediction (H.264 spec, FFmpeg h264_mvpred.h:598).
     if ctx.constrained_intra_pred && (mb.is_intra4x4 || mb.is_intra16x16 || mb.is_pcm) {
-        if has_top && !ctx.mb_info[mb_idx - ctx.mb_width as usize].is_intra {
+        if let Some(ti) = nb.top_idx
+            && !ctx.mb_info[ti].is_intra
+        {
             has_top = false;
         }
-        if has_left && !ctx.mb_info[mb_idx - 1].is_intra {
+        if let Some(li) = nb.left_idx
+            && !ctx.mb_info[li].is_intra
+        {
             has_left = false;
         }
     }
@@ -805,6 +1109,15 @@ pub fn apply_macroblock(
         is_intra16x16 = mb.is_intra16x16,
         t8x8 = mb.transform_size_8x8_flag,
         "decoded MB"
+    );
+    trace!(
+        mb_x,
+        mb_y,
+        mb_field = ctx.mb_field,
+        has_top,
+        has_left,
+        left_block_option = nb.left_block_option,
+        "INTRA_RECON_START"
     );
 
     // Decode based on macroblock type
@@ -930,6 +1243,15 @@ pub fn apply_macroblock(
             u_sum,
             v_sum,
             "MB_RECON"
+        );
+        trace!(
+            mb_x,
+            mb_y,
+            y_row0 = ?&ctx.pic.y[y_off..y_off + 16],
+            y_row1 = ?&ctx.pic.y[y_off + y_stride..y_off + y_stride + 16],
+            y_row2 = ?&ctx.pic.y[y_off + 2 * y_stride..y_off + 2 * y_stride + 16],
+            y_row3 = ?&ctx.pic.y[y_off + 3 * y_stride..y_off + 3 * y_stride + 16],
+            "INTRA_FINAL_ROWS"
         );
     }
 
@@ -3529,10 +3851,17 @@ fn decode_intra8x8(
             } else {
                 // Top-right of the right 8x8 block = top-right MB.
                 // Must check slice_table to ensure the above-right MB has
-                // been decoded. In MBAFF, MB(x+1, y-1) may not be decoded
-                // yet when processing the bottom MB of pair x.
-                if mb_x + 1 < ctx.mb_width && mb_y > 0 {
-                    let tr_idx = ((mb_y - 1) * ctx.mb_width + mb_x + 1) as usize;
+                // been decoded. In MBAFF field mode, the above row is from
+                // the previous pair row (mb_y-2), not mb_y-1.
+                let tr_y_opt = if ctx.is_mbaff && ctx.mb_field {
+                    if mb_y >= 2 { Some(mb_y - 2) } else { None }
+                } else {
+                    if mb_y > 0 { Some(mb_y - 1) } else { None }
+                };
+                if mb_x + 1 < ctx.mb_width
+                    && let Some(tr_y) = tr_y_opt
+                {
+                    let tr_idx = (tr_y * ctx.mb_width + mb_x + 1) as usize;
                     let decoded = ctx.slice_table[tr_idx] == ctx.current_slice;
                     if decoded && ctx.constrained_intra_pred {
                         ctx.mb_info[tr_idx].is_intra
@@ -3666,6 +3995,43 @@ fn decode_intra4x4(
 ) {
     let cbp_luma = mb.cbp & 0x0F;
 
+    // Raw neighbor pixels from frame buffer for MBAFF debugging.
+    // Dumps the 16-pixel top row, left column, and top-left at MB-level
+    // before any per-block gather. Compare with FFmpeg via ffmpeg_recon_extract.py.
+    {
+        let (mb_off, mb_str) = luma_mb_offset(&ctx.pic, mb_x, mb_y, ctx.mb_field);
+        let raw_top: [u8; 16] = if mb_off >= mb_str {
+            let row = mb_off - mb_str;
+            let mut t = [0u8; 16];
+            t.copy_from_slice(&ctx.pic.y[row..row + 16]);
+            t
+        } else {
+            [0u8; 16]
+        };
+        let raw_left: [u8; 16] = if has_left {
+            let mut l = [128u8; 16];
+            for (i, lv) in l.iter_mut().enumerate() {
+                *lv = ctx.pic.y[mb_off + i * mb_str - 1];
+            }
+            l
+        } else {
+            [128u8; 16]
+        };
+        let raw_tl = if has_top && has_left && mb_off >= mb_str {
+            ctx.pic.y[mb_off - mb_str - 1]
+        } else {
+            128
+        };
+        trace!(
+            mb_x, mb_y,
+            offset = mb_off, stride = mb_str,
+            top_row = ?raw_top,
+            left_col = ?raw_left,
+            top_left = raw_tl,
+            "INTRA_RAW_NEIGHBORS"
+        );
+    }
+
     // Decode each of the 16 4x4 luma blocks in block scan order
     for (block, &(blk_x, blk_y)) in BLOCK_INDEX_TO_XY.iter().enumerate() {
         let (offset, stride) = luma_block_offset(&ctx.pic, mb_x, mb_y, blk_x, blk_y, ctx.mb_field);
@@ -3690,8 +4056,21 @@ fn decode_intra4x4(
                 // blk_x == 3: top-right is from the MB to the upper-right.
                 // Must check slice_table (not just bounds) to handle MBAFF
                 // decode order where MB(x+1, y-1) may not be decoded yet.
-                if mb_x + 1 < ctx.mb_width && mb_y > 0 {
-                    let tr_idx = ((mb_y - 1) * ctx.mb_width + mb_x + 1) as usize;
+                //
+                // MBAFF field mode: the "row above" is from the previous
+                // pair row (2 MB-rows above), not the immediately adjacent
+                // MB row. The previous pair row is always fully decoded,
+                // so the check should use mb_y-2 instead of mb_y-1.
+                let tr_y_opt = if ctx.is_mbaff && ctx.mb_field {
+                    // Field mode: above row is from previous pair row
+                    if mb_y >= 2 { Some(mb_y - 2) } else { None }
+                } else {
+                    if mb_y > 0 { Some(mb_y - 1) } else { None }
+                };
+                if mb_x + 1 < ctx.mb_width
+                    && let Some(tr_y) = tr_y_opt
+                {
+                    let tr_idx = (tr_y * ctx.mb_width + mb_x + 1) as usize;
                     let decoded = ctx.slice_table[tr_idx] == ctx.current_slice;
                     if decoded && ctx.constrained_intra_pred {
                         ctx.mb_info[tr_idx].is_intra
@@ -3800,6 +4179,41 @@ fn decode_intra16x16(
 ) {
     // Apply 16x16 intra prediction
     let (offset, stride) = luma_mb_offset(&ctx.pic, mb_x, mb_y, ctx.mb_field);
+
+    // Raw neighbor pixels from frame buffer for MBAFF debugging
+    {
+        let raw_top: [u8; 16] = if offset >= stride {
+            let row = offset - stride;
+            let mut t = [0u8; 16];
+            t.copy_from_slice(&ctx.pic.y[row..row + 16]);
+            t
+        } else {
+            [0u8; 16]
+        };
+        let raw_left: [u8; 16] = if has_left {
+            let mut l = [128u8; 16];
+            for (i, lv) in l.iter_mut().enumerate() {
+                *lv = ctx.pic.y[offset + i * stride - 1];
+            }
+            l
+        } else {
+            [128u8; 16]
+        };
+        let raw_tl = if has_top && has_left && offset >= stride {
+            ctx.pic.y[offset - stride - 1]
+        } else {
+            128
+        };
+        trace!(
+            mb_x, mb_y,
+            offset, stride,
+            top_row = ?raw_top,
+            left_col = ?raw_left,
+            top_left = raw_tl,
+            "INTRA_RAW_NEIGHBORS"
+        );
+    }
+
     let top: [u8; 16] = gather_top(&ctx.pic.y, offset, stride);
     let left: [u8; 16] = gather_left(&ctx.pic.y, offset, stride, has_left);
     let top_left = gather_top_left(&ctx.pic.y, offset, stride, has_top, has_left);
