@@ -13,6 +13,23 @@ See `CLAUDE.md` and `H264.md` for detailed status.
 - WAV/PCM pipeline: byte-identical to FFmpeg 8.0.1 across all FATE suite samples
 - Audio via symphonia: 28 decoders, 10 demuxers, SNR-verified lossy codecs
 
+## MBAFF Deblock Root Cause Found — Vertical Edge at Pair Boundary (2026-03-26)
+
+Traced the CAMA1_Sony_C deblock diffs (Y≤8) to root cause via pixel watchpoint.
+
+**Finding:** MB(17,6) frame-mode (pair 3 top), above pair (17,4-5) field-mode.
+The MBAFF horizontal edge 0 handler processes the pair 2/3 boundary with doubled
+stride. The q-side pixels (pair 3 row 96) differ because FFmpeg's vertical edge 1
+at MB(17,6) modifies reconstruction pixel (276,96) from 64→65, while wedeo's doesn't.
+This cascades through the MBAFF horiz edge 0 handler to modify p1 at row 92.
+
+**Next step:** Compare vertical edge 0/1 inputs for frame-mode MB(17,6) to find why
+the normal filter produces different output. The MB boundary vertical edge (edge 0)
+may modify col 2-3 differently, changing edge 1's threshold result.
+
+New scripts: `deblock_edge_trace.py` (lldb extraction), `deblock_pixel_watch.py`
+(finds modifying MB), `deblock_mb_dump.py` (side-by-side MB comparison).
+
 ## MBAFF Deblocking Iteration Order + bS=1 Mixed Inter (2026-03-26)
 
 **Fix 1: Iteration order.** FFmpeg's `loop_filter()` (h264_slice.c:2451-2452)
