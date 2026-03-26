@@ -820,6 +820,16 @@ fn compute_luma_bs(
                 false
             };
 
+            // FFmpeg h264_loopfilter.c:557-559: horizontal inter MB boundary
+            // with mixed interlace modes → bS=1, skip MV check.
+            if is_mb_edge && !is_vertical && !p_intra && !q_intra {
+                let neighbor_field = mb_info[mb_idx - above_stride].mb_field;
+                if cur.mb_field != neighbor_field {
+                    *bs_val = 1;
+                    continue;
+                }
+            }
+
             *bs_val = compute_bs(
                 is_mb_edge,
                 p_intra,
@@ -1615,11 +1625,12 @@ pub fn deblock_frame(
     mb_info: &[MbDeblockInfo],
     slice_table: &[u16],
     slice_params: &[SliceDeblockParams],
+    is_mbaff: bool,
 ) {
     let mb_width = pic.mb_width;
     let mb_height = pic.mb_height;
 
-    debug!(mb_width, mb_height, "deblocking frame");
+    debug!(mb_width, mb_height, is_mbaff, "deblocking frame");
 
     debug_assert_eq!(
         mb_info.len(),
@@ -1627,32 +1638,74 @@ pub fn deblock_frame(
         "mb_info length must equal mb_width * mb_height"
     );
 
-    // Process macroblocks in raster order
-    for mb_y in 0..mb_height {
-        for mb_x in 0..mb_width {
-            let mb_idx = (mb_y * mb_width + mb_x) as usize;
-            let slice_id = slice_table[mb_idx] as usize;
-            let params = &slice_params[slice_id.min(slice_params.len() - 1)];
-
-            // idc == 1 means disable filter for this slice's MBs
-            if params.disable_deblocking_filter_idc == 1 {
-                continue;
-            }
-
-            deblock_mb(pic, mb_info, mb_x, mb_y, slice_table, slice_params);
-
-            {
-                let mb_field = mb_info[mb_idx].mb_field;
-                let (y_base, y_stride) = deblock_luma_offset(pic.y_stride, mb_x, mb_y, mb_field);
-                let (u_base, uv_stride) =
-                    deblock_chroma_offset(pic.uv_stride, mb_x, mb_y, mb_field);
-                let (v_base, _) = deblock_chroma_offset(pic.uv_stride, mb_x, mb_y, mb_field);
-                let y_sum = deblock_plane_sum(&pic.y, y_base, y_stride, 16);
-                let u_sum = deblock_plane_sum(&pic.u, u_base, uv_stride, 8);
-                let v_sum = deblock_plane_sum(&pic.v, v_base, uv_stride, 8);
-                tracing::trace!(mb_x, mb_y, y_sum, u_sum, v_sum, "MB_DEBLOCK");
+    // MBAFF: iterate column-first within each pair row, so both MBs of a pair
+    // at column x are deblocked before moving to column x+1. This matches
+    // FFmpeg's loop_filter() in h264_slice.c:2451-2452.
+    // Progressive: standard raster order.
+    if is_mbaff {
+        for pair_row in 0..(mb_height / 2) {
+            for mb_x in 0..mb_width {
+                for sub in 0..2u32 {
+                    let mb_y = pair_row * 2 + sub;
+                    deblock_mb_if_enabled(
+                        pic,
+                        mb_info,
+                        mb_x,
+                        mb_y,
+                        mb_width,
+                        slice_table,
+                        slice_params,
+                    );
+                }
             }
         }
+    } else {
+        for mb_y in 0..mb_height {
+            for mb_x in 0..mb_width {
+                deblock_mb_if_enabled(
+                    pic,
+                    mb_info,
+                    mb_x,
+                    mb_y,
+                    mb_width,
+                    slice_table,
+                    slice_params,
+                );
+            }
+        }
+    }
+}
+
+/// Check idc and deblock a single MB, with tracing.
+fn deblock_mb_if_enabled(
+    pic: &mut PictureBuffer,
+    mb_info: &[MbDeblockInfo],
+    mb_x: u32,
+    mb_y: u32,
+    mb_width: u32,
+    slice_table: &[u16],
+    slice_params: &[SliceDeblockParams],
+) {
+    let mb_idx = (mb_y * mb_width + mb_x) as usize;
+    let slice_id = slice_table[mb_idx] as usize;
+    let params = &slice_params[slice_id.min(slice_params.len() - 1)];
+
+    // idc == 1 means disable filter for this slice's MBs
+    if params.disable_deblocking_filter_idc == 1 {
+        return;
+    }
+
+    deblock_mb(pic, mb_info, mb_x, mb_y, slice_table, slice_params);
+
+    {
+        let mb_field = mb_info[mb_idx].mb_field;
+        let (y_base, y_stride) = deblock_luma_offset(pic.y_stride, mb_x, mb_y, mb_field);
+        let (u_base, uv_stride) = deblock_chroma_offset(pic.uv_stride, mb_x, mb_y, mb_field);
+        let (v_base, _) = deblock_chroma_offset(pic.uv_stride, mb_x, mb_y, mb_field);
+        let y_sum = deblock_plane_sum(&pic.y, y_base, y_stride, 16);
+        let u_sum = deblock_plane_sum(&pic.u, u_base, uv_stride, 8);
+        let v_sum = deblock_plane_sum(&pic.v, v_base, uv_stride, 8);
+        tracing::trace!(mb_x, mb_y, y_sum, u_sum, v_sum, "MB_DEBLOCK");
     }
 }
 
@@ -2214,7 +2267,13 @@ mod tests {
         }];
 
         let st = vec![0u16; mb_info.len()];
-        deblock_frame(&mut pic, &mb_info, &st, &[SliceDeblockParams::default()]);
+        deblock_frame(
+            &mut pic,
+            &mb_info,
+            &st,
+            &[SliceDeblockParams::default()],
+            false,
+        );
 
         // With bS=0 everywhere (single MB, no neighbors, inter with identical motion),
         // nothing should change.
@@ -2242,7 +2301,7 @@ mod tests {
             ..Default::default()
         };
         let st = vec![0u16; mb_info.len()];
-        deblock_frame(&mut pic, &mb_info, &st, &[disabled_params]);
+        deblock_frame(&mut pic, &mb_info, &st, &[disabled_params], false);
         assert_eq!(pic.y, y_before);
     }
 
@@ -2285,7 +2344,13 @@ mod tests {
         ];
 
         let st = vec![0u16; mb_info.len()];
-        deblock_frame(&mut pic, &mb_info, &st, &[SliceDeblockParams::default()]);
+        deblock_frame(
+            &mut pic,
+            &mb_info,
+            &st,
+            &[SliceDeblockParams::default()],
+            false,
+        );
 
         // The pixels near x=16 boundary should have been modified
         let mut boundary_changed = false;
@@ -2347,7 +2412,13 @@ mod tests {
         ];
 
         let st = vec![0u16; mb_info.len()];
-        deblock_frame(&mut pic, &mb_info, &st, &[SliceDeblockParams::default()]);
+        deblock_frame(
+            &mut pic,
+            &mb_info,
+            &st,
+            &[SliceDeblockParams::default()],
+            false,
+        );
 
         // The pixels near y=16 boundary should have been modified
         let mut boundary_changed = false;

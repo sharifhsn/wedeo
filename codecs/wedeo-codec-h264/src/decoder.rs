@@ -2179,11 +2179,18 @@ impl H264Decoder {
     /// Convert a completed FrameDecodeContext to a Frame.
     fn fdc_to_frame(&self, fdc: &mut FrameDecodeContext, hdr: &SliceHeader, pts: i64) -> Frame {
         if std::env::var("WEDEO_NO_DEBLOCK").is_err() {
+            // Determine MBAFF from the SPS referenced by this slice's PPS.
+            let is_mbaff = self.pps_list[hdr.pps_id as usize]
+                .as_ref()
+                .and_then(|pps| self.sps_list[pps.sps_id as usize].as_ref())
+                .is_some_and(|sps| !sps.frame_mbs_only_flag);
+
             deblock::deblock_frame(
                 &mut fdc.pic,
                 &fdc.mb_info,
                 &fdc.slice_table,
                 &fdc.slice_deblock_params,
+                is_mbaff,
             );
         }
 
