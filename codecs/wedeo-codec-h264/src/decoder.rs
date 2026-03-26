@@ -115,6 +115,22 @@ pub struct H264Decoder {
     delayed_pics: Vec<(i32, Frame, bool)>, // (poc, frame, mmco_reset)
 }
 
+/// Compute intra4x4 right-column modes as i8 for CABAC neighbor storage.
+/// Mirrors the mode array computed in `apply_macroblock` for `NeighborContext`.
+fn mb_intra4x4_modes_i8(mb: &crate::cavlc::Macroblock) -> [i8; 16] {
+    if mb.is_intra4x4 {
+        let mut modes = [-1i8; 16];
+        for (i, mode) in modes.iter_mut().enumerate() {
+            *mode = mb.intra4x4_pred_mode[i] as i8;
+        }
+        modes
+    } else if mb.is_intra {
+        [2i8; 16] // DC_PRED for I_16x16, I_PCM
+    } else {
+        [-1i8; 16] // unavailable for inter
+    }
+}
+
 impl H264Decoder {
     /// Create a new H264Decoder from codec parameters.
     pub fn new(params: CodecParameters) -> Result<Self> {
@@ -1457,6 +1473,9 @@ impl H264Decoder {
         let mut bot_left_nz = [0u8; 8];
         let mut bot_left_modes = [-1i8; 4];
         let mut bot_left_avail = false;
+        // MBAFF: save top-row context for the bottom MB (same as CABAC path).
+        let mut saved_top_modes_cavlc = [-1i8; 4];
+        let mut saved_top_nz_luma_cavlc = [0u8; 4];
 
         'pair_loop: loop {
             if mb_y >= mb_height {
@@ -1479,6 +1498,12 @@ impl H264Decoder {
                     if mb_x == 0 {
                         fdc.neighbor_ctx.new_row();
                     }
+                    // MBAFF: save top-row context before top MB overwrites it.
+                    let base = mb_x as usize * 4;
+                    saved_top_modes_cavlc
+                        .copy_from_slice(&fdc.neighbor_ctx.top_intra4x4_mode[base..base + 4]);
+                    saved_top_nz_luma_cavlc
+                        .copy_from_slice(&fdc.neighbor_ctx.top_nz_luma[base..base + 4]);
                 } else {
                     // Save top's right edge, load bottom's left.
                     top_left_nz = fdc.neighbor_ctx.left_nz;
@@ -1489,6 +1514,14 @@ impl H264Decoder {
                     fdc.neighbor_ctx.left_available = bot_left_avail;
                     if mb_x == 0 {
                         fdc.neighbor_ctx.new_row();
+                    }
+                    // MBAFF field-mode: restore pre-top-MB top context.
+                    if mb_field_decoding_flag {
+                        let base = mb_x as usize * 4;
+                        fdc.neighbor_ctx.top_intra4x4_mode[base..base + 4]
+                            .copy_from_slice(&saved_top_modes_cavlc);
+                        fdc.neighbor_ctx.top_nz_luma[base..base + 4]
+                            .copy_from_slice(&saved_top_nz_luma_cavlc);
                     }
                 }
                 fdc.neighbor_ctx.top_available = cur_y > 0
@@ -1680,15 +1713,22 @@ impl H264Decoder {
                         mb_y,
                         hdr.slice_type.is_b()
                     );
+                    let nb = crate::mb::compute_mbaff_neighbors(
+                        mb_x,
+                        mb_y,
+                        mb_width,
+                        false,
+                        false,
+                        &fdc.mb_field_flag,
+                        &fdc.slice_table,
+                        fdc.current_slice,
+                    );
                     let skip = decode_cabac_mb_skip(
                         &mut reader,
                         &mut cabac_state,
                         &cabac_nb,
-                        &fdc.slice_table,
-                        fdc.current_slice,
-                        mb_x,
-                        mb_y,
-                        mb_width,
+                        nb.left_idx,
+                        nb.top_idx,
                         hdr.slice_type.is_b(),
                     );
 
@@ -1705,6 +1745,7 @@ impl H264Decoder {
                         cabac_nb.update_after_mb(
                             mb_idx, true, false, false, false, 0, 0, &[0; 24], false,
                         );
+                        cabac_nb.store_intra4x4_modes(mb_idx, &[-1; 16]);
                         cabac_nb.update_mvd_ref_skip(mb_idx);
 
                         mb_addr += 1;
@@ -1724,6 +1765,16 @@ impl H264Decoder {
 
                 // Decode coded MB via CABAC
                 let mut cache = CabacDecodeCache::new();
+                let nb = crate::mb::compute_mbaff_neighbors(
+                    mb_x,
+                    mb_y,
+                    mb_width,
+                    false,
+                    false,
+                    &fdc.mb_field_flag,
+                    &fdc.slice_table,
+                    fdc.current_slice,
+                );
                 let mut mb = decode_mb_cabac(
                     &mut reader,
                     &mut cabac_state,
@@ -1743,6 +1794,7 @@ impl H264Decoder {
                     fdc.direct_8x8_inference_flag,
                     fdc.decode_chroma,
                     false, // non-MBAFF: always frame mode
+                    &nb,
                 )?;
 
                 // Apply entropy-agnostic processing (dequant, IDCT, pred, MC, neighbor update)
@@ -1761,6 +1813,7 @@ impl H264Decoder {
                     &mb.non_zero_count,
                     mb.transform_size_8x8_flag,
                 );
+                cabac_nb.store_intra4x4_modes(mb_idx, &mb_intra4x4_modes_i8(&mb));
 
                 mb_addr += 1;
                 mbs_decoded += 1;
@@ -1825,6 +1878,13 @@ impl H264Decoder {
         let mut bot_left_nz = [0u8; 8];
         let mut bot_left_modes = [-1i8; 4];
         let mut bot_left_avail = false;
+        // MBAFF: save top-row context (intra4x4 modes + NNZ) for the bottom MB.
+        // When the top MB of a pair runs update_after_mb, it overwrites
+        // top_intra4x4_mode at the current column. For field-mode bottom MBs,
+        // the actual top neighbor is from the previous pair row, so we must
+        // save the pre-overwrite values.
+        let mut saved_top_modes = [-1i8; 4];
+        let mut saved_top_nz_luma = [0u8; 4];
 
         loop {
             if mb_y >= mb_height {
@@ -1855,6 +1915,14 @@ impl H264Decoder {
                     if mb_x == 0 {
                         fdc.neighbor_ctx.new_row();
                     }
+                    // MBAFF: save top-row context BEFORE the top MB overwrites it.
+                    // The bottom MB needs these values when it's field-mode
+                    // (its spatial top neighbor is from the previous pair row).
+                    let base = mb_x as usize * 4;
+                    saved_top_modes
+                        .copy_from_slice(&fdc.neighbor_ctx.top_intra4x4_mode[base..base + 4]);
+                    saved_top_nz_luma
+                        .copy_from_slice(&fdc.neighbor_ctx.top_nz_luma[base..base + 4]);
                 } else {
                     // Bottom MB: save top MB's right edge as the next pair's top-row left.
                     top_left_nz = fdc.neighbor_ctx.left_nz;
@@ -1866,6 +1934,17 @@ impl H264Decoder {
                     fdc.neighbor_ctx.left_available = bot_left_avail;
                     if mb_x == 0 {
                         fdc.neighbor_ctx.new_row();
+                    }
+                    // MBAFF field-mode: restore pre-top-MB top context.
+                    // For field-mode bottom MBs, the spatial above neighbor
+                    // is from the previous pair row (mb_y - 2*stride), not
+                    // the current pair's top MB. Restore the saved values.
+                    if mb_field_decoding_flag {
+                        let base = mb_x as usize * 4;
+                        fdc.neighbor_ctx.top_intra4x4_mode[base..base + 4]
+                            .copy_from_slice(&saved_top_modes);
+                        fdc.neighbor_ctx.top_nz_luma[base..base + 4]
+                            .copy_from_slice(&saved_top_nz_luma);
                     }
                 }
                 fdc.neighbor_ctx.top_available = cur_y > 0
@@ -1881,34 +1960,52 @@ impl H264Decoder {
                     let skip = if pair_pos == 1 && top_was_skipped && bot_skip_preread {
                         bot_skip_value
                     } else {
-                        decode_cabac_mb_skip(
-                            reader,
-                            cabac_state,
-                            cabac_nb,
-                            &fdc.slice_table,
-                            fdc.current_slice,
-                            mb_x,
-                            cur_y,
-                            mb_width,
-                            hdr.slice_type.is_b(),
-                        ) != 0
+                        {
+                            let (skip_left, skip_top) = crate::mb::mbaff_skip_neighbors(
+                                mb_x,
+                                cur_y,
+                                mb_width,
+                                true,
+                                mb_field_decoding_flag,
+                                &fdc.mb_field_flag,
+                                &fdc.slice_table,
+                                fdc.current_slice,
+                            );
+                            decode_cabac_mb_skip(
+                                reader,
+                                cabac_state,
+                                cabac_nb,
+                                skip_left,
+                                skip_top,
+                                hdr.slice_type.is_b(),
+                            ) != 0
+                        }
                     };
 
                     if skip {
                         if pair_pos == 0 {
                             // Top MB is skip. Also decode bottom MB skip flag.
                             top_was_skipped = true;
-                            let bot_skip = decode_cabac_mb_skip(
-                                reader,
-                                cabac_state,
-                                cabac_nb,
-                                &fdc.slice_table,
-                                fdc.current_slice,
-                                mb_x,
-                                cur_y + 1,
-                                mb_width,
-                                hdr.slice_type.is_b(),
-                            ) != 0;
+                            let bot_skip = {
+                                let (skip_left, skip_top) = crate::mb::mbaff_skip_neighbors(
+                                    mb_x,
+                                    cur_y + 1,
+                                    mb_width,
+                                    true,
+                                    mb_field_decoding_flag,
+                                    &fdc.mb_field_flag,
+                                    &fdc.slice_table,
+                                    fdc.current_slice,
+                                );
+                                decode_cabac_mb_skip(
+                                    reader,
+                                    cabac_state,
+                                    cabac_nb,
+                                    skip_left,
+                                    skip_top,
+                                    hdr.slice_type.is_b(),
+                                ) != 0
+                            };
                             bot_skip_preread = true;
                             bot_skip_value = bot_skip;
                             if !bot_skip {
@@ -1947,6 +2044,7 @@ impl H264Decoder {
                         cabac_nb.update_after_mb(
                             mb_idx, true, false, false, false, 0, 0, &[0; 24], false,
                         );
+                        cabac_nb.store_intra4x4_modes(mb_idx, &[-1; 16]);
                         cabac_nb.update_mvd_ref_skip(mb_idx);
                         cabac_nb.mb_field_flag[mb_idx] = mb_field_decoding_flag;
                         mbs_decoded += 1;
@@ -1996,6 +2094,16 @@ impl H264Decoder {
                     reader.range()
                 );
                 let mut cache = CabacDecodeCache::new();
+                let nb = crate::mb::compute_mbaff_neighbors(
+                    mb_x,
+                    cur_y,
+                    mb_width,
+                    true,
+                    mb_field_decoding_flag,
+                    &fdc.mb_field_flag,
+                    &fdc.slice_table,
+                    fdc.current_slice,
+                );
                 let mut mb = decode_mb_cabac(
                     reader,
                     cabac_state,
@@ -2015,6 +2123,7 @@ impl H264Decoder {
                     fdc.direct_8x8_inference_flag,
                     fdc.decode_chroma,
                     mb_field_decoding_flag,
+                    &nb,
                 )?;
 
                 mb::apply_macroblock(fdc, &mut mb, hdr, pps, mb_x, cur_y, ref_pics, ref_pics_l1)?;
@@ -2031,6 +2140,7 @@ impl H264Decoder {
                     &mb.non_zero_count,
                     mb.transform_size_8x8_flag,
                 );
+                cabac_nb.store_intra4x4_modes(mb_idx, &mb_intra4x4_modes_i8(&mb));
                 cabac_nb.mb_field_flag[mb_idx] = mb_field_decoding_flag;
                 mbs_decoded += 1;
             }
