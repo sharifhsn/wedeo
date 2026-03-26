@@ -2,280 +2,73 @@
 
 ## Project Overview
 
-A clean-room Rust rewrite of FFmpeg, built incrementally using AI agent pipelines.
-**No bindgen, no c2rust, no FFI-based incremental replacement.** Pure Rust from scratch.
-
-The verification target is **bit-for-bit output parity** with FFmpeg's FATE test suite.
-The WAV/PCM pipeline has achieved this: wedeo produces byte-identical framecrc output
-to FFmpeg 8.0.1 across all PCM formats and all FATE suite WAV samples.
+Clean-room Rust rewrite of FFmpeg. **No bindgen, no c2rust, no FFI.** Pure Rust.
+Verification target: **bit-for-bit output parity** with FFmpeg's FATE test suite.
+See `H264.md` for decoder architecture, module map, and conformance status.
 
 ## Philosophy
 
-- **"Make it work, make it right, make it fast."** Correctness first, performance later.
-- Accept that the Rust port may be slower initially. Even reproducing C bugs is acceptable for behavioral parity.
-- Copy existing FFmpeg comments verbatim where they exist. Don't invent documentation where FFmpeg has none.
-- Accept `unsafe` where genuinely required (SIMD, lock-free concurrency, hardware acceleration) but isolate it.
+- **"Make it work, make it right, make it fast."** Correctness first.
+- Reproduce C bugs if needed for behavioral parity.
+- Copy FFmpeg comments verbatim. Don't invent docs where FFmpeg has none.
 
-## Workspace Structure
+## Build & Verify
 
-```
-wedeo/
-  Cargo.toml                    # workspace root (16 crates)
-  FFmpeg/                       # C reference source (read-only, n8.1)
-  fate-suite/                   # FATE test samples (synced externally)
-  start.json                    # original planning conversation
-  H264.md                       # H.264 decoder architecture & status (detailed)
+- `cargo clippy` + `cargo fmt` before considering code complete
+- `cargo nextest run` for tests (process isolation, leak detection)
+- FATE: `FATE_SUITE=./fate-suite cargo nextest run --profile fate -p wedeo-fate`
+- Video cross-validate: `cargo run --bin wedeo-framecrc -- <file>` vs `ffmpeg -bitexact -i <file> -f framecrc -`
+- Conformance: `python3 scripts/conformance_full.py` (full report), `scripts/regression_check.py` (quick check)
 
-  crates/
-    wedeo-core/                 # libavutil — Rational, Buffer, Frame, Packet, Metadata, error types
-    wedeo-codec/                # libavcodec — Decoder/Encoder traits, registry (inventory crate)
-    wedeo-format/               # libavformat — Demuxer/Muxer traits, BufferedIo, InputContext
-    wedeo-filter/               # libavfilter — Filter trait, FilterGraph (stub)
-    wedeo-resample/             # libswresample — rubato wrapper, interleaved I/O
-    wedeo-scale/                # libswscale — dcv-color-primitives wrapper
-
-  adapters/
-    wedeo-symphonia/            # Wraps symphonia decoders/demuxers behind wedeo traits (priority 50)
-    wedeo-rav1d/                # Wraps rav1d AV1 decoder behind wedeo traits
-
-  codecs/
-    wedeo-codec-pcm/            # PCM encoder (17 formats); decoders registered via symphonia at pri 100
-    wedeo-codec-h264/           # H.264/AVC Baseline decoder — 19 modules, ~15,300 lines (see H264.md)
-
-  formats/
-    wedeo-format-wav/           # WAV demuxer + muxer — RIFF/RIFX/RF64/BW64 probe, WAVEFORMATEXTENSIBLE, streaming
-    wedeo-format-h264/          # H.264 Annex B raw bitstream demuxer — probe, AU grouping
-    wedeo-format-mp4/           # MP4/MOV demuxer + muxer — ftyp/moov/mdat parsing, H.264+AAC support
-
-  bins/
-    wedeo-cli/                  # CLI tools: info (like ffprobe), decode, codecs, formats
-    wedeo-play/                 # Video player with audio (decode thread, cpal output, keyboard controls)
-
-  tests/
-    fate/                       # FATE test harness
-      src/audiogen.rs           # Bitexact port of FFmpeg's tests/audiogen.c
-      src/framecrc.rs           # framecrc output generator (audio passthrough + video decode modes)
-      tests/fate_pcm_wav.rs     # Integration tests with FFmpeg cross-validation
-      tests/fate_symphonia.rs   # Symphonia adapter tests (priority, lossless bitexact, lossy SNR)
-```
-
-## Rust Development Practices
-
-### Build & Check Commands
-- Prefer `cargo nextest run` over `cargo test` — provides process isolation, slow test detection, and leak detection
-- Run `cargo clippy` to detect warnings/errors and fix them before considering code complete
-- Run `cargo fmt` to format code before considering code complete
-- Use `cargo check` for fast compilation checks during development
-- Use [Conventional Commits](https://www.conventionalcommits.org/) — see CONTRIBUTING.md for types and scopes
-
-### FATE Verification
-- Run FATE tests: `FATE_SUITE=./fate-suite cargo nextest run --profile fate -p wedeo-fate` (or `FATE_SUITE=./fate-suite cargo test -p wedeo-fate`)
-- Cross-validate audio with FFmpeg: `cargo run --bin wedeo-framecrc -- <file>` vs `ffmpeg -bitexact -i <file> -c copy -f framecrc -`
-- Cross-validate video with FFmpeg: `cargo run --bin wedeo-framecrc -- <file>` vs `ffmpeg -bitexact -i <file> -f framecrc -`
-- Generate bitexact test WAVs: `cargo run --bin wedeo-audiogen -- output.wav 44100 2`
-- The framecrc tool auto-detects: audio uses packet passthrough (checksums raw packets), video uses decode mode (checksums decoded YUV frames)
-
-### Debugging H.264 Differences
+## Debugging H.264 Differences
 
 **Conformance workflow (do this in order):**
-1. `python3 scripts/conformance_full.py` — full 51-file conformance report (~5s). Use `--save-snapshot` to baseline.
-2. `python3 scripts/regression_check.py` — quick check against snapshot (~4s). Run after every code change.
-3. `python3 scripts/framecrc_compare.py --no-deblock --pixel-detail <file>` — triage MC vs deblock issues. **Always do this FIRST** for any DIFF file.
-4. `python3 scripts/classify_diffs.py` — categorize all DIFF files as reorder vs pixel-diff.
-5. `python3 scripts/mb_compare.py <file> --start-frame N --max-frames 1` — find differing MBs at a specific frame.
-6. `python3 scripts/reflist_compare.py <file> --ffmpeg --frame N` — side-by-side ref list comparison via lldb.
-7. `python3 scripts/conformance_full.py --triage` — show deblock vs no-deblock status for every DIFF file.
+1. `scripts/conformance_full.py` — full report. `--save-snapshot` to baseline.
+2. `scripts/regression_check.py` — quick check against snapshot. Run after every change.
+3. `scripts/framecrc_compare.py --no-deblock --pixel-detail <file>` — triage MC vs deblock.
+4. `scripts/mb_compare.py <file> --start-frame N --max-frames 1` — find differing MBs.
+5. `scripts/cabac_state_at_mb.py <file> --mb-x X --mb-y Y` — CABAC state comparison via lldb.
 
 **Key rules:**
-- **Read the FFmpeg C code FIRST** — before investigating any wedeo code path, open the corresponding FFmpeg function in `./FFmpeg/` and compare line by line. Key files: `h264_cavlc.c`, `h264idct_template.c`, `h264_mb.c`, `h264_mb_template.c`, `h264_ps.c`.
-- **HARD RULE:** After 2 failed hypotheses about pixel diffs, **STOP theorizing**. Extract actual intermediate values from FFmpeg (via lldb or C program) and wedeo (via `--features tracing`). Find **WHERE** the values first diverge before explaining **WHY**. **Time-based backstop:** if 5 minutes pass on the same pixel diff without extracting ground-truth values from BOTH decoders, STOP immediately and use `scripts/ffmpeg_lldb_chroma_dc.py` or lldb directly. The "almost there" feeling is unreliable — each algebraic proof feels cheap but the chain of proofs burns enormous context without progress.
-- **Match FFmpeg's output empirically** — don't trace FFmpeg's internal output reorder mechanism. Implement the fix, verify with conformance_full.py.
-- **Never infer intermediate values from outputs** — don't compute total_zeros from block positions or levels from dequant values. Measure directly via lldb: `breakpoint set -f file.c -l N` → `frame variable` / `expression`.
-- **FFmpeg's block layout is transposed** — `h264_slice.c:757` applies `TRANSPOSE()` to the zigzag scan, storing coefficients in column-major order. When reading block memory via lldb, `block[i]` = position `(i%4, i/4)` NOT `(i/4, i%4)`. The IDCT pass order must account for this.
-- **FFmpeg's `gb->index` includes NAL header** — 8-bit offset vs wedeo's `br.consumed()` which starts after the NAL header.
-- Use `scripts/verify_tables.py` to validate ALL lookup tables (tc0, alpha, beta, chroma_qp) against FFmpeg's C source. Run after any table change. This catches transcription errors that caused two bugs (CHROMA_QP_TABLE, TC0_TABLE).
-- Use `scripts/deblock_diff.py <file> --frame N` to analyze deblocking filter differences. Extracts pre/post-deblock pixels from both decoders, identifies differing edges, and computes applied deltas.
-- **Never manually count entries in C arrays** — always parse programmatically. Manual counting caused two bugs: CHROMA_QP_TABLE (extra `33` at index 36) and TC0_TABLE (missing `[1,1,1]` at QP 26). Use `scripts/verify_tables.py` or write a Python regex parser.
-- **Build debug FFmpeg for lldb:** `cd FFmpeg && ./configure --disable-optimizations --enable-debug=3 --disable-stripping --disable-asm && make -j$(sysctl -n hw.ncpu) ffmpeg`. The `--disable-asm` is critical on ARM64 — without it, NEON functions are used and lldb breakpoints on C functions won't hit. Function names have `_8_c` suffix (e.g., `ff_h264_chroma_dc_dequant_idct_8_c`).
-- **When formulas look identical, the bug is in the INPUTS** — don't spend time proving formula equivalence. Extract the same intermediate values (QP, qmul, DC coefficients, MC prediction) from BOTH decoders and find the first value that differs. One lldb extraction is worth more than any amount of algebraic analysis.
-- Use `ffmpeg -bsf:v trace_headers -f null -` for exact bit-level slice header layout.
-- **Tracing is always available** — no `--features` flag needed. Control output with `RUST_LOG=wedeo_codec_h264::mb=trace`. Tracing macros are near-zero-cost when no subscriber is active.
-- **Slice header overrides PPS defaults** — CAVLC must use slice-level `num_ref_idx_l0_active`, not `pps.num_ref_idx_l0_default_active`. Using PPS default when the slice header overrides to fewer refs causes CAVLC bitstream desync (extra bits consumed for ref_idx).
-- **DPB `dpb.clear()` deletes `needs_output=false` entries** — when storing a DPB entry then calling `mark_reference` (which calls `dpb.clear()` for IDR), the entry must be protected or the clear must skip it. Otherwise the entry is removed before it can be marked as ShortTerm, leaving the DPB empty for subsequent P-frames.
-- **For CAVLC desync bugs**: add `trace!()` at ALL `InvalidData` return sites in `decode_mb_cavlc`, plus at the `decode_macroblock` call site. Run with `RUST_LOG=wedeo_codec_h264::cavlc=trace,wedeo_codec_h264::mb=trace`. One run reveals WHAT failed and WHERE.
-- **Never use `eprintln!` for debug traces** — always use `tracing` crate macros (`trace!`, `debug!`) unconditionally. Never use `#[cfg(feature = "tracing")]` — tracing has no compile-time feature gates. Libraries depend on `tracing` unconditionally, binaries always init `tracing-subscriber`. Runtime `RUST_LOG` is the only control knob.
-- **When existing logs don't reveal the divergence, get better logs** — don't re-read the same trace output hoping to see something new. Options in order of effort: (1) add `trace!()` calls closer to the suspect operation in wedeo, (2) run FFmpeg with more output (`-loglevel debug`, `trace_headers` BSF, `-report`), (3) use `lldb` on FFmpeg to extract ground-truth values at the exact divergence point. Any of these takes less time than further analysis of insufficient data.
-- **FFmpeg CAVLC dequant includes normalization** — `STORE_BLOCK` in h264_cavlc.c:564 applies `(level * qmul + 32) >> 6` at dequant time for ALL block sizes (4x4 and 8x8). The IDCT then applies a SECOND `(+32)>>6`. Both `dequant_4x4` and `dequant_8x8` must include this normalization. With flat-16 scaling, `(level * INIT*64 + 32) >> 6 = level * INIT` exactly (no rounding loss).
-- **Pipeline-stage tracing tags** — use `scripts/verify_traces.py` to verify all tags are reachable. Tags: `SLICE`, `DPB`, `REFLIST` (debug), `PPS_SCALING`, `DEQUANT_TABLES` (debug), `COEFF`/`COEFF_CABAC`, `DEQUANT`, `MB_RECON`, `MB_DEBLOCK` (trace). Diagnosis tree: SLICE→PPS_SCALING→DEQUANT_TABLES→COEFF→DEQUANT→MB_RECON→MB_DEBLOCK.
-- **Dequant CQM indices** — intra Y=0, inter Y=3, intra Cb=1, intra Cr=2, inter Cb=4, inter Cr=5. Use `scripts/audit_dequant_cqm.py` to verify all call sites.
-- **Deblock NNZ for 8x8 DCT** — FFmpeg's `fill_filter_caches` (h264_slice.c:2396) overrides per-4x4 NNZ with CBP-based values for CAVLC 8x8 blocks only (`!CABAC && transform_8x8_mode`). Two rules: (1) the CBP must be NNZ-sum-derived (`!!nnz_sum` per 8x8 block, FFmpeg's `cbp_table` bits 12-15), NOT the bitstream CBP — a coded block with all-zero coefficients must produce bS=0; (2) CABAC 8x8 blocks use raw per-4x4 NNZ (already broadcast), not the CBP override. See `deblock_nnz()` in `deblock.rs`.
-- **CABAC cat=5 (8x8 luma) has NO coded_block_flag** — FFmpeg h264_cabac.c:1859 skips CBF for cat=5 in non-chroma-4:4:4: `(cat != 5 || CHROMA444(h)) && get_cabac(...)`. The CBP check is the only gate. Reading a phantom CBF bin desyncs the CABAC engine for all subsequent symbols. When adding new CABAC block categories, always read FFmpeg's `decode_cabac_residual_nondc` wrapper to check which cats have CBF.
-- **CABAC context offsets are 2D for MBAFF** — `significant_coeff_flag_offset[MB_FIELD(sl)][cat]` and `last_coeff_flag_offset[MB_FIELD(sl)][cat]` use different tables for field-mode (row 1) vs frame-mode (row 0) MBs. When porting any CABAC residual decode, check whether it indexes by `MB_FIELD(sl)` or `IS_INTERLACED(mb_type)`. The 8x8 significance offset table (`significant_coeff_flag_offset_8x8`) is also 2D. Also, `decode_cabac_field_decoding_flag` derives context from the ACTUAL above pair's field flag (`h->cur_pic.mb_type[mbb_xy] >> 7`), not a constant. Use `scripts/verify_cabac_tables.py` to verify all offset tables including field-mode variants.
-- **MBAFF field-mode above-neighbor stride** — for field MBs in MBAFF deblocking, the horizontal edge 0 neighbor is `mb_idx - 2*mb_width` (same field of pair above), NOT `mb_idx - mb_width` (other field of same pair). FFmpeg: `top_xy = mb_xy - (mb_stride << MB_FIELD(sl))`. With doubled pixel stride, the filter reads correct same-field pixels across pairs. Use `scripts/mbaff_field_map.py <file>` to check which MBs are field-mode before debugging.
+- **Read the FFmpeg C code FIRST.** Key files: `h264_cavlc.c`, `h264_cabac.c`, `h264idct_template.c`, `h264_mb.c`, `h264_mb_template.c`, `h264_ps.c`, `h264_mvpred.h`.
+- **HARD RULE:** After 2 failed hypotheses, **STOP theorizing**. Extract values from BOTH decoders. Find WHERE values diverge before explaining WHY. **5-minute backstop** without ground-truth extraction → use lldb.
+- **When formulas look identical, the bug is in the INPUTS.** One lldb extraction > any algebraic analysis.
+- **Never infer intermediate values from outputs.** Measure via lldb: `breakpoint set -f file.c -l N` → `expression`.
+- **Never manually count entries in C arrays.** Use `scripts/verify_tables.py` or write a parser.
+- **Build debug FFmpeg:** `cd FFmpeg && ./configure --disable-optimizations --enable-debug=3 --disable-stripping --disable-asm && make -j$(sysctl -n hw.ncpu) ffmpeg`. `--disable-asm` is critical on ARM64.
+- **Tracing is always available.** `RUST_LOG=wedeo_codec_h264::mb=trace`. Never use `eprintln!` — always `tracing` macros.
+- **When existing logs don't reveal the divergence, get better logs.** (1) add `trace!()`, (2) FFmpeg `-loglevel debug`, (3) lldb.
+- **CABAC cat=5 (8x8 luma) has NO coded_block_flag.** The CBP check is the only gate.
+- **CABAC context offsets are 2D for MBAFF** — `significant_coeff_flag_offset[MB_FIELD][cat]` uses field vs frame tables. Use `scripts/verify_cabac_tables.py` to verify.
+- **MBAFF field-mode above-neighbor stride** — `top_xy = mb_xy - (mb_stride << MB_FIELD)`. Use `scripts/mbaff_field_map.py` to check field/frame modes.
+- **MBAFF left_block_options** — FFmpeg's `fill_decode_neighbors` (h264_mvpred.h:491-538) selects 1 of 4 remapping variants for NNZ/CBP/intra4x4 mode context when there's a field/frame mismatch with the left neighbor. Use `scripts/verify_left_block_tables.py` to verify tables. For CABAC state comparison, breakpoint at h264_cabac.c:1966 (after field flag decode).
+- **Pipeline-stage tracing tags:** SLICE→PPS_SCALING→DEQUANT_TABLES→COEFF→DEQUANT→MB_RECON→MB_DEBLOCK.
 
-### Code Quality
-- Fix all clippy warnings unless there's a documented reason not to
-- No `#[allow(clippy::*)]` without a comment explaining why
-- Prefer safe Rust. When `unsafe` is required, add a `// SAFETY:` comment explaining the invariants
-- Use `Result<T, E>` and the `?` operator for error handling, not panics
-- Use `wrapping_add`/`wrapping_neg`/`wrapping_mul` for arithmetic that must match C overflow behavior
+## Code Quality
 
-### Architecture Principles
-- Bottom-up dependency order: wedeo-core -> wedeo-codec/wedeo-format -> wedeo-filter -> codec/format implementations -> CLI
-- Each FFmpeg library maps to a Rust crate in a workspace
-- Codecs/formats/filters are self-contained crates registered via the `inventory` crate
-- Use Rust traits for codec/demuxer/muxer abstractions (`Decoder`, `Demuxer`, `Muxer`, `Filter`)
-- Use builder pattern for codec contexts (`DecoderBuilder::new(params).open()`)
-- Use `Drop` trait / RAII instead of C's `goto cleanup` patterns
-- `Vec<(String, String)>` for metadata (NOT `HashMap` — deterministic ordering required for FATE parity)
+- Fix all clippy warnings. No `#[allow(clippy::*)]` without a comment.
+- Prefer safe Rust. `unsafe` requires `// SAFETY:` comment.
+- `Result<T, E>` + `?` for errors, not panics.
+- `wrapping_add`/`wrapping_neg`/`wrapping_mul` for C overflow parity.
 
-### Critical Technical Requirements
-- All buffer allocations must include SIMD padding: `vec.resize(len + INPUT_BUFFER_PADDING_SIZE, 0)` (64 bytes, matching `AV_INPUT_BUFFER_PADDING_SIZE`)
-- Use `u32::from_be_bytes()` / `u32::from_le_bytes()` for endianness — never hardcode byte order
-- Custom `Rational` type with FFmpeg-compatible rounding modes (not `num-rational`)
-- `rescale_rnd` uses u128 for overflow-resistant timestamp scaling (produces identical results to FFmpeg's manual long-division)
-- `reduce()` uses continued fraction algorithm matching `av_reduce` exactly, including the quality check for semi-convergents
-- Adler-32 in framecrc uses FFmpeg's non-standard init (`s1=0, s2=0`, not RFC 1950's `s1=1`)
-- Packet sizes must match FFmpeg's `ff_pcm_default_packet_size`: `bitrate / 8 / 10 / block_align`, rounded down to power of 2
-- Channel layout Display must use FFmpeg's standard names ("stereo", "5.1", etc.) not raw channel lists
+## Architecture
 
-### Adding New Codecs/Formats
+- Bottom-up: wedeo-core → wedeo-codec/wedeo-format → implementations → CLI
+- Each FFmpeg library → one Rust crate. Codecs/formats registered via `inventory`.
+- Traits: `Decoder`, `Demuxer`, `Muxer`, `Filter`. Builder pattern for contexts.
+- `Vec<(String, String)>` for metadata (NOT `HashMap` — deterministic ordering for FATE parity).
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for step-by-step instructions on adding
-new codecs and formats.
+## Critical Technical Requirements
 
-### Reference
-- FFmpeg source is at `./FFmpeg/` for reference — read C code before writing Rust equivalents
-- FATE samples are at `./fate-suite/` — test against real files, not just synthetic data
-- The original planning conversation is in `start.json`
-- FFmpeg codec_id.h values are sequential enums — count positions carefully, don't guess
-- FFmpeg's `tests/audiogen.c` is the canonical synthetic audio generator — our port is bitexact
+- SIMD padding: `vec.resize(len + 64, 0)` (matches `AV_INPUT_BUFFER_PADDING_SIZE`)
+- Endianness: `u32::from_be_bytes()` / `u32::from_le_bytes()`
+- Custom `Rational` with FFmpeg-compatible rounding (not `num-rational`)
+- Adler-32 in framecrc: FFmpeg's non-standard init (`s1=0, s2=0`)
+- Packet sizes: `bitrate / 8 / 10 / block_align`, rounded down to power of 2
 
-## Current Status (0 clippy warnings)
+## Reference
 
-### H.264 video decoder (native Rust, in progress)
-
-First native video codec. Decodes H.264 I+P+B frames to YUV420p.
-See `H264.md` for detailed architecture, module map, and conformance parity report.
-
-**Decoder** (`codecs/wedeo-codec-h264/`, ~17,000 lines):
-- NAL parsing (Annex B + NALFF/avcC), SPS/PPS, slice header with MMCO
-- CAVLC entropy decoding (all VLC tables, level/run decode, mb_type parsing, I_PCM raw bytes)
-- 17 intra prediction modes (9 Intra4x4 + 4 Intra16x16 + 4 chroma)
-- 4x4/8x8 integer IDCT, luma/chroma DC Hadamard transforms (i32 precision)
-- Flat dequantization (spec-equivalent, avoids i16 overflow in FFmpeg's precomputed tables)
-- In-loop deblocking filter (boundary strength with B-frame two-permutation check, strong/normal filtering, luma+chroma)
-- Quarter-pel luma MC (6-tap FIR), eighth-pel chroma bilinear, bi-directional MC
-- P-slice weighted prediction (uni-directional, all partition types)
-- MV prediction (median, P_SKIP, B_SKIP spatial+temporal direct with per-4x4 col_zero_flag, 16x8/8x16/8x8 sub-partitions)
-- Temporal direct prediction (dist_scale_factor MV scaling from colocated L1[0])
-- Reference list construction (L0+L1), frame_num wrap-around, MMCO, sliding window DPB with FrameNumWrap
-- Pred weight table parsing (luma/chroma weight+offset per ref)
-- FFmpeg-style output reordering (delayed_pics buffer with last_pocs detection, VUI num_reorder_frames)
-- DPB output reordering (POC type 0/1/2), cross-MB intra4x4 prediction mode tracking
-- Multi-slice frame support, avcC extradata parsing, SPS frame crop offsets
-
-**Demuxer** (`formats/wedeo-format-h264/`, ~480 lines):
-- Annex B start code scanning, SPS-based probe (score 100)
-- Access unit grouping (AUD, SPS, first_mb_in_slice boundaries)
-- File extensions: .264, .h264, .h26l, .avc
-
-**FATE conformance: 50/50 progressive CAVLC tests BITEXACT (100%), all 17/17 Baseline** (2026-03-24):
-
-| Test | Status | Notes |
-|------|--------|-------|
-| All 17 Baseline (BA*, SVA*, AUD*, BAMQ*, BANM*, BASQP*) | **BITEXACT** | I+P+B, multi-slice, per-MB QP |
-| NL1/NL2/NL3, NLMQ1/NLMQ2 (Main/CAVLC) | **BITEXACT** | Including B-frames |
-| MR1_MW_A, MR2_MW_A, MR2_TANDBERG_E, MR1_BT_A | **BITEXACT** | Multi-reference, POC type 1 |
-| MIDR_MW_D, MPS_MW_A, NRF_MW_E | **BITEXACT** | IDR, multi-PPS, non-ref frames |
-| CVPCMNL1, CVPCMNL2 | **BITEXACT** | I_PCM macroblocks |
-| HCBP1, HCBP2, HCMP1 | **BITEXACT** | 15-ref hierarchical, deep reorder buffer |
-| SL1_SVA_B | **BITEXACT** | Temporal direct + direct_8x8_inference=0 |
-| FM2_SVA_B, FM2_SVA_C | **BITEXACT** | Both decoders produce 0 frames |
-| CVBS3, CVSE3, CVSEFDFT3 | **BITEXACT** | Reorder fix resolved all prior "cascade" diffs |
-| CVWP1, CVWP2, CVWP3, CVWP5 | **BITEXACT** | Weighted pred, ref list modification, DPB-based deblock |
-| cvmp_mot_frm0_full_B | **BITEXACT** | direct_8x8_inference=0, B_8x8 MC |
-| MR3, MR4, MR5 | **BITEXACT** | POC type 2, MMCO-5, gap fill, complex MMCO |
-| CVFC1 | **BITEXACT** | Multi-slice + frame crop, non-row-aligned slice boundaries |
-| FM1_BT_B | **BITEXACT** | FMO file, both decoders produce 0 frames |
-| FM1_FT_E | Excluded | FMO unimplemented in FFmpeg (h264_ps.c:758), not in FATE |
-| MR6-9_BT_B, FI1_Sony_E | Gap | Interlaced (PAFF) / CABAC |
-
-### FFmpeg audio parity via symphonia
-
-wedeo can decode the most common audio formats by wrapping symphonia 0.5.5 behind
-wedeo's trait interfaces. Native Rust implementations (priority 100) win over
-symphonia wrappers (priority 50) when both exist (e.g., WAV/PCM always uses native).
-
-**Decode coverage (28 decoders):**
-
-| Codec | Source | Verified | Quality |
-|-------|--------|----------|---------|
-| PCM (17 variants) | Symphonia (pri 100) | FATE bitexact | Byte-identical to FFmpeg 8.0.1 |
-| FLAC 16/24-bit | Symphonia | Bitexact vs FFmpeg | Byte-identical |
-| WavPack 16/24-bit | Symphonia | Bitexact vs FFmpeg | Byte-identical |
-| Vorbis | Symphonia | SNR verified | ~140 dB SNR (float rounding only) |
-| AAC (ADTS + M4A) | Symphonia | SNR verified | ~120-134 dB SNR after alignment |
-| MP3 | Symphonia | SNR verified | ~128 dB SNR after alignment (gapless trim differs) |
-| MP1/MP2 | Symphonia | Registered | Untested |
-| Opus | opus-decoder | SNR verified | CELT ~48 dB, SILK ~11-14 dB (crate quality gap) |
-| ALAC | Symphonia | Registered | Untested (no FATE samples) |
-| ADPCM IMA WAV | Symphonia | Registered | Untested |
-| ADPCM MS | Symphonia | Registered | Untested |
-
-**Encode coverage (17 encoders):** All PCM formats, native (`wedeo-codec-pcm`), bitexact roundtrip verified.
-
-**Demux coverage (10 demuxers):**
-
-| Format | Source | Verified |
-|--------|--------|----------|
-| WAV (RIFF/RIFX/RF64/BW64) | Native | FATE bitexact, 13/13 FATE suite files |
-| H.264 Annex B | Native | Probe + decode verified |
-| OGG | Symphonia | Probe + Vorbis decode verified |
-| FLAC | Symphonia | Probe + decode bitexact verified |
-| MP4/MOV/M4A | Native + Symphonia | Probe + H.264/AAC decode verified |
-| MKV/WebM | Symphonia | Probe verified |
-| AIFF/AIFC | Symphonia | Probe verified |
-| CAF | Symphonia | Probe verified |
-| MP3 (ID3v2/sync) | Symphonia | Probe + decode SNR verified |
-
-**Mux coverage (2 muxers):** WAV — bitexact roundtrip. MP4 — H.264+AAC muxing with moov/mdat layout.
-
-**Gapless support:** MP3 (via symphonia's LAME/Xing header parsing), AAC in M4A (via iTunSMPB metadata parsing), OGG/Vorbis (via symphonia's gapless mode). Trim applied through `Packet.trim_start`/`trim_end` fields.
-
-**Audio resampling:** `wedeo-resample` wraps `rubato` with Fast/Normal/High quality modes, interleaved I/O, chunked processing.
-
-### Fully implemented and verified
-- **WAV demuxer**: RIFF/RIFX/RF64/BW64 probe, all PCM format tags, streaming, truncated file handling. 13/13 FATE suite files bitexact vs FFmpeg 8.1.
-- **PCM codec**: 17 decoders (via symphonia adapter at priority 100) + 17 native encoders (`wedeo-codec-pcm`). Byte-swapping, unsigned-to-signed conversion, 24→32-bit expansion matching FFmpeg's pcm.c.
-- **WAV muxer**: RIFF/WAVE with fmt + data chunks, PCM/float/alaw/mulaw format tags. Roundtrip bitexact.
-- **Symphonia audio backend** (`adapters/wedeo-symphonia/`): 10 non-PCM decoder factories (FLAC, MP1, MP2, MP3, AAC, Vorbis, ALAC, WavPack, ADPCM IMA/MS) + 17 PCM decoder factories + 1 Opus (`opus-decoder` crate) + 8 demuxer factories.
-- **Core types**: Rational (`av_rescale_rnd`/`av_reduce`), Buffer (Arc CoW + SIMD padding), Frame (32 side data types, video fields), Packet (41 side data types), Metadata (ordered), 36 channel layout names, all CodecId discriminants.
-- **Codec registry**: Priority-based `find_decoder`/`find_encoder`. Demuxer `probe()` uses priority as tie-breaker.
-- **FATE harness**: Bitexact audiogen, framecrc with FFmpeg-compatible Adler-32, cross-validation tests.
-
-### Framework ready, awaiting implementation
-- **wedeo-filter**: Filter trait, FilterGraph skeleton — needs format negotiation and frame queues before use.
-
-### Known architectural gaps
-- **Buffer**: No buffer pool, no custom free callback, no guaranteed SIMD alignment.
-- **Frame**: Missing opaque user data.
-- **Decoder trait**: No get_buffer callback (needed for hw accel / zero-copy).
-- **Demuxer trait**: No read_close, no chapters/programs, no find_stream_info equivalent.
-- **Filter graph**: No format negotiation, no frame passing mechanism.
-- **Error**: No error context (where/why), no codec-specific error codes.
-
-### In progress
-- **H.264 decoder** — I+P+B frame decode with deblocking, 50/50 progressive CAVLC conformance files BITEXACT (100%). See `H264.md`.
-
-### Not yet started
-- Video codecs (HEVC, VP9) — native Rust implementations
-- MKV muxer
-- Hardware acceleration
-
-### Available infrastructure crates (added as dependencies)
-- `v_frame` 0.5.1 — YUV frame buffers from rav1e (21M downloads), 64-byte aligned. For video Frame expansion.
-- `av-bitstream` 0.2.1 — Bitstream reader/writer for video codec parsing (exp-golomb, CABAC).
-- `yuvxyb` 0.5.0 — Colorspace conversions (YUV ↔ XYB/RGB). For wedeo-scale.
-
-See `TODO.md` for the full task list and `DIVERGENCES.md` for known behavioral differences vs FFmpeg.
+- FFmpeg source: `./FFmpeg/` — read C code before writing Rust equivalents
+- FATE samples: `./fate-suite/`
+- See `H264.md` for decoder status, `CONTRIBUTING.md` for adding codecs/formats
+- See `TODO.md` for tasks, `DIVERGENCES.md` for known behavioral differences
