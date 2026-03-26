@@ -7,7 +7,7 @@
 // Reference: ITU-T H.264 spec section 8.7, FFmpeg libavcodec/h264_loopfilter.c
 // and h264dsp_template.c.
 
-use tracing::debug;
+use tracing::{debug, trace};
 
 use crate::tables::CHROMA_QP_TABLE;
 
@@ -533,6 +533,8 @@ fn filter_mb_edge_luma(
     qp: u8,
     alpha_offset: i32,
     beta_offset: i32,
+    mb_x: u32,
+    mb_y: u32,
 ) {
     let (alpha, beta) = get_thresholds(qp, alpha_offset, beta_offset);
     if alpha == 0 || beta == 0 {
@@ -572,11 +574,23 @@ fn filter_mb_edge_luma(
             let q1 = plane[off + step] as i32;
             let q2 = plane[off + 2 * step] as i32;
 
+            trace!(
+                mb_x, mb_y, is_vertical, edge, i, d, cur_bs,
+                p0, p1, p2, q0, q1, q2,
+                alpha, beta, qp,
+                "DEBLOCK_PIXEL_IN"
+            );
+
             if cur_bs < 4 {
                 let tc0 = get_tc0(qp, alpha_offset, cur_bs);
                 if let Some((new_p0, new_p1, new_q0, new_q1)) =
                     filter_normal_luma(p0, p1, p2, q0, q1, q2, alpha, beta, tc0)
                 {
+                    trace!(
+                        mb_x, mb_y, is_vertical, edge, i, d,
+                        new_p0, new_q0, tc0,
+                        "DEBLOCK_PIXEL_OUT"
+                    );
                     plane[off - step] = new_p0;
                     plane[off - 2 * step] = new_p1;
                     plane[off] = new_q0;
@@ -588,6 +602,11 @@ fn filter_mb_edge_luma(
                 if let Some((new_p0, new_p1, new_p2, new_q0, new_q1, new_q2)) =
                     filter_strong_luma(p0, p1, p2, p3, q0, q1, q2, q3, alpha, beta)
                 {
+                    trace!(
+                        mb_x, mb_y, is_vertical, edge, i, d,
+                        new_p0, new_q0,
+                        "DEBLOCK_PIXEL_OUT"
+                    );
                     plane[off - step] = new_p0;
                     plane[off - 2 * step] = new_p1;
                     plane[off - 3 * step] = new_p2;
@@ -1356,6 +1375,23 @@ fn deblock_mbaff_horiz_edge0(
         let qp = avg_qp(cur.qp, above.qp);
 
         // Luma: filter at j*single_stride offset, using doubled stride
+        if mb_x == 17 && mb_y == 6 && j == 0 {
+            // Trace specific pixel at (276, 92) = p1 for i=1,d=0
+            let check_base = luma_base + j * luma_stride;
+            let check_off = check_base + 1 * 4 + 0; // i=1, d=0
+            let check_step = double_luma_stride;
+            trace!(
+                mb_x, mb_y, j,
+                p2 = pic.y[check_off - 3 * check_step] as i32,
+                p1 = pic.y[check_off - 2 * check_step] as i32,
+                p0 = pic.y[check_off - 1 * check_step] as i32,
+                q0 = pic.y[check_off] as i32,
+                q1 = pic.y[check_off + 1 * check_step] as i32,
+                q2 = pic.y[check_off + 2 * check_step] as i32,
+                bs = ?bs, qp, alpha_c0_offset, beta_offset,
+                "MBAFF_HORIZ_E0_TRACE"
+            );
+        }
         filter_mb_edge_luma(
             false, // horizontal
             &mut pic.y,
@@ -1366,6 +1402,8 @@ fn deblock_mbaff_horiz_edge0(
             qp,
             alpha_c0_offset,
             beta_offset,
+            mb_x,
+            mb_y,
         );
 
         // Chroma
@@ -1445,6 +1483,11 @@ fn deblock_mb(
     let chroma_qp_index_offset = params.chroma_qp_index_offset;
 
     // Compute field-aware pixel offsets and strides for this MB.
+    trace!(
+        mb_x, mb_y, cur_mb_field, cur_qp,
+        y_stride = pic.y_stride,
+        "DEBLOCK_MB_START"
+    );
     let (luma_base, luma_stride) = deblock_luma_offset(pic.y_stride, mb_x, mb_y, cur_mb_field);
     let (chroma_base_u, chroma_stride) =
         deblock_chroma_offset(pic.uv_stride, mb_x, mb_y, cur_mb_field);
@@ -1499,6 +1542,24 @@ fn deblock_mb(
             chroma_qp_index_offset,
         );
 
+    // Dump pre-deblock pixels and inter-stage pixels for targeted MB debugging.
+    // Controlled by RUST_LOG=wedeo_codec_h264::deblock=trace.
+    if tracing::enabled!(tracing::Level::TRACE) {
+        // Dump key columns at edge boundaries (vertical edges at cols 3-4, 7-8, 11-12)
+        for &check_col in &[3u32, 4, 7, 8, 11, 12] {
+            for row in 0..16u32 {
+                let off = luma_base + row as usize * luma_stride + check_col as usize;
+                if off < pic.y.len() {
+                    trace!(
+                        mb_x, mb_y, stage = "PRE_DEBLOCK",
+                        col = check_col, row, pixel = pic.y[off],
+                        "DEBLOCK_STATE"
+                    );
+                }
+            }
+        }
+    }
+
     // Process vertical (is_vertical=true) then horizontal (is_vertical=false) edges.
     // Chroma uses the same bS as luma (derived by mapping the 4x4 luma grid to 4:2:0).
     for is_vertical in [true, false] {
@@ -1509,6 +1570,14 @@ fn deblock_mb(
             !top_available
         };
         let luma_bs = compute_luma_bs(is_vertical, mb_info, mb_x, mb_y, mb_width);
+
+        trace!(
+            mb_x, mb_y, is_vertical,
+            bs0 = ?luma_bs[0], bs1 = ?luma_bs[1], bs2 = ?luma_bs[2], bs3 = ?luma_bs[3],
+            cur_qp,
+            alpha_c0_offset, beta_offset,
+            "DEBLOCK_EDGE"
+        );
 
         // --- Luma edges ---
         for (edge, &bs_edge) in luma_bs.iter().enumerate() {
@@ -1547,6 +1616,8 @@ fn deblock_mb(
                 qp,
                 alpha_c0_offset,
                 beta_offset,
+                mb_x,
+                mb_y,
             );
         }
 
@@ -1601,6 +1672,22 @@ fn deblock_mb(
                 );
             }
         }
+    }
+
+    // Post-deblock dump for targeted debugging
+    if tracing::enabled!(tracing::Level::TRACE) {
+        let mut vals = Vec::with_capacity(256);
+        for r in 0..16u32 {
+            for c in 0..16u32 {
+                let off = luma_base + r as usize * luma_stride + c as usize;
+                vals.push(if off < pic.y.len() { pic.y[off] } else { 0 });
+            }
+        }
+        trace!(
+            mb_x, mb_y, cur_mb_field, luma_stride,
+            pixels = ?vals,
+            "DEBLOCK_FINAL"
+        );
     }
 }
 
@@ -1674,6 +1761,14 @@ pub fn deblock_frame(
             }
         }
     }
+
+    // Check specific pixel after all deblocking is complete
+    if is_mbaff && pic.y_stride == 720 {
+        let addr = 92 * 720 + 276; // picture (276, 92)
+        if addr < pic.y.len() {
+            trace!(pixel_276_92 = pic.y[addr], "DEBLOCK_FRAME_DONE");
+        }
+    }
 }
 
 /// Check idc and deblock a single MB, with tracing.
@@ -1695,7 +1790,20 @@ fn deblock_mb_if_enabled(
         return;
     }
 
+    // Watchpoint: track changes to pixel (276,92) = pic.y[66516]
+    let watch_addr = 92usize * 720 + 276;
+    let before = if watch_addr < pic.y.len() { pic.y[watch_addr] } else { 0 };
+
     deblock_mb(pic, mb_info, mb_x, mb_y, slice_table, slice_params);
+
+    if watch_addr < pic.y.len() && pic.y[watch_addr] != before {
+        trace!(
+            mb_x, mb_y,
+            before, after = pic.y[watch_addr],
+            mb_field = mb_info[(mb_y * mb_width + mb_x) as usize].mb_field,
+            "PIXEL_WATCHPOINT"
+        );
+    }
 
     {
         let mb_field = mb_info[mb_idx].mb_field;
