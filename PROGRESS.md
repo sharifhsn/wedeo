@@ -8,10 +8,67 @@ See `CLAUDE.md` and `H264.md` for detailed status.
 - H.264 CABAC: 27/27 progressive conformance files BITEXACT (100%)
 - H.264 FRext CAVLC: **5/7 BITEXACT** (2 out-of-scope: PAFF)
 - H.264 FRext CABAC: **18/22 BITEXACT** (4 PAFF out-of-scope)
-- H.264 MBAFF: deblocking infrastructure complete (Phases 1-7), field/frame pixel addressing, mixed-interlace edge handling. 0/16 BITEXACT yet — remaining diffs from deblock behavior + inter prediction gaps.
+- H.264 MBAFF: deblocking infrastructure (Phases 1-7), field/frame pixel addressing, CABAC left_block_options remapping, per-MB top-mode storage, field-mode top-right availability. CABAC engine 100% correct. **CAMA1_Sony_C (I-slice) BITEXACT for reconstruction** (no-deblock). Other CAMA files need inter prediction fixes.
 - Precommit total: **102 passing, 0 regressed**
 - WAV/PCM pipeline: byte-identical to FFmpeg 8.0.1 across all FATE suite samples
 - Audio via symphonia: 28 decoders, 10 demuxers, SNR-verified lossy codecs
+
+## MBAFF Intra Prediction Fixes: Per-MB Top Modes + Field Top-Right (2026-03-26)
+
+Two bugs in MBAFF intra 4x4/8x8 prediction, both causing wrong prediction
+modes/inputs for field-mode MBs:
+
+**Bug 1: Top neighbor mode overwrite.** The single-row `top_intra4x4_mode`
+buffer in `NeighborContext` was overwritten by the top MB of a pair before the
+bottom MB could read the previous pair's modes. For field-mode top MBs, the
+spatial above neighbor is 2 MB-rows back (previous pair's top), but the buffer
+only had the most recent (previous pair's bottom). Fixed by adding per-MB
+bottom-row mode storage (`intra4x4_modes_top` in `CabacNeighborCtx`) and
+changing the CABAC top-mode lookup to use `nb_top` (MBAFF-adjusted index).
+
+**Bug 2: Field-mode top-right availability.** The top-right availability check
+for block column 3 (rightmost) used `(mb_y-1)*mb_width + mb_x+1`, pointing to
+the current pair row (not yet decoded). For field-mode MBs, the "above" row is
+from the previous pair row (`mb_y-2`), which is always fully decoded. Fixed in
+both `decode_intra4x4` and `decode_intra8x8`.
+
+**Result:**
+- CAMA1_Sony_C.jsv: **BITEXACT** for reconstruction (0/1350 MB diffs, no-deblock, all 5 frames)
+- 102 precommit tests: 0 regressions
+- Deblocking still shows diffs (separate known issue)
+
+New scripts:
+- `mbaff_pair_diff.py` — field-aware per-pair pixel comparison
+- `ffmpeg_recon_extract.py` — lldb-based pixel extraction from FFmpeg at specific MB
+- `mbaff_recon_compare.py` — side-by-side wedeo vs FFmpeg reconstruction comparison
+
+## MBAFF left_block_options CABAC Context Remapping (2026-03-25)
+
+Implemented FFmpeg's `left_block_options[4][32]` remapping for CABAC context
+derivation in MBAFF frames with field/frame mode mismatch.
+
+**Root cause:** When a field-mode MB has a frame-mode left neighbor (or vice versa),
+the CABAC context for NNZ, CBP, and intra4x4 pred modes must use remapped sub-block
+indices from the left neighbor. Wedeo always used the default option (0), producing
+wrong CABAC context at field/frame boundaries. This didn't cause a CABAC desync
+(pos/low/range still matched) but did produce wrong decoded coefficients/modes.
+
+**Fix:**
+- Added `left_block_option: u8` (0-3) to `MbaffNeighbors`
+- NNZ: remapped left row per `LEFT_LUMA_NZ_ROW` / `LEFT_CHROMA_NZ_ROW` tables
+- CBP: apply bit-shift formula from FFmpeg h264_mvpred.h:728-730
+- Intra4x4 modes: per-MB storage in `CabacNeighborCtx`, remapped lookups
+- LTOP/LBOT selection: top half uses LTOP, bottom half uses LBOT
+
+**Result:**
+- CABAC engine verified 100% correct at every MB (pos/low/range/field match FFmpeg)
+- CAMA1 frame 0: differing MBs 1136→837 (26% reduction), first diff MB(17,4)→MB(19,4)
+- All 102 progressive tests remain BITEXACT
+- Remaining MBAFF diffs are pixel reconstruction (apply_macroblock), not CABAC
+
+New scripts:
+- `cabac_state_at_mb.py` — side-by-side CABAC state comparison at any MB via lldb
+- `verify_left_block_tables.py` — verify wedeo's remapping tables against FFmpeg source
 
 ## MBAFF Conformance Plan Triage + Top-Right Fix (2026-03-25)
 
