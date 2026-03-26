@@ -1375,23 +1375,6 @@ fn deblock_mbaff_horiz_edge0(
         let qp = avg_qp(cur.qp, above.qp);
 
         // Luma: filter at j*single_stride offset, using doubled stride
-        if mb_x == 17 && mb_y == 6 && j == 0 {
-            // Trace specific pixel at (276, 92) = p1 for i=1,d=0
-            let check_base = luma_base + j * luma_stride;
-            let check_off = check_base + 1 * 4 + 0; // i=1, d=0
-            let check_step = double_luma_stride;
-            trace!(
-                mb_x, mb_y, j,
-                p2 = pic.y[check_off - 3 * check_step] as i32,
-                p1 = pic.y[check_off - 2 * check_step] as i32,
-                p0 = pic.y[check_off - 1 * check_step] as i32,
-                q0 = pic.y[check_off] as i32,
-                q1 = pic.y[check_off + 1 * check_step] as i32,
-                q2 = pic.y[check_off + 2 * check_step] as i32,
-                bs = ?bs, qp, alpha_c0_offset, beta_offset,
-                "MBAFF_HORIZ_E0_TRACE"
-            );
-        }
         filter_mb_edge_luma(
             false, // horizontal
             &mut pic.y,
@@ -1516,53 +1499,39 @@ fn deblock_mb(
         has_above
     };
 
-    // MBAFF mixed-interlace horizontal edge 0: handled separately before normal edges.
-    let first_horiz_edge_done = top_available
-        && deblock_mbaff_horiz_edge0(
-            pic,
-            mb_info,
-            mb_x,
-            mb_y,
-            mb_width,
-            alpha_c0_offset,
-            beta_offset,
-            chroma_qp_index_offset,
-        );
-
-    // MBAFF mixed-interlace first vertical edge: handled separately before normal edges.
-    let first_vert_edge_done = left_available
-        && deblock_mbaff_first_vert_edge(
-            pic,
-            mb_info,
-            mb_x,
-            mb_y,
-            mb_width,
-            alpha_c0_offset,
-            beta_offset,
-            chroma_qp_index_offset,
-        );
-
-    // Dump pre-deblock pixels and inter-stage pixels for targeted MB debugging.
-    // Controlled by RUST_LOG=wedeo_codec_h264::deblock=trace.
-    if tracing::enabled!(tracing::Level::TRACE) {
-        // Dump key columns at edge boundaries (vertical edges at cols 3-4, 7-8, 11-12)
-        for &check_col in &[3u32, 4, 7, 8, 11, 12] {
-            for row in 0..16u32 {
-                let off = luma_base + row as usize * luma_stride + check_col as usize;
-                if off < pic.y.len() {
-                    trace!(
-                        mb_x, mb_y, stage = "PRE_DEBLOCK",
-                        col = check_col, row, pixel = pic.y[off],
-                        "DEBLOCK_STATE"
-                    );
-                }
-            }
-        }
-    }
-
     // Process vertical (is_vertical=true) then horizontal (is_vertical=false) edges.
-    // Chroma uses the same bS as luma (derived by mapping the 4x4 luma grid to 4:2:0).
+    // MBAFF special handlers run at the start of each direction pass, matching FFmpeg's
+    // filter_mb_dir(dir=0) then filter_mb_dir(dir=1) structure. The MBAFF vert edge 0
+    // must run before any vert edges (so vert edge 1+ see its output), and the MBAFF
+    // horiz edge 0 must run after all vert edges (so it sees vert-filtered pixels).
     for is_vertical in [true, false] {
+        // MBAFF mixed-interlace edge 0: handled before normal edges in each direction.
+        let first_edge_done = if is_vertical {
+            left_available
+                && deblock_mbaff_first_vert_edge(
+                    pic,
+                    mb_info,
+                    mb_x,
+                    mb_y,
+                    mb_width,
+                    alpha_c0_offset,
+                    beta_offset,
+                    chroma_qp_index_offset,
+                )
+        } else {
+            top_available
+                && deblock_mbaff_horiz_edge0(
+                    pic,
+                    mb_info,
+                    mb_x,
+                    mb_y,
+                    mb_width,
+                    alpha_c0_offset,
+                    beta_offset,
+                    chroma_qp_index_offset,
+                )
+        };
+
         // For idc==2, skip the MB boundary edge if the neighbor is in a different slice
         let skip_mb_edge = if is_vertical {
             !left_available
@@ -1588,10 +1557,7 @@ fn deblock_mb(
             if edge == 0 && skip_mb_edge {
                 continue;
             }
-            if edge == 0 && is_vertical && first_vert_edge_done {
-                continue;
-            }
-            if edge == 0 && !is_vertical && first_horiz_edge_done {
+            if edge == 0 && first_edge_done {
                 continue;
             }
             let qp = if edge == 0 {
@@ -1632,10 +1598,7 @@ fn deblock_mb(
             if edge == 0 && skip_mb_edge {
                 continue;
             }
-            if edge == 0 && is_vertical && first_vert_edge_done {
-                continue;
-            }
-            if edge == 0 && !is_vertical && first_horiz_edge_done {
+            if edge == 0 && first_edge_done {
                 continue;
             }
 
@@ -1674,21 +1637,6 @@ fn deblock_mb(
         }
     }
 
-    // Post-deblock dump for targeted debugging
-    if tracing::enabled!(tracing::Level::TRACE) {
-        let mut vals = Vec::with_capacity(256);
-        for r in 0..16u32 {
-            for c in 0..16u32 {
-                let off = luma_base + r as usize * luma_stride + c as usize;
-                vals.push(if off < pic.y.len() { pic.y[off] } else { 0 });
-            }
-        }
-        trace!(
-            mb_x, mb_y, cur_mb_field, luma_stride,
-            pixels = ?vals,
-            "DEBLOCK_FINAL"
-        );
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1762,13 +1710,6 @@ pub fn deblock_frame(
         }
     }
 
-    // Check specific pixel after all deblocking is complete
-    if is_mbaff && pic.y_stride == 720 {
-        let addr = 92 * 720 + 276; // picture (276, 92)
-        if addr < pic.y.len() {
-            trace!(pixel_276_92 = pic.y[addr], "DEBLOCK_FRAME_DONE");
-        }
-    }
 }
 
 /// Check idc and deblock a single MB, with tracing.
@@ -1790,20 +1731,7 @@ fn deblock_mb_if_enabled(
         return;
     }
 
-    // Watchpoint: track changes to pixel (276,92) = pic.y[66516]
-    let watch_addr = 92usize * 720 + 276;
-    let before = if watch_addr < pic.y.len() { pic.y[watch_addr] } else { 0 };
-
     deblock_mb(pic, mb_info, mb_x, mb_y, slice_table, slice_params);
-
-    if watch_addr < pic.y.len() && pic.y[watch_addr] != before {
-        trace!(
-            mb_x, mb_y,
-            before, after = pic.y[watch_addr],
-            mb_field = mb_info[(mb_y * mb_width + mb_x) as usize].mb_field,
-            "PIXEL_WATCHPOINT"
-        );
-    }
 
     {
         let mb_field = mb_info[mb_idx].mb_field;
