@@ -445,6 +445,15 @@ pub struct CabacNeighborCtx {
     /// Per-MB mb_field_decoding_flag for MBAFF field context derivation.
     /// Used by decode_cabac_field_decoding_flag to check the above pair's state.
     pub mb_field_flag: Vec<bool>,
+    /// Per-MB intra4x4 right-column prediction modes for MBAFF left_block remapping.
+    /// Layout: `intra4x4_modes[mb_idx * 4 + blk_y]` = mode for right col row `blk_y`.
+    /// -1 if unavailable (inter or I16x16/PCM). Length = `mb_width * mb_height * 4`.
+    pub intra4x4_modes: Vec<i8>,
+    /// Per-MB intra4x4 bottom-row prediction modes for MBAFF top-neighbor lookup.
+    /// Layout: `intra4x4_modes_top[mb_idx * 4 + blk_x]` = mode for bottom row col `blk_x`.
+    /// Used when the single-row NeighborContext buffer is wrong due to MBAFF pair overwrites.
+    /// -1 if unavailable. Length = `mb_width * mb_height * 4`.
+    pub intra4x4_modes_top: Vec<i8>,
 }
 
 impl CabacNeighborCtx {
@@ -466,6 +475,8 @@ impl CabacNeighborCtx {
             ref_cache_l1: vec![-1; total_mbs * 4],
             transform_8x8: vec![false; total_mbs],
             mb_field_flag: vec![false; total_mbs],
+            intra4x4_modes: vec![-1; total_mbs * 4],
+            intra4x4_modes_top: vec![-1; total_mbs * 4],
         }
     }
 
@@ -479,22 +490,58 @@ impl CabacNeighborCtx {
     ///
     /// Reference: FFmpeg h264_mvpred.h:726-732.
     #[inline]
-    fn left_cbp(
+    fn left_cbp(&self, left_idx: Option<usize>, is_intra: bool) -> u32 {
+        match left_idx {
+            Some(li) => self.cbp[li],
+            None => {
+                if is_intra {
+                    0x7CF
+                } else {
+                    0x00F
+                }
+            }
+        }
+    }
+
+    /// CBP shift values for MBAFF left_block_options.
+    ///
+    /// `[option][0]` = shift for top-half luma bit (from LTOP).
+    /// `[option][1]` = shift for bottom-half luma bit (from LBOT).
+    ///
+    /// Derived from `left_block[0] & ~1` and `left_block[2] & ~1`.
+    /// Reference: FFmpeg h264_mvpred.h:728-730.
+    const CBP_SHIFT: [[u32; 2]; 4] = [
+        [0, 2], // option 0: default
+        [2, 2], // option 1
+        [0, 0], // option 2
+        [0, 0], // option 3
+    ];
+
+    /// Get left CBP for MBAFF with left_block remapping.
+    ///
+    /// Constructs the left CBP from LTOP and LBOT with remapped luma bit
+    /// extraction. Chroma/DC bits always come from LTOP.
+    ///
+    /// Reference: FFmpeg h264_mvpred.h:727-733.
+    #[inline]
+    fn left_cbp_mbaff(
         &self,
-        mb_idx: usize,
-        mb_x: u32,
-        slice_table: &[u16],
-        cur_slice: u16,
+        left_idx: Option<usize>,
+        left_idx_bot: Option<usize>,
         is_intra: bool,
+        left_block_option: u8,
     ) -> u32 {
-        if mb_x == 0 {
-            return if is_intra { 0x7CF } else { 0x00F };
+        if left_block_option == 0 {
+            return self.left_cbp(left_idx, is_intra);
         }
-        let left_idx = mb_idx - 1;
-        if slice_table[left_idx] != cur_slice {
-            return if is_intra { 0x7CF } else { 0x00F };
-        }
-        self.cbp[left_idx]
+
+        let default = if is_intra { 0x7CF } else { 0x00F };
+        let cbp_ltop = left_idx.map_or(default, |li| self.cbp[li]);
+        let cbp_lbot = left_idx_bot.map_or(default, |li| self.cbp[li]);
+
+        let [shift_top, shift_bot] = Self::CBP_SHIFT[left_block_option as usize];
+
+        (cbp_ltop & 0x7F0) | ((cbp_ltop >> shift_top) & 2) | (((cbp_lbot >> shift_bot) & 2) << 2)
     }
 
     /// Get the top CBP for the current MB.
@@ -503,23 +550,17 @@ impl CabacNeighborCtx {
     ///
     /// Reference: FFmpeg h264_mvpred.h:722-725.
     #[inline]
-    fn top_cbp(
-        &self,
-        mb_idx: usize,
-        mb_y: u32,
-        mb_width: u32,
-        slice_table: &[u16],
-        cur_slice: u16,
-        is_intra: bool,
-    ) -> u32 {
-        if mb_y == 0 {
-            return if is_intra { 0x7CF } else { 0x00F };
+    fn top_cbp(&self, top_idx: Option<usize>, is_intra: bool) -> u32 {
+        match top_idx {
+            Some(ti) => self.cbp[ti],
+            None => {
+                if is_intra {
+                    0x7CF
+                } else {
+                    0x00F
+                }
+            }
         }
-        let top_idx = mb_idx - mb_width as usize;
-        if slice_table[top_idx] != cur_slice {
-            return if is_intra { 0x7CF } else { 0x00F };
-        }
-        self.cbp[top_idx]
     }
 
     /// Store the CABAC-relevant scalar state after decoding a macroblock.
@@ -547,6 +588,25 @@ impl CabacNeighborCtx {
         let nz_base = mb_idx * 24;
         self.nz_count[nz_base..nz_base + 24].copy_from_slice(nz);
         self.transform_8x8[mb_idx] = transform_8x8_flag;
+    }
+
+    /// Store intra4x4 right-column prediction modes for MBAFF left_block remapping.
+    ///
+    /// `modes` is the 16-element raster-order intra4x4 pred mode array.
+    /// Stores the right column (indices 3, 7, 11, 15) for later left-neighbor lookups.
+    /// For non-I4x4 MBs, pass the standard 2 (DC_PRED) or -1 (unavailable) array.
+    pub fn store_intra4x4_modes(&mut self, mb_idx: usize, modes: &[i8; 16]) {
+        let base = mb_idx * 4;
+        // Right column (raster indices 3, 7, 11, 15) — for left-neighbor lookup
+        self.intra4x4_modes[base] = modes[3]; // right col, row 0
+        self.intra4x4_modes[base + 1] = modes[7]; // right col, row 1
+        self.intra4x4_modes[base + 2] = modes[11]; // right col, row 2
+        self.intra4x4_modes[base + 3] = modes[15]; // right col, row 3
+        // Bottom row (raster indices 12, 13, 14, 15) — for top-neighbor lookup in MBAFF
+        self.intra4x4_modes_top[base] = modes[12]; // bottom row, col 0
+        self.intra4x4_modes_top[base + 1] = modes[13]; // bottom row, col 1
+        self.intra4x4_modes_top[base + 2] = modes[14]; // bottom row, col 2
+        self.intra4x4_modes_top[base + 3] = modes[15]; // bottom row, col 3
     }
 
     /// Write skip-MB defaults for MVD and ref_idx.
@@ -645,20 +705,12 @@ impl CabacDecodeCache {
     /// cols 4-7) are filled by `fill_rectangle` during decode.
     ///
     /// Reference: FFmpeg h264_mvpred.h:576-929 (fill_decode_caches).
-    #[allow(clippy::too_many_arguments)]
     pub fn fill(
         &mut self,
         cabac_nb: &CabacNeighborCtx,
-        slice_table: &[u16],
-        cur_slice: u16,
-        mb_idx: usize,
-        mb_x: u32,
-        mb_y: u32,
-        mb_width: u32,
+        left_idx: Option<usize>,
+        top_idx: Option<usize>,
     ) {
-        let has_top = mb_y > 0 && slice_table[mb_idx - mb_width as usize] == cur_slice;
-        let has_left = mb_x > 0 && slice_table[mb_idx - 1] == cur_slice;
-
         for list in 0..2 {
             let ref_store = if list == 0 {
                 &cabac_nb.ref_cache_l0
@@ -672,41 +724,39 @@ impl CabacDecodeCache {
             };
 
             // Top neighbor: bottom row of top MB
-            if has_top {
-                let top_idx = mb_idx - mb_width as usize;
-                if !cabac_nb.mb_intra[top_idx] {
-                    // ref: bottom-left (part 2) fills cols 4-5, bottom-right (part 3) fills cols 6-7
-                    let r2 = ref_store[top_idx * 4 + 2];
-                    let r3 = ref_store[top_idx * 4 + 3];
-                    self.ref_cache[list][4] = r2;
-                    self.ref_cache[list][5] = r2;
-                    self.ref_cache[list][6] = r3;
-                    self.ref_cache[list][7] = r3;
-                    // mvd: bottom row = raster indices 12..15
-                    for col in 0..4 {
-                        self.mvd_cache[list][4 + col] = mvd_store[top_idx * 16 + 12 + col];
-                    }
+            if let Some(ti) = top_idx
+                && !cabac_nb.mb_intra[ti]
+            {
+                // ref: bottom-left (part 2) fills cols 4-5, bottom-right (part 3) fills cols 6-7
+                let r2 = ref_store[ti * 4 + 2];
+                let r3 = ref_store[ti * 4 + 3];
+                self.ref_cache[list][4] = r2;
+                self.ref_cache[list][5] = r2;
+                self.ref_cache[list][6] = r3;
+                self.ref_cache[list][7] = r3;
+                // mvd: bottom row = raster indices 12..15
+                for col in 0..4 {
+                    self.mvd_cache[list][4 + col] = mvd_store[ti * 16 + 12 + col];
                 }
                 // else: intra → ref stays LIST_NOT_USED, mvd stays [0,0]
             }
 
             // Left neighbor: right column of left MB
-            if has_left {
-                let left_idx = mb_idx - 1;
-                if !cabac_nb.mb_intra[left_idx] {
-                    // ref: top-right (part 1) → rows 1-2, bottom-right (part 3) → rows 3-4
-                    let r1 = ref_store[left_idx * 4 + 1];
-                    let r3 = ref_store[left_idx * 4 + 3];
-                    self.ref_cache[list][SCAN8[0] - 1] = r1; // col 3, row 1
-                    self.ref_cache[list][SCAN8[2] - 1] = r1; // col 3, row 2
-                    self.ref_cache[list][SCAN8[8] - 1] = r3; // col 3, row 3
-                    self.ref_cache[list][SCAN8[10] - 1] = r3; // col 3, row 4
-                    // mvd: right column = raster indices 3,7,11,15
-                    self.mvd_cache[list][SCAN8[0] - 1] = mvd_store[left_idx * 16 + 3];
-                    self.mvd_cache[list][SCAN8[2] - 1] = mvd_store[left_idx * 16 + 7];
-                    self.mvd_cache[list][SCAN8[8] - 1] = mvd_store[left_idx * 16 + 11];
-                    self.mvd_cache[list][SCAN8[10] - 1] = mvd_store[left_idx * 16 + 15];
-                }
+            if let Some(li) = left_idx
+                && !cabac_nb.mb_intra[li]
+            {
+                // ref: top-right (part 1) → rows 1-2, bottom-right (part 3) → rows 3-4
+                let r1 = ref_store[li * 4 + 1];
+                let r3 = ref_store[li * 4 + 3];
+                self.ref_cache[list][SCAN8[0] - 1] = r1; // col 3, row 1
+                self.ref_cache[list][SCAN8[2] - 1] = r1; // col 3, row 2
+                self.ref_cache[list][SCAN8[8] - 1] = r3; // col 3, row 3
+                self.ref_cache[list][SCAN8[10] - 1] = r3; // col 3, row 4
+                // mvd: right column = raster indices 3,7,11,15
+                self.mvd_cache[list][SCAN8[0] - 1] = mvd_store[li * 16 + 3];
+                self.mvd_cache[list][SCAN8[2] - 1] = mvd_store[li * 16 + 7];
+                self.mvd_cache[list][SCAN8[8] - 1] = mvd_store[li * 16 + 11];
+                self.mvd_cache[list][SCAN8[10] - 1] = mvd_store[li * 16 + 15];
             }
         }
     }
@@ -859,36 +909,33 @@ pub fn decode_cabac_field_decoding_flag(
 /// Context base: 11 for P-slices, 24 for B-slices.
 /// Left/top non-skip neighbors add to the context index.
 ///
+/// For MBAFF, the skip function uses its own neighbor computation (different
+/// from `fill_decode_neighbors`). The caller must provide pre-computed
+/// MBAFF-aware indices via `mbaff_skip_neighbors()`.
+///
 /// Reference: FFmpeg h264_cabac.c:1336-1371 (decode_cabac_mb_skip).
-#[allow(clippy::too_many_arguments)]
 pub fn decode_cabac_mb_skip(
     reader: &mut CabacReader,
     state: &mut [u8; 1024],
     cabac_nb: &CabacNeighborCtx,
-    slice_table: &[u16],
-    cur_slice: u16,
-    mb_x: u32,
-    mb_y: u32,
-    mb_width: u32,
+    left_idx: Option<usize>,
+    top_idx: Option<usize>,
     is_b_slice: bool,
 ) -> u8 {
-    let mb_idx = (mb_y * mb_width + mb_x) as usize;
     let mut ctx = 0u32;
 
     // Check left neighbor
-    if mb_x > 0 {
-        let left_idx = mb_idx - 1;
-        if slice_table[left_idx] == cur_slice && !cabac_nb.mb_skip[left_idx] {
-            ctx += 1;
-        }
+    if let Some(li) = left_idx
+        && !cabac_nb.mb_skip[li]
+    {
+        ctx += 1;
     }
 
     // Check top neighbor
-    if mb_y > 0 {
-        let top_idx = mb_idx - mb_width as usize;
-        if slice_table[top_idx] == cur_slice && !cabac_nb.mb_skip[top_idx] {
-            ctx += 1;
-        }
+    if let Some(ti) = top_idx
+        && !cabac_nb.mb_skip[ti]
+    {
+        ctx += 1;
     }
 
     if is_b_slice {
@@ -901,35 +948,28 @@ pub fn decode_cabac_mb_skip(
 /// Decode an intra mb_type from CABAC (I_4x4, I_16x16 variants, or I_PCM).
 ///
 /// Reference: FFmpeg h264_cabac.c:1304-1334 (decode_cabac_intra_mb_type).
-#[allow(clippy::too_many_arguments)]
 fn decode_cabac_intra_mb_type(
     reader: &mut CabacReader,
     state: &mut [u8; 1024],
     ctx_base: usize,
     intra_slice: bool,
     cabac_nb: &CabacNeighborCtx,
-    slice_table: &[u16],
-    cur_slice: u16,
-    mb_idx: usize,
-    mb_x: u32,
-    mb_y: u32,
-    mb_width: u32,
+    left_idx: Option<usize>,
+    top_idx: Option<usize>,
 ) -> u32 {
     if intra_slice {
         let mut ctx = 0usize;
         // Left neighbor: check if I_16x16 or I_PCM
-        if mb_x > 0 {
-            let left_idx = mb_idx - 1;
-            if slice_table[left_idx] == cur_slice && cabac_nb.mb_type_intra16x16_or_pcm[left_idx] {
-                ctx += 1;
-            }
+        if let Some(li) = left_idx
+            && cabac_nb.mb_type_intra16x16_or_pcm[li]
+        {
+            ctx += 1;
         }
         // Top neighbor
-        if mb_y > 0 {
-            let top_idx = mb_idx - mb_width as usize;
-            if slice_table[top_idx] == cur_slice && cabac_nb.mb_type_intra16x16_or_pcm[top_idx] {
-                ctx += 1;
-            }
+        if let Some(ti) = top_idx
+            && cabac_nb.mb_type_intra16x16_or_pcm[ti]
+        {
+            ctx += 1;
         }
         trace!(
             "CABAC_INTRA_MB_TYPE ctx_base={} ctx={} state_idx={}",
@@ -997,33 +1037,26 @@ fn decode_cabac_mb_intra4x4_pred_mode(
 /// Decode chroma prediction mode using CABAC (truncated unary, max 3).
 ///
 /// Reference: FFmpeg h264_cabac.c:1387-1410.
-#[allow(clippy::too_many_arguments)]
 fn decode_cabac_mb_chroma_pre_mode(
     reader: &mut CabacReader,
     state: &mut [u8; 1024],
     cabac_nb: &CabacNeighborCtx,
-    slice_table: &[u16],
-    cur_slice: u16,
-    mb_idx: usize,
-    mb_x: u32,
-    mb_y: u32,
-    mb_width: u32,
+    left_idx: Option<usize>,
+    top_idx: Option<usize>,
 ) -> u8 {
     let mut ctx = 0usize;
 
     // Left neighbor: chroma_pred_mode != 0
-    if mb_x > 0 {
-        let left_idx = mb_idx - 1;
-        if slice_table[left_idx] == cur_slice && cabac_nb.chroma_pred_mode[left_idx] != 0 {
-            ctx += 1;
-        }
+    if let Some(li) = left_idx
+        && cabac_nb.chroma_pred_mode[li] != 0
+    {
+        ctx += 1;
     }
     // Top neighbor
-    if mb_y > 0 {
-        let top_idx = mb_idx - mb_width as usize;
-        if slice_table[top_idx] == cur_slice && cabac_nb.chroma_pred_mode[top_idx] != 0 {
-            ctx += 1;
-        }
+    if let Some(ti) = top_idx
+        && cabac_nb.chroma_pred_mode[ti] != 0
+    {
+        ctx += 1;
     }
 
     if reader.get_cabac(&mut state[64 + ctx]) == 0 {
@@ -1156,12 +1189,8 @@ fn decode_cabac_mb_ref(
     state: &mut [u8; 1024],
     cache: &CabacDecodeCache,
     cabac_nb: &CabacNeighborCtx,
-    slice_table: &[u16],
-    cur_slice: u16,
-    mb_idx: usize,
-    mb_x: u32,
-    mb_y: u32,
-    mb_width: u32,
+    left_idx: Option<usize>,
+    top_idx: Option<usize>,
     list: usize,
     cache_pos: usize,
     is_b_slice: bool,
@@ -1177,32 +1206,10 @@ fn decode_cabac_mb_ref(
         // B-slice: check ref > 0 and neighbor is not direct-mode.
         // Left column (col 3) → left MB, top row (row 0) → top MB,
         // anything else is intra-MB (never direct).
-        if ref_a > 0
-            && !is_cache_pos_direct(
-                left_pos,
-                cabac_nb,
-                slice_table,
-                cur_slice,
-                mb_idx,
-                mb_x,
-                mb_y,
-                mb_width,
-            )
-        {
+        if ref_a > 0 && !is_cache_pos_direct(left_pos, cabac_nb, left_idx, top_idx) {
             ctx += 1;
         }
-        if ref_b > 0
-            && !is_cache_pos_direct(
-                top_pos,
-                cabac_nb,
-                slice_table,
-                cur_slice,
-                mb_idx,
-                mb_x,
-                mb_y,
-                mb_width,
-            )
-        {
+        if ref_b > 0 && !is_cache_pos_direct(top_pos, cabac_nb, left_idx, top_idx) {
             ctx += 2;
         }
     } else {
@@ -1227,73 +1234,21 @@ fn decode_cabac_mb_ref(
 
 /// Check if a cache position refers to a direct-mode neighbor MB.
 /// Col 3 → left MB, row 0 → top MB, anything else → intra-MB (not direct).
-#[allow(clippy::too_many_arguments)]
 fn is_cache_pos_direct(
     pos: usize,
     cabac_nb: &CabacNeighborCtx,
-    slice_table: &[u16],
-    cur_slice: u16,
-    mb_idx: usize,
-    mb_x: u32,
-    mb_y: u32,
-    mb_width: u32,
+    left_idx: Option<usize>,
+    top_idx: Option<usize>,
 ) -> bool {
     if pos % 8 == 3 {
         // Left column → check left MB
-        is_neighbor_direct(
-            cabac_nb,
-            slice_table,
-            cur_slice,
-            mb_idx,
-            mb_x,
-            mb_y,
-            mb_width,
-            true,
-        )
+        left_idx.is_some_and(|li| cabac_nb.mb_direct[li])
     } else if pos < 8 {
         // Top row → check top MB
-        is_neighbor_direct(
-            cabac_nb,
-            slice_table,
-            cur_slice,
-            mb_idx,
-            mb_x,
-            mb_y,
-            mb_width,
-            false,
-        )
+        top_idx.is_some_and(|ti| cabac_nb.mb_direct[ti])
     } else {
         false
     }
-}
-
-/// Check if a neighbor MB is direct mode (for B-slice ref context).
-#[allow(clippy::too_many_arguments)]
-fn is_neighbor_direct(
-    cabac_nb: &CabacNeighborCtx,
-    slice_table: &[u16],
-    cur_slice: u16,
-    mb_idx: usize,
-    mb_x: u32,
-    mb_y: u32,
-    mb_width: u32,
-    is_left: bool, // true = check left, false = check top
-) -> bool {
-    let nb_idx = if is_left {
-        if mb_x == 0 {
-            return false;
-        }
-        mb_idx - 1
-    } else {
-        if mb_y == 0 {
-            return false;
-        }
-        mb_idx - mb_width as usize
-    };
-    if slice_table[nb_idx] != cur_slice {
-        return false;
-    }
-    cabac_nb.mb_direct[nb_idx]
 }
 
 /// Decode one component of a motion vector difference using CABAC.
@@ -1436,17 +1391,15 @@ const CBF_CTX_BASE: [u16; 14] = [
 #[allow(clippy::too_many_arguments)]
 fn get_cabac_cbf_ctx(
     cabac_nb: &CabacNeighborCtx,
-    slice_table: &[u16],
-    cur_slice: u16,
-    mb_idx: usize,
-    mb_x: u32,
-    mb_y: u32,
-    mb_width: u32,
+    left_idx: Option<usize>,
+    left_idx_bot: Option<usize>,
+    top_idx: Option<usize>,
     cat: usize,
     block_idx: usize,
     is_dc: bool,
     nz_cache: &[u8; 24],
     is_intra: bool,
+    left_block_option: u8,
 ) -> usize {
     let mut ctx = 0usize;
     // For unavailable neighbors, FFmpeg's fill_decode_caches uses:
@@ -1459,14 +1412,14 @@ fn get_cabac_cbf_ctx(
         if cat == 3 {
             // Chroma DC: idx is 0 or 1 (Cb or Cr)
             let chroma_idx = block_idx; // 0=Cb, 1=Cr
-            // Left neighbor: check chroma DC coded flag
-            let nza = if mb_x > 0 && slice_table[mb_idx - 1] == cur_slice {
-                (cabac_nb.cbp[mb_idx - 1] >> (6 + chroma_idx)) & 0x01
+            // Left neighbor: check chroma DC coded flag (always from LTOP)
+            let nza = if let Some(li) = left_idx {
+                (cabac_nb.cbp[li] >> (6 + chroma_idx)) & 0x01
             } else {
                 dc_unavail
             };
-            let nzb = if mb_y > 0 && slice_table[mb_idx - mb_width as usize] == cur_slice {
-                (cabac_nb.cbp[mb_idx - mb_width as usize] >> (6 + chroma_idx)) & 0x01
+            let nzb = if let Some(ti) = top_idx {
+                (cabac_nb.cbp[ti] >> (6 + chroma_idx)) & 0x01
             } else {
                 dc_unavail
             };
@@ -1478,15 +1431,15 @@ fn get_cabac_cbf_ctx(
             }
         } else {
             // Luma DC (I16x16): idx is 0
-            let nza = if mb_x > 0 && slice_table[mb_idx - 1] == cur_slice {
-                cabac_nb.cbp[mb_idx - 1] & 0x100
+            let nza = if let Some(li) = left_idx {
+                cabac_nb.cbp[li] & 0x100
             } else if is_intra {
                 0x100
             } else {
                 0
             };
-            let nzb = if mb_y > 0 && slice_table[mb_idx - mb_width as usize] == cur_slice {
-                cabac_nb.cbp[mb_idx - mb_width as usize] & 0x100
+            let nzb = if let Some(ti) = top_idx {
+                cabac_nb.cbp[ti] & 0x100
             } else if is_intra {
                 0x100
             } else {
@@ -1505,15 +1458,13 @@ fn get_cabac_cbf_ctx(
         let unavail_nz = if is_intra { 64 } else { 0 };
         let (nza, nzb) = get_nz_neighbors(
             cabac_nb,
-            slice_table,
-            cur_slice,
-            mb_idx,
-            mb_x,
-            mb_y,
-            mb_width,
+            left_idx,
+            left_idx_bot,
+            top_idx,
             block_idx,
             nz_cache,
             unavail_nz,
+            left_block_option,
         );
         if nza > 0 {
             ctx += 1;
@@ -1526,26 +1477,53 @@ fn get_cabac_cbf_ctx(
     CBF_CTX_BASE[cat] as usize + ctx
 }
 
+/// Left-block luma NNZ row remapping for MBAFF.
+///
+/// For each `left_block_option` (0-3), maps `blk_y` (0-3) to the row of the
+/// left neighbor MB to use for NNZ context.
+///
+/// Reference: FFmpeg `left_block_options[option][8..12]` in h264_mvpred.h:491-496.
+const LEFT_LUMA_NZ_ROW: [[u8; 4]; 4] = [
+    [0, 1, 2, 3], // option 0: default [3, 7, 11, 15]
+    [2, 2, 3, 3], // option 1: [11, 11, 15, 15]
+    [0, 0, 1, 1], // option 2: [3, 3, 7, 7]
+    [0, 2, 0, 2], // option 3: [3, 11, 3, 11]
+];
+
+/// Left-block chroma NNZ row remapping for MBAFF (4:2:0).
+///
+/// For each `left_block_option` (0-3), maps chroma half (0=top, 1=bottom) to
+/// the chroma row of the left neighbor MB to use.
+///
+/// Reference: FFmpeg `left_block_options[option][12..16]` in h264_mvpred.h:491-496.
+const LEFT_CHROMA_NZ_ROW: [[u8; 2]; 4] = [
+    [0, 1], // option 0: default [17,33, 21,37]
+    [1, 1], // option 1: [21,37, 21,37]
+    [0, 0], // option 2: [17,33, 17,33]
+    [0, 0], // option 3: [17,33, 17,33]
+];
+
 /// Get left and top non-zero count neighbors for a 4x4 block.
 ///
 /// When the neighbor is unavailable, returns `unavail_nz` (64 for intra, 0 for inter).
 /// This matches FFmpeg's `fill_decode_caches` which uses `CABAC && !IS_INTRA ? 0 : 64`.
 ///
+/// For MBAFF with `left_block_option != 0`, remaps which row of the left neighbor
+/// MB is used for NNZ, and selects LTOP vs LBOT based on the block's half.
+///
 /// Returns (nz_left, nz_top).
 ///
 /// Reference: FFmpeg h264_mvpred.h:fill_decode_caches (non_zero_count_cache init).
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // mirrors FFmpeg fill_decode_caches parameter set
 fn get_nz_neighbors(
     cabac_nb: &CabacNeighborCtx,
-    slice_table: &[u16],
-    cur_slice: u16,
-    mb_idx: usize,
-    mb_x: u32,
-    mb_y: u32,
-    mb_width: u32,
+    left_idx: Option<usize>,
+    left_idx_bot: Option<usize>,
+    top_idx: Option<usize>,
     block_idx: usize,
     nz_cache: &[u8; 24],
     unavail_nz: u8,
+    left_block_option: u8,
 ) -> (u8, u8) {
     if block_idx < 16 {
         // Luma block: raster index = block_idx
@@ -1554,22 +1532,24 @@ fn get_nz_neighbors(
 
         let nza = if blk_x > 0 {
             nz_cache[block_idx - 1]
-        } else if mb_x > 0 && slice_table[mb_idx - 1] == cur_slice {
-            // Right column of left MB
-            let left_idx = mb_idx - 1;
-            let left_blk = blk_y * 4 + 3;
-            cabac_nb.nz_count[left_idx * 24 + left_blk]
         } else {
-            unavail_nz
+            // Select LTOP (top half) or LBOT (bottom half)
+            let li = if blk_y < 2 { left_idx } else { left_idx_bot };
+            if let Some(li) = li {
+                let remapped_row = LEFT_LUMA_NZ_ROW[left_block_option as usize][blk_y] as usize;
+                let left_blk = remapped_row * 4 + 3;
+                cabac_nb.nz_count[li * 24 + left_blk]
+            } else {
+                unavail_nz
+            }
         };
 
         let nzb = if blk_y > 0 {
             nz_cache[block_idx - 4]
-        } else if mb_y > 0 && slice_table[mb_idx - mb_width as usize] == cur_slice {
+        } else if let Some(ti) = top_idx {
             // Bottom row of top MB
-            let top_idx = mb_idx - mb_width as usize;
             let top_blk = 12 + blk_x;
-            cabac_nb.nz_count[top_idx * 24 + top_blk]
+            cabac_nb.nz_count[ti * 24 + top_blk]
         } else {
             unavail_nz
         };
@@ -1583,20 +1563,22 @@ fn get_nz_neighbors(
 
         let nza = if blk_x > 0 {
             nz_cache[block_idx - 1]
-        } else if mb_x > 0 && slice_table[mb_idx - 1] == cur_slice {
-            let left_idx = mb_idx - 1;
-            let left_blk = 16 + blk_y * 2 + 1;
-            cabac_nb.nz_count[left_idx * 24 + left_blk]
         } else {
-            unavail_nz
+            let li = if blk_y < 1 { left_idx } else { left_idx_bot };
+            if let Some(li) = li {
+                let chroma_row = LEFT_CHROMA_NZ_ROW[left_block_option as usize][blk_y] as usize;
+                let left_blk = 16 + chroma_row * 2 + 1;
+                cabac_nb.nz_count[li * 24 + left_blk]
+            } else {
+                unavail_nz
+            }
         };
 
         let nzb = if blk_y > 0 {
             nz_cache[block_idx - 2]
-        } else if mb_y > 0 && slice_table[mb_idx - mb_width as usize] == cur_slice {
-            let top_idx = mb_idx - mb_width as usize;
+        } else if let Some(ti) = top_idx {
             let top_blk = 16 + 2 + blk_x;
-            cabac_nb.nz_count[top_idx * 24 + top_blk]
+            cabac_nb.nz_count[ti * 24 + top_blk]
         } else {
             unavail_nz
         };
@@ -1610,20 +1592,22 @@ fn get_nz_neighbors(
 
         let nza = if blk_x > 0 {
             nz_cache[block_idx - 1]
-        } else if mb_x > 0 && slice_table[mb_idx - 1] == cur_slice {
-            let left_idx = mb_idx - 1;
-            let left_blk = 20 + blk_y * 2 + 1;
-            cabac_nb.nz_count[left_idx * 24 + left_blk]
         } else {
-            unavail_nz
+            let li = if blk_y < 1 { left_idx } else { left_idx_bot };
+            if let Some(li) = li {
+                let chroma_row = LEFT_CHROMA_NZ_ROW[left_block_option as usize][blk_y] as usize;
+                let left_blk = 20 + chroma_row * 2 + 1;
+                cabac_nb.nz_count[li * 24 + left_blk]
+            } else {
+                unavail_nz
+            }
         };
 
         let nzb = if blk_y > 0 {
             nz_cache[block_idx - 2]
-        } else if mb_y > 0 && slice_table[mb_idx - mb_width as usize] == cur_slice {
-            let top_idx = mb_idx - mb_width as usize;
+        } else if let Some(ti) = top_idx {
             let top_blk = 20 + 2 + blk_x;
-            cabac_nb.nz_count[top_idx * 24 + top_blk]
+            cabac_nb.nz_count[ti * 24 + top_blk]
         } else {
             unavail_nz
         };
@@ -1780,15 +1764,13 @@ fn decode_cabac_luma_residual(
     mb: &mut Macroblock,
     cabac_nb: &CabacNeighborCtx,
     mb_field: bool,
-    slice_table: &[u16],
-    cur_slice: u16,
-    mb_idx: usize,
-    mb_x: u32,
-    mb_y: u32,
-    mb_width: u32,
+    left_idx: Option<usize>,
+    left_idx_bot: Option<usize>,
+    top_idx: Option<usize>,
     cbp: u32,
     is_intra16x16: bool,
     is_intra: bool,
+    left_block_option: u8,
 ) {
     let nz_cache = &mut mb.non_zero_count;
     // MBAFF field-mode MBs use field scan tables for coefficient placement.
@@ -1808,17 +1790,15 @@ fn decode_cabac_luma_residual(
         // Luma DC (cat=0): 16 coefficients
         let cbf_ctx = get_cabac_cbf_ctx(
             cabac_nb,
-            slice_table,
-            cur_slice,
-            mb_idx,
-            mb_x,
-            mb_y,
-            mb_width,
+            left_idx,
+            left_idx_bot,
+            top_idx,
             0,
             0,
             true,
             nz_cache,
             is_intra,
+            left_block_option,
         );
         if reader.get_cabac(&mut state[cbf_ctx]) != 0 {
             // Store DC coded flag in cbp (bit 8)
@@ -1833,17 +1813,15 @@ fn decode_cabac_luma_residual(
             for &raster_idx in &SCAN_TO_RASTER {
                 let cbf_ctx = get_cabac_cbf_ctx(
                     cabac_nb,
-                    slice_table,
-                    cur_slice,
-                    mb_idx,
-                    mb_x,
-                    mb_y,
-                    mb_width,
+                    left_idx,
+                    left_idx_bot,
+                    top_idx,
                     1,
                     raster_idx,
                     false,
                     nz_cache,
                     is_intra,
+                    left_block_option,
                 );
                 if reader.get_cabac(&mut state[cbf_ctx]) != 0 {
                     let nz = decode_cabac_residual(
@@ -1895,17 +1873,15 @@ fn decode_cabac_luma_residual(
                     let raster_idx = SCAN_TO_RASTER[scan_idx];
                     let cbf_ctx = get_cabac_cbf_ctx(
                         cabac_nb,
-                        slice_table,
-                        cur_slice,
-                        mb_idx,
-                        mb_x,
-                        mb_y,
-                        mb_width,
+                        left_idx,
+                        left_idx_bot,
+                        top_idx,
                         2,
                         raster_idx,
                         false,
                         nz_cache,
                         is_intra,
+                        left_block_option,
                     );
                     let cbf = reader.get_cabac(&mut state[cbf_ctx]);
                     if cbf != 0 {
@@ -1936,15 +1912,13 @@ fn decode_cabac_chroma_residual(
     mb: &mut Macroblock,
     cabac_nb: &CabacNeighborCtx,
     mb_field: bool,
-    slice_table: &[u16],
-    cur_slice: u16,
-    mb_idx: usize,
-    mb_x: u32,
-    mb_y: u32,
-    mb_width: u32,
+    left_idx: Option<usize>,
+    left_idx_bot: Option<usize>,
+    top_idx: Option<usize>,
     cbp: u32,
     stored_cbp: &mut u32,
     is_intra: bool,
+    left_block_option: u8,
 ) {
     let nz_cache = &mut mb.non_zero_count;
     let scan_4x4 = if mb_field {
@@ -1958,17 +1932,15 @@ fn decode_cabac_chroma_residual(
         for c in 0..2u32 {
             let cbf_ctx = get_cabac_cbf_ctx(
                 cabac_nb,
-                slice_table,
-                cur_slice,
-                mb_idx,
-                mb_x,
-                mb_y,
-                mb_width,
+                left_idx,
+                left_idx_bot,
+                top_idx,
                 3,
                 c as usize,
                 true,
                 nz_cache,
                 is_intra,
+                left_block_option,
             );
             if reader.get_cabac(&mut state[cbf_ctx]) != 0 {
                 // Chroma DC 2x2 uses identity scan (positions map 1:1 to the
@@ -1997,17 +1969,15 @@ fn decode_cabac_chroma_residual(
                 let nz_idx = 16 + 4 * c + i;
                 let cbf_ctx = get_cabac_cbf_ctx(
                     cabac_nb,
-                    slice_table,
-                    cur_slice,
-                    mb_idx,
-                    mb_x,
-                    mb_y,
-                    mb_width,
+                    left_idx,
+                    left_idx_bot,
+                    top_idx,
                     4,
                     nz_idx,
                     false,
                     nz_cache,
                     is_intra,
+                    left_block_option,
                 );
                 if reader.get_cabac(&mut state[cbf_ctx]) != 0 {
                     let nz = decode_cabac_residual(
@@ -2042,8 +2012,8 @@ pub fn decode_mb_cabac(
     _pps: &Pps,
     cabac_nb: &CabacNeighborCtx,
     neighbor: &NeighborContext,
-    slice_table: &[u16],
-    cur_slice: u16,
+    _slice_table: &[u16],
+    _cur_slice: u16,
     mb_x: u32,
     mb_y: u32,
     mb_width: u32,
@@ -2054,9 +2024,14 @@ pub fn decode_mb_cabac(
     direct_8x8_inference_flag: bool,
     decode_chroma: bool,
     mb_field: bool,
+    nb: &crate::mb::MbaffNeighbors,
 ) -> Result<Macroblock> {
     let mut mb = Macroblock::default();
-    let mb_idx = (mb_y * mb_width + mb_x) as usize;
+    let _mb_idx = (mb_y * mb_width + mb_x) as usize;
+    let nb_left = nb.left_idx;
+    let nb_left_bot = nb.left_idx_bot;
+    let nb_top = nb.top_idx;
+    let left_block_option = nb.left_block_option;
 
     trace!(
         "CABAC_MB_START mb_x={} mb_y={} slice_type={:?}",
@@ -2069,19 +2044,8 @@ pub fn decode_mb_cabac(
 
     match slice_type {
         SliceType::I | SliceType::SI => {
-            let raw_mt = decode_cabac_intra_mb_type(
-                reader,
-                state,
-                3,
-                true,
-                cabac_nb,
-                slice_table,
-                cur_slice,
-                mb_idx,
-                mb_x,
-                mb_y,
-                mb_width,
-            );
+            let raw_mt =
+                decode_cabac_intra_mb_type(reader, state, 3, true, cabac_nb, nb_left, nb_top);
             is_intra = true;
             decode_intra_mb_cabac(&mut mb, raw_mt)?;
             cbp = mb.cbp;
@@ -2102,19 +2066,8 @@ pub fn decode_mb_cabac(
                 cbp = 0;
             } else {
                 // Intra MB in P-slice
-                let raw_mt = decode_cabac_intra_mb_type(
-                    reader,
-                    state,
-                    17,
-                    false,
-                    cabac_nb,
-                    slice_table,
-                    cur_slice,
-                    mb_idx,
-                    mb_x,
-                    mb_y,
-                    mb_width,
-                );
+                let raw_mt =
+                    decode_cabac_intra_mb_type(reader, state, 17, false, cabac_nb, nb_left, nb_top);
                 is_intra = true;
                 decode_intra_mb_cabac(&mut mb, raw_mt)?;
                 cbp = mb.cbp;
@@ -2124,18 +2077,18 @@ pub fn decode_mb_cabac(
             // B-slice mb_type decode
             let mut b_ctx = 0usize;
             // Left neighbor: not direct
-            if mb_x > 0 && slice_table[mb_idx - 1] == cur_slice {
-                let left_idx = mb_idx - 1;
-                if !cabac_nb.mb_direct[left_idx] && !cabac_nb.mb_skip[left_idx] {
-                    b_ctx += 1;
-                }
+            if let Some(left_idx) = nb_left
+                && !cabac_nb.mb_direct[left_idx]
+                && !cabac_nb.mb_skip[left_idx]
+            {
+                b_ctx += 1;
             }
             // Top neighbor: not direct
-            if mb_y > 0 && slice_table[mb_idx - mb_width as usize] == cur_slice {
-                let top_idx = mb_idx - mb_width as usize;
-                if !cabac_nb.mb_direct[top_idx] && !cabac_nb.mb_skip[top_idx] {
-                    b_ctx += 1;
-                }
+            if let Some(top_idx) = nb_top
+                && !cabac_nb.mb_direct[top_idx]
+                && !cabac_nb.mb_skip[top_idx]
+            {
+                b_ctx += 1;
             }
 
             trace!("CABAC_B_MB_TYPE b_ctx={} state_idx={}", b_ctx, 27 + b_ctx);
@@ -2176,17 +2129,7 @@ pub fn decode_mb_cabac(
                 } else if bits == 13 {
                     // Intra MB in B-slice
                     let raw_mt = decode_cabac_intra_mb_type(
-                        reader,
-                        state,
-                        32,
-                        false,
-                        cabac_nb,
-                        slice_table,
-                        cur_slice,
-                        mb_idx,
-                        mb_x,
-                        mb_y,
-                        mb_width,
+                        reader, state, 32, false, cabac_nb, nb_left, nb_top,
                     );
                     is_intra = true;
                     decode_intra_mb_cabac(&mut mb, raw_mt)?;
@@ -2304,14 +2247,15 @@ pub fn decode_mb_cabac(
     let neighbor_ts = {
         let mut ts = 0usize;
         // Top neighbor
-        if mb_y > 0
-            && slice_table[mb_idx - mb_width as usize] == cur_slice
-            && cabac_nb.transform_8x8[mb_idx - mb_width as usize]
+        if let Some(ti) = nb_top
+            && cabac_nb.transform_8x8[ti]
         {
             ts += 1;
         }
         // Left neighbor
-        if mb_x > 0 && slice_table[mb_idx - 1] == cur_slice && cabac_nb.transform_8x8[mb_idx - 1] {
+        if let Some(li) = nb_left
+            && cabac_nb.transform_8x8[li]
+        {
             ts += 1;
         }
         ts
@@ -2339,16 +2283,29 @@ pub fn decode_mb_cabac(
             let left_mode: i8 = if blk_x > 0 {
                 mode_cache[raster_idx - 1]
             } else if neighbor.left_available {
-                neighbor.left_intra4x4_mode[blk_y]
+                if left_block_option == 0 {
+                    neighbor.left_intra4x4_mode[blk_y]
+                } else {
+                    // MBAFF: use remapped row from the appropriate left MB
+                    let remapped_row = LEFT_LUMA_NZ_ROW[left_block_option as usize][blk_y] as usize;
+                    let li = if blk_y < 2 { nb_left } else { nb_left_bot };
+                    if let Some(li) = li {
+                        cabac_nb.intra4x4_modes[li * 4 + remapped_row]
+                    } else {
+                        -1
+                    }
+                }
             } else {
                 -1
             };
 
             let top_mode: i8 = if blk_y > 0 {
                 mode_cache[raster_idx - 4]
-            } else if neighbor.top_available {
-                let abs_blk_x = mb_x as usize * 4 + blk_x;
-                neighbor.top_intra4x4_mode[abs_blk_x]
+            } else if let Some(top_idx) = nb_top {
+                // Use per-MB bottom-row storage indexed by the MBAFF-adjusted
+                // top neighbor. This avoids the single-row buffer overwrite
+                // problem in MBAFF pair processing.
+                cabac_nb.intra4x4_modes_top[top_idx * 4 + blk_x]
             } else {
                 -1
             };
@@ -2379,31 +2336,14 @@ pub fn decode_mb_cabac(
     // 4. Chroma prediction mode (for intra MBs)
     trace!("CABAC_SECTION chroma_pred_mode");
     if is_intra && decode_chroma {
-        mb.chroma_pred_mode = decode_cabac_mb_chroma_pre_mode(
-            reader,
-            state,
-            cabac_nb,
-            slice_table,
-            cur_slice,
-            mb_idx,
-            mb_x,
-            mb_y,
-            mb_width,
-        );
+        mb.chroma_pred_mode =
+            decode_cabac_mb_chroma_pre_mode(reader, state, cabac_nb, nb_left, nb_top);
     }
 
     // 5. Inter prediction — fill scan8 cache and decode ref/mvd.
     // The cache handles both cross-MB and intra-MB neighbor lookups via scan8.
     if !is_intra {
-        cache.fill(
-            cabac_nb,
-            slice_table,
-            cur_slice,
-            mb_idx,
-            mb_x,
-            mb_y,
-            mb_width,
-        );
+        cache.fill(cabac_nb, nb_left, nb_top);
     }
 
     if !is_intra && (slice_type == SliceType::P || slice_type == SliceType::SP) {
@@ -2412,19 +2352,7 @@ pub fn decode_mb_cabac(
                 // P_L0_16x16: one ref, one mvd
                 if num_ref_idx_l0_active > 1 {
                     mb.ref_idx_l0[0] = decode_cabac_mb_ref(
-                        reader,
-                        state,
-                        cache,
-                        cabac_nb,
-                        slice_table,
-                        cur_slice,
-                        mb_idx,
-                        mb_x,
-                        mb_y,
-                        mb_width,
-                        0,
-                        SCAN8[0],
-                        false,
+                        reader, state, cache, cabac_nb, nb_left, nb_top, 0, SCAN8[0], false,
                     ) as i8;
                 } else {
                     mb.ref_idx_l0[0] = 0;
@@ -2440,19 +2368,7 @@ pub fn decode_mb_cabac(
                     let scan8_n = SCAN8[part as usize * 8];
                     if num_ref_idx_l0_active > 1 {
                         mb.ref_idx_l0[part as usize] = decode_cabac_mb_ref(
-                            reader,
-                            state,
-                            cache,
-                            cabac_nb,
-                            slice_table,
-                            cur_slice,
-                            mb_idx,
-                            mb_x,
-                            mb_y,
-                            mb_width,
-                            0,
-                            scan8_n,
-                            false,
+                            reader, state, cache, cabac_nb, nb_left, nb_top, 0, scan8_n, false,
                         ) as i8;
                     } else {
                         mb.ref_idx_l0[part as usize] = 0;
@@ -2479,19 +2395,7 @@ pub fn decode_mb_cabac(
                     let scan8_n = SCAN8[part as usize * 4];
                     if num_ref_idx_l0_active > 1 {
                         mb.ref_idx_l0[part as usize] = decode_cabac_mb_ref(
-                            reader,
-                            state,
-                            cache,
-                            cabac_nb,
-                            slice_table,
-                            cur_slice,
-                            mb_idx,
-                            mb_x,
-                            mb_y,
-                            mb_width,
-                            0,
-                            scan8_n,
-                            false,
+                            reader, state, cache, cabac_nb, nb_left, nb_top, 0, scan8_n, false,
                         ) as i8;
                     } else {
                         mb.ref_idx_l0[part as usize] = 0;
@@ -2534,12 +2438,8 @@ pub fn decode_mb_cabac(
                             state,
                             cache,
                             cabac_nb,
-                            slice_table,
-                            cur_slice,
-                            mb_idx,
-                            mb_x,
-                            mb_y,
-                            mb_width,
+                            nb_left,
+                            nb_top,
                             0,
                             SCAN8[i * 4],
                             false,
@@ -2613,12 +2513,8 @@ pub fn decode_mb_cabac(
                         state,
                         cache,
                         cabac_nb,
-                        slice_table,
-                        cur_slice,
-                        mb_idx,
-                        mb_x,
-                        mb_y,
-                        mb_width,
+                        nb_left,
+                        nb_top,
                         0,
                         SCAN8[i * 4],
                         true,
@@ -2647,12 +2543,8 @@ pub fn decode_mb_cabac(
                         state,
                         cache,
                         cabac_nb,
-                        slice_table,
-                        cur_slice,
-                        mb_idx,
-                        mb_x,
-                        mb_y,
-                        mb_width,
+                        nb_left,
+                        nb_top,
                         1,
                         SCAN8[i * 4],
                         true,
@@ -2756,19 +2648,7 @@ pub fn decode_mb_cabac(
                     let scan8_n = ref_scan8(p);
                     if num_ref_idx_l0_active > 1 {
                         mb.ref_idx_l0[p] = decode_cabac_mb_ref(
-                            reader,
-                            state,
-                            cache,
-                            cabac_nb,
-                            slice_table,
-                            cur_slice,
-                            mb_idx,
-                            mb_x,
-                            mb_y,
-                            mb_width,
-                            0,
-                            scan8_n,
-                            true,
+                            reader, state, cache, cabac_nb, nb_left, nb_top, 0, scan8_n, true,
                         ) as i8;
                     } else {
                         mb.ref_idx_l0[p] = 0;
@@ -2783,19 +2663,7 @@ pub fn decode_mb_cabac(
                     let scan8_n = ref_scan8(p);
                     if num_ref_idx_l1_active > 1 {
                         mb.ref_idx_l1[p] = decode_cabac_mb_ref(
-                            reader,
-                            state,
-                            cache,
-                            cabac_nb,
-                            slice_table,
-                            cur_slice,
-                            mb_idx,
-                            mb_x,
-                            mb_y,
-                            mb_width,
-                            1,
-                            scan8_n,
-                            true,
+                            reader, state, cache, cabac_nb, nb_left, nb_top, 1, scan8_n, true,
                         ) as i8;
                     } else {
                         mb.ref_idx_l1[p] = 0;
@@ -2830,8 +2698,8 @@ pub fn decode_mb_cabac(
     // 6. CBP (for non-I16x16)
     trace!("CABAC_SECTION cbp");
     if !mb.is_intra16x16 {
-        let left_cbp = cabac_nb.left_cbp(mb_idx, mb_x, slice_table, cur_slice, is_intra);
-        let top_cbp = cabac_nb.top_cbp(mb_idx, mb_y, mb_width, slice_table, cur_slice, is_intra);
+        let left_cbp = cabac_nb.left_cbp_mbaff(nb_left, nb_left_bot, is_intra, left_block_option);
+        let top_cbp = cabac_nb.top_cbp(nb_top, is_intra);
         cbp = decode_cabac_mb_cbp_luma(reader, state, left_cbp, top_cbp);
         if decode_chroma {
             cbp |= decode_cabac_mb_cbp_chroma(reader, state, left_cbp, top_cbp) << 4;
@@ -2870,15 +2738,13 @@ pub fn decode_mb_cabac(
             &mut mb,
             cabac_nb,
             mb_field,
-            slice_table,
-            cur_slice,
-            mb_idx,
-            mb_x,
-            mb_y,
-            mb_width,
+            nb_left,
+            nb_left_bot,
+            nb_top,
             cbp,
             is_i16x16,
             is_intra,
+            left_block_option,
         );
 
         // Decode chroma residual (4:2:0)
@@ -2889,15 +2755,13 @@ pub fn decode_mb_cabac(
             &mut mb,
             cabac_nb,
             mb_field,
-            slice_table,
-            cur_slice,
-            mb_idx,
-            mb_x,
-            mb_y,
-            mb_width,
+            nb_left,
+            nb_left_bot,
+            nb_top,
             cbp,
             &mut stored_cbp,
             is_intra,
+            left_block_option,
         );
 
         // Per-MB coefficient summary for pipeline-stage tracing
