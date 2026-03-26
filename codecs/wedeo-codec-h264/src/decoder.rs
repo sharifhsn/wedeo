@@ -117,7 +117,7 @@ pub struct H264Decoder {
 
 /// Compute intra4x4 right-column modes as i8 for CABAC neighbor storage.
 /// Mirrors the mode array computed in `apply_macroblock` for `NeighborContext`.
-fn mb_intra4x4_modes_i8(mb: &crate::cavlc::Macroblock) -> [i8; 16] {
+fn mb_intra4x4_modes_i8(mb: &crate::cavlc::Macroblock, constrained_intra: bool) -> [i8; 16] {
     if mb.is_intra4x4 {
         let mut modes = [-1i8; 16];
         for (i, mode) in modes.iter_mut().enumerate() {
@@ -126,8 +126,10 @@ fn mb_intra4x4_modes_i8(mb: &crate::cavlc::Macroblock) -> [i8; 16] {
         modes
     } else if mb.is_intra {
         [2i8; 16] // DC_PRED for I_16x16, I_PCM
+    } else if constrained_intra {
+        [-1i8; 16] // unavailable for inter when constrained_intra_pred
     } else {
-        [-1i8; 16] // unavailable for inter
+        [2i8; 16] // DC_PRED for inter (matches FFmpeg fill_decode_caches)
     }
 }
 
@@ -1745,7 +1747,8 @@ impl H264Decoder {
                         cabac_nb.update_after_mb(
                             mb_idx, true, false, false, false, 0, 0, &[0; 24], false,
                         );
-                        cabac_nb.store_intra4x4_modes(mb_idx, &[-1; 16]);
+                        let skip_modes = if pps.constrained_intra_pred { [-1i8; 16] } else { [2i8; 16] };
+                        cabac_nb.store_intra4x4_modes(mb_idx, &skip_modes);
                         cabac_nb.update_mvd_ref_skip(mb_idx);
 
                         mb_addr += 1;
@@ -1813,7 +1816,7 @@ impl H264Decoder {
                     &mb.non_zero_count,
                     mb.transform_size_8x8_flag,
                 );
-                cabac_nb.store_intra4x4_modes(mb_idx, &mb_intra4x4_modes_i8(&mb));
+                cabac_nb.store_intra4x4_modes(mb_idx, &mb_intra4x4_modes_i8(&mb, pps.constrained_intra_pred));
 
                 mb_addr += 1;
                 mbs_decoded += 1;
@@ -2044,7 +2047,8 @@ impl H264Decoder {
                         cabac_nb.update_after_mb(
                             mb_idx, true, false, false, false, 0, 0, &[0; 24], false,
                         );
-                        cabac_nb.store_intra4x4_modes(mb_idx, &[-1; 16]);
+                        let skip_modes = if pps.constrained_intra_pred { [-1i8; 16] } else { [2i8; 16] };
+                        cabac_nb.store_intra4x4_modes(mb_idx, &skip_modes);
                         cabac_nb.update_mvd_ref_skip(mb_idx);
                         cabac_nb.mb_field_flag[mb_idx] = mb_field_decoding_flag;
                         mbs_decoded += 1;
@@ -2140,7 +2144,7 @@ impl H264Decoder {
                     &mb.non_zero_count,
                     mb.transform_size_8x8_flag,
                 );
-                cabac_nb.store_intra4x4_modes(mb_idx, &mb_intra4x4_modes_i8(&mb));
+                cabac_nb.store_intra4x4_modes(mb_idx, &mb_intra4x4_modes_i8(&mb, pps.constrained_intra_pred));
                 cabac_nb.mb_field_flag[mb_idx] = mb_field_decoding_flag;
                 mbs_decoded += 1;
             }

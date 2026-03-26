@@ -2240,8 +2240,6 @@ pub fn decode_mb_cabac(
     let mut dct8x8_allowed = _pps.transform_8x8_mode;
 
     // 3. Intra prediction modes
-    trace!("CABAC_SECTION intra_pred_modes");
-
     // Compute neighbor_transform_size for CABAC context 399.
     // Reference: FFmpeg h264_mvpred.h:928
     let neighbor_ts = {

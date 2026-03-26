@@ -385,13 +385,12 @@ pub fn predict_8x8l(
             }
             ft[15] = ((top[14] as u16 + 3 * top[15] as u16 + 2) >> 2) as u8;
         } else {
-            // No top-right: filter t7, then replicate the FILTERED value.
-            // FFmpeg: t7 = avg3(top[6], top[7], top[7]), then t8..t15 = t7.
-            // Reference: FFmpeg h264pred_template.c — when !has_topright,
-            // t8=t9=...=t15=t7 (the filtered t7, not the raw top[7]).
+            // No top-right: filter t7, then replicate the RAW p[7,-1].
+            // Spec 8.3.2.2: p[8..15,-1] = p[7,-1] (unfiltered), then
+            // filtering in 8.3.2.2.1 yields p'[8..15] = p[7,-1] since
+            // avg3(v,v,v) = v. FFmpeg: t8=t9=...=t15=SRC(7,-1) (raw).
             ft[7] = avg3(top[6], top[7], top[7]);
-            let ft7 = ft[7];
-            ft[8..16].fill(ft7);
+            ft[8..16].fill(top[7]);
         }
     }
 
