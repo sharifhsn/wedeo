@@ -15,7 +15,8 @@
 /// minimum nor the maximum.
 #[inline(always)]
 fn median(a: i16, b: i16, c: i16) -> i16 {
-    a + b + c - a.min(b).min(c) - a.max(b).max(c)
+    let (a, b, c) = (a as i32, b as i32, c as i32);
+    (a + b + c - a.min(b).min(c) - a.max(b).max(c)) as i16
 }
 
 // ---------------------------------------------------------------------------

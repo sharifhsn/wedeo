@@ -100,6 +100,17 @@ pub fn idct8x8_add(dst: &mut [u8], stride: usize, coeffs: &mut [i16; 64]) {
     // Add rounding bias
     coeffs[0] = coeffs[0].wrapping_add(32);
 
+    // FFmpeg stores coefficients in COLUMN-MAJOR (transposed) order and applies
+    // the same loop structure. With our ROW-MAJOR coefficients, we must swap the
+    // pass order to match FFmpeg's effective computation:
+    //   FFmpeg: row-transform first, column-transform second (on transposed data)
+    //   Wedeo:  row-transform first, column-transform second (on row-major data)
+    //
+    // The >>1/>>2 truncation in the butterfly makes pass order significant.
+    //
+    // Reference: FFmpeg `ff_h264_idct8_add` in h264idct_template.c, noting that
+    // FFmpeg's block layout is transposed.
+
     // First pass: row transform (iterates over rows, mixes columns within each row)
     for i in 0..8 {
         let row = i * 8;

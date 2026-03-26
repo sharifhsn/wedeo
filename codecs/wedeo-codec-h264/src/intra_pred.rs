@@ -385,16 +385,13 @@ pub fn predict_8x8l(
             }
             ft[15] = ((top[14] as u16 + 3 * top[15] as u16 + 2) >> 2) as u8;
         } else {
-            // No top-right: filter t7 using top[7] as boundary, then replicate
-            ft[7] = ((top[8].wrapping_add(0) as u16 // top[8] is top[7] when no top-right
-                + 2 * top[7] as u16
-                + top[6] as u16
-                + 2)
-                >> 2) as u8;
-            // Actually: if no top-right, top[8..15] should be top[7] (replicated by caller).
-            // So ft[7] = avg3(top[6], top[7], top[7])
+            // No top-right: filter t7, then replicate the FILTERED value.
+            // FFmpeg: t7 = avg3(top[6], top[7], top[7]), then t8..t15 = t7.
+            // Reference: FFmpeg h264pred_template.c — when !has_topright,
+            // t8=t9=...=t15=t7 (the filtered t7, not the raw top[7]).
             ft[7] = avg3(top[6], top[7], top[7]);
-            ft[8..16].fill(top[7]);
+            let ft7 = ft[7];
+            ft[8..16].fill(ft7);
         }
     }
 
