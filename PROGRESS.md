@@ -13,6 +13,26 @@ See `CLAUDE.md` and `H264.md` for detailed status.
 - WAV/PCM pipeline: byte-identical to FFmpeg 8.0.1 across all FATE suite samples
 - Audio via symphonia: 28 decoders, 10 demuxers, SNR-verified lossy codecs
 
+## MBAFF Deblocking Iteration Order + bS=1 Mixed Inter (2026-03-26)
+
+**Fix 1: Iteration order.** FFmpeg's `loop_filter()` (h264_slice.c:2451-2452)
+iterates MBAFF deblocking column-first within pair rows: for each mb_x, deblock
+both MBs of the pair before moving to mb_x+1. Wedeo used raster order. Fixed
+`deblock_frame()` to accept `is_mbaff` and use the correct order. Measurably
+better: Y≤8 vs Y≤10 for CAMA1_Sony_C.
+
+**Fix 2: bS=1 for mixed horizontal inter edges.** FFmpeg h264_loopfilter.c:557-559
+sets bS=1 and skips MV check for horizontal MB boundary edges between MBs with
+different interlace modes. Added in `compute_luma_bs()`. Not triggered by
+CAMA1_Sony_C (I-only) but needed for CAMA1_TOSHIBA_B etc.
+
+**Result:**
+- CAMA1_Sony_C: Y≤8, U≤8, V≤6 (was Y≤10, U≤10, V≤9 with raster order)
+- 52/52 precommit BITEXACT, 0 regressions
+- Remaining small diffs (±1 at horiz_e3, cascading to ±8) need lldb investigation
+
+New script: `deblock_ab_compare.py` — pixel-level A/B compare with edge classification.
+
 ## MBAFF Intra Prediction Fixes: Per-MB Top Modes + Field Top-Right (2026-03-26)
 
 Two bugs in MBAFF intra 4x4/8x8 prediction, both causing wrong prediction
@@ -136,7 +156,7 @@ Implemented Phases 1-7 of the MBAFF deblocking plan:
 - CAVLC field scan table selection: `FIELD_SCAN_4X4` for field-mode MBs
 
 102/102 progressive tests remain BITEXACT. CAMA1_Sony_C (MBAFF, mixed field/frame) still DIFF —
-remaining diffs come from frame-mode pair deblocking behavior differences (possibly backup_mb_border).
+remaining diffs come from deblocking iteration order (fixed 2026-03-26) and unknown filter input differences.
 
 New script: `mbaff_field_map.py` — shows per-MB field/frame mode grid for MBAFF files.
 
