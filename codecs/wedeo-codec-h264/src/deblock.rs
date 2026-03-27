@@ -185,6 +185,23 @@ pub struct PictureBuffer {
     pub mb_height: u32,
 }
 
+impl PictureBuffer {
+    /// Zero-sized sentinel for `mem::replace` in SharedPicture::Drop.
+    pub fn empty() -> Self {
+        Self {
+            y: Vec::new(),
+            u: Vec::new(),
+            v: Vec::new(),
+            y_stride: 0,
+            uv_stride: 0,
+            width: 0,
+            height: 0,
+            mb_width: 0,
+            mb_height: 0,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------

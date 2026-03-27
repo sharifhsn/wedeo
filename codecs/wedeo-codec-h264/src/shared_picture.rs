@@ -17,6 +17,86 @@ use crate::deblock::PictureBuffer;
 /// Progress sentinel: all rows decoded + deblocked.
 pub const PROGRESS_COMPLETE: i32 = i32::MAX;
 
+// ---------------------------------------------------------------------------
+// BufferPool — reuse PictureBuffer allocations across frames
+// ---------------------------------------------------------------------------
+
+/// Pool of reusable PictureBuffers to avoid per-frame malloc/free.
+///
+/// Lives on `H264Decoder`. On resolution change, the pool is flushed
+/// (mismatched buffers are dropped, not recycled).
+pub struct BufferPool {
+    free: Vec<PictureBuffer>,
+    width: u32,
+    height: u32,
+}
+
+impl Default for BufferPool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BufferPool {
+    pub fn new() -> Self {
+        Self {
+            free: Vec::new(),
+            width: 0,
+            height: 0,
+        }
+    }
+
+    /// Acquire a buffer of the given dimensions, pre-filled with `y_fill` / `uv_fill`.
+    /// Returns a pooled buffer if one is available and dimensions match;
+    /// otherwise allocates fresh.
+    pub fn acquire(
+        &mut self,
+        width: u32,
+        height: u32,
+        mb_width: u32,
+        mb_height: u32,
+        uv_fill: u8,
+    ) -> PictureBuffer {
+        // Resolution change: flush all pooled buffers
+        if width != self.width || height != self.height {
+            self.free.clear();
+            self.width = width;
+            self.height = height;
+        }
+
+        if let Some(mut buf) = self.free.pop() {
+            // Reuse: fill with zeros (luma) and uv_fill (chroma)
+            buf.y.fill(0);
+            buf.u.fill(uv_fill);
+            buf.v.fill(uv_fill);
+            buf
+        } else {
+            // Fresh allocation
+            let y_stride = width as usize;
+            let uv_stride = (width / 2) as usize;
+            PictureBuffer {
+                y: vec![0u8; y_stride * height as usize],
+                u: vec![uv_fill; uv_stride * (height / 2) as usize],
+                v: vec![uv_fill; uv_stride * (height / 2) as usize],
+                y_stride,
+                uv_stride,
+                width,
+                height,
+                mb_width,
+                mb_height,
+            }
+        }
+    }
+
+    /// Return a buffer to the pool for reuse.
+    pub fn reclaim(&mut self, buf: PictureBuffer) {
+        // Only keep buffers that match current dimensions
+        if buf.width == self.width && buf.height == self.height && !buf.y.is_empty() {
+            self.free.push(buf);
+        }
+    }
+}
+
 /// Thread-safe picture with row-level progress tracking.
 ///
 /// SAFETY: Concurrent access is mediated by `row_progress`:
@@ -29,6 +109,8 @@ pub struct SharedPicture {
     // For blocking wait when spin is insufficient
     progress_mutex: Mutex<()>,
     progress_cond: Condvar,
+    /// If set, the buffer returns to this pool when the last Arc drops.
+    return_to: Option<Arc<Mutex<BufferPool>>>,
 }
 
 // SAFETY: Concurrent access is mediated by `row_progress` atomic.
@@ -45,6 +127,20 @@ impl SharedPicture {
             mb_height,
             progress_mutex: Mutex::new(()),
             progress_cond: Condvar::new(),
+            return_to: None,
+        })
+    }
+
+    /// Create a SharedPicture that returns its buffer to `pool` on drop.
+    pub fn new_pooled(pic: PictureBuffer, pool: &Arc<Mutex<BufferPool>>) -> Arc<Self> {
+        let mb_height = pic.mb_height;
+        Arc::new(Self {
+            data: UnsafeCell::new(pic),
+            row_progress: AtomicI32::new(-1),
+            mb_height,
+            progress_mutex: Mutex::new(()),
+            progress_cond: Condvar::new(),
+            return_to: Some(Arc::clone(pool)),
         })
     }
 
@@ -117,6 +213,19 @@ impl SharedPicture {
     }
 }
 
+impl Drop for SharedPicture {
+    fn drop(&mut self) {
+        if let Some(pool) = self.return_to.take() {
+            // SAFETY: &mut self in drop() guarantees exclusive access.
+            // No other references exist (Arc refcount hit 0).
+            let buf = std::mem::replace(self.data.get_mut(), PictureBuffer::empty());
+            if let Ok(mut pool) = pool.lock() {
+                pool.reclaim(buf);
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // PicHandle — transparent Deref wrapper for current-frame decode
 // ---------------------------------------------------------------------------
@@ -134,6 +243,13 @@ impl PicHandle {
     pub fn new(pic: PictureBuffer) -> Self {
         Self {
             shared: SharedPicture::new(pic),
+        }
+    }
+
+    /// Create a PicHandle whose buffer returns to `pool` when all references drop.
+    pub fn new_pooled(pic: PictureBuffer, pool: &Arc<Mutex<BufferPool>>) -> Self {
+        Self {
+            shared: SharedPicture::new_pooled(pic, pool),
         }
     }
 

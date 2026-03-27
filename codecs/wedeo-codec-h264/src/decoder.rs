@@ -6,8 +6,8 @@
 //
 // Reference: FFmpeg libavcodec/h264dec.c, h264_slice.c
 
-use std::collections::VecDeque;
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
 
 use tracing::{debug, trace, warn};
 use wedeo_codec::bitstream::{BitRead, BitReadBE, get_ue_golomb};
@@ -28,9 +28,10 @@ use crate::mb::{self, FrameDecodeContext};
 use crate::nal::{NalUnit, NalUnitType, split_annex_b, split_nalff};
 use crate::pps::{Pps, parse_pps};
 use crate::refs;
-use crate::shared_picture::SharedPicture;
+use crate::shared_picture::{BufferPool, SharedPicture};
 use crate::slice::{SliceHeader, SliceType, parse_slice_header};
 use crate::sps::{Sps, parse_sps};
+use crate::thread_pool::{DecodeThreadPool, FrameWork, InFlightDecode, SliceWorkUnit};
 
 // ---------------------------------------------------------------------------
 // Decoder state
@@ -65,9 +66,17 @@ pub struct H264Decoder {
     current_last_hdr: Option<SliceHeader>,
     /// Buffered slices for the current frame (decoded on worker thread).
     pending_slices: Vec<SliceWorkUnit>,
-    /// Queue of in-flight frame decode threads.
+    /// Queue of in-flight frame metadata (dispatch order).
     /// Non-ref B-frames accumulate here; ref frames trigger join-all.
     in_flight_queue: VecDeque<InFlightFrame>,
+    /// Persistent thread pool for frame decode workers.
+    pool: DecodeThreadPool,
+    /// Monotonic counter for FIFO result ordering.
+    next_dispatch_id: u64,
+    /// Buffer for out-of-order results from the pool.
+    result_buffer: HashMap<u64, Box<InFlightDecode>>,
+    /// Pool of reusable PictureBuffers to avoid per-frame malloc/free.
+    buffer_pool: Arc<Mutex<BufferPool>>,
     /// PTS of the current frame being decoded.
     current_pts: i64,
     /// Decoded Picture Buffer for reference picture management.
@@ -125,66 +134,11 @@ pub struct H264Decoder {
 // Frame-level threading types
 // ---------------------------------------------------------------------------
 
-/// Metadata for a frame whose decode is complete and whose deblock
-/// may be running on a background thread. After the thread joins,
-/// `complete_in_flight` handles DPB store and output buffering.
-struct InFlightDecode {
-    /// Frame decode context (deblock runs on this in the background thread).
-    fdc: FrameDecodeContext,
-    /// POC of this picture.
-    poc: i32,
-    /// H.264 frame_num from the slice header.
-    frame_num_h264: u32,
-    /// nal_ref_idc — non-zero means this frame is a reference.
-    nal_ref_idc: u8,
-    /// Whether this was an IDR NAL.
-    is_idr: bool,
-    /// Last slice header (for MMCO, deblocking params, etc.).
-    last_hdr: SliceHeader,
-    /// DPB indices for L0 reference list (for DPB ref_poc storage).
-    ref_list_l0: Vec<usize>,
-    /// DPB indices for L1 reference list (for DPB ref_poc storage).
-    ref_list_l1: Vec<usize>,
-    /// DPB slot index from store_placeholder (Phase 3).
-    dpb_idx: Option<usize>,
-}
-
-/// Per-slice snapshot of DPB-derived state + RBSP data for worker thread.
-///
-/// Each slice within a frame can have different ref lists (e.g., CABAST3 has
-/// alternating I/P slices). The main thread snapshots all DPB-derived state
-/// per-slice so the worker can apply each before decoding.
-struct SliceWorkUnit {
-    hdr: SliceHeader,
-    rbsp: Vec<u8>,
-    sps: Sps,
-    pps: Pps,
-    /// Owned Arc refs for MC (cross-thread safe).
-    ref_pics_l0: Vec<Arc<SharedPicture>>,
-    ref_pics_l1: Vec<Arc<SharedPicture>>,
-    /// Slice index for slice_table tracking.
-    slice_idx: u16,
-    /// Per-slice FDC state snapshot (from DPB).
-    cur_l0_ref_poc: Vec<i32>,
-    cur_l0_ref_dpb: Vec<usize>,
-    cur_l1_ref_poc: Vec<i32>,
-    cur_l1_ref_dpb: Vec<usize>,
-    col_mv: Vec<[i16; 2]>,
-    col_ref: Vec<i8>,
-    col_mv_l1: Vec<[i16; 2]>,
-    col_ref_l1: Vec<i8>,
-    col_mb_intra: Vec<bool>,
-    col_poc: i32,
-    col_l1_is_long_term: bool,
-    col_ref_poc_l0: Vec<i32>,
-    col_ref_poc_l1: Vec<i32>,
-    implicit_weight: Vec<Vec<i32>>,
-    cur_poc: i32,
-}
-
-/// Tracks an in-flight frame decode thread.
+/// Tracks an in-flight frame submitted to the thread pool.
+/// No longer holds a JoinHandle — the pool manages threads.
 struct InFlightFrame {
-    handle: std::thread::JoinHandle<Box<InFlightDecode>>,
+    /// Monotonic dispatch ID for FIFO result ordering.
+    sequence_id: u64,
     /// Pre-computed output ordering data (from pre-dispatch state update).
     frame_mmco_reset: bool,
     out_of_order: usize,
@@ -304,6 +258,14 @@ impl H264Decoder {
             current_last_hdr: None,
             pending_slices: Vec::new(),
             in_flight_queue: VecDeque::new(),
+            pool: DecodeThreadPool::new(
+                std::thread::available_parallelism()
+                    .map(|n| n.get().clamp(1, 4))
+                    .unwrap_or(2),
+            ),
+            next_dispatch_id: 0,
+            result_buffer: HashMap::new(),
+            buffer_pool: Arc::new(Mutex::new(BufferPool::new())),
             current_pts: 0,
             dpb: Dpb::new(16),
             ref_list_l0: Vec::new(),
@@ -781,7 +743,8 @@ impl H264Decoder {
                     );
 
                     // Start new frame context
-                    self.current_fdc = Some(FrameDecodeContext::new(&sps, &pps));
+                    self.current_fdc =
+                        Some(FrameDecodeContext::new(&sps, &pps, Some(&self.buffer_pool)));
                     self.current_pts = self.frame_num as i64;
                     self.current_is_idr = is_idr;
                     self.current_frame_num_h264 = hdr.frame_num;
@@ -1167,85 +1130,27 @@ impl H264Decoder {
             // Note: MMCO-5 resets prev_frame_num/poc to 0 in complete_in_flight
             // (post-join). Safe because ref frames are joined before next frame.
 
-            // === Dispatch worker thread ===
-            let handle = std::thread::spawn(move || {
-                let mut fdc = fdc;
+            // === Dispatch to thread pool ===
+            let seq_id = self.next_dispatch_id;
+            self.next_dispatch_id += 1;
 
-                // Decode all buffered slices
-                for slice in slices.into_iter() {
-                    // Apply per-slice FDC state from snapshot
-                    fdc.current_slice = slice.slice_idx;
-                    fdc.cur_l0_ref_poc = slice.cur_l0_ref_poc;
-                    fdc.cur_l0_ref_dpb = slice.cur_l0_ref_dpb;
-                    fdc.cur_l1_ref_poc = slice.cur_l1_ref_poc;
-                    fdc.cur_l1_ref_dpb = slice.cur_l1_ref_dpb;
-                    fdc.col_mv = slice.col_mv;
-                    fdc.col_ref = slice.col_ref;
-                    fdc.col_mv_l1 = slice.col_mv_l1;
-                    fdc.col_ref_l1 = slice.col_ref_l1;
-                    fdc.col_mb_intra = slice.col_mb_intra;
-                    fdc.col_poc = slice.col_poc;
-                    fdc.col_l1_is_long_term = slice.col_l1_is_long_term;
-                    fdc.col_ref_poc_l0 = slice.col_ref_poc_l0;
-                    fdc.col_ref_poc_l1 = slice.col_ref_poc_l1;
-                    fdc.implicit_weight = slice.implicit_weight;
-                    fdc.cur_poc = slice.cur_poc;
-
-                    let _ = H264Decoder::decode_slice_into(
-                        &slice.rbsp,
-                        &slice.hdr,
-                        &slice.sps,
-                        &slice.pps,
-                        &mut fdc,
-                        &slice.ref_pics_l0,
-                        &slice.ref_pics_l1,
-                    );
-                }
-
-                // Last-row deblock (inline deblock defers by 1 row)
-                if deblock_enabled {
-                    let mb_height = fdc.mb_height;
-                    let mb_width = fdc.mb_width;
-                    if fdc.is_mbaff {
-                        let pair_rows = mb_height / 2;
-                        if pair_rows > 0 {
-                            deblock::deblock_row_mbaff(
-                                &mut fdc.pic,
-                                &fdc.mb_info,
-                                &fdc.slice_table,
-                                &fdc.slice_deblock_params,
-                                pair_rows - 1,
-                                mb_width,
-                            );
-                        }
-                    } else if mb_height > 0 {
-                        deblock::deblock_row(
-                            &mut fdc.pic,
-                            &fdc.mb_info,
-                            &fdc.slice_table,
-                            &fdc.slice_deblock_params,
-                            mb_height - 1,
-                            mb_width,
-                        );
-                    }
-                }
-                fdc.pic.mark_complete();
-
-                Box::new(InFlightDecode {
-                    fdc,
-                    poc,
-                    frame_num_h264,
-                    nal_ref_idc,
-                    is_idr,
-                    last_hdr,
-                    ref_list_l0,
-                    ref_list_l1,
-                    dpb_idx,
-                })
-            });
+            self.pool.submit(Box::new(FrameWork {
+                fdc,
+                slices,
+                deblock_enabled,
+                sequence_id: seq_id,
+                poc,
+                frame_num_h264,
+                nal_ref_idc,
+                is_idr,
+                last_hdr,
+                ref_list_l0,
+                ref_list_l1,
+                dpb_idx,
+            }));
 
             self.in_flight_queue.push_back(InFlightFrame {
-                handle,
+                sequence_id: seq_id,
                 frame_mmco_reset,
                 out_of_order,
             });
@@ -1258,19 +1163,39 @@ impl H264Decoder {
         }
     }
 
-    /// Join the oldest in-flight frame and run post-join completion.
+    /// Wait for the oldest in-flight frame result and run post-join completion.
+    /// Uses FIFO ordering: if the pool delivers results out of order, buffers
+    /// them in `result_buffer` until the needed `sequence_id` arrives.
     fn join_oldest_in_flight(&mut self) {
         if let Some(frame) = self.in_flight_queue.pop_front() {
-            match frame.handle.join() {
-                Ok(boxed) => {
-                    self.complete_in_flight(boxed, frame.frame_mmco_reset, frame.out_of_order)
+            let needed = frame.sequence_id;
+
+            // Check buffer first
+            let boxed = if let Some(b) = self.result_buffer.remove(&needed) {
+                b
+            } else {
+                // Recv until we get the one we need, buffering others
+                loop {
+                    match self.pool.recv() {
+                        Some(result) => {
+                            if result.sequence_id == needed {
+                                break result.decode;
+                            }
+                            self.result_buffer.insert(result.sequence_id, result.decode);
+                        }
+                        None => {
+                            warn!("pool result channel closed unexpectedly");
+                            return;
+                        }
+                    }
                 }
-                Err(e) => warn!("frame thread panicked: {:?}", e),
-            }
+            };
+
+            self.complete_in_flight(boxed, frame.frame_mmco_reset, frame.out_of_order);
         }
     }
 
-    /// Join all in-flight frames in order.
+    /// Join all in-flight frames in dispatch order.
     fn join_all_in_flight(&mut self) {
         while !self.in_flight_queue.is_empty() {
             self.join_oldest_in_flight();
@@ -1531,7 +1456,7 @@ impl H264Decoder {
     /// Returns the number of MBs decoded in this slice.
     #[allow(clippy::too_many_arguments)] // H.264 slice decode needs all parameters
     #[tracing::instrument(skip_all, fields(first_mb = hdr.first_mb_in_slice, slice_type = ?hdr.slice_type))]
-    fn decode_slice_into(
+    pub(crate) fn decode_slice_into(
         rbsp: &[u8],
         hdr: &SliceHeader,
         sps: &Sps,

@@ -5,7 +5,7 @@
 //
 // Reference: FFmpeg libavcodec/h264_mb.c, h264_slice.c
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tracing::{debug, trace};
 use wedeo_codec::bitstream::BitReadBE;
@@ -19,7 +19,7 @@ use crate::intra_pred;
 use crate::mc;
 use crate::mvpred::{self, MvContext};
 use crate::pps::Pps;
-use crate::shared_picture::{PicHandle, SharedPicture};
+use crate::shared_picture::{BufferPool, PicHandle, SharedPicture};
 use crate::slice::SliceHeader;
 use crate::sps::Sps;
 use crate::tables::CHROMA_QP_TABLE;
@@ -455,31 +455,41 @@ pub struct FrameDecodeContext {
 
 impl FrameDecodeContext {
     /// Create a new frame decode context for the given SPS and PPS.
-    pub fn new(sps: &Sps, pps: &Pps) -> Self {
+    /// If `buffer_pool` is provided, acquires the PictureBuffer from it
+    /// (reusing a previous allocation when possible).
+    pub fn new(sps: &Sps, pps: &Pps, buffer_pool: Option<&Arc<Mutex<BufferPool>>>) -> Self {
         let mb_width = sps.mb_width;
         let mb_height = sps.mb_height;
         let width = mb_width * 16;
         let height = mb_height * 16;
 
         let decode_chroma = sps.chroma_format_idc != 0;
-        let y_stride = width as usize;
-        let uv_stride = (width / 2) as usize;
         // Monochrome: fill U/V with 128 (mid-gray). FFmpeg outputs monochrome as
         // yuv420p with U/V=128, not gray8. Chroma prediction/MC on 128-filled planes
         // naturally produces 128, so no additional guards needed in reconstruction.
         let uv_fill = if decode_chroma { 0u8 } else { 128u8 };
 
-        let pic = PicHandle::new(PictureBuffer {
-            y: vec![0u8; y_stride * height as usize],
-            u: vec![uv_fill; uv_stride * (height / 2) as usize],
-            v: vec![uv_fill; uv_stride * (height / 2) as usize],
-            y_stride,
-            uv_stride,
-            width,
-            height,
-            mb_width,
-            mb_height,
-        });
+        let pic = if let Some(pool) = buffer_pool {
+            let buf = pool
+                .lock()
+                .unwrap()
+                .acquire(width, height, mb_width, mb_height, uv_fill);
+            PicHandle::new_pooled(buf, pool)
+        } else {
+            let y_stride = width as usize;
+            let uv_stride = (width / 2) as usize;
+            PicHandle::new(PictureBuffer {
+                y: vec![0u8; y_stride * height as usize],
+                u: vec![uv_fill; uv_stride * (height / 2) as usize],
+                v: vec![uv_fill; uv_stride * (height / 2) as usize],
+                y_stride,
+                uv_stride,
+                width,
+                height,
+                mb_width,
+                mb_height,
+            })
+        };
 
         let total_mbs = (mb_width * mb_height) as usize;
 

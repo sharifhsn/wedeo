@@ -19,3 +19,4 @@ pub mod shared_picture;
 pub mod slice;
 pub mod sps;
 pub mod tables;
+pub mod thread_pool;
