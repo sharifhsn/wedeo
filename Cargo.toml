@@ -32,6 +32,7 @@ inventory = "0.3"
 tracing = { version = "0.1", features = ["attributes"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 rayon = "1"
+cc = "1"
 
 cpal = "0.17"
 minifb = "0.28"

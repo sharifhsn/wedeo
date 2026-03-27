@@ -720,6 +720,15 @@ pub fn mc_luma(
     pic_height: u32,
     scratch: &mut McScratch,
 ) {
+    // Try NEON assembly for interior 16×16 and 8×8 blocks.
+    #[cfg(has_asm)]
+    if crate::asm_dispatch::mc_luma_asm(
+        dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos,
+        dx, dy, block_w, block_h, pic_width as i32, pic_height as i32,
+    ) {
+        return;
+    }
+
     let pw = pic_width as i32;
     let ph = pic_height as i32;
 
@@ -1000,6 +1009,15 @@ pub fn mc_chroma(
     pic_height: u32,
 ) {
     debug_assert!(dx < 8 && dy < 8);
+
+    // Try NEON assembly for interior blocks with matching strides.
+    #[cfg(has_asm)]
+    if crate::asm_dispatch::mc_chroma_asm(
+        dst, dst_stride, ref_uv, ref_stride, ref_x, ref_y_pos,
+        dx, dy, block_w, block_h, pic_width as i32, pic_height as i32,
+    ) {
+        return;
+    }
 
     let pw = pic_width as i32;
     let ph = pic_height as i32;

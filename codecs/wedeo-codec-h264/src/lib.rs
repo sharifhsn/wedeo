@@ -1,3 +1,8 @@
+#[cfg(has_asm)]
+pub mod asm_dispatch;
+#[cfg(has_asm)]
+pub mod asm_ffi;
+
 pub mod cabac;
 pub mod cabac_tables;
 pub mod cavlc;
