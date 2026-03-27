@@ -335,8 +335,56 @@ FRext CAVLC: 3/6 BITEXACT. Precommit: 39/39 passing.
   deblock edge/pair/filter caused it (covering both vertical AND horizontal edges).
   Would have saved ~30 min of manual pixel tracing in this session.
 
+## Phase 7: Persistent Thread Pool + Buffer Recycling — Complete (2026-03-27)
+
+Replaced per-frame `std::thread::spawn` with fixed-size `DecodeThreadPool`
+(mpsc channels, `Arc<Mutex<Receiver>>` work-stealing). Added `BufferPool`
+for `PictureBuffer` reuse via `SharedPicture::Drop` reclaim.
+
+**Benchmark (BBB 1080p 10s, 10 runs):**
+
+| Config | Wall | User | System |
+|--------|------|------|--------|
+| wedeo single-threaded | 18.1s ±1.2s | 16.7s | 0.59s |
+| wedeo Phase 7 (auto) | 12.8s ±1.4s | 20.0s | 0.56s |
+| FFmpeg -threads 1 | 1.50s ±0.09s | 1.74s | 0.04s |
+| FFmpeg -threads 0 | 0.80s ±0.11s | 3.75s | 0.20s |
+
+Threading speedup: wedeo **1.42x**, FFmpeg **1.87x**.
+Single-threaded gap: wedeo is **12x slower** than FFmpeg (scalar Rust vs C+NEON).
+
+**Env var:** `WEDEO_THREADS=N` (1=single-threaded, 0/unset=auto, max 4).
+
+**Profile breakdown (active CPU, BBB 1080p):**
+
+| Subsystem | % CPU | Notes |
+|-----------|-------|-------|
+| Motion Compensation | 47.8% | `extract_ref_block` 14.8%, lowpass filters 17% |
+| Memory alloc/free | 16.2% | Per-call `vec![]` in mc_luma/mc_chroma |
+| MB decode + recon | 11.7% | apply_mc_bi_partition 6.8% |
+| Deblocking | 10.8% | filter_mb_edge_luma 3.3% |
+| memcpy/memmove | 5.8% | System-optimized |
+| CABAC | 1.8% | Inherently serial |
+
+**Key finding:** 16.2% of CPU is malloc/free from ~23 per-call `vec![]`
+allocations in mc.rs. A 1080p B-frame with ~4000 sub-blocks generates
+~100k heap allocations per frame. Pre-allocated scratch buffers would
+eliminate this entirely with zero algorithmic change.
+
+**Performance roadmap (estimated impact on single-threaded gap):**
+1. MC scratch buffers — eliminate 16% alloc overhead → ~10x gap
+2. SIMD MC lowpass (NEON) — ~4x for 47% subsystem → ~6x gap
+3. SIMD deblock (NEON) — ~4x for 11% subsystem → ~5x gap
+
+SIMD approach: raw `std::arch::aarch64` intrinsics (safe since Rust 1.87,
+NEON mandatory on ARM64 = no multiversioning). See Medium article
+"The State of SIMD in Rust in 2025" for option tradeoffs.
+
 ## Next Steps
 
+- **MC scratch buffers** — pre-allocate on FrameDecodeContext, eliminate per-call vec![]
+- SIMD for MC lowpass filters (NEON)
+- SIMD for deblock filter (NEON)
 - Expand FRext to CABAC files
 - Interlaced (PAFF) support
 - Additional video codecs (HEVC, VP9)
