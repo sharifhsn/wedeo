@@ -451,6 +451,8 @@ pub struct FrameDecodeContext {
     /// starts one row below the pair's top-left corner.
     /// Set by the decoder loop before calling apply_macroblock/decode_macroblock.
     pub mb_field: bool,
+    /// Pre-allocated scratch buffers for motion compensation (eliminates per-call heap allocs).
+    pub mc_scratch: mc::McScratch,
 }
 
 impl FrameDecodeContext {
@@ -551,6 +553,7 @@ impl FrameDecodeContext {
             decode_chroma,
             is_mbaff: !sps.frame_mbs_only_flag,
             mb_field: false,
+            mc_scratch: mc::McScratch::new(),
         }
     }
 
@@ -1976,6 +1979,7 @@ fn apply_mc_partition(
         block_h,
         rp.width,
         rp.height,
+        &mut ctx.mc_scratch,
     );
 
     // Chroma: eighth-pixel precision (MV divided by 2 with rounding)
@@ -3525,6 +3529,7 @@ fn apply_mc_bi_partition(
         block_h,
         rp_l1.width,
         rp_l1.height,
+        &mut ctx.mc_scratch,
     );
 
     // Average or weighted-average luma (field-aware destination stride)

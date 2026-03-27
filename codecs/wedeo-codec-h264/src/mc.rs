@@ -11,6 +11,67 @@
 use crate::deblock::PictureBuffer;
 
 // ---------------------------------------------------------------------------
+// Pre-allocated scratch buffers for MC (eliminates per-call heap allocations)
+// ---------------------------------------------------------------------------
+
+/// Scratch buffers reused across all MC calls within a frame.
+///
+/// Replaces ~15k-20k short-lived `vec![]` allocations per 1080p frame with
+/// 4 persistent buffers totaling ~4 KB.
+pub struct McScratch {
+    /// i32 buffer for extract_ref_block output.
+    /// Worst case: (16+5) × (16+5) = 441 i32s (for hv_lowpass src).
+    pub ref_buf: Vec<i32>,
+    /// Second i32 buffer for functions needing two extract_ref_block calls
+    /// or hv_lowpass tmp.
+    pub ref_buf2: Vec<i32>,
+    /// u8 buffer for first half-pel filter output. Worst case: 16×16 = 256.
+    pub half_a: Vec<u8>,
+    /// u8 buffer for second half-pel output (avg_pixels needs two live).
+    pub half_b: Vec<u8>,
+}
+
+impl Default for McScratch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl McScratch {
+    pub fn new() -> Self {
+        // Pre-allocate for the common worst case (16×16 block with 6-tap filter).
+        let max_ref = (16 + 5) * (16 + 5); // 441
+        let max_pix = 16 * 16; // 256
+        Self {
+            ref_buf: vec![0i32; max_ref],
+            ref_buf2: vec![0i32; max_ref],
+            half_a: vec![0u8; max_pix],
+            half_b: vec![0u8; max_pix],
+        }
+    }
+
+    /// Ensure all buffers are large enough for a block of size `w × h`.
+    /// Never shrinks — only grows if needed.
+    #[inline]
+    fn ensure_capacity(&mut self, w: usize, h: usize) {
+        let max_ref = (w + 5) * (h + 5);
+        let max_pix = w * h;
+        if self.ref_buf.len() < max_ref {
+            self.ref_buf.resize(max_ref, 0);
+        }
+        if self.ref_buf2.len() < max_ref {
+            self.ref_buf2.resize(max_ref, 0);
+        }
+        if self.half_a.len() < max_pix {
+            self.half_a.resize(max_pix, 0);
+        }
+        if self.half_b.len() < max_pix {
+            self.half_b.resize(max_pix, 0);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Pixel helpers
 // ---------------------------------------------------------------------------
 
@@ -138,13 +199,13 @@ fn hv_lowpass(
     src_stride: usize,
     block_w: usize,
     block_h: usize,
+    tmp: &mut [i32],
 ) {
     // First pass: horizontal filter into tmp.
     // We need (block_h + 5) rows of horizontally-filtered output so the
     // vertical pass has enough taps.
     let tmp_h = block_h + 5;
     let tmp_stride = block_w;
-    let mut tmp = vec![0i32; tmp_stride * tmp_h];
 
     for j in 0..tmp_h {
         for i in 0..block_w {
@@ -233,12 +294,14 @@ fn qpel_h_avg(
     pw: i32,
     ph: i32,
     full_pel_col_offset: usize,
+    scratch: &mut McScratch,
 ) {
     let src_w = block_w + 5;
     let src_h = block_h;
-    let mut src = vec![0i32; src_w * src_h];
+    let needed = src_w * src_h;
+    scratch.ref_buf[..needed].fill(0);
     extract_ref_block(
-        &mut src,
+        &mut scratch.ref_buf[..needed],
         ref_y,
         ref_stride,
         ref_x - 2,
@@ -249,17 +312,33 @@ fn qpel_h_avg(
         ph,
     );
 
-    let mut half_h = vec![0u8; block_w * block_h];
-    h_lowpass(&mut half_h, block_w, &src, src_w, block_w, block_h);
+    let pix = block_w * block_h;
+    scratch.half_a[..pix].fill(0);
+    h_lowpass(
+        &mut scratch.half_a[..pix],
+        block_w,
+        &scratch.ref_buf[..needed],
+        src_w,
+        block_w,
+        block_h,
+    );
 
-    let mut full_pel = vec![0u8; block_w * block_h];
+    scratch.half_b[..pix].fill(0);
     for j in 0..block_h {
         for i in 0..block_w {
-            full_pel[j * block_w + i] = src[j * src_w + i + full_pel_col_offset] as u8;
+            scratch.half_b[j * block_w + i] =
+                scratch.ref_buf[j * src_w + i + full_pel_col_offset] as u8;
         }
     }
     avg_pixels(
-        dst, dst_stride, &full_pel, block_w, &half_h, block_w, block_w, block_h,
+        dst,
+        dst_stride,
+        &scratch.half_b[..pix],
+        block_w,
+        &scratch.half_a[..pix],
+        block_w,
+        block_w,
+        block_h,
     );
 }
 
@@ -281,12 +360,14 @@ fn qpel_v_avg(
     pw: i32,
     ph: i32,
     full_pel_row_offset: usize,
+    scratch: &mut McScratch,
 ) {
     let src_w = block_w;
     let src_h = block_h + 5;
-    let mut src = vec![0i32; src_w * src_h];
+    let needed = src_w * src_h;
+    scratch.ref_buf[..needed].fill(0);
     extract_ref_block(
-        &mut src,
+        &mut scratch.ref_buf[..needed],
         ref_y,
         ref_stride,
         ref_x,
@@ -297,17 +378,33 @@ fn qpel_v_avg(
         ph,
     );
 
-    let mut half_v = vec![0u8; block_w * block_h];
-    v_lowpass(&mut half_v, block_w, &src, src_w, block_w, block_h);
+    let pix = block_w * block_h;
+    scratch.half_a[..pix].fill(0);
+    v_lowpass(
+        &mut scratch.half_a[..pix],
+        block_w,
+        &scratch.ref_buf[..needed],
+        src_w,
+        block_w,
+        block_h,
+    );
 
-    let mut full_pel = vec![0u8; block_w * block_h];
+    scratch.half_b[..pix].fill(0);
     for j in 0..block_h {
         for i in 0..block_w {
-            full_pel[j * block_w + i] = src[(j + full_pel_row_offset) * src_w + i] as u8;
+            scratch.half_b[j * block_w + i] =
+                scratch.ref_buf[(j + full_pel_row_offset) * src_w + i] as u8;
         }
     }
     avg_pixels(
-        dst, dst_stride, &full_pel, block_w, &half_v, block_w, block_w, block_h,
+        dst,
+        dst_stride,
+        &scratch.half_b[..pix],
+        block_w,
+        &scratch.half_a[..pix],
+        block_w,
+        block_w,
+        block_h,
     );
 }
 
@@ -332,12 +429,17 @@ fn qpel_diagonal(
     ph: i32,
     h_row_delta: i32,
     v_col_delta: i32,
+    scratch: &mut McScratch,
 ) {
+    let pix = block_w * block_h;
+
+    // First extract → ref_buf, h_lowpass → half_a
     let src_h_w = block_w + 5;
     let src_h_h = block_h;
-    let mut src_h_buf = vec![0i32; src_h_w * src_h_h];
+    let needed_h = src_h_w * src_h_h;
+    scratch.ref_buf[..needed_h].fill(0);
     extract_ref_block(
-        &mut src_h_buf,
+        &mut scratch.ref_buf[..needed_h],
         ref_y,
         ref_stride,
         ref_x - 2,
@@ -347,14 +449,23 @@ fn qpel_diagonal(
         pw,
         ph,
     );
-    let mut half_h = vec![0u8; block_w * block_h];
-    h_lowpass(&mut half_h, block_w, &src_h_buf, src_h_w, block_w, block_h);
+    scratch.half_a[..pix].fill(0);
+    h_lowpass(
+        &mut scratch.half_a[..pix],
+        block_w,
+        &scratch.ref_buf[..needed_h],
+        src_h_w,
+        block_w,
+        block_h,
+    );
 
+    // Second extract → ref_buf2, v_lowpass → half_b
     let src_v_w = block_w;
     let src_v_h = block_h + 5;
-    let mut src_v_buf = vec![0i32; src_v_w * src_v_h];
+    let needed_v = src_v_w * src_v_h;
+    scratch.ref_buf2[..needed_v].fill(0);
     extract_ref_block(
-        &mut src_v_buf,
+        &mut scratch.ref_buf2[..needed_v],
         ref_y,
         ref_stride,
         ref_x + v_col_delta,
@@ -364,11 +475,25 @@ fn qpel_diagonal(
         pw,
         ph,
     );
-    let mut half_v = vec![0u8; block_w * block_h];
-    v_lowpass(&mut half_v, block_w, &src_v_buf, src_v_w, block_w, block_h);
+    scratch.half_b[..pix].fill(0);
+    v_lowpass(
+        &mut scratch.half_b[..pix],
+        block_w,
+        &scratch.ref_buf2[..needed_v],
+        src_v_w,
+        block_w,
+        block_h,
+    );
 
     avg_pixels(
-        dst, dst_stride, &half_h, block_w, &half_v, block_w, block_w, block_h,
+        dst,
+        dst_stride,
+        &scratch.half_a[..pix],
+        block_w,
+        &scratch.half_b[..pix],
+        block_w,
+        block_w,
+        block_h,
     );
 }
 
@@ -389,12 +514,17 @@ fn qpel_mixed_h_hv(
     pw: i32,
     ph: i32,
     h_row_delta: i32,
+    scratch: &mut McScratch,
 ) {
+    let pix = block_w * block_h;
+
+    // h_lowpass extract → ref_buf, filter → half_a
     let src_h_w = block_w + 5;
     let src_h_h = block_h;
-    let mut src_h_buf = vec![0i32; src_h_w * src_h_h];
+    let needed_h = src_h_w * src_h_h;
+    scratch.ref_buf[..needed_h].fill(0);
     extract_ref_block(
-        &mut src_h_buf,
+        &mut scratch.ref_buf[..needed_h],
         ref_y,
         ref_stride,
         ref_x - 2,
@@ -404,14 +534,23 @@ fn qpel_mixed_h_hv(
         pw,
         ph,
     );
-    let mut half_h = vec![0u8; block_w * block_h];
-    h_lowpass(&mut half_h, block_w, &src_h_buf, src_h_w, block_w, block_h);
+    scratch.half_a[..pix].fill(0);
+    h_lowpass(
+        &mut scratch.half_a[..pix],
+        block_w,
+        &scratch.ref_buf[..needed_h],
+        src_h_w,
+        block_w,
+        block_h,
+    );
 
+    // hv_lowpass extract → ref_buf2, hv_lowpass uses ref_buf as tmp → half_b
     let src_hv_w = block_w + 5;
     let src_hv_h = block_h + 5;
-    let mut src_hv_buf = vec![0i32; src_hv_w * src_hv_h];
+    let needed_hv = src_hv_w * src_hv_h;
+    scratch.ref_buf2[..needed_hv].fill(0);
     extract_ref_block(
-        &mut src_hv_buf,
+        &mut scratch.ref_buf2[..needed_hv],
         ref_y,
         ref_stride,
         ref_x - 2,
@@ -421,18 +560,27 @@ fn qpel_mixed_h_hv(
         pw,
         ph,
     );
-    let mut half_hv = vec![0u8; block_w * block_h];
+    scratch.half_b[..pix].fill(0);
+    // hv_lowpass reads from ref_buf2, uses ref_buf as tmp (ref_buf is free after h_lowpass consumed it)
     hv_lowpass(
-        &mut half_hv,
+        &mut scratch.half_b[..pix],
         block_w,
-        &src_hv_buf,
+        &scratch.ref_buf2[..needed_hv],
         src_hv_w,
         block_w,
         block_h,
+        &mut scratch.ref_buf,
     );
 
     avg_pixels(
-        dst, dst_stride, &half_h, block_w, &half_hv, block_w, block_w, block_h,
+        dst,
+        dst_stride,
+        &scratch.half_a[..pix],
+        block_w,
+        &scratch.half_b[..pix],
+        block_w,
+        block_w,
+        block_h,
     );
 }
 
@@ -453,12 +601,17 @@ fn qpel_mixed_v_hv(
     pw: i32,
     ph: i32,
     v_col_delta: i32,
+    scratch: &mut McScratch,
 ) {
+    let pix = block_w * block_h;
+
+    // v_lowpass extract → ref_buf, filter → half_a
     let src_v_w = block_w;
     let src_v_h = block_h + 5;
-    let mut src_v_buf = vec![0i32; src_v_w * src_v_h];
+    let needed_v = src_v_w * src_v_h;
+    scratch.ref_buf[..needed_v].fill(0);
     extract_ref_block(
-        &mut src_v_buf,
+        &mut scratch.ref_buf[..needed_v],
         ref_y,
         ref_stride,
         ref_x + v_col_delta,
@@ -468,14 +621,23 @@ fn qpel_mixed_v_hv(
         pw,
         ph,
     );
-    let mut half_v = vec![0u8; block_w * block_h];
-    v_lowpass(&mut half_v, block_w, &src_v_buf, src_v_w, block_w, block_h);
+    scratch.half_a[..pix].fill(0);
+    v_lowpass(
+        &mut scratch.half_a[..pix],
+        block_w,
+        &scratch.ref_buf[..needed_v],
+        src_v_w,
+        block_w,
+        block_h,
+    );
 
+    // hv_lowpass extract → ref_buf2, hv_lowpass uses ref_buf as tmp → half_b
     let src_hv_w = block_w + 5;
     let src_hv_h = block_h + 5;
-    let mut src_hv_buf = vec![0i32; src_hv_w * src_hv_h];
+    let needed_hv = src_hv_w * src_hv_h;
+    scratch.ref_buf2[..needed_hv].fill(0);
     extract_ref_block(
-        &mut src_hv_buf,
+        &mut scratch.ref_buf2[..needed_hv],
         ref_y,
         ref_stride,
         ref_x - 2,
@@ -485,18 +647,27 @@ fn qpel_mixed_v_hv(
         pw,
         ph,
     );
-    let mut half_hv = vec![0u8; block_w * block_h];
+    scratch.half_b[..pix].fill(0);
+    // hv_lowpass reads from ref_buf2, uses ref_buf as tmp (ref_buf is free after v_lowpass consumed it)
     hv_lowpass(
-        &mut half_hv,
+        &mut scratch.half_b[..pix],
         block_w,
-        &src_hv_buf,
+        &scratch.ref_buf2[..needed_hv],
         src_hv_w,
         block_w,
         block_h,
+        &mut scratch.ref_buf,
     );
 
     avg_pixels(
-        dst, dst_stride, &half_v, block_w, &half_hv, block_w, block_w, block_h,
+        dst,
+        dst_stride,
+        &scratch.half_a[..pix],
+        block_w,
+        &scratch.half_b[..pix],
+        block_w,
+        block_w,
+        block_h,
     );
 }
 
@@ -547,9 +718,12 @@ pub fn mc_luma(
     block_h: usize,
     pic_width: u32,
     pic_height: u32,
+    scratch: &mut McScratch,
 ) {
     let pw = pic_width as i32;
     let ph = pic_height as i32;
+
+    scratch.ensure_capacity(block_w, block_h);
 
     match (dx, dy) {
         // ------------------------------------------------------------------
@@ -558,13 +732,22 @@ pub fn mc_luma(
         (0, 0) => {
             let src_w = block_w;
             let src_h = block_h;
-            let mut src = vec![0i32; src_w * src_h];
+            let needed = src_w * src_h;
+            scratch.ref_buf[..needed].fill(0);
             extract_ref_block(
-                &mut src, ref_y, ref_stride, ref_x, ref_y_pos, src_w, src_h, pw, ph,
+                &mut scratch.ref_buf[..needed],
+                ref_y,
+                ref_stride,
+                ref_x,
+                ref_y_pos,
+                src_w,
+                src_h,
+                pw,
+                ph,
             );
             for j in 0..block_h {
                 for i in 0..block_w {
-                    dst[j * dst_stride + i] = src[j * src_w + i] as u8;
+                    dst[j * dst_stride + i] = scratch.ref_buf[j * src_w + i] as u8;
                 }
             }
         }
@@ -573,12 +756,12 @@ pub fn mc_luma(
         // (2,0): horizontal half-pel (the "b" position)
         // ------------------------------------------------------------------
         (2, 0) => {
-            // Need 2 extra pixels on each side horizontally for the 6-tap filter.
             let src_w = block_w + 5;
             let src_h = block_h;
-            let mut src = vec![0i32; src_w * src_h];
+            let needed = src_w * src_h;
+            scratch.ref_buf[..needed].fill(0);
             extract_ref_block(
-                &mut src,
+                &mut scratch.ref_buf[..needed],
                 ref_y,
                 ref_stride,
                 ref_x - 2,
@@ -588,7 +771,14 @@ pub fn mc_luma(
                 pw,
                 ph,
             );
-            h_lowpass(dst, dst_stride, &src, src_w, block_w, block_h);
+            h_lowpass(
+                dst,
+                dst_stride,
+                &scratch.ref_buf[..needed],
+                src_w,
+                block_w,
+                block_h,
+            );
         }
 
         // ------------------------------------------------------------------
@@ -597,9 +787,10 @@ pub fn mc_luma(
         (0, 2) => {
             let src_w = block_w;
             let src_h = block_h + 5;
-            let mut src = vec![0i32; src_w * src_h];
+            let needed = src_w * src_h;
+            scratch.ref_buf[..needed].fill(0);
             extract_ref_block(
-                &mut src,
+                &mut scratch.ref_buf[..needed],
                 ref_y,
                 ref_stride,
                 ref_x,
@@ -609,7 +800,14 @@ pub fn mc_luma(
                 pw,
                 ph,
             );
-            v_lowpass(dst, dst_stride, &src, src_w, block_w, block_h);
+            v_lowpass(
+                dst,
+                dst_stride,
+                &scratch.ref_buf[..needed],
+                src_w,
+                block_w,
+                block_h,
+            );
         }
 
         // ------------------------------------------------------------------
@@ -618,9 +816,10 @@ pub fn mc_luma(
         (2, 2) => {
             let src_w = block_w + 5;
             let src_h = block_h + 5;
-            let mut src = vec![0i32; src_w * src_h];
+            let needed = src_w * src_h;
+            scratch.ref_buf[..needed].fill(0);
             extract_ref_block(
-                &mut src,
+                &mut scratch.ref_buf[..needed],
                 ref_y,
                 ref_stride,
                 ref_x - 2,
@@ -630,7 +829,15 @@ pub fn mc_luma(
                 pw,
                 ph,
             );
-            hv_lowpass(dst, dst_stride, &src, src_w, block_w, block_h);
+            hv_lowpass(
+                dst,
+                dst_stride,
+                &scratch.ref_buf[..needed],
+                src_w,
+                block_w,
+                block_h,
+                &mut scratch.ref_buf2,
+            );
         }
 
         // ------------------------------------------------------------------
@@ -638,6 +845,7 @@ pub fn mc_luma(
         // ------------------------------------------------------------------
         (1, 0) => qpel_h_avg(
             dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos, block_w, block_h, pw, ph, 2,
+            scratch,
         ),
 
         // ------------------------------------------------------------------
@@ -645,6 +853,7 @@ pub fn mc_luma(
         // ------------------------------------------------------------------
         (3, 0) => qpel_h_avg(
             dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos, block_w, block_h, pw, ph, 3,
+            scratch,
         ),
 
         // ------------------------------------------------------------------
@@ -652,6 +861,7 @@ pub fn mc_luma(
         // ------------------------------------------------------------------
         (0, 1) => qpel_v_avg(
             dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos, block_w, block_h, pw, ph, 2,
+            scratch,
         ),
 
         // ------------------------------------------------------------------
@@ -659,6 +869,7 @@ pub fn mc_luma(
         // ------------------------------------------------------------------
         (0, 3) => qpel_v_avg(
             dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos, block_w, block_h, pw, ph, 3,
+            scratch,
         ),
 
         // ------------------------------------------------------------------
@@ -666,6 +877,7 @@ pub fn mc_luma(
         // ------------------------------------------------------------------
         (1, 1) => qpel_diagonal(
             dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos, block_w, block_h, pw, ph, 0, 0,
+            scratch,
         ),
 
         // ------------------------------------------------------------------
@@ -673,6 +885,7 @@ pub fn mc_luma(
         // ------------------------------------------------------------------
         (3, 1) => qpel_diagonal(
             dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos, block_w, block_h, pw, ph, 0, 1,
+            scratch,
         ),
 
         // ------------------------------------------------------------------
@@ -680,6 +893,7 @@ pub fn mc_luma(
         // ------------------------------------------------------------------
         (1, 3) => qpel_diagonal(
             dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos, block_w, block_h, pw, ph, 1, 0,
+            scratch,
         ),
 
         // ------------------------------------------------------------------
@@ -687,6 +901,7 @@ pub fn mc_luma(
         // ------------------------------------------------------------------
         (3, 3) => qpel_diagonal(
             dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos, block_w, block_h, pw, ph, 1, 1,
+            scratch,
         ),
 
         // ------------------------------------------------------------------
@@ -694,6 +909,7 @@ pub fn mc_luma(
         // ------------------------------------------------------------------
         (2, 1) => qpel_mixed_h_hv(
             dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos, block_w, block_h, pw, ph, 0,
+            scratch,
         ),
 
         // ------------------------------------------------------------------
@@ -701,6 +917,7 @@ pub fn mc_luma(
         // ------------------------------------------------------------------
         (2, 3) => qpel_mixed_h_hv(
             dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos, block_w, block_h, pw, ph, 1,
+            scratch,
         ),
 
         // ------------------------------------------------------------------
@@ -708,6 +925,7 @@ pub fn mc_luma(
         // ------------------------------------------------------------------
         (1, 2) => qpel_mixed_v_hv(
             dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos, block_w, block_h, pw, ph, 0,
+            scratch,
         ),
 
         // ------------------------------------------------------------------
@@ -715,6 +933,7 @@ pub fn mc_luma(
         // ------------------------------------------------------------------
         (3, 2) => qpel_mixed_v_hv(
             dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos, block_w, block_h, pw, ph, 1,
+            scratch,
         ),
 
         _ => unreachable!("dx and dy must be in 0..4, got ({}, {})", dx, dy),
@@ -925,6 +1144,7 @@ pub fn mc_block(
     blk_y: u32,
     block_w: usize,
     block_h: usize,
+    scratch: &mut McScratch,
 ) {
     // Luma.
     let (lx, ly, ldx, ldy) = mv_to_ref_pos_luma(mv, mb_x, mb_y, blk_x, blk_y);
@@ -945,6 +1165,7 @@ pub fn mc_block(
         block_h,
         ref_pic.width,
         ref_pic.height,
+        scratch,
     );
 
     // Chroma (4:2:0 — half resolution each way).
@@ -1044,11 +1265,21 @@ mod tests {
     fn test_fullpel_copy() {
         let (ref_data, ref_stride) = make_test_ref(16, 16);
         let mut dst = vec![0u8; 4 * 4];
+        let mut scratch = McScratch::new();
         mc_luma(
-            &mut dst, 4, &ref_data, ref_stride, 2, 3, // ref position
-            0, 0, // full-pel
-            4, 4, // block size
-            16, 16,
+            &mut dst,
+            4,
+            &ref_data,
+            ref_stride,
+            2,
+            3, // ref position
+            0,
+            0, // full-pel
+            4,
+            4, // block size
+            16,
+            16,
+            &mut scratch,
         );
         // Verify each pixel matches the reference at (2,3).
         for j in 0..4 {
@@ -1071,11 +1302,21 @@ mod tests {
         let ref_data: Vec<u8> = vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100];
         let ref_stride = 10;
         let mut dst = [0u8; 1];
+        let mut scratch = McScratch::new();
         mc_luma(
-            &mut dst, 1, &ref_data, ref_stride, 2, 0, // ref position (integer part)
-            2, 0, // dx=2 (half-pel horizontal), dy=0
-            1, 1, // 1x1 block
-            10, 1,
+            &mut dst,
+            1,
+            &ref_data,
+            ref_stride,
+            2,
+            0, // ref position (integer part)
+            2,
+            0, // dx=2 (half-pel horizontal), dy=0
+            1,
+            1, // 1x1 block
+            10,
+            1,
+            &mut scratch,
         );
         // Expected: clip((10 - 100 + 600 + 800 - 250 + 60 + 16) >> 5) = clip(1136 >> 5) = clip(35) = 35
         assert_eq!(dst[0], 35);
@@ -1087,10 +1328,21 @@ mod tests {
         let ref_stride = 1;
         let ref_data: Vec<u8> = vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100];
         let mut dst = [0u8; 1];
+        let mut scratch = McScratch::new();
         mc_luma(
-            &mut dst, 1, &ref_data, ref_stride, 0, 2, // ref position
-            0, 2, // dy=2 (half-pel vertical)
-            1, 1, 1, 10,
+            &mut dst,
+            1,
+            &ref_data,
+            ref_stride,
+            0,
+            2, // ref position
+            0,
+            2, // dy=2 (half-pel vertical)
+            1,
+            1,
+            1,
+            10,
+            &mut scratch,
         );
         // Same calculation as horizontal: 35
         assert_eq!(dst[0], 35);
@@ -1106,8 +1358,21 @@ mod tests {
         let h = 16;
         let ref_data = vec![128u8; w * h];
         let mut dst = [0u8; 4 * 4];
+        let mut scratch = McScratch::new();
         mc_luma(
-            &mut dst, 4, &ref_data, w, 4, 4, 2, 2, 4, 4, w as u32, h as u32,
+            &mut dst,
+            4,
+            &ref_data,
+            w,
+            4,
+            4,
+            2,
+            2,
+            4,
+            4,
+            w as u32,
+            h as u32,
+            &mut scratch,
         );
         for p in &dst {
             assert_eq!(*p, 128, "uniform reference should produce uniform output");
@@ -1123,8 +1388,21 @@ mod tests {
         let h = 16;
         let ref_data = vec![100u8; w * h];
         let mut dst = [0u8; 4 * 4];
+        let mut scratch = McScratch::new();
         mc_luma(
-            &mut dst, 4, &ref_data, w, 4, 4, 1, 0, 4, 4, w as u32, h as u32,
+            &mut dst,
+            4,
+            &ref_data,
+            w,
+            4,
+            4,
+            1,
+            0,
+            4,
+            4,
+            w as u32,
+            h as u32,
+            &mut scratch,
         );
         for p in &dst {
             assert_eq!(*p, 100);
@@ -1186,7 +1464,22 @@ mod tests {
         // The edge-clamped pixel at (-1,-1) should be ref[0,0].
         let ref_data = vec![42u8; 4 * 4];
         let mut dst = [0u8; 2 * 2];
-        mc_luma(&mut dst, 2, &ref_data, 4, -1, -1, 0, 0, 2, 2, 4, 4);
+        let mut scratch = McScratch::new();
+        mc_luma(
+            &mut dst,
+            2,
+            &ref_data,
+            4,
+            -1,
+            -1,
+            0,
+            0,
+            2,
+            2,
+            4,
+            4,
+            &mut scratch,
+        );
         assert_eq!(dst[0], 42);
         assert_eq!(dst[1], 42);
         assert_eq!(dst[2], 42);
@@ -1198,9 +1491,21 @@ mod tests {
         // MV pointing past the bottom-right corner.
         let ref_data = vec![99u8; 8 * 8];
         let mut dst = [0u8; 2 * 2];
+        let mut scratch = McScratch::new();
         mc_luma(
-            &mut dst, 2, &ref_data, 8, 7, 7, // starts at last pixel
-            0, 0, 2, 2, 8, 8,
+            &mut dst,
+            2,
+            &ref_data,
+            8,
+            7,
+            7, // starts at last pixel
+            0,
+            0,
+            2,
+            2,
+            8,
+            8,
+            &mut scratch,
         );
         // All clamped to ref[7,7] = 99.
         for p in &dst {
@@ -1267,12 +1572,25 @@ mod tests {
         let h = 32;
         let val = 77u8;
         let ref_data = vec![val; w * h];
+        let mut scratch = McScratch::new();
 
         for dy in 0..4u8 {
             for dx in 0..4u8 {
                 let mut dst = [0u8; 4 * 4];
                 mc_luma(
-                    &mut dst, 4, &ref_data, w, 8, 8, dx, dy, 4, 4, w as u32, h as u32,
+                    &mut dst,
+                    4,
+                    &ref_data,
+                    w,
+                    8,
+                    8,
+                    dx,
+                    dy,
+                    4,
+                    4,
+                    w as u32,
+                    h as u32,
+                    &mut scratch,
                 );
                 for (idx, p) in dst.iter().enumerate() {
                     assert_eq!(
@@ -1313,9 +1631,21 @@ mod tests {
             }
         }
         let mut dst = [0u8; 4 * 4];
+        let mut scratch = McScratch::new();
         mc_luma(
-            &mut dst, 4, &ref_data, w, 2, 0, 2, 0, // horizontal half-pel
-            4, 4, w as u32, h as u32,
+            &mut dst,
+            4,
+            &ref_data,
+            w,
+            2,
+            0,
+            2,
+            0, // horizontal half-pel
+            4,
+            4,
+            w as u32,
+            h as u32,
+            &mut scratch,
         );
         // Row 0, col 0: filter6(0, 10, 20, 30, 40, 50) = 800, (816)>>5 = 25
         assert_eq!(dst[0], 25);
