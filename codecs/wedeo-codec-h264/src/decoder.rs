@@ -34,6 +34,24 @@ use crate::sps::{Sps, parse_sps};
 use crate::thread_pool::{DecodeThreadPool, FrameWork, InFlightDecode, SliceWorkUnit};
 
 // ---------------------------------------------------------------------------
+// Threading configuration
+// ---------------------------------------------------------------------------
+
+/// Number of frame-decode worker threads.
+/// Reads `WEDEO_THREADS` env var (1 = single-threaded, 0 or unset = auto).
+fn decode_thread_count() -> usize {
+    if let Some(n) = std::env::var("WEDEO_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        return n.clamp(1, 4);
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get().clamp(1, 4))
+        .unwrap_or(2)
+}
+
+// ---------------------------------------------------------------------------
 // Decoder state
 // ---------------------------------------------------------------------------
 
@@ -258,11 +276,7 @@ impl H264Decoder {
             current_last_hdr: None,
             pending_slices: Vec::new(),
             in_flight_queue: VecDeque::new(),
-            pool: DecodeThreadPool::new(
-                std::thread::available_parallelism()
-                    .map(|n| n.get().clamp(1, 4))
-                    .unwrap_or(2),
-            ),
+            pool: DecodeThreadPool::new(decode_thread_count()),
             next_dispatch_id: 0,
             result_buffer: HashMap::new(),
             buffer_pool: Arc::new(Mutex::new(BufferPool::new())),
@@ -1084,9 +1098,7 @@ impl H264Decoder {
                 self.join_all_in_flight();
             }
             // Enforce max in-flight capacity
-            let max_in_flight = std::thread::available_parallelism()
-                .map(|n| n.get().clamp(1, 4))
-                .unwrap_or(2);
+            let max_in_flight = decode_thread_count();
             while self.in_flight_queue.len() >= max_in_flight {
                 self.join_oldest_in_flight();
             }
