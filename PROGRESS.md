@@ -13,6 +13,26 @@ See `CLAUDE.md` and `H264.md` for detailed status.
 - WAV/PCM pipeline: byte-identical to FFmpeg 8.0.1 across all FATE suite samples
 - Audio via symphonia: 28 decoders, 10 demuxers, SNR-verified lossy codecs
 
+## Frame-Level Threading — Infrastructure Complete (2026-03-27)
+
+Steps 1-8 of frame-level threading committed:
+- `SharedPicture` with `AtomicI32` row progress + `Condvar` wait
+- `PicHandle` Deref wrapper, DPB `Arc<SharedPicture>` migration
+- `publish_row()` / `wait_for_row()` for row-level MC dependencies
+- `InFlightDecode` decouples frame completion from decode loop
+- Deblock offloaded to rayon thread pool (`rayon::spawn` + `mpsc::sync_channel`)
+- Non-ref B-frames defer join → deblock overlaps next frame's decode
+
+**Benchmark (BBB 1080p 10s):** 16.28s sync → 15.43s rayon (~5% faster).
+
+**Deblock row wavefront** stays on `std::thread::scope` — rayon deadlocks
+with spin-wait dependencies (yield_now creates recursive nested chains).
+
+**New script:** `bench_ab.py` — A/B benchmark current vs previous commit via hyperfine.
+
+**Next:** Pipelined frame decode (multiple frames decoding simultaneously using
+the row-level progress infrastructure already in place).
+
 ## FRext Conformance — All Progressive Files BITEXACT (2026-03-26)
 
 **Root cause (Group A+B, 17 files):** `CabacNeighborCtx.intra4x4_modes` stored -1
