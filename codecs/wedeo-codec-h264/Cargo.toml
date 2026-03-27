@@ -10,3 +10,4 @@ wedeo-core = { workspace = true }
 wedeo-codec = { workspace = true }
 inventory = { workspace = true }
 tracing = { workspace = true }
+rayon = { workspace = true }

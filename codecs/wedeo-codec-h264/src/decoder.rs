@@ -115,9 +115,9 @@ pub struct H264Decoder {
     /// The bool flag is `mmco_reset` — set when MMCO-5 or out_of_order==16
     /// causes a POC sequence restart. Acts as a barrier in min-POC search.
     delayed_pics: Vec<(i32, Frame, bool)>, // (poc, frame, mmco_reset)
-    /// In-flight deblock thread. The thread runs deblock + mark_complete,
-    /// then returns the Box<InFlightDecode> for DPB store on the main thread.
-    in_flight: Option<std::thread::JoinHandle<Box<InFlightDecode>>>,
+    /// In-flight deblock result. The rayon pool runs deblock + mark_complete,
+    /// then sends the Box<InFlightDecode> back for DPB store on the main thread.
+    in_flight: Option<std::sync::mpsc::Receiver<Box<InFlightDecode>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -922,14 +922,15 @@ impl H264Decoder {
                 ref_list_l1: self.ref_list_l1.clone(),
             });
 
-            // 3. Spawn deblock thread
-            let handle = std::thread::spawn(move || {
+            // 3. Spawn deblock on rayon thread pool
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            rayon::spawn(move || {
                 let mut b = boxed;
                 Self::deblock_fdc(&mut b.fdc);
-                b
+                let _ = tx.send(b);
             });
 
-            self.in_flight = Some(handle);
+            self.in_flight = Some(rx);
 
             // 4. Reference frames: join immediately so DPB is updated
             //    before the next frame's ref list build.
@@ -948,13 +949,13 @@ impl H264Decoder {
         }
     }
 
-    /// Join any pending in-flight deblock thread and complete its DPB store + output.
+    /// Join any pending in-flight deblock task and complete its DPB store + output.
     fn join_in_flight(&mut self) {
-        if let Some(handle) = self.in_flight.take() {
+        if let Some(rx) = self.in_flight.take() {
             trace!("joining deblock thread");
-            match handle.join() {
+            match rx.recv() {
                 Ok(in_flight) => self.complete_in_flight(in_flight),
-                Err(e) => warn!("deblock thread panicked: {:?}", e),
+                Err(e) => warn!("deblock channel closed: {}", e),
             }
         }
     }
