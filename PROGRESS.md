@@ -372,7 +372,7 @@ allocations in mc.rs. A 1080p B-frame with ~4000 sub-blocks generates
 eliminate this entirely with zero algorithmic change.
 
 **Performance roadmap (estimated impact on single-threaded gap):**
-1. MC scratch buffers — eliminate 16% alloc overhead → ~10x gap
+1. ~~MC scratch buffers — eliminate 16% alloc overhead → ~10x gap~~ **DONE** (7-13% measured)
 2. SIMD MC lowpass (NEON) — ~4x for 47% subsystem → ~6x gap
 3. SIMD deblock (NEON) — ~4x for 11% subsystem → ~5x gap
 
@@ -380,11 +380,45 @@ SIMD approach: raw `std::arch::aarch64` intrinsics (safe since Rust 1.87,
 NEON mandatory on ARM64 = no multiversioning). See Medium article
 "The State of SIMD in Rust in 2025" for option tradeoffs.
 
+## MC Scratch Buffers — Complete (2026-03-27)
+
+Replaced ~23 `vec![]` allocations per `mc_luma` call with 4 pre-allocated
+scratch buffers (`McScratch` struct) on `FrameDecodeContext`. Total scratch
+footprint: ~4 KB, reused across all MC calls within a frame.
+
+**Benchmark (CVWP1_TOSHIBA_E, single-threaded, 30 runs):**
+- Old: 273.5ms user ± 39.3ms
+- New: 242.2ms user ± 28.6ms (~11.5% user time reduction)
+
+**BBB 1080p (5 runs, taskpolicy pinned):**
+- Old: 19.2s user → New: 17.9s user (~7% reduction, 1.13x)
+
+## Divan Micro-Benchmarks — Complete (2026-03-27)
+
+55 benchmarks across 5 subsystems with `AllocProfiler`, `BytesCount`/
+`ItemsCount` throughput counters, parameterized inputs.
+
+**Scalar baselines (median, key benchmarks):**
+
+| Benchmark | Time | Throughput |
+|-----------|------|------------|
+| mc_luma 16×16 qpel(0,0) | 276ns | 928 MB/s |
+| mc_luma 16×16 qpel(2,2) | 854ns | 300 MB/s |
+| mc_luma 16×16 qpel(1,1) | 1.29µs | 198 MB/s |
+| idct4x4_add | 10ns | 1.6 GB/s |
+| idct8x8_add | 47ns | 1.4 GB/s |
+| predict_16x16 plane | 86ns | 3.0 GB/s |
+| deblock_row 16-wide | 5.9µs | 1.0 GB/s |
+| get_cabac | 6.9µs/1K | 145M items/s |
+
+Run: `cargo bench -p wedeo-codec-h264`
+Baseline tool: `python3 scripts/bench_baseline.py save` / `compare`
+
 ## Next Steps
 
-- **MC scratch buffers** — pre-allocate on FrameDecodeContext, eliminate per-call vec![]
-- SIMD for MC lowpass filters (NEON)
+- SIMD for MC lowpass filters (NEON) — primary target, 3x slower at qpel(2,2) vs (0,0)
 - SIMD for deblock filter (NEON)
+- SIMD for IDCT (NEON) — 8x8 butterfly is 4.7x slower than 4x4
 - Expand FRext to CABAC files
 - Interlaced (PAFF) support
 - Additional video codecs (HEVC, VP9)

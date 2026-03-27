@@ -28,5 +28,8 @@ Thumbs.db
 scripts/.conformance_snapshot.json
 scripts/.conformance_delta_*.json
 
+# Benchmark baselines (local, not shared)
+.bench_baselines/
+
 # Claude Code ephemeral session state
 .claude/primer.md
