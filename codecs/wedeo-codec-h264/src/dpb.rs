@@ -7,7 +7,9 @@
 // Reference: ITU-T H.264 Annex A (level limits), Section 8.2.5 (DPB),
 // FFmpeg libavcodec/h264_refs.c
 
-use crate::deblock::PictureBuffer;
+use std::sync::Arc;
+
+use crate::shared_picture::SharedPicture;
 use crate::tables::LEVEL_MAX_DPB_MBS;
 
 // ---------------------------------------------------------------------------
@@ -31,8 +33,10 @@ pub enum RefStatus {
 
 /// A decoded picture in the DPB.
 pub struct DpbEntry {
-    /// Decoded picture data (Y/U/V planes).
-    pub pic: PictureBuffer,
+    /// Decoded picture data (Y/U/V planes) with row-level progress tracking.
+    /// Arc-wrapped to allow zero-copy sharing across threads (reference pictures
+    /// are read-only after DPB insertion).
+    pub pic: Arc<SharedPicture>,
     /// Picture Order Count.
     pub poc: i32,
     /// frame_num from the slice header.
@@ -298,11 +302,12 @@ pub fn max_dpb_frames(level_idc: u8, mb_width: u32, mb_height: u32) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::deblock::PictureBuffer;
 
     /// Create a minimal DpbEntry for testing.
     fn make_entry(frame_num: u32, poc: i32, status: RefStatus) -> DpbEntry {
         DpbEntry {
-            pic: PictureBuffer {
+            pic: SharedPicture::new(PictureBuffer {
                 y: vec![128; 16 * 16],
                 u: vec![128; 8 * 8],
                 v: vec![128; 8 * 8],
@@ -312,7 +317,7 @@ mod tests {
                 height: 16,
                 mb_width: 1,
                 mb_height: 1,
-            },
+            }),
             poc,
             frame_num,
             status,

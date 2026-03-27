@@ -7,9 +7,20 @@
 // Reference: ITU-T H.264 spec section 8.7, FFmpeg libavcodec/h264_loopfilter.c
 // and h264dsp_template.c.
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use tracing::{debug, trace};
 
 use crate::tables::CHROMA_QP_TABLE;
+
+/// Wrapper to send a `*mut PictureBuffer` across scoped threads.
+///
+/// SAFETY: Only used within `std::thread::scope` where the wavefront ordering
+/// guarantees disjoint row access. All threads are joined before the pointer
+/// is invalidated.
+struct SyncPic(*mut PictureBuffer);
+unsafe impl Send for SyncPic {}
+unsafe impl Sync for SyncPic {}
 
 // ---------------------------------------------------------------------------
 // Threshold tables from the H.264 spec (Table 8-16) and FFmpeg.
@@ -575,9 +586,22 @@ fn filter_mb_edge_luma(
             let q2 = plane[off + 2 * step] as i32;
 
             trace!(
-                mb_x, mb_y, is_vertical, edge, i, d, cur_bs,
-                p0, p1, p2, q0, q1, q2,
-                alpha, beta, qp,
+                mb_x,
+                mb_y,
+                is_vertical,
+                edge,
+                i,
+                d,
+                cur_bs,
+                p0,
+                p1,
+                p2,
+                q0,
+                q1,
+                q2,
+                alpha,
+                beta,
+                qp,
                 "DEBLOCK_PIXEL_IN"
             );
 
@@ -587,9 +611,8 @@ fn filter_mb_edge_luma(
                     filter_normal_luma(p0, p1, p2, q0, q1, q2, alpha, beta, tc0)
                 {
                     trace!(
-                        mb_x, mb_y, is_vertical, edge, i, d,
-                        new_p0, new_q0, tc0,
-                        "DEBLOCK_PIXEL_OUT"
+                        mb_x,
+                        mb_y, is_vertical, edge, i, d, new_p0, new_q0, tc0, "DEBLOCK_PIXEL_OUT"
                     );
                     plane[off - step] = new_p0;
                     plane[off - 2 * step] = new_p1;
@@ -603,9 +626,8 @@ fn filter_mb_edge_luma(
                     filter_strong_luma(p0, p1, p2, p3, q0, q1, q2, q3, alpha, beta)
                 {
                     trace!(
-                        mb_x, mb_y, is_vertical, edge, i, d,
-                        new_p0, new_q0,
-                        "DEBLOCK_PIXEL_OUT"
+                        mb_x,
+                        mb_y, is_vertical, edge, i, d, new_p0, new_q0, "DEBLOCK_PIXEL_OUT"
                     );
                     plane[off - step] = new_p0;
                     plane[off - 2 * step] = new_p1;
@@ -1467,7 +1489,10 @@ fn deblock_mb(
 
     // Compute field-aware pixel offsets and strides for this MB.
     trace!(
-        mb_x, mb_y, cur_mb_field, cur_qp,
+        mb_x,
+        mb_y,
+        cur_mb_field,
+        cur_qp,
         y_stride = pic.y_stride,
         "DEBLOCK_MB_START"
     );
@@ -1636,7 +1661,6 @@ fn deblock_mb(
             }
         }
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -1673,10 +1697,89 @@ pub fn deblock_frame(
         "mb_info length must equal mb_width * mb_height"
     );
 
-    // MBAFF: iterate column-first within each pair row, so both MBs of a pair
-    // at column x are deblocked before moving to column x+1. This matches
-    // FFmpeg's loop_filter() in h264_slice.c:2451-2452.
-    // Progressive: standard raster order.
+    // MBAFF uses column-first pair iteration — complex ordering, keep sequential.
+    // Tiny frames (<=2 rows) have no parallelism benefit.
+    if is_mbaff || mb_height <= 2 {
+        deblock_frame_sequential(pic, mb_info, slice_table, slice_params, is_mbaff);
+        return;
+    }
+
+    // Progressive parallel deblocking: row-wavefront with work-stealing.
+    //
+    // SAFETY argument: Each MB row Y writes to luma pixel rows [Y*16-3 .. Y*16+15]
+    // and chroma [Y*8-1 .. Y*8+7]. The wavefront guarantee (row Y-1 complete before
+    // row Y starts) ensures no concurrent writes to overlapping regions.
+    // The Acquire/Release ordering ensures pixel writes from row Y-1 are visible to
+    // row Y's thread.
+
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get().min(mb_height as usize / 2).max(1))
+        .unwrap_or(1);
+
+    if num_threads <= 1 {
+        deblock_frame_sequential(pic, mb_info, slice_table, slice_params, false);
+        return;
+    }
+
+    let row_progress: Vec<AtomicU32> = (0..mb_height).map(|_| AtomicU32::new(0)).collect();
+    let next_row = AtomicU32::new(0);
+
+    // SAFETY: thread::scope joins all threads before returning, and the
+    // wavefront ensures disjoint row access. See SyncPic doc comment.
+    let sync_pic = SyncPic(pic as *mut PictureBuffer);
+
+    std::thread::scope(|s| {
+        for _ in 0..num_threads {
+            let sync_pic = &sync_pic;
+            let row_progress = &row_progress;
+            let next_row = &next_row;
+            s.spawn(move || {
+                loop {
+                    let my_row = next_row.fetch_add(1, Ordering::Relaxed);
+                    if my_row >= mb_height {
+                        break;
+                    }
+
+                    // Wait for dependency: row my_row - 1 must be done
+                    if my_row > 0 {
+                        while row_progress[(my_row - 1) as usize].load(Ordering::Acquire) == 0 {
+                            std::hint::spin_loop();
+                        }
+                    }
+
+                    // SAFETY: Row my_row writes to pixels disjoint from all other active rows.
+                    // Row my_row-1 is complete (checked above), so its pixel writes are visible.
+                    let pic = unsafe { &mut *sync_pic.0 };
+                    for mb_x in 0..mb_width {
+                        deblock_mb_if_enabled(
+                            pic,
+                            mb_info,
+                            mb_x,
+                            my_row,
+                            mb_width,
+                            slice_table,
+                            slice_params,
+                        );
+                    }
+
+                    row_progress[my_row as usize].store(1, Ordering::Release);
+                }
+            });
+        }
+    });
+}
+
+/// Sequential deblocking fallback (MBAFF or single-threaded).
+fn deblock_frame_sequential(
+    pic: &mut PictureBuffer,
+    mb_info: &[MbDeblockInfo],
+    slice_table: &[u16],
+    slice_params: &[SliceDeblockParams],
+    is_mbaff: bool,
+) {
+    let mb_width = pic.mb_width;
+    let mb_height = pic.mb_height;
+
     if is_mbaff {
         for pair_row in 0..(mb_height / 2) {
             for mb_x in 0..mb_width {
@@ -1709,7 +1812,6 @@ pub fn deblock_frame(
             }
         }
     }
-
 }
 
 /// Check idc and deblock a single MB, with tracing.

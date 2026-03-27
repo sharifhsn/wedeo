@@ -7,6 +7,7 @@
 // Reference: FFmpeg libavcodec/h264dec.c, h264_slice.c
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use tracing::{debug, trace, warn};
 use wedeo_codec::bitstream::{BitRead, BitReadBE, get_ue_golomb};
@@ -27,6 +28,7 @@ use crate::mb::{self, FrameDecodeContext};
 use crate::nal::{NalUnit, NalUnitType, split_annex_b, split_nalff};
 use crate::pps::{Pps, parse_pps};
 use crate::refs;
+use crate::shared_picture::SharedPicture;
 use crate::slice::{SliceHeader, SliceType, parse_slice_header};
 use crate::sps::{Sps, parse_sps};
 
@@ -478,7 +480,7 @@ impl H264Decoder {
             .filter_map(|e| e.as_ref())
             .filter(|e| e.status == RefStatus::ShortTerm)
             .max_by_key(|e| e.frame_num)
-            .map(|e| (e.pic.clone(), e.poc));
+            .map(|e| (Arc::clone(&e.pic), e.poc));
 
         // Safety limit: never fill more than max_frame_num steps
         let mut steps = 0u32;
@@ -492,11 +494,12 @@ impl H264Decoder {
             let gap_frame_num = self.prev_frame_num_h264;
 
             // Clone previous ref picture data, or use mid-grey fallback.
+            // Arc::clone is a cheap refcount bump — gap frames share pixel data.
             let (pic, poc) = if let Some((prev_pic, prev_poc)) = &prev_pic {
-                (prev_pic.clone(), *prev_poc + 2 * steps as i32)
+                (Arc::clone(prev_pic), *prev_poc + 2 * steps as i32)
             } else {
                 (
-                    PictureBuffer {
+                    SharedPicture::new(PictureBuffer {
                         y: vec![128u8; y_stride * pic_h as usize],
                         u: vec![128u8; uv_stride * (pic_h / 2) as usize],
                         v: vec![128u8; uv_stride * (pic_h / 2) as usize],
@@ -506,7 +509,7 @@ impl H264Decoder {
                         height: pic_h,
                         mb_width: mb_w,
                         mb_height: mb_h,
-                    },
+                    }),
                     0,
                 )
             };
@@ -731,16 +734,18 @@ impl H264Decoder {
                         chroma_qp_index_offset: slice_chroma_qp_offset,
                     };
 
-                    // Build list of reference PictureBuffer pointers
-                    let ref_pic_list: Vec<&PictureBuffer> = self
+                    // Build list of SharedPicture references for MC.
+                    // In single-threaded mode, all are PROGRESS_COMPLETE.
+                    // In frame-threaded mode, wait_for_row is called per-MB in MC.
+                    let ref_pic_list: Vec<&SharedPicture> = self
                         .ref_list_l0
                         .iter()
-                        .filter_map(|&dpb_idx| self.dpb.get(dpb_idx).map(|e| &e.pic))
+                        .filter_map(|&dpb_idx| self.dpb.get(dpb_idx).map(|e| e.pic.as_ref()))
                         .collect();
-                    let ref_pic_list_l1: Vec<&PictureBuffer> = self
+                    let ref_pic_list_l1: Vec<&SharedPicture> = self
                         .ref_list_l1
                         .iter()
-                        .filter_map(|&dpb_idx| self.dpb.get(dpb_idx).map(|e| &e.pic))
+                        .filter_map(|&dpb_idx| self.dpb.get(dpb_idx).map(|e| e.pic.as_ref()))
                         .collect();
 
                     // Set L0/L1 ref POCs for deblocking ref-identity comparison
@@ -796,12 +801,14 @@ impl H264Decoder {
                     if hdr.slice_type.is_p() || hdr.slice_type.is_b() {
                         for &dpb_idx in &self.ref_list_l0 {
                             if let Some(e) = self.dpb.get(dpb_idx) {
-                                let s = e.pic.y_stride;
+                                // SAFETY: DPB pictures are PROGRESS_COMPLETE (trace-only access).
+                                let pic = unsafe { e.pic.data() };
+                                let s = pic.y_stride;
                                 // Sample pixels at y=128, x=155-165
                                 let row128: Vec<u8> = (155..166usize)
                                     .map(|x| {
-                                        if 128 < e.pic.height as usize && x < e.pic.width as usize {
-                                            e.pic.y[128 * s + x]
+                                        if 128 < pic.height as usize && x < pic.width as usize {
+                                            pic.y[128 * s + x]
                                         } else {
                                             0
                                         }
@@ -820,7 +827,7 @@ impl H264Decoder {
                         }
                     }
 
-                    match self.decode_slice_into(
+                    match Self::decode_slice_into(
                         &nalu.data,
                         &hdr,
                         &sps,
@@ -1062,7 +1069,7 @@ impl H264Decoder {
                 .collect();
 
             let entry = DpbEntry {
-                pic: fdc.pic,
+                pic: fdc.pic.into_shared(),
                 poc: self.current_poc,
                 frame_num: self.current_frame_num_h264,
                 status: RefStatus::Unused,
@@ -1097,12 +1104,14 @@ impl H264Decoder {
             if let Some(dpb_idx) = self.dpb.store(entry) {
                 {
                     let e = self.dpb.get(dpb_idx).unwrap();
+                    // SAFETY: Just stored — picture is complete (trace-only access).
+                    let pic = unsafe { e.pic.data() };
                     tracing::trace!(
                         internal_frame = self.frame_num,
                         dpb_idx,
                         h264_frame_num = e.frame_num,
-                        y_ptr = ?e.pic.y.as_ptr(),
-                        pixel_160_32 = e.pic.y[32 * e.pic.y_stride + 160],
+                        y_ptr = ?pic.y.as_ptr(),
+                        pixel_160_32 = pic.y[32 * pic.y_stride + 160],
                         "DPB stored entry"
                     );
                 }
@@ -1235,38 +1244,36 @@ impl H264Decoder {
     /// Dispatches to CAVLC or CABAC slice decode based on PPS entropy_coding_mode_flag.
     /// Returns the number of MBs decoded in this slice.
     #[allow(clippy::too_many_arguments)] // H.264 slice decode needs all parameters
-    #[tracing::instrument(skip_all, fields(poc = self.current_poc, first_mb = hdr.first_mb_in_slice, slice_type = ?hdr.slice_type))]
+    #[tracing::instrument(skip_all, fields(first_mb = hdr.first_mb_in_slice, slice_type = ?hdr.slice_type))]
     fn decode_slice_into(
-        &self,
         rbsp: &[u8],
         hdr: &SliceHeader,
         sps: &Sps,
         pps: &Pps,
         fdc: &mut FrameDecodeContext,
-        ref_pics: &[&PictureBuffer],
-        ref_pics_l1: &[&PictureBuffer],
+        ref_pics: &[&SharedPicture],
+        ref_pics_l1: &[&SharedPicture],
     ) -> Result<u32> {
         fdc.qp = hdr.slice_qp as u8;
         fdc.last_qscale_diff = 0; // H.264 spec: prevMbQpDelta = 0 at slice start
 
         if pps.entropy_coding_mode_flag {
-            self.decode_slice_cabac(rbsp, hdr, sps, pps, fdc, ref_pics, ref_pics_l1)
+            Self::decode_slice_cabac(rbsp, hdr, sps, pps, fdc, ref_pics, ref_pics_l1)
         } else {
-            self.decode_slice_cavlc(rbsp, hdr, sps, pps, fdc, ref_pics, ref_pics_l1)
+            Self::decode_slice_cavlc(rbsp, hdr, sps, pps, fdc, ref_pics, ref_pics_l1)
         }
     }
 
     /// Decode a CAVLC-coded slice.
     #[allow(clippy::too_many_arguments)]
     fn decode_slice_cavlc(
-        &self,
         rbsp: &[u8],
         hdr: &SliceHeader,
         sps: &Sps,
         pps: &Pps,
         fdc: &mut FrameDecodeContext,
-        ref_pics: &[&PictureBuffer],
-        ref_pics_l1: &[&PictureBuffer],
+        ref_pics: &[&SharedPicture],
+        ref_pics_l1: &[&SharedPicture],
     ) -> Result<u32> {
         let mb_width = sps.mb_width;
         let mb_height = sps.mb_height;
@@ -1288,7 +1295,7 @@ impl H264Decoder {
         let is_mbaff = !sps.frame_mbs_only_flag;
 
         if is_mbaff {
-            return self.decode_slice_cavlc_mbaff(
+            return Self::decode_slice_cavlc_mbaff(
                 &mut br,
                 rbsp_bits,
                 hdr,
@@ -1358,6 +1365,10 @@ impl H264Decoder {
                     }
                     mb_addr += 1;
                     mbs_decoded += 1;
+                    // Signal row completion for frame-level threading
+                    if mb_addr.is_multiple_of(mb_width) {
+                        fdc.pic.publish_row((mb_addr / mb_width - 1) as i32);
+                    }
                 }
 
                 if mb_addr >= total_mbs {
@@ -1409,6 +1420,10 @@ impl H264Decoder {
             )?;
             mb_addr += 1;
             mbs_decoded += 1;
+            // Signal row completion for frame-level threading
+            if mb_addr.is_multiple_of(mb_width) {
+                fdc.pic.publish_row((mb_addr / mb_width - 1) as i32);
+            }
         }
 
         // Validate bitstream position: after decoding all MBs in this slice,
@@ -1440,15 +1455,14 @@ impl H264Decoder {
     ///            h264_cavlc.c:689-701 (MBAFF skip/field flag logic).
     #[allow(clippy::too_many_arguments)]
     fn decode_slice_cavlc_mbaff(
-        &self,
         br: &mut BitReadBE<'_>,
         rbsp_bits: usize,
         hdr: &SliceHeader,
         sps: &Sps,
         pps: &Pps,
         fdc: &mut FrameDecodeContext,
-        ref_pics: &[&PictureBuffer],
-        ref_pics_l1: &[&PictureBuffer],
+        ref_pics: &[&SharedPicture],
+        ref_pics_l1: &[&SharedPicture],
         is_inter_slice: bool,
     ) -> Result<u32> {
         let mb_width = sps.mb_width;
@@ -1600,6 +1614,8 @@ impl H264Decoder {
             // Advance to next pair
             mb_x += 1;
             if mb_x >= mb_width {
+                // Pair row complete — signal both MB rows (top and bottom)
+                fdc.pic.publish_row((mb_y + 1) as i32);
                 mb_x = 0;
                 mb_y += 2;
             }
@@ -1631,14 +1647,13 @@ impl H264Decoder {
     /// Reference: FFmpeg h264_cabac.c:1920-2499 (ff_h264_decode_mb_cabac).
     #[allow(clippy::too_many_arguments)]
     fn decode_slice_cabac(
-        &self,
         rbsp: &[u8],
         hdr: &SliceHeader,
         sps: &Sps,
         pps: &Pps,
         fdc: &mut FrameDecodeContext,
-        ref_pics: &[&PictureBuffer],
-        ref_pics_l1: &[&PictureBuffer],
+        ref_pics: &[&SharedPicture],
+        ref_pics_l1: &[&SharedPicture],
     ) -> Result<u32> {
         use crate::cabac::{
             CabacDecodeCache, CabacNeighborCtx, CabacReader, decode_cabac_mb_skip, decode_mb_cabac,
@@ -1676,7 +1691,7 @@ impl H264Decoder {
         let is_mbaff = !sps.frame_mbs_only_flag;
 
         if is_mbaff {
-            mbs_decoded = self.decode_slice_cabac_mbaff(
+            mbs_decoded = Self::decode_slice_cabac_mbaff(
                 &mut reader,
                 &mut cabac_state,
                 &mut cabac_nb,
@@ -1747,12 +1762,19 @@ impl H264Decoder {
                         cabac_nb.update_after_mb(
                             mb_idx, true, false, false, false, 0, 0, &[0; 24], false,
                         );
-                        let skip_modes = if pps.constrained_intra_pred { [-1i8; 16] } else { [2i8; 16] };
+                        let skip_modes = if pps.constrained_intra_pred {
+                            [-1i8; 16]
+                        } else {
+                            [2i8; 16]
+                        };
                         cabac_nb.store_intra4x4_modes(mb_idx, &skip_modes);
                         cabac_nb.update_mvd_ref_skip(mb_idx);
 
                         mb_addr += 1;
                         mbs_decoded += 1;
+                        if mb_addr.is_multiple_of(mb_width) {
+                            fdc.pic.publish_row((mb_addr / mb_width - 1) as i32);
+                        }
 
                         // Check terminate after skip
                         if reader.get_cabac_terminate() {
@@ -1816,10 +1838,16 @@ impl H264Decoder {
                     &mb.non_zero_count,
                     mb.transform_size_8x8_flag,
                 );
-                cabac_nb.store_intra4x4_modes(mb_idx, &mb_intra4x4_modes_i8(&mb, pps.constrained_intra_pred));
+                cabac_nb.store_intra4x4_modes(
+                    mb_idx,
+                    &mb_intra4x4_modes_i8(&mb, pps.constrained_intra_pred),
+                );
 
                 mb_addr += 1;
                 mbs_decoded += 1;
+                if mb_addr.is_multiple_of(mb_width) {
+                    fdc.pic.publish_row((mb_addr / mb_width - 1) as i32);
+                }
 
                 // Check terminate
                 if reader.get_cabac_terminate() {
@@ -1842,7 +1870,6 @@ impl H264Decoder {
     ///            h264_cabac.c:1935-1962 (MBAFF skip/field flag logic).
     #[allow(clippy::too_many_arguments)]
     fn decode_slice_cabac_mbaff(
-        &self,
         reader: &mut crate::cabac::CabacReader<'_>,
         cabac_state: &mut [u8; 1024],
         cabac_nb: &mut crate::cabac::CabacNeighborCtx,
@@ -1850,8 +1877,8 @@ impl H264Decoder {
         sps: &Sps,
         pps: &Pps,
         fdc: &mut FrameDecodeContext,
-        ref_pics: &[&PictureBuffer],
-        ref_pics_l1: &[&PictureBuffer],
+        ref_pics: &[&SharedPicture],
+        ref_pics_l1: &[&SharedPicture],
         is_inter_slice: bool,
     ) -> Result<u32> {
         use crate::cabac::{
@@ -2047,7 +2074,11 @@ impl H264Decoder {
                         cabac_nb.update_after_mb(
                             mb_idx, true, false, false, false, 0, 0, &[0; 24], false,
                         );
-                        let skip_modes = if pps.constrained_intra_pred { [-1i8; 16] } else { [2i8; 16] };
+                        let skip_modes = if pps.constrained_intra_pred {
+                            [-1i8; 16]
+                        } else {
+                            [2i8; 16]
+                        };
                         cabac_nb.store_intra4x4_modes(mb_idx, &skip_modes);
                         cabac_nb.update_mvd_ref_skip(mb_idx);
                         cabac_nb.mb_field_flag[mb_idx] = mb_field_decoding_flag;
@@ -2144,7 +2175,10 @@ impl H264Decoder {
                     &mb.non_zero_count,
                     mb.transform_size_8x8_flag,
                 );
-                cabac_nb.store_intra4x4_modes(mb_idx, &mb_intra4x4_modes_i8(&mb, pps.constrained_intra_pred));
+                cabac_nb.store_intra4x4_modes(
+                    mb_idx,
+                    &mb_intra4x4_modes_i8(&mb, pps.constrained_intra_pred),
+                );
                 cabac_nb.mb_field_flag[mb_idx] = mb_field_decoding_flag;
                 mbs_decoded += 1;
             }
@@ -2172,6 +2206,8 @@ impl H264Decoder {
             // Advance to next pair
             mb_x += 1;
             if mb_x >= mb_width {
+                // Pair row complete — signal both MB rows (top and bottom)
+                fdc.pic.publish_row((mb_y + 1) as i32);
                 mb_x = 0;
                 mb_y += 2; // Skip to next pair row
             }
@@ -2197,6 +2233,10 @@ impl H264Decoder {
                 is_mbaff,
             );
         }
+
+        // Mark picture as fully complete (decoded + deblocked).
+        // In frame-threaded mode, this unblocks any threads waiting for this picture.
+        fdc.pic.mark_complete();
 
         // Convert PictureBuffer to Frame, applying SPS crop offsets.
         let width = self.width as usize;

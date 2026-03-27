@@ -15,6 +15,7 @@ pub mod nal;
 pub mod pps;
 pub mod refs;
 pub mod sei;
+pub mod shared_picture;
 pub mod slice;
 pub mod sps;
 pub mod tables;

@@ -17,6 +17,7 @@ use crate::intra_pred;
 use crate::mc;
 use crate::mvpred::{self, MvContext};
 use crate::pps::Pps;
+use crate::shared_picture::{PicHandle, SharedPicture};
 use crate::slice::SliceHeader;
 use crate::sps::Sps;
 use crate::tables::CHROMA_QP_TABLE;
@@ -368,7 +369,7 @@ pub fn mbaff_skip_neighbors(
 
 /// Frame-level decode context.
 pub struct FrameDecodeContext {
-    pub pic: PictureBuffer,
+    pub pic: PicHandle,
     pub mb_info: Vec<MbDeblockInfo>,
     pub neighbor_ctx: NeighborContext,
     /// Current QP (starts from PPS init_qp + slice_qp_delta, modified per-MB).
@@ -466,7 +467,7 @@ impl FrameDecodeContext {
         // naturally produces 128, so no additional guards needed in reconstruction.
         let uv_fill = if decode_chroma { 0u8 } else { 128u8 };
 
-        let pic = PictureBuffer {
+        let pic = PicHandle::new(PictureBuffer {
             y: vec![0u8; y_stride * height as usize],
             u: vec![uv_fill; uv_stride * (height / 2) as usize],
             v: vec![uv_fill; uv_stride * (height / 2) as usize],
@@ -476,7 +477,7 @@ impl FrameDecodeContext {
             height,
             mb_width,
             mb_height,
-        };
+        });
 
         let total_mbs = (mb_width * mb_height) as usize;
 
@@ -1001,8 +1002,8 @@ pub fn decode_macroblock(
     pps: &Pps,
     mb_x: u32,
     mb_y: u32,
-    ref_pics: &[&PictureBuffer],
-    ref_pics_l1: &[&PictureBuffer],
+    ref_pics: &[&SharedPicture],
+    ref_pics_l1: &[&SharedPicture],
 ) -> Result<()> {
     // 1. Parse macroblock syntax via CAVLC
     let mut mb = decode_mb_cavlc(
@@ -1048,8 +1049,8 @@ pub fn apply_macroblock(
     pps: &Pps,
     mb_x: u32,
     mb_y: u32,
-    ref_pics: &[&PictureBuffer],
-    ref_pics_l1: &[&PictureBuffer],
+    ref_pics: &[&SharedPicture],
+    ref_pics_l1: &[&SharedPicture],
 ) -> Result<()> {
     let mb_idx = (mb_y * ctx.mb_width + mb_x) as usize;
 
@@ -1306,8 +1307,8 @@ fn decode_inter_mb(
     mb_y: u32,
     qp: u8,
     chroma_qp: [u8; 2],
-    ref_pics: &[&PictureBuffer],
-    ref_pics_l1: &[&PictureBuffer],
+    ref_pics: &[&SharedPicture],
+    ref_pics_l1: &[&SharedPicture],
 ) {
     // Dispatch B-frame inter MBs to dedicated handler
     if slice_hdr.slice_type.is_b() {
@@ -1908,7 +1909,7 @@ fn decode_inter_mb(
 #[allow(clippy::too_many_arguments)]
 fn apply_mc_partition(
     ctx: &mut FrameDecodeContext,
-    ref_pic: &PictureBuffer,
+    ref_pic: &SharedPicture,
     mb_x: u32,
     mb_y: u32,
     px_offset_x: u32,
@@ -1917,6 +1918,21 @@ fn apply_mc_partition(
     block_h: usize,
     mv: [i16; 2],
 ) {
+    // For MV-based reference lookup, use frame-mode coordinates (not field-adjusted).
+    let dst_y = (mb_y * 16 + px_offset_y) as i32;
+    let mvy = mv[1] as i32;
+
+    // Compute the highest reference pixel row needed.
+    // MV is quarter-pel; 6-tap luma filter reads 2 pixels above + 3 below.
+    let ref_y_bottom = dst_y + (mvy >> 2) + block_h as i32 + 3;
+    let needed_mb_row = (ref_y_bottom.max(0) as u32 / 16).min(ref_pic.mb_height() - 1);
+
+    // Block until reference picture has decoded this row
+    ref_pic.wait_for_row(needed_mb_row as i32);
+
+    // SAFETY: wait_for_row guarantees the needed rows are published.
+    let rp = unsafe { ref_pic.data() };
+
     // Compute field-aware destination offset and stride.
     // In field mode, the dst stride is doubled and the offset is adjusted for bottom field.
     // The reference picture is always frame-mode (full-frame stride), so ref addressing is unchanged.
@@ -1924,13 +1940,10 @@ fn apply_mc_partition(
     let (luma_mb_off, luma_dst_stride) = luma_mb_offset(&ctx.pic, mb_x, mb_y, mb_field);
     let luma_offset = luma_mb_off + px_offset_y as usize * luma_dst_stride + px_offset_x as usize;
 
-    // For MV-based reference lookup, use frame-mode coordinates (not field-adjusted).
     let dst_x = (mb_x * 16 + px_offset_x) as i32;
-    let dst_y = (mb_y * 16 + px_offset_y) as i32;
 
     // Quarter-pixel MV components
     let mvx = mv[0] as i32;
-    let mvy = mv[1] as i32;
 
     // Luma: quarter-pixel precision
     let luma_ref_x = dst_x + (mvx >> 2);
@@ -1941,16 +1954,16 @@ fn apply_mc_partition(
     mc::mc_luma(
         &mut ctx.pic.y[luma_offset..],
         luma_dst_stride,
-        &ref_pic.y,
-        ref_pic.y_stride,
+        &rp.y,
+        rp.y_stride,
         luma_ref_x,
         luma_ref_y,
         luma_dx,
         luma_dy,
         block_w,
         block_h,
-        ref_pic.width,
-        ref_pic.height,
+        rp.width,
+        rp.height,
     );
 
     // Chroma: eighth-pixel precision (MV divided by 2 with rounding)
@@ -1978,31 +1991,31 @@ fn apply_mc_partition(
     mc::mc_chroma(
         &mut ctx.pic.u[chroma_offset..],
         chroma_dst_stride,
-        &ref_pic.u,
-        ref_pic.uv_stride,
+        &rp.u,
+        rp.uv_stride,
         chroma_ref_x,
         chroma_ref_y,
         chroma_dx,
         chroma_dy,
         chroma_w,
         chroma_h,
-        ref_pic.width / 2,
-        ref_pic.height / 2,
+        rp.width / 2,
+        rp.height / 2,
     );
 
     mc::mc_chroma(
         &mut ctx.pic.v[chroma_offset..],
         chroma_dst_stride,
-        &ref_pic.v,
-        ref_pic.uv_stride,
+        &rp.v,
+        rp.uv_stride,
         chroma_ref_x,
         chroma_ref_y,
         chroma_dx,
         chroma_dy,
         chroma_w,
         chroma_h,
-        ref_pic.width / 2,
-        ref_pic.height / 2,
+        rp.width / 2,
+        rp.height / 2,
     );
 }
 
@@ -2018,8 +2031,8 @@ pub fn decode_skip_mb(
     slice_hdr: &SliceHeader,
     mb_x: u32,
     mb_y: u32,
-    ref_pics: &[&PictureBuffer],
-    _ref_pics_l1: &[&PictureBuffer],
+    ref_pics: &[&SharedPicture],
+    _ref_pics_l1: &[&SharedPicture],
 ) {
     if ref_pics.is_empty() {
         fill_mb_gray(ctx, mb_x, mb_y);
@@ -2076,8 +2089,8 @@ pub fn decode_b_skip_mb(
     slice_hdr: &SliceHeader,
     mb_x: u32,
     mb_y: u32,
-    ref_pics: &[&PictureBuffer],
-    ref_pics_l1: &[&PictureBuffer],
+    ref_pics: &[&SharedPicture],
+    ref_pics_l1: &[&SharedPicture],
 ) {
     if ref_pics.is_empty() || ref_pics_l1.is_empty() {
         fill_mb_gray(ctx, mb_x, mb_y);
@@ -2176,8 +2189,8 @@ fn decode_b_inter_mb(
     mb_y: u32,
     qp: u8,
     chroma_qp: [u8; 2],
-    ref_pics: &[&PictureBuffer],
-    ref_pics_l1: &[&PictureBuffer],
+    ref_pics: &[&SharedPicture],
+    ref_pics_l1: &[&SharedPicture],
 ) {
     if ref_pics.is_empty() && ref_pics_l1.is_empty() {
         fill_mb_gray(ctx, mb_x, mb_y);
@@ -2494,8 +2507,8 @@ fn decode_b_8x8_mb(
     slice_hdr: &SliceHeader,
     mb_x: u32,
     mb_y: u32,
-    ref_pics: &[&PictureBuffer],
-    ref_pics_l1: &[&PictureBuffer],
+    ref_pics: &[&SharedPicture],
+    ref_pics_l1: &[&SharedPicture],
 ) {
     use crate::tables::B_SUB_MB_TYPE_INFO;
 
@@ -3432,8 +3445,8 @@ fn apply_weight_uni_at(
 #[allow(clippy::too_many_arguments)]
 fn apply_mc_bi_partition(
     ctx: &mut FrameDecodeContext,
-    ref_pics: &[&PictureBuffer],
-    ref_pics_l1: &[&PictureBuffer],
+    ref_pics: &[&SharedPicture],
+    ref_pics_l1: &[&SharedPicture],
     mb_x: u32,
     mb_y: u32,
     px_offset_x: u32,
@@ -3448,6 +3461,16 @@ fn apply_mc_bi_partition(
 ) {
     let ref_l0 = ref_pics[(ref_idx_l0.max(0) as usize).min(ref_pics.len() - 1)];
     let ref_l1 = ref_pics_l1[(ref_idx_l1.max(0) as usize).min(ref_pics_l1.len() - 1)];
+
+    // Await L1 reference progress (L0 is awaited inside apply_mc_partition)
+    let dst_y_await = (mb_y * 16 + px_offset_y) as i32;
+    let mvy_l1 = mv_l1[1] as i32;
+    let ref_y_bottom_l1 = dst_y_await + (mvy_l1 >> 2) + block_h as i32 + 3;
+    let needed_row_l1 = (ref_y_bottom_l1.max(0) as u32 / 16).min(ref_l1.mb_height() - 1);
+    ref_l1.wait_for_row(needed_row_l1 as i32);
+
+    // SAFETY: wait_for_row guarantees the needed rows are published.
+    let rp_l1 = unsafe { ref_l1.data() };
 
     // MC L0 into destination
     apply_mc_partition(
@@ -3480,16 +3503,16 @@ fn apply_mc_bi_partition(
     mc::mc_luma(
         &mut tmp_y,
         block_w,
-        &ref_l1.y,
-        ref_l1.y_stride,
+        &rp_l1.y,
+        rp_l1.y_stride,
         l1_ref_x,
         l1_ref_y,
         l1_dx,
         l1_dy,
         block_w,
         block_h,
-        ref_l1.width,
-        ref_l1.height,
+        rp_l1.width,
+        rp_l1.height,
     );
 
     // Average or weighted-average luma (field-aware destination stride)
@@ -3565,16 +3588,16 @@ fn apply_mc_bi_partition(
     mc::mc_chroma(
         &mut tmp_u,
         chroma_w,
-        &ref_l1.u,
-        ref_l1.uv_stride,
+        &rp_l1.u,
+        rp_l1.uv_stride,
         chroma_ref_x,
         chroma_ref_y,
         chroma_dx,
         chroma_dy,
         chroma_w,
         chroma_h,
-        ref_l1.width / 2,
-        ref_l1.height / 2,
+        rp_l1.width / 2,
+        rp_l1.height / 2,
     );
     // Field-aware destination offset
     let (chroma_mb_off, chroma_dst_stride) = chroma_mb_offset(&ctx.pic, mb_x, mb_y, mb_field);
@@ -3585,16 +3608,16 @@ fn apply_mc_bi_partition(
     mc::mc_chroma(
         &mut tmp_v,
         chroma_w,
-        &ref_l1.v,
-        ref_l1.uv_stride,
+        &rp_l1.v,
+        rp_l1.uv_stride,
         chroma_ref_x,
         chroma_ref_y,
         chroma_dx,
         chroma_dy,
         chroma_w,
         chroma_h,
-        ref_l1.width / 2,
-        ref_l1.height / 2,
+        rp_l1.width / 2,
+        rp_l1.height / 2,
     );
 
     if slice_hdr.weighted_bipred_idc == 2
