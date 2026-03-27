@@ -1,0 +1,42 @@
+# Extract CABAC state from FFmpeg at key points for MB(17,4)
+# Usage: lldb -s scripts/ffmpeg_cabac_trace.lldb FFmpeg/ffmpeg
+
+settings set auto-confirm true
+
+# After mb_type (I-slice): line 2030
+b h264_cabac.c:2030
+breakpoint modify --condition "sl->mb_x == 17 && sl->mb_y == 4" --one-shot true
+breakpoint command add --one-liner "script print(f'FFmpeg STEP_1 after_mb_type pos={lldb.frame.FindVariable(\"sl\").GetChildMemberWithName(\"cabac\").GetChildMemberWithName(\"bytestream\").GetValueAsUnsigned() - lldb.frame.FindVariable(\"sl\").GetChildMemberWithName(\"cabac\").GetChildMemberWithName(\"bytestream_start\").GetValueAsUnsigned()} low={lldb.frame.FindVariable(\"sl\").GetChildMemberWithName(\"cabac\").GetChildMemberWithName(\"low\").GetValueAsSigned()} range={lldb.frame.FindVariable(\"sl\").GetChildMemberWithName(\"cabac\").GetChildMemberWithName(\"range\").GetValueAsSigned()}')"
+
+# After intra4x4 modes: line 2094
+b h264_cabac.c:2094
+breakpoint modify --condition "sl->mb_x == 17 && sl->mb_y == 4" --one-shot true
+breakpoint command add --one-liner "script print(f'FFmpeg STEP_2 after_intra4x4 pos={lldb.frame.FindVariable(\"sl\").GetChildMemberWithName(\"cabac\").GetChildMemberWithName(\"bytestream\").GetValueAsUnsigned() - lldb.frame.FindVariable(\"sl\").GetChildMemberWithName(\"cabac\").GetChildMemberWithName(\"bytestream_start\").GetValueAsUnsigned()} low={lldb.frame.FindVariable(\"sl\").GetChildMemberWithName(\"cabac\").GetChildMemberWithName(\"low\").GetValueAsSigned()} range={lldb.frame.FindVariable(\"sl\").GetChildMemberWithName(\"cabac\").GetChildMemberWithName(\"range\").GetValueAsSigned()}')"
+
+# After chroma pred mode: line 2110
+b h264_cabac.c:2110
+breakpoint modify --condition "sl->mb_x == 17 && sl->mb_y == 4" --one-shot true
+breakpoint command add --one-liner "script print(f'FFmpeg STEP_3 after_chroma_pred pos={lldb.frame.FindVariable(\"sl\").GetChildMemberWithName(\"cabac\").GetChildMemberWithName(\"bytestream\").GetValueAsUnsigned() - lldb.frame.FindVariable(\"sl\").GetChildMemberWithName(\"cabac\").GetChildMemberWithName(\"bytestream_start\").GetValueAsUnsigned()} low={lldb.frame.FindVariable(\"sl\").GetChildMemberWithName(\"cabac\").GetChildMemberWithName(\"low\").GetValueAsSigned()} range={lldb.frame.FindVariable(\"sl\").GetChildMemberWithName(\"cabac\").GetChildMemberWithName(\"range\").GetValueAsSigned()}')"
+
+# After CBP: line 2345
+b h264_cabac.c:2345
+breakpoint modify --condition "sl->mb_x == 17 && sl->mb_y == 4" --one-shot true
+breakpoint command add --one-liner "script print(f'FFmpeg STEP_4 after_cbp cbp=0x{lldb.frame.FindVariable(\"cbp\").GetValueAsUnsigned():x} pos={lldb.frame.FindVariable(\"sl\").GetChildMemberWithName(\"cabac\").GetChildMemberWithName(\"bytestream\").GetValueAsUnsigned() - lldb.frame.FindVariable(\"sl\").GetChildMemberWithName(\"cabac\").GetChildMemberWithName(\"bytestream_start\").GetValueAsUnsigned()} low={lldb.frame.FindVariable(\"sl\").GetChildMemberWithName(\"cabac\").GetChildMemberWithName(\"low\").GetValueAsSigned()} range={lldb.frame.FindVariable(\"sl\").GetChildMemberWithName(\"cabac\").GetChildMemberWithName(\"range\").GetValueAsSigned()}')"
+
+# After qp_delta: line 2428
+b h264_cabac.c:2428
+breakpoint modify --condition "sl->mb_x == 17 && sl->mb_y == 4" --one-shot true
+breakpoint command add --one-liner "script print(f'FFmpeg STEP_5 after_qp_delta pos={lldb.frame.FindVariable(\"sl\").GetChildMemberWithName(\"cabac\").GetChildMemberWithName(\"bytestream\").GetValueAsUnsigned() - lldb.frame.FindVariable(\"sl\").GetChildMemberWithName(\"cabac\").GetChildMemberWithName(\"bytestream_start\").GetValueAsUnsigned()} low={lldb.frame.FindVariable(\"sl\").GetChildMemberWithName(\"cabac\").GetChildMemberWithName(\"low\").GetValueAsSigned()} range={lldb.frame.FindVariable(\"sl\").GetChildMemberWithName(\"cabac\").GetChildMemberWithName(\"range\").GetValueAsSigned()}')"
+
+# After luma residual: line 2437
+b h264_cabac.c:2437
+breakpoint modify --condition "sl->mb_x == 17 && sl->mb_y == 4" --one-shot true
+breakpoint command add --one-liner "script print(f'FFmpeg STEP_6 after_luma_residual pos={lldb.frame.FindVariable(\"sl\").GetChildMemberWithName(\"cabac\").GetChildMemberWithName(\"bytestream\").GetValueAsUnsigned() - lldb.frame.FindVariable(\"sl\").GetChildMemberWithName(\"cabac\").GetChildMemberWithName(\"bytestream_start\").GetValueAsUnsigned()} low={lldb.frame.FindVariable(\"sl\").GetChildMemberWithName(\"cabac\").GetChildMemberWithName(\"low\").GetValueAsSigned()} range={lldb.frame.FindVariable(\"sl\").GetChildMemberWithName(\"cabac\").GetChildMemberWithName(\"range\").GetValueAsSigned()}')"
+
+# After all residual: line 2495
+b h264_cabac.c:2495
+breakpoint modify --condition "sl->mb_x == 17 && sl->mb_y == 4" --one-shot true
+breakpoint command add --one-liner "script print(f'FFmpeg STEP_7 after_all_residual pos={lldb.frame.FindVariable(\"sl\").GetChildMemberWithName(\"cabac\").GetChildMemberWithName(\"bytestream\").GetValueAsUnsigned() - lldb.frame.FindVariable(\"sl\").GetChildMemberWithName(\"cabac\").GetChildMemberWithName(\"bytestream_start\").GetValueAsUnsigned()} low={lldb.frame.FindVariable(\"sl\").GetChildMemberWithName(\"cabac\").GetChildMemberWithName(\"low\").GetValueAsSigned()} range={lldb.frame.FindVariable(\"sl\").GetChildMemberWithName(\"cabac\").GetChildMemberWithName(\"range\").GetValueAsSigned()}')"
+
+# Run
+run -bitexact -i fate-suite/h264-conformance/CAMA1_Sony_C.jsv -f framecrc -
