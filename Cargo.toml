@@ -27,6 +27,7 @@ description = "Clean-room Rust rewrite of FFmpeg"
 
 [workspace.dependencies]
 bitflags = "2"
+divan = "0.1.21"
 inventory = "0.3"
 tracing = { version = "0.1", features = ["attributes"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
