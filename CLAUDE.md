@@ -42,6 +42,7 @@ See `H264.md` for decoder architecture, module map, and conformance status.
 - **CABAC context offsets are 2D for MBAFF** — `significant_coeff_flag_offset[MB_FIELD][cat]` uses field vs frame tables. Use `scripts/verify_cabac_tables.py` to verify.
 - **MBAFF field-mode above-neighbor stride** — `top_xy = mb_xy - (mb_stride << MB_FIELD)`. Use `scripts/mbaff_field_map.py` to check field/frame modes.
 - **MBAFF left_block_options** — FFmpeg's `fill_decode_neighbors` (h264_mvpred.h:491-538) selects 1 of 4 remapping variants for NNZ/CBP/intra4x4 mode context when there's a field/frame mismatch with the left neighbor. Use `scripts/verify_left_block_tables.py` to verify tables. For CABAC state comparison, breakpoint at h264_cabac.c:1966 (after field flag decode).
+- **CABAC neighbor cache:** FFmpeg's `fill_decode_caches` (h264_mvpred.h:576) is the canonical reference for how neighbor values populate the CABAC context. For inter/skip MBs, `intra4x4_pred_mode` = 2 (DC) without `constrained_intra_pred`, -1 with it. Wedeo has two parallel storage systems (`NeighborContext` + `CabacNeighborCtx`) — both must store consistent values. Use `scripts/cabac_state_compare.py` to diff CABAC engine state at MB boundaries.
 - **Pipeline-stage tracing tags:** SLICE→PPS_SCALING→DEQUANT_TABLES→COEFF→DEQUANT→MB_RECON→MB_DEBLOCK.
 
 ## Code Quality

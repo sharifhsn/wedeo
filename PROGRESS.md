@@ -7,24 +7,27 @@ See `CLAUDE.md` and `H264.md` for detailed status.
 - H.264 CAVLC: **52/52** progressive conformance files BITEXACT (100%) — added CI_MW_D, LS_SVA_D
 - H.264 CABAC: 27/27 progressive conformance files BITEXACT (100%)
 - H.264 FRext CAVLC: **5/7 BITEXACT** (2 out-of-scope: PAFF)
-- H.264 FRext CABAC: **18/22 BITEXACT** (4 PAFF out-of-scope) — 12 Group A files have I-frame matching, P/B-frame diffs (8x8 intra pred bug, coefficients verified correct)
+- H.264 FRext: **23/55 BITEXACT** — all progressive High Profile 4:2:0 8-bit files pass. Remaining are interlaced (MBAFF/PAFF), 10-bit, or 4:2:2.
 - H.264 MBAFF: deblocking infrastructure (Phases 1-7), field/frame pixel addressing, CABAC left_block_options remapping, per-MB top-mode storage, field-mode top-right availability. CABAC engine 100% correct. **CAMA1_Sony_C (I-slice) BITEXACT for reconstruction** (no-deblock). Other CAMA files need inter prediction fixes.
-- Precommit total: **102 passing, 0 regressed**
+- Precommit total: **52 passing, 0 regressed** (snapshot needs update to include new FRext files)
 - WAV/PCM pipeline: byte-identical to FFmpeg 8.0.1 across all FATE suite samples
 - Audio via symphonia: 28 decoders, 10 demuxers, SNR-verified lossy codecs
 
-## FRext Conformance Investigation (2026-03-26)
+## FRext Conformance — All Progressive Files BITEXACT (2026-03-26)
 
-**Fixed:** Median overflow in `mvpred.rs:18` (i16→i32 cast). HPCAMAPALQ no longer panics.
-**Fixed:** Intra 8x8 filtered top-right extension in `intra_pred.rs:393` (use filtered ft[7] not raw top[7]).
+**Root cause (Group A+B, 17 files):** `CabacNeighborCtx.intra4x4_modes` stored -1
+(unavailable) for inter/skip MBs instead of 2 (DC_PRED). This caused wrong CABAC
+predicted mode when `min(left_intra_mode, top_mode)` had one inter neighbor and one
+intra neighbor with mode < 2. FFmpeg's `fill_decode_caches` stores 2 for non-I4x4
+neighbors without `constrained_intra_pred`. Fix: `decoder.rs:mb_intra4x4_modes_i8()`
+now returns `[2; 16]` for inter MBs, `[-1; 16]` only with constrained_intra_pred.
 
-**Open bug — Group A (12 files):** I-frame matches, P/B-frames differ. CABAC coefficients verified
-identical between wedeo and FFmpeg (element-by-element). The 8x8 intra prediction DC value in P-frames
-differs by ~14 despite identical raw reference pixels. Root cause unknown.
-Next diagnostic: add fprintf to FFmpeg's pred8x8l_dc to compare filtered reference samples.
+**Also fixed:**
+- Median overflow in `mvpred.rs:18` (i16→i32 cast). HPCAMAPALQ no longer panics.
+- Intra 8x8 top-right extension in `intra_pred.rs:393` — reverted to raw `top[7]` per spec.
 
-**New scripts:** `frame_type_map.py` (decode/display order mapping), `coeff_compare_8x8.py` (element-wise
-coefficient comparison), `pixel_compare_mb.py` (per-pixel MB comparison with 4x4 block breakdown).
+**New scripts:** `frame_type_map.py`, `coeff_compare_8x8.py`, `pixel_compare_mb.py`,
+`cabac_state_compare.py` (CABAC engine state comparison at MB boundaries).
 
 ## MBAFF Deblock Root Cause Found — Vertical Edge at Pair Boundary (2026-03-26)
 
