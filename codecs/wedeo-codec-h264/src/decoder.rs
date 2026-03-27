@@ -115,6 +115,34 @@ pub struct H264Decoder {
     /// The bool flag is `mmco_reset` — set when MMCO-5 or out_of_order==16
     /// causes a POC sequence restart. Acts as a barrier in min-POC search.
     delayed_pics: Vec<(i32, Frame, bool)>, // (poc, frame, mmco_reset)
+    /// In-flight frame decode (background thread result awaiting join).
+    /// Boxed to avoid stack overflow — FrameDecodeContext is large.
+    in_flight: Option<Box<InFlightDecode>>,
+}
+
+// ---------------------------------------------------------------------------
+// Frame-level threading types
+// ---------------------------------------------------------------------------
+
+/// Metadata for a frame whose decode+deblock is complete but whose
+/// DPB store and output buffering haven't happened yet.
+struct InFlightDecode {
+    /// Completed frame decode context (after decode + deblock).
+    fdc: FrameDecodeContext,
+    /// POC of this picture.
+    poc: i32,
+    /// H.264 frame_num from the slice header.
+    frame_num_h264: u32,
+    /// nal_ref_idc — non-zero means this frame is a reference.
+    nal_ref_idc: u8,
+    /// Whether this was an IDR NAL.
+    is_idr: bool,
+    /// Last slice header (for MMCO, deblocking params, etc.).
+    last_hdr: SliceHeader,
+    /// DPB indices for L0 reference list (for DPB ref_poc storage).
+    ref_list_l0: Vec<usize>,
+    /// DPB indices for L1 reference list (for DPB ref_poc storage).
+    ref_list_l1: Vec<usize>,
 }
 
 /// Compute intra4x4 right-column modes as i8 for CABAC neighbor storage.
@@ -179,6 +207,7 @@ impl H264Decoder {
             crop_top: 0,
             output_frame_counter: 0,
             delayed_pics: Vec::new(),
+            in_flight: None,
         };
 
         // Parse avcC extradata if present (MP4/NALFF format).
@@ -870,154 +899,183 @@ impl H264Decoder {
         Ok(())
     }
 
-    /// Flush a completed frame: apply deblocking, emit the output frame,
-    /// and store the decoded picture in the DPB for reference.
+    /// Flush a completed frame: package as InFlightDecode, then complete it.
     fn finish_current_frame(&mut self) {
-        if let (Some(mut fdc), Some(last_hdr)) =
-            (self.current_fdc.take(), self.current_last_hdr.as_ref())
+        if let (Some(fdc), Some(last_hdr)) = (self.current_fdc.take(), self.current_last_hdr.take())
         {
-            // Set initial PTS to POC for reordering. Sequential PTS is
-            // assigned later when flushing from delayed_pics.
-            let frame = self.fdc_to_frame(&mut fdc, last_hdr, self.current_poc as i64);
-            debug!(
-                frame_num = self.frame_num,
-                poc = self.current_poc,
-                reorder_depth = self.reorder_depth,
-                "frame complete"
-            );
+            let in_flight = Box::new(InFlightDecode {
+                fdc,
+                poc: self.current_poc,
+                frame_num_h264: self.current_frame_num_h264,
+                nal_ref_idc: self.current_nal_ref_idc,
+                is_idr: self.current_is_idr,
+                last_hdr,
+                ref_list_l0: self.ref_list_l0.clone(),
+                ref_list_l1: self.ref_list_l1.clone(),
+            });
+            self.complete_in_flight(in_flight);
+        }
+    }
 
-            // IDR resets the POC sequence. Clear last_pocs so the gap
-            // detection doesn't falsely trigger from the old sequence.
-            if self.current_is_idr {
-                self.last_pocs = [i64::MIN; 16];
-            }
+    /// Join any pending in-flight decode and complete its DPB store + output.
+    fn join_in_flight(&mut self) {
+        if let Some(in_flight) = self.in_flight.take() {
+            self.complete_in_flight(in_flight);
+        }
+    }
 
-            // Determine if this frame has an MMCO-5 (Reset) operation.
-            // Needed early because MMCO-5 resets POC to 0, and we must
-            // use the reset POC for last_pocs insertion (matching FFmpeg
-            // where MMCO runs before h264_select_output_frame).
-            let has_mmco5 = last_hdr.adaptive_ref_pic_marking
-                && last_hdr
-                    .mmco_ops
-                    .iter()
-                    .any(|op| matches!(op, crate::slice::MmcoOp::Reset));
+    /// Complete an in-flight decode: deblock, emit output frame, DPB store.
+    /// Takes Box to keep the large FrameDecodeContext on the heap.
+    fn complete_in_flight(&mut self, mut in_flight: Box<InFlightDecode>) {
+        // Set initial PTS to POC for reordering. Sequential PTS is
+        // assigned later when flushing from delayed_pics.
+        let frame = self.fdc_to_frame(
+            &mut in_flight.fdc,
+            &in_flight.last_hdr,
+            in_flight.poc as i64,
+        );
+        debug!(
+            frame_num = self.frame_num,
+            poc = in_flight.poc,
+            reorder_depth = self.reorder_depth,
+            "frame complete"
+        );
 
-            // Dynamically compute reorder depth using FFmpeg's last_pocs
-            // algorithm (h264_slice.c:1309-1332). Insert current POC into
-            // the sorted ascending last_pocs array and derive out_of_order
-            // from the insertion position. The algorithm shifts values left
-            // as it scans, then places cur_poc at the insertion point.
-            //
-            // When MMCO-5 is present, reset last_pocs and use POC 0
-            // (matching FFmpeg where MMCO_RESET clears last_pocs in
-            // h264_refs.c:724-725 and resets POC before this runs).
-            if has_mmco5 {
-                self.last_pocs = [i64::MIN; 16];
-            }
-            let cur_poc = if has_mmco5 {
-                0i64
-            } else {
-                self.current_poc as i64
-            };
-            let mut insert_pos = 0usize;
-            for i in 0..=16 {
-                if i == 16 || cur_poc < self.last_pocs[i] {
-                    if i > 0 {
-                        self.last_pocs[i - 1] = cur_poc;
-                    }
-                    insert_pos = i;
-                    break;
-                } else if i > 0 {
-                    self.last_pocs[i - 1] = self.last_pocs[i];
+        // IDR resets the POC sequence. Clear last_pocs so the gap
+        // detection doesn't falsely trigger from the old sequence.
+        if in_flight.is_idr {
+            self.last_pocs = [i64::MIN; 16];
+        }
+
+        // Determine if this frame has an MMCO-5 (Reset) operation.
+        // Needed early because MMCO-5 resets POC to 0, and we must
+        // use the reset POC for last_pocs insertion (matching FFmpeg
+        // where MMCO runs before h264_select_output_frame).
+        let has_mmco5 = in_flight.last_hdr.adaptive_ref_pic_marking
+            && in_flight
+                .last_hdr
+                .mmco_ops
+                .iter()
+                .any(|op| matches!(op, crate::slice::MmcoOp::Reset));
+
+        // Dynamically compute reorder depth using FFmpeg's last_pocs
+        // algorithm (h264_slice.c:1309-1332). Insert current POC into
+        // the sorted ascending last_pocs array and derive out_of_order
+        // from the insertion position. The algorithm shifts values left
+        // as it scans, then places cur_poc at the insertion point.
+        //
+        // When MMCO-5 is present, reset last_pocs and use POC 0
+        // (matching FFmpeg where MMCO_RESET clears last_pocs in
+        // h264_refs.c:724-725 and resets POC before this runs).
+        if has_mmco5 {
+            self.last_pocs = [i64::MIN; 16];
+        }
+        let cur_poc = if has_mmco5 {
+            0i64
+        } else {
+            in_flight.poc as i64
+        };
+        let mut insert_pos = 0usize;
+        for i in 0..=16 {
+            if i == 16 || cur_poc < self.last_pocs[i] {
+                if i > 0 {
+                    self.last_pocs[i - 1] = cur_poc;
                 }
+                insert_pos = i;
+                break;
+            } else if i > 0 {
+                self.last_pocs[i - 1] = self.last_pocs[i];
             }
+        }
 
-            let mut out_of_order = 16 - insert_pos;
+        let mut out_of_order = 16 - insert_pos;
 
-            // Also increase for B-frames or POC gap > 2
-            if last_hdr.slice_type.is_b()
-                || (self.last_pocs[14] > i64::MIN && (self.last_pocs[15] - self.last_pocs[14]) > 2)
-            {
-                out_of_order = out_of_order.max(1);
-            }
+        // Also increase for B-frames or POC gap > 2
+        if in_flight.last_hdr.slice_type.is_b()
+            || (self.last_pocs[14] > i64::MIN && (self.last_pocs[15] - self.last_pocs[14]) > 2)
+        {
+            out_of_order = out_of_order.max(1);
+        }
 
-            // If all entries are smaller than current (out_of_order == 16),
-            // it means POC went backwards (e.g., frame_num gap wrap or
-            // MMCO reset). Reset last_pocs.
-            if out_of_order == 16 {
-                self.last_pocs = [i64::MIN; 16];
-                self.last_pocs[0] = cur_poc;
-            } else if out_of_order > self.reorder_depth && !self.has_bitstream_restriction {
-                self.reorder_depth = out_of_order;
-            }
+        // If all entries are smaller than current (out_of_order == 16),
+        // it means POC went backwards (e.g., frame_num gap wrap or
+        // MMCO reset). Reset last_pocs.
+        if out_of_order == 16 {
+            self.last_pocs = [i64::MIN; 16];
+            self.last_pocs[0] = cur_poc;
+        } else if out_of_order > self.reorder_depth && !self.has_bitstream_restriction {
+            self.reorder_depth = out_of_order;
+        }
 
-            // The mmco_reset flag acts as a barrier in the delayed_pics
-            // buffer, preventing min-POC search from mixing frames across
-            // POC sequence boundaries.
-            // Reference: FFmpeg h264_slice.c:1301, 1327, 1346-1353.
-            // IDR frames that arrive when the delayed_pics buffer is
-            // non-empty are barriers: they prevent the min-POC search from
-            // mixing frames across POC sequence boundaries. The first IDR
-            // (empty buffer) is not a barrier since there are no prior frames.
-            let mid_stream_idr = self.current_is_idr && !self.delayed_pics.is_empty();
-            let frame_mmco_reset = has_mmco5 || out_of_order == 16 || mid_stream_idr;
+        // The mmco_reset flag acts as a barrier in the delayed_pics
+        // buffer, preventing min-POC search from mixing frames across
+        // POC sequence boundaries.
+        // Reference: FFmpeg h264_slice.c:1301, 1327, 1346-1353.
+        // IDR frames that arrive when the delayed_pics buffer is
+        // non-empty are barriers: they prevent the min-POC search from
+        // mixing frames across POC sequence boundaries. The first IDR
+        // (empty buffer) is not a barrier since there are no prior frames.
+        let mid_stream_idr = in_flight.is_idr && !self.delayed_pics.is_empty();
+        let frame_mmco_reset = has_mmco5 || out_of_order == 16 || mid_stream_idr;
 
-            // Add current frame to the delayed_pics buffer.
-            // Use the original POC (not the MMCO-5 reset value) since
-            // min-POC ordering needs the real POC for correct output.
-            self.delayed_pics
-                .push((self.current_poc, frame, frame_mmco_reset));
+        // Add current frame to the delayed_pics buffer.
+        // Use the original POC (not the MMCO-5 reset value) since
+        // min-POC ordering needs the real POC for correct output.
+        self.delayed_pics
+            .push((in_flight.poc, frame, frame_mmco_reset));
 
-            // Output frames when buffer exceeds reorder_depth AND the
-            // current frame is in order (out_of_order == 0).
-            // Exception: always allow output when there's an mmco_reset
-            // barrier in the buffer, to drain old POC sequences. This
-            // prevents the out_of_order gate from blocking output when
-            // POC cycling (due to MMCO-5) keeps out_of_order > 0.
-            let has_barrier = self.delayed_pics.iter().any(|(_, _, reset)| *reset);
-            let allow_output = out_of_order == 0 || has_barrier;
-            while allow_output && self.delayed_pics.len() > self.reorder_depth {
-                let out_idx = if self.delayed_pics[0].2 {
-                    // mmco_reset at front: output it directly
-                    0
-                } else {
-                    // Find barrier: first mmco_reset at index >= 1
-                    let barrier = self
-                        .delayed_pics
-                        .iter()
-                        .enumerate()
-                        .skip(1)
-                        .find(|(_, (_, _, reset))| *reset)
-                        .map(|(i, _)| i)
-                        .unwrap_or(self.delayed_pics.len());
+        // Output frames when buffer exceeds reorder_depth AND the
+        // current frame is in order (out_of_order == 0).
+        // Exception: always allow output when there's an mmco_reset
+        // barrier in the buffer, to drain old POC sequences. This
+        // prevents the out_of_order gate from blocking output when
+        // POC cycling (due to MMCO-5) keeps out_of_order > 0.
+        let has_barrier = self.delayed_pics.iter().any(|(_, _, reset)| *reset);
+        let allow_output = out_of_order == 0 || has_barrier;
+        while allow_output && self.delayed_pics.len() > self.reorder_depth {
+            let out_idx = if self.delayed_pics[0].2 {
+                // mmco_reset at front: output it directly
+                0
+            } else {
+                // Find barrier: first mmco_reset at index >= 1
+                let barrier = self
+                    .delayed_pics
+                    .iter()
+                    .enumerate()
+                    .skip(1)
+                    .find(|(_, (_, _, reset))| *reset)
+                    .map(|(i, _)| i)
+                    .unwrap_or(self.delayed_pics.len());
 
-                    // Find min-POC within [0, barrier)
-                    self.delayed_pics[..barrier]
-                        .iter()
-                        .enumerate()
-                        .min_by_key(|(_, (poc, _, _))| *poc)
-                        .map(|(i, _)| i)
-                        .unwrap()
-                };
-                let (_, mut f, _) = self.delayed_pics.remove(out_idx);
-                f.pts = self.output_frame_counter;
-                self.output_frame_counter += 1;
-                self.output_queue.push_back(f);
-            }
+                // Find min-POC within [0, barrier)
+                self.delayed_pics[..barrier]
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, (poc, _, _))| *poc)
+                    .map(|(i, _)| i)
+                    .unwrap()
+            };
+            let (_, mut f, _) = self.delayed_pics.remove(out_idx);
+            f.pts = self.output_frame_counter;
+            self.output_frame_counter += 1;
+            self.output_queue.push_back(f);
+        }
 
-            // Non-reference pictures (nal_ref_idc == 0, typically B-frames)
-            // don't need to be stored in the DPB.
-            if self.current_nal_ref_idc == 0 {
-                self.frame_num += 1;
-                return;
-            }
+        // Non-reference pictures (nal_ref_idc == 0, typically B-frames)
+        // don't need to be stored in the DPB.
+        if in_flight.nal_ref_idc == 0 {
+            self.frame_num += 1;
+            return;
+        }
 
-            // Store decoded picture in DPB for reference
-            let mb_width = fdc.mb_width;
-            let mb_height = fdc.mb_height;
-            let total_blocks = (mb_width * mb_height * 16) as usize;
+        // Store decoded picture in DPB for reference
+        let mb_width = in_flight.fdc.mb_width;
+        let mb_height = in_flight.fdc.mb_height;
+        let total_blocks = (mb_width * mb_height * 16) as usize;
 
-            // Extract MV info from the frame decode context
+        // Extract MV info from the frame decode context
+        let (mv_info, ref_info, mv_info_l1, ref_info_l1, mb_intra) = {
+            let fdc = &in_flight.fdc;
             let mv_info = if fdc.mv_ctx.mv.len() == total_blocks {
                 fdc.mv_ctx.mv.clone()
             } else {
@@ -1055,188 +1113,189 @@ impl H264Decoder {
             }
 
             let mb_intra: Vec<bool> = fdc.mb_info.iter().map(|info| info.is_intra).collect();
+            (mv_info, ref_info, mv_info_l1, ref_info_l1, mb_intra)
+        };
 
-            // Store L0/L1 ref POCs for temporal direct mode mapping.
-            let ref_poc_l0: Vec<i32> = self
-                .ref_list_l0
-                .iter()
-                .filter_map(|&dpb_idx| self.dpb.get(dpb_idx).map(|e| e.poc))
-                .collect();
-            let ref_poc_l1: Vec<i32> = self
-                .ref_list_l1
-                .iter()
-                .filter_map(|&dpb_idx| self.dpb.get(dpb_idx).map(|e| e.poc))
-                .collect();
+        // Store L0/L1 ref POCs for temporal direct mode mapping.
+        let ref_poc_l0: Vec<i32> = in_flight
+            .ref_list_l0
+            .iter()
+            .filter_map(|&dpb_idx| self.dpb.get(dpb_idx).map(|e| e.poc))
+            .collect();
+        let ref_poc_l1: Vec<i32> = in_flight
+            .ref_list_l1
+            .iter()
+            .filter_map(|&dpb_idx| self.dpb.get(dpb_idx).map(|e| e.poc))
+            .collect();
 
-            let entry = DpbEntry {
-                pic: fdc.pic.into_shared(),
-                poc: self.current_poc,
-                frame_num: self.current_frame_num_h264,
-                status: RefStatus::Unused,
-                long_term_frame_idx: 0,
-                mv_info,
-                ref_info,
-                mv_info_l1,
-                ref_info_l1,
-                mb_intra,
-                needs_output: false,
-                ref_poc_l0,
-                ref_poc_l1,
-            };
+        let entry = DpbEntry {
+            pic: in_flight.fdc.pic.into_shared(),
+            poc: in_flight.poc,
+            frame_num: in_flight.frame_num_h264,
+            status: RefStatus::Unused,
+            long_term_frame_idx: 0,
+            mv_info,
+            ref_info,
+            mv_info_l1,
+            ref_info_l1,
+            mb_intra,
+            needs_output: false,
+            ref_poc_l0,
+            ref_poc_l1,
+        };
 
-            // Try to store in DPB; if full, remove oldest first
+        // Try to store in DPB; if full, remove oldest first
+        if self.dpb.is_full() {
+            self.dpb.remove_oldest_short_term();
+            // If still full, remove any unused entry
             if self.dpb.is_full() {
-                self.dpb.remove_oldest_short_term();
-                // If still full, remove any unused entry
-                if self.dpb.is_full() {
-                    for i in 0..self.dpb.entries.len() {
-                        if let Some(e) = &self.dpb.entries[i]
-                            && e.status == RefStatus::Unused
-                        {
-                            self.dpb.entries[i] = None;
-                            break;
-                        }
+                for i in 0..self.dpb.entries.len() {
+                    if let Some(e) = &self.dpb.entries[i]
+                        && e.status == RefStatus::Unused
+                    {
+                        self.dpb.entries[i] = None;
+                        break;
                     }
                 }
             }
+        }
 
-            let mut mmco_did_reset = false;
-            if let Some(dpb_idx) = self.dpb.store(entry) {
-                {
-                    let e = self.dpb.get(dpb_idx).unwrap();
-                    // SAFETY: Just stored — picture is complete (trace-only access).
-                    let pic = unsafe { e.pic.data() };
-                    tracing::trace!(
-                        internal_frame = self.frame_num,
-                        dpb_idx,
-                        h264_frame_num = e.frame_num,
-                        y_ptr = ?pic.y.as_ptr(),
-                        pixel_160_32 = pic.y[32 * pic.y_stride + 160],
-                        "DPB stored entry"
-                    );
-                }
-                // Apply reference picture marking
-                let (sps_max_refs, max_frame_num) = self
-                    .sps_list
-                    .iter()
-                    .find_map(|s| {
-                        s.as_ref()
-                            .map(|sps| (sps.max_num_ref_frames, 1u32 << sps.log2_max_frame_num))
-                    })
-                    .unwrap_or((4, 16));
-                mmco_did_reset = refs::mark_reference(
-                    &mut self.dpb,
-                    last_hdr,
-                    self.current_is_idr,
-                    self.current_frame_num_h264,
-                    max_frame_num,
-                    sps_max_refs,
-                    Some(dpb_idx),
-                );
-            }
-
-            // Log DPB summary for debugging tools (dpb_compare.py)
+        let mut mmco_did_reset = false;
+        if let Some(dpb_idx) = self.dpb.store(entry) {
             {
-                let st_fns: Vec<u32> = self
-                    .dpb
-                    .entries
-                    .iter()
-                    .filter_map(|e| {
-                        e.as_ref()
-                            .and_then(|e| (e.status == RefStatus::ShortTerm).then_some(e.frame_num))
-                    })
-                    .collect();
-                let lt_fns: Vec<u32> = self
-                    .dpb
-                    .entries
-                    .iter()
-                    .filter_map(|e| {
-                        e.as_ref().and_then(|e| {
-                            (e.status == RefStatus::LongTerm).then_some(e.long_term_frame_idx)
-                        })
-                    })
-                    .collect();
-                let st_pocs: Vec<i32> = self
-                    .dpb
-                    .entries
-                    .iter()
-                    .filter_map(|e| {
-                        e.as_ref()
-                            .and_then(|e| (e.status == RefStatus::ShortTerm).then_some(e.poc))
-                    })
-                    .collect();
-                debug!(
-                    frame_num = self.current_frame_num_h264,
-                    poc = self.current_poc,
-                    short_term_count = st_fns.len(),
-                    short_term_pocs = ?st_pocs,
-                    short_term_fns = ?st_fns,
-                    long_term_count = lt_fns.len(),
-                    long_term_indices = ?lt_fns,
-                    "DPB"
+                let e = self.dpb.get(dpb_idx).unwrap();
+                // SAFETY: Just stored — picture is complete (trace-only access).
+                let pic = unsafe { e.pic.data() };
+                tracing::trace!(
+                    internal_frame = self.frame_num,
+                    dpb_idx,
+                    h264_frame_num = e.frame_num,
+                    y_ptr = ?pic.y.as_ptr(),
+                    pixel_160_32 = pic.y[32 * pic.y_stride + 160],
+                    "DPB stored entry"
                 );
             }
+            // Apply reference picture marking
+            let (sps_max_refs, max_frame_num) = self
+                .sps_list
+                .iter()
+                .find_map(|s| {
+                    s.as_ref()
+                        .map(|sps| (sps.max_num_ref_frames, 1u32 << sps.log2_max_frame_num))
+                })
+                .unwrap_or((4, 16));
+            mmco_did_reset = refs::mark_reference(
+                &mut self.dpb,
+                &in_flight.last_hdr,
+                in_flight.is_idr,
+                in_flight.frame_num_h264,
+                max_frame_num,
+                sps_max_refs,
+                Some(dpb_idx),
+            );
+        }
 
-            // Update POC type 0 state for reference pictures only.
-            // Non-reference pictures (nal_ref_idc == 0, e.g. B-frames)
-            // do not update the POC state.
-            if self.current_nal_ref_idc > 0 {
-                let max_poc_lsb = self
-                    .sps_list
-                    .iter()
-                    .find_map(|s| s.as_ref().map(|sps| 1u32 << sps.log2_max_poc_lsb))
-                    .unwrap_or(16);
-                let poc_lsb = last_hdr.pic_order_cnt_lsb;
-                // Recompute poc_msb using the same logic as compute_poc_type0
-                if self.current_is_idr {
-                    self.prev_poc_msb = 0;
-                    self.prev_poc_lsb = 0;
-                } else {
-                    let poc_msb = if poc_lsb < self.prev_poc_lsb
-                        && (self.prev_poc_lsb.wrapping_sub(poc_lsb)) >= max_poc_lsb / 2
-                    {
-                        self.prev_poc_msb + max_poc_lsb as i32
-                    } else if poc_lsb > self.prev_poc_lsb
-                        && (poc_lsb.wrapping_sub(self.prev_poc_lsb)) > max_poc_lsb / 2
-                    {
-                        self.prev_poc_msb - max_poc_lsb as i32
-                    } else {
-                        self.prev_poc_msb
-                    };
-                    self.prev_poc_msb = poc_msb;
-                    self.prev_poc_lsb = poc_lsb;
-                }
-            }
+        // Log DPB summary for debugging tools (dpb_compare.py)
+        {
+            let st_fns: Vec<u32> = self
+                .dpb
+                .entries
+                .iter()
+                .filter_map(|e| {
+                    e.as_ref()
+                        .and_then(|e| (e.status == RefStatus::ShortTerm).then_some(e.frame_num))
+                })
+                .collect();
+            let lt_fns: Vec<u32> = self
+                .dpb
+                .entries
+                .iter()
+                .filter_map(|e| {
+                    e.as_ref().and_then(|e| {
+                        (e.status == RefStatus::LongTerm).then_some(e.long_term_frame_idx)
+                    })
+                })
+                .collect();
+            let st_pocs: Vec<i32> = self
+                .dpb
+                .entries
+                .iter()
+                .filter_map(|e| {
+                    e.as_ref()
+                        .and_then(|e| (e.status == RefStatus::ShortTerm).then_some(e.poc))
+                })
+                .collect();
+            debug!(
+                frame_num = in_flight.frame_num_h264,
+                poc = in_flight.poc,
+                short_term_count = st_fns.len(),
+                short_term_pocs = ?st_pocs,
+                short_term_fns = ?st_fns,
+                long_term_count = lt_fns.len(),
+                long_term_indices = ?lt_fns,
+                "DPB"
+            );
+        }
 
-            // Update POC type 1/2 state: frame_num_offset persists across
-            // all frames (not just references).
-            self.prev_frame_num_offset = self.frame_num_offset;
-            self.prev_frame_num_h264 = self.current_frame_num_h264;
-
-            // MMCO-5 (Reset) resets frame_num to 0 and frame_num_offset.
-            // Must happen AFTER the normal prev_frame_num/POC update above,
-            // so the reset overrides the normal assignments.
-            //
-            // Spec 8.2.1.1: after MMCO-5, prevPicOrderCntMsb = 0 and
-            // prevPicOrderCntLsb = TopFieldOrderCnt (which is 0 for frames
-            // after MMCO-5 resets PicOrderCnt).
-            // Spec 8.2.1.2/8.2.1.3: after MMCO-5, prevFrameNumOffset = 0.
-            // Reference: FFmpeg h264_slice.c — MMCO-5 resets poc_msb/poc_lsb
-            // inside ff_h264_execute_ref_pic_marking BEFORE the prev_poc
-            // assignments, so prev_poc_msb and prev_poc_lsb end up as 0.
-            if mmco_did_reset {
-                debug!(
-                    h264_fn = self.current_frame_num_h264,
-                    "MMCO-5 reset: prev_frame_num/poc/offset → 0"
-                );
-                self.prev_frame_num_h264 = 0;
+        // Update POC type 0 state for reference pictures only.
+        // Non-reference pictures (nal_ref_idc == 0, e.g. B-frames)
+        // do not update the POC state.
+        if in_flight.nal_ref_idc > 0 {
+            let max_poc_lsb = self
+                .sps_list
+                .iter()
+                .find_map(|s| s.as_ref().map(|sps| 1u32 << sps.log2_max_poc_lsb))
+                .unwrap_or(16);
+            let poc_lsb = in_flight.last_hdr.pic_order_cnt_lsb;
+            // Recompute poc_msb using the same logic as compute_poc_type0
+            if in_flight.is_idr {
                 self.prev_poc_msb = 0;
                 self.prev_poc_lsb = 0;
-                self.prev_frame_num_offset = 0;
+            } else {
+                let poc_msb = if poc_lsb < self.prev_poc_lsb
+                    && (self.prev_poc_lsb.wrapping_sub(poc_lsb)) >= max_poc_lsb / 2
+                {
+                    self.prev_poc_msb + max_poc_lsb as i32
+                } else if poc_lsb > self.prev_poc_lsb
+                    && (poc_lsb.wrapping_sub(self.prev_poc_lsb)) > max_poc_lsb / 2
+                {
+                    self.prev_poc_msb - max_poc_lsb as i32
+                } else {
+                    self.prev_poc_msb
+                };
+                self.prev_poc_msb = poc_msb;
+                self.prev_poc_lsb = poc_lsb;
             }
-
-            self.frame_num += 1;
         }
+
+        // Update POC type 1/2 state: frame_num_offset persists across
+        // all frames (not just references).
+        self.prev_frame_num_offset = self.frame_num_offset;
+        self.prev_frame_num_h264 = in_flight.frame_num_h264;
+
+        // MMCO-5 (Reset) resets frame_num to 0 and frame_num_offset.
+        // Must happen AFTER the normal prev_frame_num/POC update above,
+        // so the reset overrides the normal assignments.
+        //
+        // Spec 8.2.1.1: after MMCO-5, prevPicOrderCntMsb = 0 and
+        // prevPicOrderCntLsb = TopFieldOrderCnt (which is 0 for frames
+        // after MMCO-5 resets PicOrderCnt).
+        // Spec 8.2.1.2/8.2.1.3: after MMCO-5, prevFrameNumOffset = 0.
+        // Reference: FFmpeg h264_slice.c — MMCO-5 resets poc_msb/poc_lsb
+        // inside ff_h264_execute_ref_pic_marking BEFORE the prev_poc
+        // assignments, so prev_poc_msb and prev_poc_lsb end up as 0.
+        if mmco_did_reset {
+            debug!(
+                h264_fn = in_flight.frame_num_h264,
+                "MMCO-5 reset: prev_frame_num/poc/offset → 0"
+            );
+            self.prev_frame_num_h264 = 0;
+            self.prev_poc_msb = 0;
+            self.prev_poc_lsb = 0;
+            self.prev_frame_num_offset = 0;
+        }
+
+        self.frame_num += 1;
     }
 
     /// Decode a slice into a FrameDecodeContext.
@@ -2382,8 +2441,9 @@ impl Decoder for H264Decoder {
             }
             None => {
                 // Drain mode: no more packets will be sent.
-                // Flush any in-progress frame.
+                // Flush any in-progress or in-flight frame.
                 self.finish_current_frame();
+                self.join_in_flight();
 
                 // Flush all remaining delayed_pics using barrier-aware
                 // min-POC search, matching FFmpeg's send_next_delayed_frame()
