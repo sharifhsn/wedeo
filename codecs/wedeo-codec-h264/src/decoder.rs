@@ -115,19 +115,20 @@ pub struct H264Decoder {
     /// The bool flag is `mmco_reset` — set when MMCO-5 or out_of_order==16
     /// causes a POC sequence restart. Acts as a barrier in min-POC search.
     delayed_pics: Vec<(i32, Frame, bool)>, // (poc, frame, mmco_reset)
-    /// In-flight frame decode (background thread result awaiting join).
-    /// Boxed to avoid stack overflow — FrameDecodeContext is large.
-    in_flight: Option<Box<InFlightDecode>>,
+    /// In-flight deblock thread. The thread runs deblock + mark_complete,
+    /// then returns the Box<InFlightDecode> for DPB store on the main thread.
+    in_flight: Option<std::thread::JoinHandle<Box<InFlightDecode>>>,
 }
 
 // ---------------------------------------------------------------------------
 // Frame-level threading types
 // ---------------------------------------------------------------------------
 
-/// Metadata for a frame whose decode+deblock is complete but whose
-/// DPB store and output buffering haven't happened yet.
+/// Metadata for a frame whose decode is complete and whose deblock
+/// may be running on a background thread. After the thread joins,
+/// `complete_in_flight` handles DPB store and output buffering.
 struct InFlightDecode {
-    /// Completed frame decode context (after decode + deblock).
+    /// Frame decode context (deblock runs on this in the background thread).
     fdc: FrameDecodeContext,
     /// POC of this picture.
     poc: i32,
@@ -899,11 +900,18 @@ impl H264Decoder {
         Ok(())
     }
 
-    /// Flush a completed frame: package as InFlightDecode, then complete it.
+    /// Flush a completed frame: join any previous in-flight, then spawn
+    /// a deblock thread for this frame. Reference frames join immediately
+    /// (DPB must be updated before the next frame's ref list build).
+    /// Non-reference frames defer the join so deblock overlaps next decode.
     fn finish_current_frame(&mut self) {
         if let (Some(fdc), Some(last_hdr)) = (self.current_fdc.take(), self.current_last_hdr.take())
         {
-            let in_flight = Box::new(InFlightDecode {
+            // 1. Join previous in-flight (serializes DPB access)
+            self.join_in_flight();
+
+            // 2. Package — Box BEFORE spawn to avoid stack overflow
+            let boxed = Box::new(InFlightDecode {
                 fdc,
                 poc: self.current_poc,
                 frame_num_h264: self.current_frame_num_h264,
@@ -913,14 +921,41 @@ impl H264Decoder {
                 ref_list_l0: self.ref_list_l0.clone(),
                 ref_list_l1: self.ref_list_l1.clone(),
             });
-            self.complete_in_flight(in_flight);
+
+            // 3. Spawn deblock thread
+            let handle = std::thread::spawn(move || {
+                let mut b = boxed;
+                Self::deblock_fdc(&mut b.fdc);
+                b
+            });
+
+            self.in_flight = Some(handle);
+
+            // 4. Reference frames: join immediately so DPB is updated
+            //    before the next frame's ref list build.
+            if self.current_nal_ref_idc > 0 || self.current_is_idr {
+                trace!(
+                    poc = self.current_poc,
+                    "ref frame — joining deblock immediately"
+                );
+                self.join_in_flight();
+            } else {
+                trace!(
+                    poc = self.current_poc,
+                    "non-ref frame — deferring deblock join"
+                );
+            }
         }
     }
 
-    /// Join any pending in-flight decode and complete its DPB store + output.
+    /// Join any pending in-flight deblock thread and complete its DPB store + output.
     fn join_in_flight(&mut self) {
-        if let Some(in_flight) = self.in_flight.take() {
-            self.complete_in_flight(in_flight);
+        if let Some(handle) = self.in_flight.take() {
+            trace!("joining deblock thread");
+            match handle.join() {
+                Ok(in_flight) => self.complete_in_flight(in_flight),
+                Err(e) => warn!("deblock thread panicked: {:?}", e),
+            }
         }
     }
 
@@ -2275,28 +2310,23 @@ impl H264Decoder {
         Ok(mbs_decoded)
     }
 
-    /// Convert a completed FrameDecodeContext to a Frame.
-    fn fdc_to_frame(&self, fdc: &mut FrameDecodeContext, hdr: &SliceHeader, pts: i64) -> Frame {
+    /// Run deblocking filter and mark picture as complete.
+    /// Static method (no `&self`) — callable from a background thread.
+    fn deblock_fdc(fdc: &mut FrameDecodeContext) {
         if std::env::var("WEDEO_NO_DEBLOCK").is_err() {
-            // Determine MBAFF from the SPS referenced by this slice's PPS.
-            let is_mbaff = self.pps_list[hdr.pps_id as usize]
-                .as_ref()
-                .and_then(|pps| self.sps_list[pps.sps_id as usize].as_ref())
-                .is_some_and(|sps| !sps.frame_mbs_only_flag);
-
             deblock::deblock_frame(
                 &mut fdc.pic,
                 &fdc.mb_info,
                 &fdc.slice_table,
                 &fdc.slice_deblock_params,
-                is_mbaff,
+                fdc.is_mbaff,
             );
         }
-
-        // Mark picture as fully complete (decoded + deblocked).
-        // In frame-threaded mode, this unblocks any threads waiting for this picture.
         fdc.pic.mark_complete();
+    }
 
+    /// Convert a deblocked FrameDecodeContext to a Frame (pixel copy only).
+    fn fdc_to_frame(&self, fdc: &mut FrameDecodeContext, hdr: &SliceHeader, pts: i64) -> Frame {
         // Convert PictureBuffer to Frame, applying SPS crop offsets.
         let width = self.width as usize;
         let height = self.height as usize;
@@ -2493,6 +2523,9 @@ impl Decoder for H264Decoder {
     }
 
     fn flush(&mut self) {
+        // Join any in-flight deblock thread before clearing state.
+        self.finish_current_frame();
+        self.join_in_flight();
         self.output_queue.clear();
         self.draining = false;
         self.frame_num = 0;
