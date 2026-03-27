@@ -1,6 +1,8 @@
-Licensed under either of
+Wedeo is a Rust rewrite of FFmpeg and is derived from FFmpeg source code.
 
-  Apache License, Version 2.0 (LICENSE-APACHE or http://www.apache.org/licenses/LICENSE-2.0)
-  MIT license (LICENSE-MIT or http://opensource.org/licenses/MIT)
+Licensed under the GNU Lesser General Public License version 2.1 or later
+(LGPL-2.1-or-later). See COPYING.LGPLv2.1 for the full license text.
 
-at your option.
+FFmpeg copyright holders are listed in the FFmpeg source tree. Wedeo's Rust
+translation does not claim independent copyright over the algorithms, logic,
+and structure derived from FFmpeg.

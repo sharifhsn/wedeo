@@ -2,7 +2,8 @@
 
 ## Project Overview
 
-Clean-room Rust rewrite of FFmpeg. **No bindgen, no c2rust, no FFI.** Pure Rust.
+Rust rewrite of FFmpeg, translated directly from FFmpeg's C source. **No bindgen,
+no c2rust, no FFI.** Pure Rust. Licensed under **LGPL-2.1-or-later** (same as FFmpeg).
 Verification target: **bit-for-bit output parity** with FFmpeg's FATE test suite.
 See `H264.md` for decoder architecture, module map, and conformance status.
 
