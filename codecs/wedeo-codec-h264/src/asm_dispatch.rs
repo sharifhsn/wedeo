@@ -271,12 +271,99 @@ pub fn mc_chroma_asm(
 }
 
 // ---------------------------------------------------------------------------
-// IDCT dispatch — deferred to Phase 2
+// IDCT dispatch
 // ---------------------------------------------------------------------------
 //
 // FFmpeg's NEON IDCT expects column-major (transposed) coefficients. Wedeo
-// stores row-major. The butterfly's >>1 truncation makes pass order significant
-// for bitexact results. Needs coefficient transposition or pass-order analysis
-// before enabling. IDCT is only ~5% of CPU, so MC is the priority.
+// stores row-major, so we transpose in-place before calling NEON.
 //
-// FFI declarations are in asm_ffi.rs, ready to wire when validated.
+// Rounding: The Rust scalar path adds +32 to block[0] then uses plain >>6.
+// The NEON path uses `srshr #6` = `(v + 32) >> 6` per element with NO +32
+// to block[0]. These are equivalent because +32 enters via the even butterfly
+// path (never hits >>1 truncation) and distributes uniformly to all outputs.
+// Therefore: do NOT add +32 before calling NEON.
+//
+// DC-only functions only read block[0], so layout is irrelevant — direct call.
+
+/// In-place transpose of a 4x4 coefficient matrix stored as [i16; 16].
+/// Swaps off-diagonal elements: (row, col) <-> (col, row).
+#[inline]
+fn transpose_4x4(coeffs: &mut [i16; 16]) {
+    for i in 0..4 {
+        for j in (i + 1)..4 {
+            coeffs.swap(i * 4 + j, j * 4 + i);
+        }
+    }
+}
+
+/// In-place transpose of an 8x8 coefficient matrix stored as [i16; 64].
+#[inline]
+fn transpose_8x8(coeffs: &mut [i16; 64]) {
+    for i in 0..8 {
+        for j in (i + 1)..8 {
+            coeffs.swap(i * 8 + j, j * 8 + i);
+        }
+    }
+}
+
+/// 4x4 DC-only IDCT via NEON. Only reads block[0], no transpose needed.
+#[inline]
+pub fn idct4x4_dc_add_asm(dst: &mut [u8], stride: usize, dc: &mut i16) {
+    // SAFETY: NEON dc_add only reads/writes [x1] (one i16). The `srshr #6`
+    // computes (dc + 32) >> 6, matching the scalar path. The function zeros
+    // block[0] via `strh w3=0, [x1]`.
+    unsafe {
+        asm_ffi::ff_h264_idct_dc_add_neon(
+            dst.as_mut_ptr(),
+            dc as *mut i16,
+            stride as i32,
+        );
+    }
+}
+
+/// 8x8 DC-only IDCT via NEON. Only reads block[0], no transpose needed.
+#[inline]
+pub fn idct8x8_dc_add_asm(dst: &mut [u8], stride: usize, dc: &mut i16) {
+    // SAFETY: Same as 4x4 dc_add — only touches [x1].
+    unsafe {
+        asm_ffi::ff_h264_idct8_dc_add_neon(
+            dst.as_mut_ptr(),
+            dc as *mut i16,
+            stride as i32,
+        );
+    }
+}
+
+/// 4x4 full IDCT via NEON with in-place transpose.
+///
+/// Transposes coefficients from row-major to column-major (what the NEON
+/// butterfly expects), then calls the assembly function. The NEON function
+/// handles rounding via `srshr #6` and zeros the coefficient block.
+#[inline]
+pub fn idct4x4_add_asm(dst: &mut [u8], stride: usize, coeffs: &mut [i16; 16]) {
+    transpose_4x4(coeffs);
+    // SAFETY: coeffs is a contiguous 32-byte block. The NEON function reads
+    // all 16 coefficients, performs the butterfly + srshr + add-to-dst, and
+    // zeros the block via st1 of zero vectors.
+    unsafe {
+        asm_ffi::ff_h264_idct_add_neon(
+            dst.as_mut_ptr(),
+            coeffs.as_mut_ptr(),
+            stride as i32,
+        );
+    }
+}
+
+/// 8x8 full IDCT via NEON with in-place transpose.
+#[inline]
+pub fn idct8x8_add_asm(dst: &mut [u8], stride: usize, coeffs: &mut [i16; 64]) {
+    transpose_8x8(coeffs);
+    // SAFETY: coeffs is a contiguous 128-byte block. Same guarantees as 4x4.
+    unsafe {
+        asm_ffi::ff_h264_idct8_add_neon(
+            dst.as_mut_ptr(),
+            coeffs.as_mut_ptr(),
+            stride as i32,
+        );
+    }
+}

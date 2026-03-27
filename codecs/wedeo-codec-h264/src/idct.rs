@@ -19,7 +19,14 @@
 /// Coefficients are stored in row-major order: `coeffs[y*4+x]`.
 ///
 /// Reference: FFmpeg `ff_h264_idct_add` in h264idct_template.c
+#[allow(unreachable_code)]
 pub fn idct4x4_add(dst: &mut [u8], stride: usize, coeffs: &mut [i16; 16]) {
+    #[cfg(has_asm)]
+    {
+        crate::asm_dispatch::idct4x4_add_asm(dst, stride, coeffs);
+        return;
+    }
+
     // Add rounding bias to DC coefficient (same as FFmpeg's block[0] += 1 << 5)
     coeffs[0] = coeffs[0].wrapping_add(32);
 
@@ -72,7 +79,14 @@ pub fn idct4x4_add(dst: &mut [u8], stride: usize, coeffs: &mut [i16; 16]) {
 /// the full butterfly computation.
 ///
 /// Reference: FFmpeg `ff_h264_idct_dc_add` in h264idct_template.c
+#[allow(unreachable_code)]
 pub fn idct4x4_dc_add(dst: &mut [u8], stride: usize, dc: &mut i16) {
+    #[cfg(has_asm)]
+    {
+        crate::asm_dispatch::idct4x4_dc_add_asm(dst, stride, dc);
+        return;
+    }
+
     let val = (*dc as i32 + 32) >> 6;
     *dc = 0;
 
@@ -96,7 +110,14 @@ pub fn idct4x4_dc_add(dst: &mut [u8], stride: usize, dc: &mut i16) {
 /// swap is required (same approach as the 4x4 IDCT).
 ///
 /// Reference: FFmpeg `ff_h264_idct8_add` in h264idct_template.c
+#[allow(unreachable_code)]
 pub fn idct8x8_add(dst: &mut [u8], stride: usize, coeffs: &mut [i16; 64]) {
+    #[cfg(has_asm)]
+    {
+        crate::asm_dispatch::idct8x8_add_asm(dst, stride, coeffs);
+        return;
+    }
+
     // Add rounding bias
     coeffs[0] = coeffs[0].wrapping_add(32);
 
@@ -202,7 +223,14 @@ pub fn idct8x8_add(dst: &mut [u8], stride: usize, coeffs: &mut [i16; 64]) {
 /// DC-only 8x8 IDCT shortcut: add `(dc + 32) >> 6` to all 64 pixels.
 ///
 /// Reference: FFmpeg `ff_h264_idct8_dc_add` in h264idct_template.c
+#[allow(unreachable_code)]
 pub fn idct8x8_dc_add(dst: &mut [u8], stride: usize, dc: &mut i16) {
+    #[cfg(has_asm)]
+    {
+        crate::asm_dispatch::idct8x8_dc_add_asm(dst, stride, dc);
+        return;
+    }
+
     let val = (*dc as i32 + 32) >> 6;
     *dc = 0;
 

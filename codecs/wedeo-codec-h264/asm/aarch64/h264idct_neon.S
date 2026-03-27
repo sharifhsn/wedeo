@@ -102,93 +102,9 @@ function ff_h264_idct_dc_add_neon, export=1
         ret
 endfunc
 
-function ff_h264_idct_add16_neon, export=1
-        mov             x12, x30
-        mov             x6,  x0         // dest
-        mov             x5,  x1         // block_offset
-        mov             x1,  x2         // block
-        mov             w9,  w3         // stride
-        movrel          x7,  scan8
-        mov             x10, #16
-        movrel          x13, .L_ff_h264_idct_dc_add_neon
-        movrel          x14, .L_ff_h264_idct_add_neon
-1:      mov             w2,  w9
-        ldrb            w3,  [x7], #1
-        ldrsw           x0,  [x5], #4
-        ldrb            w3,  [x4,  w3,  uxtw]
-        subs            w3,  w3,  #1
-        b.lt            2f
-        ldrsh           w3,  [x1]
-        add             x0,  x0,  x6
-        ccmp            w3,  #0,  #4,  eq
-        csel            x15, x13, x14, ne
-        blr             x15
-2:      subs            x10, x10, #1
-        add             x1,  x1,  #32
-        b.ne            1b
-        ret             x12
-endfunc
-
-function ff_h264_idct_add16intra_neon, export=1
-        mov             x12, x30
-        mov             x6,  x0         // dest
-        mov             x5,  x1         // block_offset
-        mov             x1,  x2         // block
-        mov             w9,  w3         // stride
-        movrel          x7,  scan8
-        mov             x10, #16
-        movrel          x13, .L_ff_h264_idct_dc_add_neon
-        movrel          x14, .L_ff_h264_idct_add_neon
-1:      mov             w2,  w9
-        ldrb            w3,  [x7], #1
-        ldrsw           x0,  [x5], #4
-        ldrb            w3,  [x4,  w3,  uxtw]
-        add             x0,  x0,  x6
-        cmp             w3,  #0
-        ldrsh           w3,  [x1]
-        csel            x15, x13, x14, eq
-        ccmp            w3,  #0,  #0,  eq
-        b.eq            2f
-        blr             x15
-2:      subs            x10, x10, #1
-        add             x1,  x1,  #32
-        b.ne            1b
-        ret             x12
-endfunc
-
-function ff_h264_idct_add8_neon, export=1
-        stp             x19, x20, [sp, #-0x40]!
-        mov             x12, x30
-        ldp             x6,  x15, [x0]          // dest[0], dest[1]
-        add             x5,  x1,  #16*4         // block_offset
-        add             x9,  x2,  #16*32        // block
-        mov             w19, w3                 // stride
-        movrel          x13, .L_ff_h264_idct_dc_add_neon
-        movrel          x14, .L_ff_h264_idct_add_neon
-        movrel          x7,  scan8, 16
-        mov             x10, #0
-        mov             x11, #16
-1:      mov             w2,  w19
-        ldrb            w3,  [x7, x10]          // scan8[i]
-        ldrsw           x0,  [x5, x10, lsl #2]  // block_offset[i]
-        ldrb            w3,  [x4, w3,  uxtw]    // nnzc[ scan8[i] ]
-        add             x0,  x0,  x6            // block_offset[i] + dst[j-1]
-        add             x1,  x9,  x10, lsl #5   // block + i * 16
-        cmp             w3,  #0
-        ldrsh           w3,  [x1]               // block[i*16]
-        csel            x20, x13, x14, eq
-        ccmp            w3,  #0,  #0,  eq
-        b.eq            2f
-        blr             x20
-2:      add             x10, x10, #1
-        cmp             x10, #4
-        csel            x10, x11, x10, eq     // mov x10, #16
-        csel            x6,  x15, x6,  eq
-        cmp             x10, #20
-        b.lt            1b
-        ldp             x19, x20, [sp], #0x40
-        ret             x12
-endfunc
+// Batch dispatch functions (add16, add16intra, add8) removed — they use
+// movrel with local labels (scan8, .L_*) which generates text relocations
+// on macOS. Wedeo calls individual IDCT functions directly.
 
 .macro  idct8x8_cols    pass
   .if \pass == 0
@@ -373,43 +289,4 @@ function ff_h264_idct8_dc_add_neon, export=1
         ret
 endfunc
 
-function ff_h264_idct8_add4_neon, export=1
-        mov             x12, x30
-        mov             x6,  x0
-        mov             x5,  x1
-        mov             x1,  x2
-        mov             w2,  w3
-        movrel          x7,  scan8
-        mov             w10, #16
-        movrel          x13, .L_ff_h264_idct8_dc_add_neon
-        movrel          x14, .L_ff_h264_idct8_add_neon
-1:      ldrb            w9,  [x7], #4
-        ldrsw           x0,  [x5], #16
-        ldrb            w9,  [x4, w9, uxtw]
-        subs            w9,  w9,  #1
-        b.lt            2f
-        ldrsh           w11,  [x1]
-        add             x0,  x6,  x0
-        ccmp            w11, #0,  #4,  eq
-        csel            x15, x13, x14, ne
-        blr             x15
-2:      subs            w10, w10, #4
-        add             x1,  x1,  #128
-        b.ne            1b
-        ret             x12
-endfunc
-
-const   scan8
-        .byte           4+ 1*8, 5+ 1*8, 4+ 2*8, 5+ 2*8
-        .byte           6+ 1*8, 7+ 1*8, 6+ 2*8, 7+ 2*8
-        .byte           4+ 3*8, 5+ 3*8, 4+ 4*8, 5+ 4*8
-        .byte           6+ 3*8, 7+ 3*8, 6+ 4*8, 7+ 4*8
-        .byte           4+ 6*8, 5+ 6*8, 4+ 7*8, 5+ 7*8
-        .byte           6+ 6*8, 7+ 6*8, 6+ 7*8, 7+ 7*8
-        .byte           4+ 8*8, 5+ 8*8, 4+ 9*8, 5+ 9*8
-        .byte           6+ 8*8, 7+ 8*8, 6+ 9*8, 7+ 9*8
-        .byte           4+11*8, 5+11*8, 4+12*8, 5+12*8
-        .byte           6+11*8, 7+11*8, 6+12*8, 7+12*8
-        .byte           4+13*8, 5+13*8, 4+14*8, 5+14*8
-        .byte           6+13*8, 7+13*8, 6+14*8, 7+14*8
-endconst
+// ff_h264_idct8_add4_neon and scan8 table removed (same text-relocation issue).
