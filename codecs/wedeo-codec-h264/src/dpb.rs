@@ -116,6 +116,67 @@ impl Dpb {
         }
     }
 
+    /// Store a placeholder entry for a frame that is about to be decoded.
+    ///
+    /// The placeholder has status=Unused and empty MV/ref data, but holds
+    /// an `Arc<SharedPicture>` with `row_progress = -1`. Later frames can
+    /// find this picture in ref lists; MC will `wait_for_row()` until the
+    /// needed rows are decoded.
+    ///
+    /// Returns the DPB slot index, or `None` if no free slot is available.
+    pub fn store_placeholder(
+        &mut self,
+        pic: Arc<SharedPicture>,
+        poc: i32,
+        frame_num: u32,
+    ) -> Option<usize> {
+        let total_blocks =
+            (pic.mb_height() as usize) * (unsafe { pic.data() }.mb_width as usize) * 16;
+        let entry = DpbEntry {
+            pic,
+            poc,
+            frame_num,
+            status: RefStatus::Unused,
+            long_term_frame_idx: 0,
+            mv_info: vec![[0i16; 2]; total_blocks],
+            ref_info: vec![-1i8; total_blocks],
+            mv_info_l1: vec![[0i16; 2]; total_blocks],
+            ref_info_l1: vec![-1i8; total_blocks],
+            mb_intra: Vec::new(),
+            needs_output: false,
+            ref_poc_l0: Vec::new(),
+            ref_poc_l1: Vec::new(),
+        };
+        self.store(entry)
+    }
+
+    /// Finalize a placeholder entry after decode is complete.
+    ///
+    /// Fills in MV data, reference info, and sets the reference status.
+    /// Called from `complete_in_flight` instead of `store()`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn finalize_entry(
+        &mut self,
+        idx: usize,
+        mv_info: Vec<[i16; 2]>,
+        ref_info: Vec<i8>,
+        mv_info_l1: Vec<[i16; 2]>,
+        ref_info_l1: Vec<i8>,
+        mb_intra: Vec<bool>,
+        ref_poc_l0: Vec<i32>,
+        ref_poc_l1: Vec<i32>,
+    ) {
+        if let Some(entry) = self.get_mut(idx) {
+            entry.mv_info = mv_info;
+            entry.ref_info = ref_info;
+            entry.mv_info_l1 = mv_info_l1;
+            entry.ref_info_l1 = ref_info_l1;
+            entry.mb_intra = mb_intra;
+            entry.ref_poc_l0 = ref_poc_l0;
+            entry.ref_poc_l1 = ref_poc_l1;
+        }
+    }
+
     /// Get a reference picture by DPB index.
     pub fn get(&self, idx: usize) -> Option<&DpbEntry> {
         self.entries.get(idx).and_then(|e| e.as_ref())

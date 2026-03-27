@@ -5,6 +5,8 @@
 //
 // Reference: FFmpeg libavcodec/h264_mb.c, h264_slice.c
 
+use std::sync::Arc;
+
 use tracing::{debug, trace};
 use wedeo_codec::bitstream::BitReadBE;
 use wedeo_core::error::Result;
@@ -1002,8 +1004,8 @@ pub fn decode_macroblock(
     pps: &Pps,
     mb_x: u32,
     mb_y: u32,
-    ref_pics: &[&SharedPicture],
-    ref_pics_l1: &[&SharedPicture],
+    ref_pics: &[Arc<SharedPicture>],
+    ref_pics_l1: &[Arc<SharedPicture>],
 ) -> Result<()> {
     // 1. Parse macroblock syntax via CAVLC
     let mut mb = decode_mb_cavlc(
@@ -1049,8 +1051,8 @@ pub fn apply_macroblock(
     pps: &Pps,
     mb_x: u32,
     mb_y: u32,
-    ref_pics: &[&SharedPicture],
-    ref_pics_l1: &[&SharedPicture],
+    ref_pics: &[Arc<SharedPicture>],
+    ref_pics_l1: &[Arc<SharedPicture>],
 ) -> Result<()> {
     let mb_idx = (mb_y * ctx.mb_width + mb_x) as usize;
 
@@ -1307,8 +1309,8 @@ fn decode_inter_mb(
     mb_y: u32,
     qp: u8,
     chroma_qp: [u8; 2],
-    ref_pics: &[&SharedPicture],
-    ref_pics_l1: &[&SharedPicture],
+    ref_pics: &[Arc<SharedPicture>],
+    ref_pics_l1: &[Arc<SharedPicture>],
 ) {
     // Dispatch B-frame inter MBs to dedicated handler
     if slice_hdr.slice_type.is_b() {
@@ -1376,7 +1378,7 @@ fn decode_inter_mb(
             ];
             trace!(mb_x, mb_y, mvp = ?mvp, mvd = ?mb.mvd_l0[0], mv = ?mv, "16x16 MV");
 
-            let ref_pic = ref_pics[ref_idx.min(ref_pics.len() - 1)];
+            let ref_pic = &ref_pics[ref_idx.min(ref_pics.len() - 1)];
             apply_mc_partition(ctx, ref_pic, mb_x, mb_y, 0, 0, 16, 16, mv);
             if slice_hdr.use_weight || slice_hdr.use_weight_chroma {
                 apply_weight_p(ctx, slice_hdr, mb_x, mb_y, 0, 0, 16, 16, ref_idx);
@@ -1427,7 +1429,7 @@ fn decode_inter_mb(
 
                 trace!(mb_x, mb_y, part, mvp = ?mvp, mvd = ?mb.mvd_l0[part as usize], mv = ?mv, ref_idx, "16x8 MV");
 
-                let ref_pic = ref_pics[ref_idx.min(ref_pics.len() - 1)];
+                let ref_pic = &ref_pics[ref_idx.min(ref_pics.len() - 1)];
                 apply_mc_partition(ctx, ref_pic, mb_x, mb_y, 0, blk_y * 4, 16, 8, mv);
                 if slice_hdr.use_weight || slice_hdr.use_weight_chroma {
                     apply_weight_p(ctx, slice_hdr, mb_x, mb_y, 0, blk_y * 4, 16, 8, ref_idx);
@@ -1474,7 +1476,7 @@ fn decode_inter_mb(
                     mvp[1].wrapping_add(mb.mvd_l0[part as usize][1]),
                 ];
 
-                let ref_pic = ref_pics[ref_idx.min(ref_pics.len() - 1)];
+                let ref_pic = &ref_pics[ref_idx.min(ref_pics.len() - 1)];
                 apply_mc_partition(ctx, ref_pic, mb_x, mb_y, blk_x * 4, 0, 8, 16, mv);
                 if slice_hdr.use_weight || slice_hdr.use_weight_chroma {
                     apply_weight_p(ctx, slice_hdr, mb_x, mb_y, blk_x * 4, 0, 8, 16, ref_idx);
@@ -1540,7 +1542,7 @@ fn decode_inter_mb(
                         ];
                         trace!(mb_x, mb_y, i8x8, mvp = ?mvp, mvd = ?mb.mvd_l0[mvd_idx], mv = ?mv, "P_8x8 MV");
 
-                        let ref_pic = ref_pics[ref_idx.min(ref_pics.len() - 1)];
+                        let ref_pic = &ref_pics[ref_idx.min(ref_pics.len() - 1)];
                         apply_mc_partition(
                             ctx,
                             ref_pic,
@@ -1614,7 +1616,7 @@ fn decode_inter_mb(
                                 mv_c = ?n.mv_c, ref_c = n.ref_c, c_avail = n.c_avail,
                                 mvp = ?mvp, mvd = ?mb.mvd_l0[mvd_idx], mv = ?mv, "P_8x4 MV");
 
-                            let ref_pic = ref_pics[ref_idx.min(ref_pics.len() - 1)];
+                            let ref_pic = &ref_pics[ref_idx.min(ref_pics.len() - 1)];
                             apply_mc_partition(
                                 ctx,
                                 ref_pic,
@@ -1687,7 +1689,7 @@ fn decode_inter_mb(
                                 mv_c = ?n.mv_c, ref_c = n.ref_c, c_avail = n.c_avail,
                                 mvp = ?mvp, mvd = ?mb.mvd_l0[mvd_idx], mv = ?mv, "P_4x8 MV");
 
-                            let ref_pic = ref_pics[ref_idx.min(ref_pics.len() - 1)];
+                            let ref_pic = &ref_pics[ref_idx.min(ref_pics.len() - 1)];
                             apply_mc_partition(
                                 ctx,
                                 ref_pic,
@@ -1756,7 +1758,7 @@ fn decode_inter_mb(
                                 mvp[1].wrapping_add(mb.mvd_l0[mvd_idx][1]),
                             ];
 
-                            let ref_pic = ref_pics[ref_idx.min(ref_pics.len() - 1)];
+                            let ref_pic = &ref_pics[ref_idx.min(ref_pics.len() - 1)];
                             apply_mc_partition(
                                 ctx,
                                 ref_pic,
@@ -2031,8 +2033,8 @@ pub fn decode_skip_mb(
     slice_hdr: &SliceHeader,
     mb_x: u32,
     mb_y: u32,
-    ref_pics: &[&SharedPicture],
-    _ref_pics_l1: &[&SharedPicture],
+    ref_pics: &[Arc<SharedPicture>],
+    _ref_pics_l1: &[Arc<SharedPicture>],
 ) {
     if ref_pics.is_empty() {
         fill_mb_gray(ctx, mb_x, mb_y);
@@ -2063,7 +2065,7 @@ pub fn decode_skip_mb(
         trace!(mb_x, mb_y, mv = ?mv, "P_SKIP MV");
 
         // Apply motion compensation from ref_pics[0]
-        apply_mc_partition(ctx, ref_pics[0], mb_x, mb_y, 0, 0, 16, 16, mv);
+        apply_mc_partition(ctx, &ref_pics[0], mb_x, mb_y, 0, 0, 16, 16, mv);
         if slice_hdr.use_weight || slice_hdr.use_weight_chroma {
             apply_weight_p(ctx, slice_hdr, mb_x, mb_y, 0, 0, 16, 16, 0);
         }
@@ -2089,8 +2091,8 @@ pub fn decode_b_skip_mb(
     slice_hdr: &SliceHeader,
     mb_x: u32,
     mb_y: u32,
-    ref_pics: &[&SharedPicture],
-    ref_pics_l1: &[&SharedPicture],
+    ref_pics: &[Arc<SharedPicture>],
+    ref_pics_l1: &[Arc<SharedPicture>],
 ) {
     if ref_pics.is_empty() || ref_pics_l1.is_empty() {
         fill_mb_gray(ctx, mb_x, mb_y);
@@ -2132,7 +2134,7 @@ pub fn decode_b_skip_mb(
                     slice_hdr,
                 );
             } else if use_l0 {
-                let ref_pic = ref_pics[(ref_l0 as usize).min(ref_pics.len() - 1)];
+                let ref_pic = &ref_pics[(ref_l0 as usize).min(ref_pics.len() - 1)];
                 apply_mc_partition(ctx, ref_pic, mb_x, mb_y, px_x, px_y, 4, 4, mv_l0);
                 if slice_hdr.use_weight || slice_hdr.use_weight_chroma {
                     apply_weight_list(
@@ -2149,7 +2151,7 @@ pub fn decode_b_skip_mb(
                     );
                 }
             } else if use_l1 {
-                let ref_pic = ref_pics_l1[(ref_l1 as usize).min(ref_pics_l1.len() - 1)];
+                let ref_pic = &ref_pics_l1[(ref_l1 as usize).min(ref_pics_l1.len() - 1)];
                 apply_mc_partition(ctx, ref_pic, mb_x, mb_y, px_x, px_y, 4, 4, mv_l1);
                 if slice_hdr.use_weight || slice_hdr.use_weight_chroma {
                     apply_weight_list(
@@ -2189,8 +2191,8 @@ fn decode_b_inter_mb(
     mb_y: u32,
     qp: u8,
     chroma_qp: [u8; 2],
-    ref_pics: &[&SharedPicture],
-    ref_pics_l1: &[&SharedPicture],
+    ref_pics: &[Arc<SharedPicture>],
+    ref_pics_l1: &[Arc<SharedPicture>],
 ) {
     if ref_pics.is_empty() && ref_pics_l1.is_empty() {
         fill_mb_gray(ctx, mb_x, mb_y);
@@ -2239,7 +2241,7 @@ fn decode_b_inter_mb(
                     slice_hdr,
                 );
             } else if use_l0 {
-                let ref_pic = ref_pics[(ref_l0 as usize).min(ref_pics.len() - 1)];
+                let ref_pic = &ref_pics[(ref_l0 as usize).min(ref_pics.len() - 1)];
                 apply_mc_partition(ctx, ref_pic, mb_x, mb_y, px_x, px_y, 4, 4, mv_l0);
                 if slice_hdr.use_weight || slice_hdr.use_weight_chroma {
                     apply_weight_list(
@@ -2256,7 +2258,7 @@ fn decode_b_inter_mb(
                     );
                 }
             } else if use_l1 {
-                let ref_pic = ref_pics_l1[(ref_l1 as usize).min(ref_pics_l1.len() - 1)];
+                let ref_pic = &ref_pics_l1[(ref_l1 as usize).min(ref_pics_l1.len() - 1)];
                 apply_mc_partition(ctx, ref_pic, mb_x, mb_y, px_x, px_y, 4, 4, mv_l1);
                 if slice_hdr.use_weight || slice_hdr.use_weight_chroma {
                     apply_weight_list(
@@ -2451,7 +2453,7 @@ fn decode_b_inter_mb(
                     slice_hdr,
                 );
             } else if uses_l0 && !ref_pics.is_empty() {
-                let ref_pic = ref_pics[(ref_l0 as usize).min(ref_pics.len() - 1)];
+                let ref_pic = &ref_pics[(ref_l0 as usize).min(ref_pics.len() - 1)];
                 apply_mc_partition(ctx, ref_pic, mb_x, mb_y, px_x, px_y, pw, ph, mv_l0);
                 if slice_hdr.use_weight || slice_hdr.use_weight_chroma {
                     apply_weight_list(
@@ -2468,7 +2470,7 @@ fn decode_b_inter_mb(
                     );
                 }
             } else if uses_l1 && !ref_pics_l1.is_empty() {
-                let ref_pic = ref_pics_l1[(ref_l1 as usize).min(ref_pics_l1.len() - 1)];
+                let ref_pic = &ref_pics_l1[(ref_l1 as usize).min(ref_pics_l1.len() - 1)];
                 apply_mc_partition(ctx, ref_pic, mb_x, mb_y, px_x, px_y, pw, ph, mv_l1);
                 if slice_hdr.use_weight || slice_hdr.use_weight_chroma {
                     apply_weight_list(
@@ -2507,8 +2509,8 @@ fn decode_b_8x8_mb(
     slice_hdr: &SliceHeader,
     mb_x: u32,
     mb_y: u32,
-    ref_pics: &[&SharedPicture],
-    ref_pics_l1: &[&SharedPicture],
+    ref_pics: &[Arc<SharedPicture>],
+    ref_pics_l1: &[Arc<SharedPicture>],
 ) {
     use crate::tables::B_SUB_MB_TYPE_INFO;
 
@@ -2561,7 +2563,7 @@ fn decode_b_8x8_mb(
                             slice_hdr,
                         );
                     } else if use_l0 {
-                        let ref_pic = ref_pics[(ref_l0 as usize).min(ref_pics.len() - 1)];
+                        let ref_pic = &ref_pics[(ref_l0 as usize).min(ref_pics.len() - 1)];
                         apply_mc_partition(ctx, ref_pic, mb_x, mb_y, px_x, px_y, 4, 4, mv_l0);
                         if slice_hdr.use_weight || slice_hdr.use_weight_chroma {
                             apply_weight_list(
@@ -2578,7 +2580,7 @@ fn decode_b_8x8_mb(
                             );
                         }
                     } else if use_l1 {
-                        let ref_pic = ref_pics_l1[(ref_l1 as usize).min(ref_pics_l1.len() - 1)];
+                        let ref_pic = &ref_pics_l1[(ref_l1 as usize).min(ref_pics_l1.len() - 1)];
                         apply_mc_partition(ctx, ref_pic, mb_x, mb_y, px_x, px_y, 4, 4, mv_l1);
                         if slice_hdr.use_weight || slice_hdr.use_weight_chroma {
                             apply_weight_list(
@@ -2789,7 +2791,7 @@ fn decode_b_8x8_mb(
                         slice_hdr,
                     );
                 } else if uses_l0 && !ref_pics.is_empty() {
-                    let ref_pic = ref_pics[(ref_l0 as usize).min(ref_pics.len() - 1)];
+                    let ref_pic = &ref_pics[(ref_l0 as usize).min(ref_pics.len() - 1)];
                     apply_mc_partition(ctx, ref_pic, mb_x, mb_y, px_x, px_y, pw, ph, mv_l0);
                     if slice_hdr.use_weight || slice_hdr.use_weight_chroma {
                         apply_weight_list(
@@ -2806,7 +2808,7 @@ fn decode_b_8x8_mb(
                         );
                     }
                 } else if uses_l1 && !ref_pics_l1.is_empty() {
-                    let ref_pic = ref_pics_l1[(ref_l1 as usize).min(ref_pics_l1.len() - 1)];
+                    let ref_pic = &ref_pics_l1[(ref_l1 as usize).min(ref_pics_l1.len() - 1)];
                     apply_mc_partition(ctx, ref_pic, mb_x, mb_y, px_x, px_y, pw, ph, mv_l1);
                     if slice_hdr.use_weight || slice_hdr.use_weight_chroma {
                         apply_weight_list(
@@ -3445,8 +3447,8 @@ fn apply_weight_uni_at(
 #[allow(clippy::too_many_arguments)]
 fn apply_mc_bi_partition(
     ctx: &mut FrameDecodeContext,
-    ref_pics: &[&SharedPicture],
-    ref_pics_l1: &[&SharedPicture],
+    ref_pics: &[Arc<SharedPicture>],
+    ref_pics_l1: &[Arc<SharedPicture>],
     mb_x: u32,
     mb_y: u32,
     px_offset_x: u32,
@@ -3459,8 +3461,8 @@ fn apply_mc_bi_partition(
     ref_idx_l1: i8,
     slice_hdr: &SliceHeader,
 ) {
-    let ref_l0 = ref_pics[(ref_idx_l0.max(0) as usize).min(ref_pics.len() - 1)];
-    let ref_l1 = ref_pics_l1[(ref_idx_l1.max(0) as usize).min(ref_pics_l1.len() - 1)];
+    let ref_l0 = &ref_pics[(ref_idx_l0.max(0) as usize).min(ref_pics.len() - 1)];
+    let ref_l1 = &ref_pics_l1[(ref_idx_l1.max(0) as usize).min(ref_pics_l1.len() - 1)];
 
     // Await L1 reference progress (L0 is awaited inside apply_mc_partition)
     let dst_y_await = (mb_y * 16 + px_offset_y) as i32;

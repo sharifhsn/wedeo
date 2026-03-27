@@ -1769,6 +1769,60 @@ pub fn deblock_frame(
     });
 }
 
+/// Deblock a single MB row (progressive, non-MBAFF).
+///
+/// Calls `deblock_mb_if_enabled` for each MB in row `mb_y`.
+/// Used by inline deblock in the decode loop (per-row deblock with 1-row delay).
+pub fn deblock_row(
+    pic: &mut PictureBuffer,
+    mb_info: &[MbDeblockInfo],
+    slice_table: &[u16],
+    slice_params: &[SliceDeblockParams],
+    mb_y: u32,
+    mb_width: u32,
+) {
+    for mb_x in 0..mb_width {
+        deblock_mb_if_enabled(
+            pic,
+            mb_info,
+            mb_x,
+            mb_y,
+            mb_width,
+            slice_table,
+            slice_params,
+        );
+    }
+}
+
+/// Deblock a single MBAFF pair row (both top and bottom MB of the pair).
+///
+/// MBAFF uses column-first pair iteration: for each column, process top then
+/// bottom MB. `pair_row` is the pair index (0-based), so the MB rows are
+/// `pair_row * 2` and `pair_row * 2 + 1`.
+pub fn deblock_row_mbaff(
+    pic: &mut PictureBuffer,
+    mb_info: &[MbDeblockInfo],
+    slice_table: &[u16],
+    slice_params: &[SliceDeblockParams],
+    pair_row: u32,
+    mb_width: u32,
+) {
+    for mb_x in 0..mb_width {
+        for sub in 0..2u32 {
+            let mb_y = pair_row * 2 + sub;
+            deblock_mb_if_enabled(
+                pic,
+                mb_info,
+                mb_x,
+                mb_y,
+                mb_width,
+                slice_table,
+                slice_params,
+            );
+        }
+    }
+}
+
 /// Sequential deblocking fallback (MBAFF or single-threaded).
 fn deblock_frame_sequential(
     pic: &mut PictureBuffer,
@@ -2647,5 +2701,159 @@ mod tests {
         //     = 137 + clip3(-1, 1, (139 + 133)>>1 - 137)
         //     = 137 + clip3(-1, 1, 136 - 137) = 137 + (-1) = 136
         assert_eq!(new_q1, 136);
+    }
+
+    /// Create a multi-MB picture with non-trivial pixel data for deblock comparison.
+    /// 4x3 MBs (64x48 luma, 32x24 chroma) with gradient-like data.
+    fn make_pic_4x3() -> PictureBuffer {
+        let mb_w = 4u32;
+        let mb_h = 3u32;
+        let w = (mb_w * 16) as usize;
+        let h = (mb_h * 16) as usize;
+        let cw = (mb_w * 8) as usize;
+        let ch = (mb_h * 8) as usize;
+        let mut y = vec![128u8; w * h];
+        let mut u = vec![128u8; cw * ch];
+        let mut v = vec![128u8; cw * ch];
+        // Create variations across MB boundaries to exercise the filter.
+        for row in 0..h {
+            for col in 0..w {
+                y[row * w + col] = ((row * 7 + col * 13 + 50) % 256) as u8;
+            }
+        }
+        for row in 0..ch {
+            for col in 0..cw {
+                u[row * cw + col] = ((row * 11 + col * 5 + 80) % 256) as u8;
+                v[row * cw + col] = ((row * 3 + col * 9 + 120) % 256) as u8;
+            }
+        }
+        PictureBuffer {
+            y,
+            u,
+            v,
+            y_stride: w,
+            uv_stride: cw,
+            width: w as u32,
+            height: h as u32,
+            mb_width: mb_w,
+            mb_height: mb_h,
+        }
+    }
+
+    /// Build MB info and slice table for a uniform I-slice frame (all intra, single slice).
+    fn make_mb_info_intra(
+        mb_w: u32,
+        mb_h: u32,
+    ) -> (Vec<MbDeblockInfo>, Vec<u16>, Vec<SliceDeblockParams>) {
+        let total = (mb_w * mb_h) as usize;
+        let mb_info: Vec<MbDeblockInfo> = (0..total)
+            .map(|_| MbDeblockInfo {
+                qp: 28,
+                is_intra: true,
+                non_zero_count: [16; 24],
+                ..Default::default()
+            })
+            .collect();
+        let slice_table = vec![0u16; total];
+        let slice_params = vec![SliceDeblockParams {
+            alpha_c0_offset: 0,
+            beta_offset: 0,
+            disable_deblocking_filter_idc: 0,
+            chroma_qp_index_offset: [0, 0],
+        }];
+        (mb_info, slice_table, slice_params)
+    }
+
+    #[test]
+    fn deblock_row_matches_deblock_frame() {
+        let pic_frame = make_pic_4x3();
+        let mut pic_row = pic_frame.clone();
+        let mut pic_frame_mut = pic_frame;
+        let mb_w = pic_row.mb_width;
+        let mb_h = pic_row.mb_height;
+        let (mb_info, slice_table, slice_params) = make_mb_info_intra(mb_w, mb_h);
+
+        // Deblock whole frame
+        deblock_frame(
+            &mut pic_frame_mut,
+            &mb_info,
+            &slice_table,
+            &slice_params,
+            false,
+        );
+
+        // Deblock row by row
+        for mb_y in 0..mb_h {
+            deblock_row(
+                &mut pic_row,
+                &mb_info,
+                &slice_table,
+                &slice_params,
+                mb_y,
+                mb_w,
+            );
+        }
+
+        assert_eq!(
+            pic_row.y, pic_frame_mut.y,
+            "Y plane mismatch between deblock_row and deblock_frame"
+        );
+        assert_eq!(pic_row.u, pic_frame_mut.u, "U plane mismatch");
+        assert_eq!(pic_row.v, pic_frame_mut.v, "V plane mismatch");
+    }
+
+    #[test]
+    fn deblock_row_mbaff_matches_deblock_frame() {
+        // 4x4 MBs (2 pair rows) for MBAFF
+        let mb_w = 4u32;
+        let mb_h = 4u32;
+        let w = (mb_w * 16) as usize;
+        let h = (mb_h * 16) as usize;
+        let cw = (mb_w * 8) as usize;
+        let ch = (mb_h * 8) as usize;
+        let mut y = vec![128u8; w * h];
+        for row in 0..h {
+            for col in 0..w {
+                y[row * w + col] = ((row * 7 + col * 13 + 50) % 256) as u8;
+            }
+        }
+        let u = vec![128u8; cw * ch];
+        let v = vec![128u8; cw * ch];
+        let pic = PictureBuffer {
+            y,
+            u,
+            v,
+            y_stride: w,
+            uv_stride: cw,
+            width: w as u32,
+            height: h as u32,
+            mb_width: mb_w,
+            mb_height: mb_h,
+        };
+        let mut pic_frame = pic.clone();
+        let mut pic_row = pic;
+        let (mb_info, slice_table, slice_params) = make_mb_info_intra(mb_w, mb_h);
+
+        // Deblock whole frame (MBAFF)
+        deblock_frame(&mut pic_frame, &mb_info, &slice_table, &slice_params, true);
+
+        // Deblock pair row by pair row
+        for pair_row in 0..(mb_h / 2) {
+            deblock_row_mbaff(
+                &mut pic_row,
+                &mb_info,
+                &slice_table,
+                &slice_params,
+                pair_row,
+                mb_w,
+            );
+        }
+
+        assert_eq!(
+            pic_row.y, pic_frame.y,
+            "Y plane mismatch in MBAFF deblock_row"
+        );
+        assert_eq!(pic_row.u, pic_frame.u, "U plane mismatch in MBAFF");
+        assert_eq!(pic_row.v, pic_frame.v, "V plane mismatch in MBAFF");
     }
 }

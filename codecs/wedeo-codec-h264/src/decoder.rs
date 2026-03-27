@@ -61,12 +61,13 @@ pub struct H264Decoder {
     codec_descriptor: CodecDescriptor,
     /// In-progress frame decode context for multi-slice frames.
     current_fdc: Option<FrameDecodeContext>,
-    /// Total MBs decoded so far for the current frame.
-    current_mbs_decoded: u32,
-    /// Total MBs expected for the current frame.
-    current_total_mbs: u32,
     /// Last slice header for the current frame (for deblocking parameters).
     current_last_hdr: Option<SliceHeader>,
+    /// Buffered slices for the current frame (decoded on worker thread).
+    pending_slices: Vec<SliceWorkUnit>,
+    /// Queue of in-flight frame decode threads.
+    /// Non-ref B-frames accumulate here; ref frames trigger join-all.
+    in_flight_queue: VecDeque<InFlightFrame>,
     /// PTS of the current frame being decoded.
     current_pts: i64,
     /// Decoded Picture Buffer for reference picture management.
@@ -115,9 +116,9 @@ pub struct H264Decoder {
     /// The bool flag is `mmco_reset` — set when MMCO-5 or out_of_order==16
     /// causes a POC sequence restart. Acts as a barrier in min-POC search.
     delayed_pics: Vec<(i32, Frame, bool)>, // (poc, frame, mmco_reset)
-    /// In-flight deblock result. The rayon pool runs deblock + mark_complete,
-    /// then sends the Box<InFlightDecode> back for DPB store on the main thread.
-    in_flight: Option<std::sync::mpsc::Receiver<Box<InFlightDecode>>>,
+    /// DPB slot index for the current frame's placeholder entry (Phase 3).
+    /// Set when store_placeholder is called at frame start, consumed in complete_in_flight.
+    current_dpb_idx: Option<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -144,6 +145,121 @@ struct InFlightDecode {
     ref_list_l0: Vec<usize>,
     /// DPB indices for L1 reference list (for DPB ref_poc storage).
     ref_list_l1: Vec<usize>,
+    /// DPB slot index from store_placeholder (Phase 3).
+    dpb_idx: Option<usize>,
+}
+
+/// Per-slice snapshot of DPB-derived state + RBSP data for worker thread.
+///
+/// Each slice within a frame can have different ref lists (e.g., CABAST3 has
+/// alternating I/P slices). The main thread snapshots all DPB-derived state
+/// per-slice so the worker can apply each before decoding.
+struct SliceWorkUnit {
+    hdr: SliceHeader,
+    rbsp: Vec<u8>,
+    sps: Sps,
+    pps: Pps,
+    /// Owned Arc refs for MC (cross-thread safe).
+    ref_pics_l0: Vec<Arc<SharedPicture>>,
+    ref_pics_l1: Vec<Arc<SharedPicture>>,
+    /// Slice index for slice_table tracking.
+    slice_idx: u16,
+    /// Per-slice FDC state snapshot (from DPB).
+    cur_l0_ref_poc: Vec<i32>,
+    cur_l0_ref_dpb: Vec<usize>,
+    cur_l1_ref_poc: Vec<i32>,
+    cur_l1_ref_dpb: Vec<usize>,
+    col_mv: Vec<[i16; 2]>,
+    col_ref: Vec<i8>,
+    col_mv_l1: Vec<[i16; 2]>,
+    col_ref_l1: Vec<i8>,
+    col_mb_intra: Vec<bool>,
+    col_poc: i32,
+    col_l1_is_long_term: bool,
+    col_ref_poc_l0: Vec<i32>,
+    col_ref_poc_l1: Vec<i32>,
+    implicit_weight: Vec<Vec<i32>>,
+    cur_poc: i32,
+}
+
+/// Tracks an in-flight frame decode thread.
+struct InFlightFrame {
+    handle: std::thread::JoinHandle<Box<InFlightDecode>>,
+    /// Pre-computed output ordering data (from pre-dispatch state update).
+    frame_mmco_reset: bool,
+    out_of_order: usize,
+}
+
+// Compile-time check: types must be Send for cross-thread dispatch.
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<SliceWorkUnit>();
+    assert_send::<FrameDecodeContext>();
+};
+
+/// Inline deblock for a completed progressive MB row.
+///
+/// Deblocks the PREVIOUS row (Y-1), not the just-completed row (Y).
+/// This preserves intra prediction correctness: row Y's decode read
+/// pre-deblock pixels from row Y-1. It's now safe to deblock Y-1
+/// since no future decode will read its pre-deblock state.
+///
+/// After deblocking row Y-1, row Y-2 is finalized (row Y-1's top edge
+/// filter was the last write to row Y-2). So publish row Y-2.
+///
+/// When deblock is disabled: publish the completed row immediately.
+fn inline_deblock_row(
+    fdc: &mut FrameDecodeContext,
+    completed_row: u32,
+    mb_width: u32,
+    deblock_enabled: bool,
+) {
+    if deblock_enabled {
+        if completed_row > 0 {
+            deblock::deblock_row(
+                &mut fdc.pic,
+                &fdc.mb_info,
+                &fdc.slice_table,
+                &fdc.slice_deblock_params,
+                completed_row - 1,
+                mb_width,
+            );
+            if completed_row > 1 {
+                fdc.pic.publish_row((completed_row - 2) as i32);
+            }
+        }
+    } else {
+        fdc.pic.publish_row(completed_row as i32);
+    }
+}
+
+/// Inline deblock for a completed MBAFF pair row.
+///
+/// Same deferred-by-1 principle: deblocks the PREVIOUS pair row, then
+/// publishes the pair row before that.
+fn inline_deblock_pair_row(
+    fdc: &mut FrameDecodeContext,
+    pair_row: u32,
+    mb_width: u32,
+    deblock_enabled: bool,
+) {
+    if deblock_enabled {
+        if pair_row > 0 {
+            deblock::deblock_row_mbaff(
+                &mut fdc.pic,
+                &fdc.mb_info,
+                &fdc.slice_table,
+                &fdc.slice_deblock_params,
+                pair_row - 1,
+                mb_width,
+            );
+            if pair_row > 1 {
+                fdc.pic.publish_row(((pair_row - 1) * 2 - 1) as i32);
+            }
+        }
+    } else {
+        fdc.pic.publish_row((pair_row * 2 + 1) as i32);
+    }
 }
 
 /// Compute intra4x4 right-column modes as i8 for CABAC neighbor storage.
@@ -185,9 +301,9 @@ impl H264Decoder {
                 profiles: &[],
             },
             current_fdc: None,
-            current_mbs_decoded: 0,
-            current_total_mbs: 0,
             current_last_hdr: None,
+            pending_slices: Vec::new(),
+            in_flight_queue: VecDeque::new(),
             current_pts: 0,
             dpb: Dpb::new(16),
             ref_list_l0: Vec::new(),
@@ -208,7 +324,7 @@ impl H264Decoder {
             crop_top: 0,
             output_frame_counter: 0,
             delayed_pics: Vec::new(),
-            in_flight: None,
+            current_dpb_idx: None,
         };
 
         // Parse avcC extradata if present (MP4/NALFF format).
@@ -637,7 +753,6 @@ impl H264Decoder {
                     .clone()
                     .ok_or(Error::InvalidData)?;
 
-                let total_mbs = sps.mb_width * sps.mb_height;
                 let is_idr = nalu.nal_type == NalUnitType::Idr;
 
                 // Check if this starts a new frame
@@ -667,8 +782,6 @@ impl H264Decoder {
 
                     // Start new frame context
                     self.current_fdc = Some(FrameDecodeContext::new(&sps, &pps));
-                    self.current_mbs_decoded = 0;
-                    self.current_total_mbs = total_mbs;
                     self.current_pts = self.frame_num as i64;
                     self.current_is_idr = is_idr;
                     self.current_frame_num_h264 = hdr.frame_num;
@@ -701,6 +814,32 @@ impl H264Decoder {
                     } else {
                         // POC type 2
                         self.current_poc = self.compute_poc_type2(hdr.frame_num, nalu.nal_ref_idc);
+                    }
+
+                    // Early DPB insertion (Phase 3): store a placeholder so
+                    // later frames can find this picture in ref lists. MC will
+                    // wait_for_row() until the needed rows are decoded.
+                    if nalu.nal_ref_idc > 0 || is_idr {
+                        // Make room in DPB if needed
+                        if self.dpb.is_full() {
+                            self.dpb.remove_oldest_short_term();
+                            if self.dpb.is_full() {
+                                for i in 0..self.dpb.entries.len() {
+                                    if let Some(e) = &self.dpb.entries[i]
+                                        && e.status == RefStatus::Unused
+                                    {
+                                        self.dpb.entries[i] = None;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(ref fdc) = self.current_fdc {
+                            let shared = fdc.pic.shared().clone();
+                            self.current_dpb_idx =
+                                self.dpb
+                                    .store_placeholder(shared, self.current_poc, hdr.frame_num);
+                        }
                     }
                 }
 
@@ -739,8 +878,8 @@ impl H264Decoder {
                     self.ref_list_l1.clear();
                 }
 
-                // Decode this slice into the current frame context.
-                // Take the fdc temporarily to avoid borrow conflicts.
+                // Buffer this slice for worker thread decode.
+                // Take the fdc temporarily to avoid borrow conflicts with self.dpb.
                 if let Some(mut fdc) = self.current_fdc.take() {
                     // Track slice boundaries for neighbor availability.
                     // First slice (first_mb==0) starts at 0; continuations increment.
@@ -748,7 +887,8 @@ impl H264Decoder {
                         fdc.current_slice += 1;
                     }
 
-                    // Store per-slice deblocking parameters.
+                    // Store per-slice deblocking parameters on the FDC.
+                    // The worker thread uses these for inline deblock.
                     let slice_idx = fdc.current_slice as usize;
                     let slice_chroma_qp_offset = self.pps_list[hdr.pps_id as usize]
                         .as_ref()
@@ -765,21 +905,20 @@ impl H264Decoder {
                     };
 
                     // Build list of SharedPicture references for MC.
-                    // In single-threaded mode, all are PROGRESS_COMPLETE.
-                    // In frame-threaded mode, wait_for_row is called per-MB in MC.
-                    let ref_pic_list: Vec<&SharedPicture> = self
+                    let ref_pic_list: Vec<Arc<SharedPicture>> = self
                         .ref_list_l0
                         .iter()
-                        .filter_map(|&dpb_idx| self.dpb.get(dpb_idx).map(|e| e.pic.as_ref()))
+                        .filter_map(|&dpb_idx| self.dpb.get(dpb_idx).map(|e| Arc::clone(&e.pic)))
                         .collect();
-                    let ref_pic_list_l1: Vec<&SharedPicture> = self
+                    let ref_pic_list_l1: Vec<Arc<SharedPicture>> = self
                         .ref_list_l1
                         .iter()
-                        .filter_map(|&dpb_idx| self.dpb.get(dpb_idx).map(|e| e.pic.as_ref()))
+                        .filter_map(|&dpb_idx| self.dpb.get(dpb_idx).map(|e| Arc::clone(&e.pic)))
                         .collect();
 
-                    // Set L0/L1 ref POCs for deblocking ref-identity comparison
-                    // and temporal direct dist_scale_factor.
+                    // Set per-slice DPB-derived state on the FDC, then snapshot
+                    // into SliceWorkUnit. Use std::mem::take to move large vectors
+                    // (col_mv etc.) into the SliceWorkUnit without double-cloning.
                     if hdr.slice_type.is_p() || hdr.slice_type.is_b() {
                         fdc.cur_l0_ref_poc = self
                             .ref_list_l0
@@ -788,8 +927,6 @@ impl H264Decoder {
                             .collect();
                         fdc.cur_l0_ref_dpb = self.ref_list_l0.clone();
                     } else {
-                        // I-slice: clear ref POC/DPB to avoid stale data
-                        // from a previous P/B-slice in the same frame.
                         fdc.cur_l0_ref_poc.clear();
                         fdc.cur_l0_ref_dpb.clear();
                     }
@@ -831,10 +968,9 @@ impl H264Decoder {
                     if hdr.slice_type.is_p() || hdr.slice_type.is_b() {
                         for &dpb_idx in &self.ref_list_l0 {
                             if let Some(e) = self.dpb.get(dpb_idx) {
-                                // SAFETY: DPB pictures are PROGRESS_COMPLETE (trace-only access).
+                                // SAFETY: Ref frames are joined — PROGRESS_COMPLETE.
                                 let pic = unsafe { e.pic.data() };
                                 let s = pic.y_stride;
-                                // Sample pixels at y=128, x=155-165
                                 let row128: Vec<u8> = (155..166usize)
                                     .map(|x| {
                                         if 128 < pic.height as usize && x < pic.width as usize {
@@ -857,34 +993,37 @@ impl H264Decoder {
                         }
                     }
 
-                    match Self::decode_slice_into(
-                        &nalu.data,
-                        &hdr,
-                        &sps,
-                        &pps,
-                        &mut fdc,
-                        &ref_pic_list,
-                        &ref_pic_list_l1,
-                    ) {
-                        Ok(mbs) => {
-                            self.current_mbs_decoded += mbs;
-                            self.current_last_hdr = Some(hdr.clone());
-                            self.current_fdc = Some(fdc);
-                        }
-                        Err(e) => {
-                            warn!(
-                                first_mb = hdr.first_mb_in_slice,
-                                error = ?e,
-                                "slice decode failed"
-                            );
-                            self.current_fdc = Some(fdc);
-                        }
-                    }
-                }
+                    // Snapshot per-slice state into SliceWorkUnit.
+                    // Use take() for large vectors to avoid double-cloning:
+                    // DPB entry → FDC (clone), FDC → SliceWorkUnit (move).
+                    let cur_slice_idx = fdc.current_slice;
+                    self.pending_slices.push(SliceWorkUnit {
+                        hdr: hdr.clone(),
+                        rbsp: nalu.data.clone(),
+                        sps: sps.clone(),
+                        pps: pps.clone(),
+                        ref_pics_l0: ref_pic_list,
+                        ref_pics_l1: ref_pic_list_l1,
+                        slice_idx: cur_slice_idx,
+                        cur_l0_ref_poc: std::mem::take(&mut fdc.cur_l0_ref_poc),
+                        cur_l0_ref_dpb: std::mem::take(&mut fdc.cur_l0_ref_dpb),
+                        cur_l1_ref_poc: std::mem::take(&mut fdc.cur_l1_ref_poc),
+                        cur_l1_ref_dpb: std::mem::take(&mut fdc.cur_l1_ref_dpb),
+                        col_mv: std::mem::take(&mut fdc.col_mv),
+                        col_ref: std::mem::take(&mut fdc.col_ref),
+                        col_mv_l1: std::mem::take(&mut fdc.col_mv_l1),
+                        col_ref_l1: std::mem::take(&mut fdc.col_ref_l1),
+                        col_mb_intra: std::mem::take(&mut fdc.col_mb_intra),
+                        col_poc: fdc.col_poc,
+                        col_l1_is_long_term: fdc.col_l1_is_long_term,
+                        col_ref_poc_l0: std::mem::take(&mut fdc.col_ref_poc_l0),
+                        col_ref_poc_l1: std::mem::take(&mut fdc.col_ref_poc_l1),
+                        implicit_weight: std::mem::take(&mut fdc.implicit_weight),
+                        cur_poc: fdc.cur_poc,
+                    });
 
-                // Check if the frame is complete
-                if self.current_mbs_decoded >= self.current_total_mbs {
-                    self.finish_current_frame();
+                    self.current_last_hdr = Some(hdr.clone());
+                    self.current_fdc = Some(fdc);
                 }
             }
             // SEI, AUD, Filler, and other NAL types are silently ignored.
@@ -900,180 +1039,275 @@ impl H264Decoder {
         Ok(())
     }
 
-    /// Flush a completed frame: join any previous in-flight, then spawn
-    /// a deblock thread for this frame. Reference frames join immediately
-    /// (DPB must be updated before the next frame's ref list build).
-    /// Non-reference frames defer the join so deblock overlaps next decode.
+    /// Flush a completed frame: dispatch all buffered slices to a worker
+    /// thread, manage the in-flight queue, apply pre-dispatch state updates.
+    ///
+    /// Phase 6: the entire slice decode + last-row deblock + mark_complete
+    /// runs on a dedicated std::thread. Reference frames join immediately;
+    /// non-ref B-frames are deferred in in_flight_queue.
     fn finish_current_frame(&mut self) {
         if let (Some(fdc), Some(last_hdr)) = (self.current_fdc.take(), self.current_last_hdr.take())
         {
-            // 1. Join previous in-flight (serializes DPB access)
-            self.join_in_flight();
+            let slices = std::mem::take(&mut self.pending_slices);
+            if slices.is_empty() {
+                // No slices buffered — put FDC back
+                self.current_fdc = Some(fdc);
+                self.current_last_hdr = Some(last_hdr);
+                return;
+            }
 
-            // 2. Package — Box BEFORE spawn to avoid stack overflow
-            let boxed = Box::new(InFlightDecode {
-                fdc,
-                poc: self.current_poc,
-                frame_num_h264: self.current_frame_num_h264,
-                nal_ref_idc: self.current_nal_ref_idc,
-                is_idr: self.current_is_idr,
-                last_hdr,
-                ref_list_l0: self.ref_list_l0.clone(),
-                ref_list_l1: self.ref_list_l1.clone(),
+            let deblock_enabled = std::env::var("WEDEO_NO_DEBLOCK").is_err();
+            let poc = self.current_poc;
+            let frame_num_h264 = self.current_frame_num_h264;
+            let nal_ref_idc = self.current_nal_ref_idc;
+            let is_idr = self.current_is_idr;
+            let ref_list_l0 = self.ref_list_l0.clone();
+            let ref_list_l1 = self.ref_list_l1.clone();
+            let dpb_idx = self.current_dpb_idx.take();
+            let is_ref = nal_ref_idc > 0 || is_idr;
+
+            // === Pre-dispatch state updates ===
+            // These must happen before the next frame's process_nal to ensure
+            // correct POC computation, frame_num gap fill, and ref list build.
+
+            // IDR resets last_pocs
+            if is_idr {
+                self.last_pocs = [i64::MIN; 16];
+            }
+
+            let has_mmco5 = last_hdr.adaptive_ref_pic_marking
+                && last_hdr
+                    .mmco_ops
+                    .iter()
+                    .any(|op| matches!(op, crate::slice::MmcoOp::Reset));
+            if has_mmco5 {
+                self.last_pocs = [i64::MIN; 16];
+            }
+
+            // last_pocs update + out_of_order computation
+            let cur_poc_i64 = if has_mmco5 { 0i64 } else { poc as i64 };
+            let mut insert_pos = 0usize;
+            for i in 0..=16 {
+                if i == 16 || cur_poc_i64 < self.last_pocs[i] {
+                    if i > 0 {
+                        self.last_pocs[i - 1] = cur_poc_i64;
+                    }
+                    insert_pos = i;
+                    break;
+                } else if i > 0 {
+                    self.last_pocs[i - 1] = self.last_pocs[i];
+                }
+            }
+
+            let mut out_of_order = 16 - insert_pos;
+            if last_hdr.slice_type.is_b()
+                || (self.last_pocs[14] > i64::MIN && (self.last_pocs[15] - self.last_pocs[14]) > 2)
+            {
+                out_of_order = out_of_order.max(1);
+            }
+
+            if out_of_order == 16 {
+                self.last_pocs = [i64::MIN; 16];
+                self.last_pocs[0] = cur_poc_i64;
+            } else if out_of_order > self.reorder_depth && !self.has_bitstream_restriction {
+                self.reorder_depth = out_of_order;
+            }
+
+            // === Queue management (before state updates for correct mid_stream_idr) ===
+            // Ref frames: join all queued non-ref frames first to ensure
+            // correct output ordering in delayed_pics. Must happen before
+            // mid_stream_idr check so delayed_pics reflects all prior frames.
+            if is_ref {
+                self.join_all_in_flight();
+            }
+            // Enforce max in-flight capacity
+            let max_in_flight = std::thread::available_parallelism()
+                .map(|n| n.get().clamp(1, 4))
+                .unwrap_or(2);
+            while self.in_flight_queue.len() >= max_in_flight {
+                self.join_oldest_in_flight();
+            }
+
+            let mid_stream_idr = is_idr && !self.delayed_pics.is_empty();
+            let frame_mmco_reset = has_mmco5 || out_of_order == 16 || mid_stream_idr;
+
+            // POC state update (ref frames only — non-ref don't affect POC tracking)
+            if nal_ref_idc > 0 {
+                let max_poc_lsb = self
+                    .sps_list
+                    .iter()
+                    .find_map(|s| s.as_ref().map(|sps| 1u32 << sps.log2_max_poc_lsb))
+                    .unwrap_or(16);
+                let poc_lsb = last_hdr.pic_order_cnt_lsb;
+                if is_idr {
+                    self.prev_poc_msb = 0;
+                    self.prev_poc_lsb = 0;
+                } else {
+                    let poc_msb = if poc_lsb < self.prev_poc_lsb
+                        && (self.prev_poc_lsb.wrapping_sub(poc_lsb)) >= max_poc_lsb / 2
+                    {
+                        self.prev_poc_msb + max_poc_lsb as i32
+                    } else if poc_lsb > self.prev_poc_lsb
+                        && (poc_lsb.wrapping_sub(self.prev_poc_lsb)) > max_poc_lsb / 2
+                    {
+                        self.prev_poc_msb - max_poc_lsb as i32
+                    } else {
+                        self.prev_poc_msb
+                    };
+                    self.prev_poc_msb = poc_msb;
+                    self.prev_poc_lsb = poc_lsb;
+                }
+            }
+
+            // frame_num state (all frames)
+            self.prev_frame_num_offset = self.frame_num_offset;
+            self.prev_frame_num_h264 = frame_num_h264;
+            self.frame_num += 1;
+
+            // Note: MMCO-5 resets prev_frame_num/poc to 0 in complete_in_flight
+            // (post-join). Safe because ref frames are joined before next frame.
+
+            // === Dispatch worker thread ===
+            let handle = std::thread::spawn(move || {
+                let mut fdc = fdc;
+
+                // Decode all buffered slices
+                for slice in slices.into_iter() {
+                    // Apply per-slice FDC state from snapshot
+                    fdc.current_slice = slice.slice_idx;
+                    fdc.cur_l0_ref_poc = slice.cur_l0_ref_poc;
+                    fdc.cur_l0_ref_dpb = slice.cur_l0_ref_dpb;
+                    fdc.cur_l1_ref_poc = slice.cur_l1_ref_poc;
+                    fdc.cur_l1_ref_dpb = slice.cur_l1_ref_dpb;
+                    fdc.col_mv = slice.col_mv;
+                    fdc.col_ref = slice.col_ref;
+                    fdc.col_mv_l1 = slice.col_mv_l1;
+                    fdc.col_ref_l1 = slice.col_ref_l1;
+                    fdc.col_mb_intra = slice.col_mb_intra;
+                    fdc.col_poc = slice.col_poc;
+                    fdc.col_l1_is_long_term = slice.col_l1_is_long_term;
+                    fdc.col_ref_poc_l0 = slice.col_ref_poc_l0;
+                    fdc.col_ref_poc_l1 = slice.col_ref_poc_l1;
+                    fdc.implicit_weight = slice.implicit_weight;
+                    fdc.cur_poc = slice.cur_poc;
+
+                    let _ = H264Decoder::decode_slice_into(
+                        &slice.rbsp,
+                        &slice.hdr,
+                        &slice.sps,
+                        &slice.pps,
+                        &mut fdc,
+                        &slice.ref_pics_l0,
+                        &slice.ref_pics_l1,
+                    );
+                }
+
+                // Last-row deblock (inline deblock defers by 1 row)
+                if deblock_enabled {
+                    let mb_height = fdc.mb_height;
+                    let mb_width = fdc.mb_width;
+                    if fdc.is_mbaff {
+                        let pair_rows = mb_height / 2;
+                        if pair_rows > 0 {
+                            deblock::deblock_row_mbaff(
+                                &mut fdc.pic,
+                                &fdc.mb_info,
+                                &fdc.slice_table,
+                                &fdc.slice_deblock_params,
+                                pair_rows - 1,
+                                mb_width,
+                            );
+                        }
+                    } else if mb_height > 0 {
+                        deblock::deblock_row(
+                            &mut fdc.pic,
+                            &fdc.mb_info,
+                            &fdc.slice_table,
+                            &fdc.slice_deblock_params,
+                            mb_height - 1,
+                            mb_width,
+                        );
+                    }
+                }
+                fdc.pic.mark_complete();
+
+                Box::new(InFlightDecode {
+                    fdc,
+                    poc,
+                    frame_num_h264,
+                    nal_ref_idc,
+                    is_idr,
+                    last_hdr,
+                    ref_list_l0,
+                    ref_list_l1,
+                    dpb_idx,
+                })
             });
 
-            // 3. Spawn deblock on rayon thread pool
-            let (tx, rx) = std::sync::mpsc::sync_channel(1);
-            rayon::spawn(move || {
-                let mut b = boxed;
-                Self::deblock_fdc(&mut b.fdc);
-                let _ = tx.send(b);
+            self.in_flight_queue.push_back(InFlightFrame {
+                handle,
+                frame_mmco_reset,
+                out_of_order,
             });
 
-            self.in_flight = Some(rx);
-
-            // 4. Reference frames: join immediately so DPB is updated
-            //    before the next frame's ref list build.
-            if self.current_nal_ref_idc > 0 || self.current_is_idr {
-                trace!(
-                    poc = self.current_poc,
-                    "ref frame — joining deblock immediately"
-                );
-                self.join_in_flight();
-            } else {
-                trace!(
-                    poc = self.current_poc,
-                    "non-ref frame — deferring deblock join"
-                );
+            // Ref frames: join immediately (DPB/MMCO must complete before
+            // next frame's ref list build)
+            if is_ref {
+                self.join_oldest_in_flight();
             }
         }
     }
 
-    /// Join any pending in-flight deblock task and complete its DPB store + output.
-    fn join_in_flight(&mut self) {
-        if let Some(rx) = self.in_flight.take() {
-            trace!("joining deblock thread");
-            match rx.recv() {
-                Ok(in_flight) => self.complete_in_flight(in_flight),
-                Err(e) => warn!("deblock channel closed: {}", e),
+    /// Join the oldest in-flight frame and run post-join completion.
+    fn join_oldest_in_flight(&mut self) {
+        if let Some(frame) = self.in_flight_queue.pop_front() {
+            match frame.handle.join() {
+                Ok(boxed) => {
+                    self.complete_in_flight(boxed, frame.frame_mmco_reset, frame.out_of_order)
+                }
+                Err(e) => warn!("frame thread panicked: {:?}", e),
             }
         }
     }
 
-    /// Complete an in-flight decode: deblock, emit output frame, DPB store.
-    /// Takes Box to keep the large FrameDecodeContext on the heap.
-    fn complete_in_flight(&mut self, mut in_flight: Box<InFlightDecode>) {
-        // Set initial PTS to POC for reordering. Sequential PTS is
-        // assigned later when flushing from delayed_pics.
+    /// Join all in-flight frames in order.
+    fn join_all_in_flight(&mut self) {
+        while !self.in_flight_queue.is_empty() {
+            self.join_oldest_in_flight();
+        }
+    }
+
+    /// Complete an in-flight decode: emit output frame, DPB store.
+    ///
+    /// Post-join work only. Pre-dispatch state updates (last_pocs, reorder_depth,
+    /// POC state, frame_num) were already applied in `finish_current_frame`.
+    fn complete_in_flight(
+        &mut self,
+        mut in_flight: Box<InFlightDecode>,
+        frame_mmco_reset: bool,
+        out_of_order: usize,
+    ) {
         let frame = self.fdc_to_frame(
             &mut in_flight.fdc,
             &in_flight.last_hdr,
             in_flight.poc as i64,
         );
         debug!(
-            frame_num = self.frame_num,
             poc = in_flight.poc,
             reorder_depth = self.reorder_depth,
             "frame complete"
         );
 
-        // IDR resets the POC sequence. Clear last_pocs so the gap
-        // detection doesn't falsely trigger from the old sequence.
-        if in_flight.is_idr {
-            self.last_pocs = [i64::MIN; 16];
-        }
-
-        // Determine if this frame has an MMCO-5 (Reset) operation.
-        // Needed early because MMCO-5 resets POC to 0, and we must
-        // use the reset POC for last_pocs insertion (matching FFmpeg
-        // where MMCO runs before h264_select_output_frame).
-        let has_mmco5 = in_flight.last_hdr.adaptive_ref_pic_marking
-            && in_flight
-                .last_hdr
-                .mmco_ops
-                .iter()
-                .any(|op| matches!(op, crate::slice::MmcoOp::Reset));
-
-        // Dynamically compute reorder depth using FFmpeg's last_pocs
-        // algorithm (h264_slice.c:1309-1332). Insert current POC into
-        // the sorted ascending last_pocs array and derive out_of_order
-        // from the insertion position. The algorithm shifts values left
-        // as it scans, then places cur_poc at the insertion point.
-        //
-        // When MMCO-5 is present, reset last_pocs and use POC 0
-        // (matching FFmpeg where MMCO_RESET clears last_pocs in
-        // h264_refs.c:724-725 and resets POC before this runs).
-        if has_mmco5 {
-            self.last_pocs = [i64::MIN; 16];
-        }
-        let cur_poc = if has_mmco5 {
-            0i64
-        } else {
-            in_flight.poc as i64
-        };
-        let mut insert_pos = 0usize;
-        for i in 0..=16 {
-            if i == 16 || cur_poc < self.last_pocs[i] {
-                if i > 0 {
-                    self.last_pocs[i - 1] = cur_poc;
-                }
-                insert_pos = i;
-                break;
-            } else if i > 0 {
-                self.last_pocs[i - 1] = self.last_pocs[i];
-            }
-        }
-
-        let mut out_of_order = 16 - insert_pos;
-
-        // Also increase for B-frames or POC gap > 2
-        if in_flight.last_hdr.slice_type.is_b()
-            || (self.last_pocs[14] > i64::MIN && (self.last_pocs[15] - self.last_pocs[14]) > 2)
-        {
-            out_of_order = out_of_order.max(1);
-        }
-
-        // If all entries are smaller than current (out_of_order == 16),
-        // it means POC went backwards (e.g., frame_num gap wrap or
-        // MMCO reset). Reset last_pocs.
-        if out_of_order == 16 {
-            self.last_pocs = [i64::MIN; 16];
-            self.last_pocs[0] = cur_poc;
-        } else if out_of_order > self.reorder_depth && !self.has_bitstream_restriction {
-            self.reorder_depth = out_of_order;
-        }
-
-        // The mmco_reset flag acts as a barrier in the delayed_pics
-        // buffer, preventing min-POC search from mixing frames across
-        // POC sequence boundaries.
-        // Reference: FFmpeg h264_slice.c:1301, 1327, 1346-1353.
-        // IDR frames that arrive when the delayed_pics buffer is
-        // non-empty are barriers: they prevent the min-POC search from
-        // mixing frames across POC sequence boundaries. The first IDR
-        // (empty buffer) is not a barrier since there are no prior frames.
-        let mid_stream_idr = in_flight.is_idr && !self.delayed_pics.is_empty();
-        let frame_mmco_reset = has_mmco5 || out_of_order == 16 || mid_stream_idr;
-
-        // Add current frame to the delayed_pics buffer.
-        // Use the original POC (not the MMCO-5 reset value) since
-        // min-POC ordering needs the real POC for correct output.
+        // Add to delayed_pics and flush output
         self.delayed_pics
             .push((in_flight.poc, frame, frame_mmco_reset));
 
-        // Output frames when buffer exceeds reorder_depth AND the
-        // current frame is in order (out_of_order == 0).
-        // Exception: always allow output when there's an mmco_reset
-        // barrier in the buffer, to drain old POC sequences. This
-        // prevents the out_of_order gate from blocking output when
-        // POC cycling (due to MMCO-5) keeps out_of_order > 0.
         let has_barrier = self.delayed_pics.iter().any(|(_, _, reset)| *reset);
         let allow_output = out_of_order == 0 || has_barrier;
         while allow_output && self.delayed_pics.len() > self.reorder_depth {
             let out_idx = if self.delayed_pics[0].2 {
-                // mmco_reset at front: output it directly
                 0
             } else {
-                // Find barrier: first mmco_reset at index >= 1
                 let barrier = self
                     .delayed_pics
                     .iter()
@@ -1082,8 +1316,6 @@ impl H264Decoder {
                     .find(|(_, (_, _, reset))| *reset)
                     .map(|(i, _)| i)
                     .unwrap_or(self.delayed_pics.len());
-
-                // Find min-POC within [0, barrier)
                 self.delayed_pics[..barrier]
                     .iter()
                     .enumerate()
@@ -1097,10 +1329,8 @@ impl H264Decoder {
             self.output_queue.push_back(f);
         }
 
-        // Non-reference pictures (nal_ref_idc == 0, typically B-frames)
-        // don't need to be stored in the DPB.
+        // Non-reference pictures don't need DPB storage.
         if in_flight.nal_ref_idc == 0 {
-            self.frame_num += 1;
             return;
         }
 
@@ -1109,7 +1339,6 @@ impl H264Decoder {
         let mb_height = in_flight.fdc.mb_height;
         let total_blocks = (mb_width * mb_height * 16) as usize;
 
-        // Extract MV info from the frame decode context
         let (mv_info, ref_info, mv_info_l1, ref_info_l1, mb_intra) = {
             let fdc = &in_flight.fdc;
             let mv_info = if fdc.mv_ctx.mv.len() == total_blocks {
@@ -1140,7 +1369,6 @@ impl H264Decoder {
                 let val = fdc.pic.y[py * s + px];
                 let val2 = fdc.pic.y[py * s + px + 2];
                 tracing::trace!(
-                    frame_num = self.frame_num,
                     mb10_2_pixel0 = val,
                     mb10_2_pixel2 = val2,
                     y_ptr = ?fdc.pic.y.as_ptr(),
@@ -1152,7 +1380,6 @@ impl H264Decoder {
             (mv_info, ref_info, mv_info_l1, ref_info_l1, mb_intra)
         };
 
-        // Store L0/L1 ref POCs for temporal direct mode mapping.
         let ref_poc_l0: Vec<i32> = in_flight
             .ref_list_l0
             .iter()
@@ -1164,46 +1391,58 @@ impl H264Decoder {
             .filter_map(|&dpb_idx| self.dpb.get(dpb_idx).map(|e| e.poc))
             .collect();
 
-        let entry = DpbEntry {
-            pic: in_flight.fdc.pic.into_shared(),
-            poc: in_flight.poc,
-            frame_num: in_flight.frame_num_h264,
-            status: RefStatus::Unused,
-            long_term_frame_idx: 0,
-            mv_info,
-            ref_info,
-            mv_info_l1,
-            ref_info_l1,
-            mb_intra,
-            needs_output: false,
-            ref_poc_l0,
-            ref_poc_l1,
-        };
+        let dpb_idx = if let Some(idx) = in_flight.dpb_idx {
+            self.dpb.finalize_entry(
+                idx,
+                mv_info,
+                ref_info,
+                mv_info_l1,
+                ref_info_l1,
+                mb_intra,
+                ref_poc_l0,
+                ref_poc_l1,
+            );
+            Some(idx)
+        } else {
+            let entry = DpbEntry {
+                pic: in_flight.fdc.pic.into_shared(),
+                poc: in_flight.poc,
+                frame_num: in_flight.frame_num_h264,
+                status: RefStatus::Unused,
+                long_term_frame_idx: 0,
+                mv_info,
+                ref_info,
+                mv_info_l1,
+                ref_info_l1,
+                mb_intra,
+                needs_output: false,
+                ref_poc_l0,
+                ref_poc_l1,
+            };
 
-        // Try to store in DPB; if full, remove oldest first
-        if self.dpb.is_full() {
-            self.dpb.remove_oldest_short_term();
-            // If still full, remove any unused entry
             if self.dpb.is_full() {
-                for i in 0..self.dpb.entries.len() {
-                    if let Some(e) = &self.dpb.entries[i]
-                        && e.status == RefStatus::Unused
-                    {
-                        self.dpb.entries[i] = None;
-                        break;
+                self.dpb.remove_oldest_short_term();
+                if self.dpb.is_full() {
+                    for i in 0..self.dpb.entries.len() {
+                        if let Some(e) = &self.dpb.entries[i]
+                            && e.status == RefStatus::Unused
+                        {
+                            self.dpb.entries[i] = None;
+                            break;
+                        }
                     }
                 }
             }
-        }
+            self.dpb.store(entry)
+        };
 
         let mut mmco_did_reset = false;
-        if let Some(dpb_idx) = self.dpb.store(entry) {
+        if let Some(dpb_idx) = dpb_idx {
             {
                 let e = self.dpb.get(dpb_idx).unwrap();
-                // SAFETY: Just stored — picture is complete (trace-only access).
+                // SAFETY: Decode + deblock complete — picture is PROGRESS_COMPLETE.
                 let pic = unsafe { e.pic.data() };
                 tracing::trace!(
-                    internal_frame = self.frame_num,
                     dpb_idx,
                     h264_frame_num = e.frame_num,
                     y_ptr = ?pic.y.as_ptr(),
@@ -1211,7 +1450,6 @@ impl H264Decoder {
                     "DPB stored entry"
                 );
             }
-            // Apply reference picture marking
             let (sps_max_refs, max_frame_num) = self
                 .sps_list
                 .iter()
@@ -1231,7 +1469,7 @@ impl H264Decoder {
             );
         }
 
-        // Log DPB summary for debugging tools (dpb_compare.py)
+        // DPB summary log
         {
             let st_fns: Vec<u32> = self
                 .dpb
@@ -1273,53 +1511,8 @@ impl H264Decoder {
             );
         }
 
-        // Update POC type 0 state for reference pictures only.
-        // Non-reference pictures (nal_ref_idc == 0, e.g. B-frames)
-        // do not update the POC state.
-        if in_flight.nal_ref_idc > 0 {
-            let max_poc_lsb = self
-                .sps_list
-                .iter()
-                .find_map(|s| s.as_ref().map(|sps| 1u32 << sps.log2_max_poc_lsb))
-                .unwrap_or(16);
-            let poc_lsb = in_flight.last_hdr.pic_order_cnt_lsb;
-            // Recompute poc_msb using the same logic as compute_poc_type0
-            if in_flight.is_idr {
-                self.prev_poc_msb = 0;
-                self.prev_poc_lsb = 0;
-            } else {
-                let poc_msb = if poc_lsb < self.prev_poc_lsb
-                    && (self.prev_poc_lsb.wrapping_sub(poc_lsb)) >= max_poc_lsb / 2
-                {
-                    self.prev_poc_msb + max_poc_lsb as i32
-                } else if poc_lsb > self.prev_poc_lsb
-                    && (poc_lsb.wrapping_sub(self.prev_poc_lsb)) > max_poc_lsb / 2
-                {
-                    self.prev_poc_msb - max_poc_lsb as i32
-                } else {
-                    self.prev_poc_msb
-                };
-                self.prev_poc_msb = poc_msb;
-                self.prev_poc_lsb = poc_lsb;
-            }
-        }
-
-        // Update POC type 1/2 state: frame_num_offset persists across
-        // all frames (not just references).
-        self.prev_frame_num_offset = self.frame_num_offset;
-        self.prev_frame_num_h264 = in_flight.frame_num_h264;
-
-        // MMCO-5 (Reset) resets frame_num to 0 and frame_num_offset.
-        // Must happen AFTER the normal prev_frame_num/POC update above,
-        // so the reset overrides the normal assignments.
-        //
-        // Spec 8.2.1.1: after MMCO-5, prevPicOrderCntMsb = 0 and
-        // prevPicOrderCntLsb = TopFieldOrderCnt (which is 0 for frames
-        // after MMCO-5 resets PicOrderCnt).
-        // Spec 8.2.1.2/8.2.1.3: after MMCO-5, prevFrameNumOffset = 0.
-        // Reference: FFmpeg h264_slice.c — MMCO-5 resets poc_msb/poc_lsb
-        // inside ff_h264_execute_ref_pic_marking BEFORE the prev_poc
-        // assignments, so prev_poc_msb and prev_poc_lsb end up as 0.
+        // MMCO-5 (Reset) overrides the pre-dispatch state updates.
+        // Safe because ref frames (which have MMCO) are joined immediately.
         if mmco_did_reset {
             debug!(
                 h264_fn = in_flight.frame_num_h264,
@@ -1330,8 +1523,6 @@ impl H264Decoder {
             self.prev_poc_lsb = 0;
             self.prev_frame_num_offset = 0;
         }
-
-        self.frame_num += 1;
     }
 
     /// Decode a slice into a FrameDecodeContext.
@@ -1346,8 +1537,8 @@ impl H264Decoder {
         sps: &Sps,
         pps: &Pps,
         fdc: &mut FrameDecodeContext,
-        ref_pics: &[&SharedPicture],
-        ref_pics_l1: &[&SharedPicture],
+        ref_pics: &[Arc<SharedPicture>],
+        ref_pics_l1: &[Arc<SharedPicture>],
     ) -> Result<u32> {
         fdc.qp = hdr.slice_qp as u8;
         fdc.last_qscale_diff = 0; // H.264 spec: prevMbQpDelta = 0 at slice start
@@ -1367,8 +1558,8 @@ impl H264Decoder {
         sps: &Sps,
         pps: &Pps,
         fdc: &mut FrameDecodeContext,
-        ref_pics: &[&SharedPicture],
-        ref_pics_l1: &[&SharedPicture],
+        ref_pics: &[Arc<SharedPicture>],
+        ref_pics_l1: &[Arc<SharedPicture>],
     ) -> Result<u32> {
         let mb_width = sps.mb_width;
         let mb_height = sps.mb_height;
@@ -1403,6 +1594,7 @@ impl H264Decoder {
             );
         }
 
+        let deblock_enabled = std::env::var("WEDEO_NO_DEBLOCK").is_err();
         let mut mb_addr = first_mb;
 
         while mb_addr < total_mbs {
@@ -1460,9 +1652,9 @@ impl H264Decoder {
                     }
                     mb_addr += 1;
                     mbs_decoded += 1;
-                    // Signal row completion for frame-level threading
+                    // Inline deblock + publish with 1-row delay
                     if mb_addr.is_multiple_of(mb_width) {
-                        fdc.pic.publish_row((mb_addr / mb_width - 1) as i32);
+                        inline_deblock_row(fdc, mb_addr / mb_width - 1, mb_width, deblock_enabled);
                     }
                 }
 
@@ -1515,9 +1707,9 @@ impl H264Decoder {
             )?;
             mb_addr += 1;
             mbs_decoded += 1;
-            // Signal row completion for frame-level threading
+            // Inline deblock + publish with 1-row delay
             if mb_addr.is_multiple_of(mb_width) {
-                fdc.pic.publish_row((mb_addr / mb_width - 1) as i32);
+                inline_deblock_row(fdc, mb_addr / mb_width - 1, mb_width, deblock_enabled);
             }
         }
 
@@ -1556,14 +1748,15 @@ impl H264Decoder {
         sps: &Sps,
         pps: &Pps,
         fdc: &mut FrameDecodeContext,
-        ref_pics: &[&SharedPicture],
-        ref_pics_l1: &[&SharedPicture],
+        ref_pics: &[Arc<SharedPicture>],
+        ref_pics_l1: &[Arc<SharedPicture>],
         is_inter_slice: bool,
     ) -> Result<u32> {
         let mb_width = sps.mb_width;
         let mb_height = sps.mb_height;
         let total_mbs = mb_width * mb_height;
         let first_mb = hdr.first_mb_in_slice;
+        let deblock_enabled = std::env::var("WEDEO_NO_DEBLOCK").is_err();
 
         // For MBAFF, first_mb_in_slice is in pair units.
         let mut mb_x = first_mb % mb_width;
@@ -1709,8 +1902,8 @@ impl H264Decoder {
             // Advance to next pair
             mb_x += 1;
             if mb_x >= mb_width {
-                // Pair row complete — signal both MB rows (top and bottom)
-                fdc.pic.publish_row((mb_y + 1) as i32);
+                // Pair row complete — inline deblock + publish with 1-pair-row delay
+                inline_deblock_pair_row(fdc, mb_y / 2, mb_width, deblock_enabled);
                 mb_x = 0;
                 mb_y += 2;
             }
@@ -1747,8 +1940,8 @@ impl H264Decoder {
         sps: &Sps,
         pps: &Pps,
         fdc: &mut FrameDecodeContext,
-        ref_pics: &[&SharedPicture],
-        ref_pics_l1: &[&SharedPicture],
+        ref_pics: &[Arc<SharedPicture>],
+        ref_pics_l1: &[Arc<SharedPicture>],
     ) -> Result<u32> {
         use crate::cabac::{
             CabacDecodeCache, CabacNeighborCtx, CabacReader, decode_cabac_mb_skip, decode_mb_cabac,
@@ -1784,6 +1977,7 @@ impl H264Decoder {
         let mut mbs_decoded = 0u32;
         let is_inter_slice = hdr.slice_type.is_p() || hdr.slice_type.is_b();
         let is_mbaff = !sps.frame_mbs_only_flag;
+        let deblock_enabled = std::env::var("WEDEO_NO_DEBLOCK").is_err();
 
         if is_mbaff {
             mbs_decoded = Self::decode_slice_cabac_mbaff(
@@ -1867,8 +2061,14 @@ impl H264Decoder {
 
                         mb_addr += 1;
                         mbs_decoded += 1;
+                        // Inline deblock + publish with 1-row delay
                         if mb_addr.is_multiple_of(mb_width) {
-                            fdc.pic.publish_row((mb_addr / mb_width - 1) as i32);
+                            inline_deblock_row(
+                                fdc,
+                                mb_addr / mb_width - 1,
+                                mb_width,
+                                deblock_enabled,
+                            );
                         }
 
                         // Check terminate after skip
@@ -1940,8 +2140,9 @@ impl H264Decoder {
 
                 mb_addr += 1;
                 mbs_decoded += 1;
+                // Inline deblock + publish with 1-row delay
                 if mb_addr.is_multiple_of(mb_width) {
-                    fdc.pic.publish_row((mb_addr / mb_width - 1) as i32);
+                    inline_deblock_row(fdc, mb_addr / mb_width - 1, mb_width, deblock_enabled);
                 }
 
                 // Check terminate
@@ -1972,8 +2173,8 @@ impl H264Decoder {
         sps: &Sps,
         pps: &Pps,
         fdc: &mut FrameDecodeContext,
-        ref_pics: &[&SharedPicture],
-        ref_pics_l1: &[&SharedPicture],
+        ref_pics: &[Arc<SharedPicture>],
+        ref_pics_l1: &[Arc<SharedPicture>],
         is_inter_slice: bool,
     ) -> Result<u32> {
         use crate::cabac::{
@@ -1993,6 +2194,7 @@ impl H264Decoder {
 
         let mut mbs_decoded = 0u32;
         let mut mb_field_decoding_flag = false;
+        let deblock_enabled = std::env::var("WEDEO_NO_DEBLOCK").is_err();
 
         // Two separate left-side contexts for MBAFF: one for top MBs, one for bottom MBs.
         // After each pair, the top row's left context holds the top MB's right edge,
@@ -2301,29 +2503,14 @@ impl H264Decoder {
             // Advance to next pair
             mb_x += 1;
             if mb_x >= mb_width {
-                // Pair row complete — signal both MB rows (top and bottom)
-                fdc.pic.publish_row((mb_y + 1) as i32);
+                // Pair row complete — inline deblock + publish with 1-pair-row delay
+                inline_deblock_pair_row(fdc, mb_y / 2, mb_width, deblock_enabled);
                 mb_x = 0;
                 mb_y += 2; // Skip to next pair row
             }
         }
 
         Ok(mbs_decoded)
-    }
-
-    /// Run deblocking filter and mark picture as complete.
-    /// Static method (no `&self`) — callable from a background thread.
-    fn deblock_fdc(fdc: &mut FrameDecodeContext) {
-        if std::env::var("WEDEO_NO_DEBLOCK").is_err() {
-            deblock::deblock_frame(
-                &mut fdc.pic,
-                &fdc.mb_info,
-                &fdc.slice_table,
-                &fdc.slice_deblock_params,
-                fdc.is_mbaff,
-            );
-        }
-        fdc.pic.mark_complete();
     }
 
     /// Convert a deblocked FrameDecodeContext to a Frame (pixel copy only).
@@ -2472,9 +2659,9 @@ impl Decoder for H264Decoder {
             }
             None => {
                 // Drain mode: no more packets will be sent.
-                // Flush any in-progress or in-flight frame.
+                // Flush any in-progress frame and join all in-flight workers.
                 self.finish_current_frame();
-                self.join_in_flight();
+                self.join_all_in_flight();
 
                 // Flush all remaining delayed_pics using barrier-aware
                 // min-POC search, matching FFmpeg's send_next_delayed_frame()
@@ -2524,9 +2711,9 @@ impl Decoder for H264Decoder {
     }
 
     fn flush(&mut self) {
-        // Join any in-flight deblock thread before clearing state.
         self.finish_current_frame();
-        self.join_in_flight();
+        self.join_all_in_flight();
+        self.pending_slices.clear();
         self.output_queue.clear();
         self.draining = false;
         self.frame_num = 0;

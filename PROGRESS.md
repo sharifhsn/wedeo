@@ -13,25 +13,30 @@ See `CLAUDE.md` and `H264.md` for detailed status.
 - WAV/PCM pipeline: byte-identical to FFmpeg 8.0.1 across all FATE suite samples
 - Audio via symphonia: 28 decoders, 10 demuxers, SNR-verified lossy codecs
 
-## Frame-Level Threading — Infrastructure Complete (2026-03-27)
+## Phase 6: Multi-Frame Pipeline — Complete (2026-03-27)
 
-Steps 1-8 of frame-level threading committed:
-- `SharedPicture` with `AtomicI32` row progress + `Condvar` wait
-- `PicHandle` Deref wrapper, DPB `Arc<SharedPicture>` migration
-- `publish_row()` / `wait_for_row()` for row-level MC dependencies
-- `InFlightDecode` decouples frame completion from decode loop
-- Deblock offloaded to rayon thread pool (`rayon::spawn` + `mpsc::sync_channel`)
-- Non-ref B-frames defer join → deblock overlaps next frame's decode
+N frames decode concurrently. Main thread parses headers + buffers slices;
+worker threads decode + deblock + mark_complete.
 
-**Benchmark (BBB 1080p 10s):** 16.28s sync → 15.43s rayon (~5% faster).
+**Architecture:**
+- `SliceWorkUnit`: per-slice DPB state snapshot (ref POCs, colocated MVs,
+  implicit weights) + RBSP data. Uses `std::mem::take` for zero-copy
+  transfer of large vectors from FDC.
+- `InFlightFrame`: JoinHandle + pre-computed `frame_mmco_reset` / `out_of_order`
+- Ref frames: `join_all_in_flight()` → dispatch → join immediately
+- Non-ref B-frames: dispatch and defer — run in parallel on separate threads
+- Pre-dispatch: last_pocs, reorder_depth, POC state, frame_num state
+- Post-join: fdc_to_frame, delayed_pics insertion, DPB finalize, MMCO
 
-**Deblock row wavefront** stays on `std::thread::scope` — rayon deadlocks
-with spin-wait dependencies (yield_now creates recursive nested chains).
+**Benchmark (BBB 1080p 10s):** 11.8s wall / 18.4s user (user > wall = parallelism).
 
-**New script:** `bench_ab.py` — A/B benchmark current vs previous commit via hyperfine.
+**Phases 1-5 recap:**
+- Phase 1-2: Inline per-row deblock with 1-row delay
+- Phase 3: Early DPB insertion via `store_placeholder`
+- Phase 4: `Arc<SharedPicture>`, `FrameDecodeContext` Send
+- Phase 5: Single-frame background decode (std::thread::spawn)
 
-**Next:** Pipelined frame decode (multiple frames decoding simultaneously using
-the row-level progress infrastructure already in place).
+**Next:** Phase 7 — persistent thread pool, buffer recycling.
 
 ## FRext Conformance — All Progressive Files BITEXACT (2026-03-26)
 
