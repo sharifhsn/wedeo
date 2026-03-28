@@ -26,24 +26,22 @@ See `H264.md` for decoder architecture, module map, and conformance status.
 **Conformance workflow (do this in order):**
 1. `scripts/conformance_full.py` — full report. `--save-snapshot` to baseline.
 2. `scripts/regression_check.py` — quick check against snapshot. Run after every change.
-3. `scripts/framecrc_compare.py --no-deblock --pixel-detail <file>` — triage MC vs deblock.
-4. `scripts/mb_compare.py <file> --start-frame N --max-frames 1` — find differing MBs.
-5. `scripts/cabac_state_at_mb.py <file> --mb-x X --mb-y Y` — CABAC state comparison via lldb.
+3. `scripts/framecrc_compare.py --pixel-detail <file>` — triage specific files with per-plane pixel diffs.
 
 **Key rules:**
 - **Read the FFmpeg C code FIRST.** Key files: `h264_cavlc.c`, `h264_cabac.c`, `h264idct_template.c`, `h264_mb.c`, `h264_mb_template.c`, `h264_ps.c`, `h264_mvpred.h`.
 - **HARD RULE:** After 2 failed hypotheses, **STOP theorizing**. Extract values from BOTH decoders. Find WHERE values diverge before explaining WHY. **5-minute backstop** without ground-truth extraction → use lldb.
 - **When formulas look identical, the bug is in the INPUTS.** One lldb extraction > any algebraic analysis.
 - **Never infer intermediate values from outputs.** Measure via lldb: `breakpoint set -f file.c -l N` → `expression`.
-- **Never manually count entries in C arrays.** Use `scripts/verify_tables.py` or write a parser.
+- **Never manually count entries in C arrays.** Write a parser or use lldb to extract table contents.
 - **Build debug FFmpeg:** `cd FFmpeg && ./configure --disable-optimizations --enable-debug=3 --disable-stripping --disable-asm && make -j$(sysctl -n hw.ncpu) ffmpeg`. `--disable-asm` is critical on ARM64.
 - **Tracing is always available.** `RUST_LOG=wedeo_codec_h264::mb=trace`. Never use `eprintln!` — always `tracing` macros.
 - **When existing logs don't reveal the divergence, get better logs.** (1) add `trace!()`, (2) FFmpeg `-loglevel debug`, (3) lldb.
 - **CABAC cat=5 (8x8 luma) has NO coded_block_flag.** The CBP check is the only gate.
-- **CABAC context offsets are 2D for MBAFF** — `significant_coeff_flag_offset[MB_FIELD][cat]` uses field vs frame tables. Use `scripts/verify_cabac_tables.py` to verify.
-- **MBAFF field-mode above-neighbor stride** — `top_xy = mb_xy - (mb_stride << MB_FIELD)`. Use `scripts/mbaff_field_map.py` to check field/frame modes.
-- **MBAFF left_block_options** — FFmpeg's `fill_decode_neighbors` (h264_mvpred.h:491-538) selects 1 of 4 remapping variants for NNZ/CBP/intra4x4 mode context when there's a field/frame mismatch with the left neighbor. Use `scripts/verify_left_block_tables.py` to verify tables. For CABAC state comparison, breakpoint at h264_cabac.c:1966 (after field flag decode).
-- **CABAC neighbor cache:** FFmpeg's `fill_decode_caches` (h264_mvpred.h:576) is the canonical reference for how neighbor values populate the CABAC context. For inter/skip MBs, `intra4x4_pred_mode` = 2 (DC) without `constrained_intra_pred`, -1 with it. Wedeo has two parallel storage systems (`NeighborContext` + `CabacNeighborCtx`) — both must store consistent values. Use `scripts/cabac_state_compare.py` to diff CABAC engine state at MB boundaries.
+- **CABAC context offsets are 2D for MBAFF** — `significant_coeff_flag_offset[MB_FIELD][cat]` uses field vs frame tables.
+- **MBAFF field-mode above-neighbor stride** — `top_xy = mb_xy - (mb_stride << MB_FIELD)`.
+- **MBAFF left_block_options** — FFmpeg's `fill_decode_neighbors` (h264_mvpred.h:491-538) selects 1 of 4 remapping variants for NNZ/CBP/intra4x4 mode context when there's a field/frame mismatch with the left neighbor. For CABAC state comparison, breakpoint at h264_cabac.c:1966 (after field flag decode).
+- **CABAC neighbor cache:** FFmpeg's `fill_decode_caches` (h264_mvpred.h:576) is the canonical reference for how neighbor values populate the CABAC context. For inter/skip MBs, `intra4x4_pred_mode` = 2 (DC) without `constrained_intra_pred`, -1 with it. Wedeo has two parallel storage systems (`NeighborContext` + `CabacNeighborCtx`) — both must store consistent values.
 - **Pipeline-stage tracing tags:** SLICE→PPS_SCALING→DEQUANT_TABLES→COEFF→DEQUANT→MB_RECON→MB_DEBLOCK.
 
 ## Code Quality
