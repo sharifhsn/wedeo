@@ -443,6 +443,157 @@ pub fn mc_chroma_avg_asm(
 }
 
 // ---------------------------------------------------------------------------
+// Deblock loop filter dispatch
+// ---------------------------------------------------------------------------
+//
+// FFmpeg NEON naming is counter-intuitive:
+//   v_loop_filter = horizontal edge (reads vertically across the edge)
+//   h_loop_filter = vertical edge (reads horizontally across the edge)
+//
+// Mapped from wedeo's `is_vertical` flag:
+//   is_vertical=true  → h_loop_filter (vertical boundary, reads horizontally)
+//   is_vertical=false → v_loop_filter (horizontal boundary, reads vertically)
+
+/// tc0 table in NEON format: indexed by [index_a][bS] for bS 0..3.
+/// bS=0 → -1 (NEON skips pairs where tc0 < 0).
+/// bS=1..3 → same values as TC0_TABLE[index_a][bS-1].
+/// Matches FFmpeg's tc0_table (h264_loopfilter.c:69).
+#[rustfmt::skip]
+const TC0_NEON: [[i8; 4]; 52] = [
+    [-1, 0, 0, 0], [-1, 0, 0, 0], [-1, 0, 0, 0], [-1, 0, 0, 0],
+    [-1, 0, 0, 0], [-1, 0, 0, 0], [-1, 0, 0, 0], [-1, 0, 0, 0],
+    [-1, 0, 0, 0], [-1, 0, 0, 0], [-1, 0, 0, 0], [-1, 0, 0, 0],
+    [-1, 0, 0, 0], [-1, 0, 0, 0], [-1, 0, 0, 0], [-1, 0, 0, 0],
+    [-1, 0, 0, 0], [-1, 0, 0, 1], [-1, 0, 0, 1], [-1, 0, 0, 1],
+    [-1, 0, 0, 1], [-1, 0, 1, 1], [-1, 0, 1, 1], [-1, 1, 1, 1],
+    [-1, 1, 1, 1], [-1, 1, 1, 1], [-1, 1, 1, 1], [-1, 1, 1, 2],
+    [-1, 1, 1, 2], [-1, 1, 1, 2], [-1, 1, 1, 2], [-1, 1, 2, 3],
+    [-1, 1, 2, 3], [-1, 2, 2, 3], [-1, 2, 2, 4], [-1, 2, 3, 4],
+    [-1, 2, 3, 4], [-1, 3, 3, 5], [-1, 3, 4, 6], [-1, 3, 4, 6],
+    [-1, 4, 5, 7], [-1, 4, 5, 8], [-1, 4, 6, 9], [-1, 5, 7,10],
+    [-1, 6, 8,11], [-1, 6, 8,13], [-1, 7,10,14], [-1, 8,11,16],
+    [-1, 9,12,18], [-1,10,13,20], [-1,11,15,23], [-1,13,17,25],
+];
+
+/// Try to filter a luma edge via NEON assembly.
+///
+/// Returns `true` if NEON handled the edge, `false` if scalar fallback is needed.
+/// Mixed bS (some 4, some <4) cannot be handled by NEON — returns false.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub fn deblock_luma_edge_asm(
+    plane: &mut [u8],
+    base: usize,
+    stride: usize,
+    is_vertical: bool,
+    bs: [u8; 4],
+    index_a: usize,
+    alpha: i32,
+    beta: i32,
+) -> bool {
+    let all_intra = bs.iter().all(|&b| b == 4);
+    let any_intra = bs.contains(&4);
+
+    if all_intra {
+        // All bS=4: use intra (strong) NEON filter
+        let pix = &mut plane[base..];
+        let s = stride as isize;
+        // SAFETY: The caller verified alpha/beta thresholds and base offset.
+        // The NEON intra filter processes 16 pixel pairs.
+        unsafe {
+            if is_vertical {
+                asm_ffi::ff_h264_h_loop_filter_luma_intra_neon(pix.as_mut_ptr(), s, alpha, beta);
+            } else {
+                asm_ffi::ff_h264_v_loop_filter_luma_intra_neon(pix.as_mut_ptr(), s, alpha, beta);
+            }
+        }
+        return true;
+    }
+
+    if any_intra {
+        // Mixed bS=4 and bS<4: NEON can't handle, fall back to scalar
+        return false;
+    }
+
+    // All bS < 4: build tc0 array from table (luma: no +1)
+    let tc0: [i8; 4] = [
+        TC0_NEON[index_a][bs[0] as usize],
+        TC0_NEON[index_a][bs[1] as usize],
+        TC0_NEON[index_a][bs[2] as usize],
+        TC0_NEON[index_a][bs[3] as usize],
+    ];
+
+    let pix = &mut plane[base..];
+    let s = stride as isize;
+    // SAFETY: tc0 is a valid 4-byte array. Same base/stride guarantees as above.
+    unsafe {
+        if is_vertical {
+            asm_ffi::ff_h264_h_loop_filter_luma_neon(pix.as_mut_ptr(), s, alpha, beta, tc0.as_ptr());
+        } else {
+            asm_ffi::ff_h264_v_loop_filter_luma_neon(pix.as_mut_ptr(), s, alpha, beta, tc0.as_ptr());
+        }
+    }
+    true
+}
+
+/// Try to filter a chroma edge via NEON assembly.
+///
+/// Returns `true` if NEON handled the edge, `false` if scalar fallback is needed.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub fn deblock_chroma_edge_asm(
+    plane: &mut [u8],
+    base: usize,
+    stride: usize,
+    is_vertical: bool,
+    bs: [u8; 4],
+    index_a: usize,
+    alpha: i32,
+    beta: i32,
+) -> bool {
+    let all_intra = bs.iter().all(|&b| b == 4);
+    let any_intra = bs.contains(&4);
+
+    if all_intra {
+        let pix = &mut plane[base..];
+        let s = stride as isize;
+        // SAFETY: Same guarantees as luma. Chroma intra processes 8 pixel pairs.
+        unsafe {
+            if is_vertical {
+                asm_ffi::ff_h264_h_loop_filter_chroma_intra_neon(pix.as_mut_ptr(), s, alpha, beta);
+            } else {
+                asm_ffi::ff_h264_v_loop_filter_chroma_intra_neon(pix.as_mut_ptr(), s, alpha, beta);
+            }
+        }
+        return true;
+    }
+
+    if any_intra {
+        return false;
+    }
+
+    // Chroma: tc0 = table value + 1 (matches FFmpeg h264_loopfilter.c:134)
+    let tc0: [i8; 4] = [
+        TC0_NEON[index_a][bs[0] as usize] + 1,
+        TC0_NEON[index_a][bs[1] as usize] + 1,
+        TC0_NEON[index_a][bs[2] as usize] + 1,
+        TC0_NEON[index_a][bs[3] as usize] + 1,
+    ];
+
+    let pix = &mut plane[base..];
+    let s = stride as isize;
+    // SAFETY: Same as luma. Chroma normal filter processes 8 pixel pairs.
+    unsafe {
+        if is_vertical {
+            asm_ffi::ff_h264_h_loop_filter_chroma_neon(pix.as_mut_ptr(), s, alpha, beta, tc0.as_ptr());
+        } else {
+            asm_ffi::ff_h264_v_loop_filter_chroma_neon(pix.as_mut_ptr(), s, alpha, beta, tc0.as_ptr());
+        }
+    }
+    true
+}
+
+// ---------------------------------------------------------------------------
 // IDCT dispatch
 // ---------------------------------------------------------------------------
 //

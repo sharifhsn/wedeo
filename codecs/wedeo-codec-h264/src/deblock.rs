@@ -578,6 +578,17 @@ fn filter_mb_edge_luma(
     };
     let base = mb_base_offset + edge_pixel_offset;
 
+    // Try NEON assembly: processes all 16 pixel pairs in one call.
+    #[cfg(has_asm)]
+    {
+        let index_a = clip3(0, 51, qp as i32 + alpha_offset) as usize;
+        if crate::asm_dispatch::deblock_luma_edge_asm(
+            plane, base, stride, is_vertical, bs, index_a, alpha, beta,
+        ) {
+            return;
+        }
+    }
+
     for i in 0..4u8 {
         let cur_bs = bs[i as usize];
         if cur_bs == 0 {
@@ -693,6 +704,18 @@ fn filter_mb_edge_chroma(
         edge * 4 * stride
     };
     let base = mb_base_offset + edge_pixel_offset;
+
+    // Try NEON assembly: processes all 8 chroma pixel pairs in one call.
+    #[cfg(has_asm)]
+    {
+        let index_a = clip3(0, 51, qp as i32 + alpha_offset) as usize;
+        if crate::asm_dispatch::deblock_chroma_edge_asm(
+            plane, base, stride, is_vertical, bs, index_a, alpha, beta,
+        ) {
+            return;
+        }
+    }
+
     let step = if is_vertical { 1 } else { stride };
 
     for i in 0..4u8 {
