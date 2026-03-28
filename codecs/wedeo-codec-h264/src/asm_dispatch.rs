@@ -384,6 +384,64 @@ pub fn mc_chroma_asm(
     true
 }
 
+/// Try to perform chroma MC avg (bi-prediction) via NEON assembly.
+///
+/// Same constraints as `mc_chroma_asm`. The `avg` variant reads the existing
+/// dst pixels and averages them with the MC result.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub fn mc_chroma_avg_asm(
+    dst: &mut [u8],
+    dst_stride: usize,
+    ref_uv: &[u8],
+    ref_stride: usize,
+    ref_x: i32,
+    ref_y_pos: i32,
+    dx: u8,
+    dy: u8,
+    block_w: usize,
+    block_h: usize,
+    pic_w: i32,
+    pic_h: i32,
+) -> bool {
+    if dst_stride != ref_stride {
+        return false;
+    }
+
+    let dx_extra = if dx > 0 { 1 } else { 0 };
+    let dy_extra = if dy > 0 { 1 } else { 0 };
+    if ref_x < 0
+        || ref_y_pos < 0
+        || ref_x + block_w as i32 + dx_extra > pic_w
+        || ref_y_pos + block_h as i32 + dy_extra > pic_h
+    {
+        return false;
+    }
+
+    let func: ChromaMcFn = match block_w {
+        8 => asm_ffi::ff_avg_h264_chroma_mc8_neon,
+        4 => asm_ffi::ff_avg_h264_chroma_mc4_neon,
+        2 => asm_ffi::ff_avg_h264_chroma_mc2_neon,
+        _ => return false,
+    };
+
+    let src_off = ref_y_pos as usize * ref_stride + ref_x as usize;
+    let stride = ref_stride as isize;
+
+    // SAFETY: Bounds checked above, block dimensions match function expectations.
+    unsafe {
+        func(
+            dst.as_mut_ptr(),
+            ref_uv[src_off..].as_ptr(),
+            stride,
+            block_h as i32,
+            dx as i32,
+            dy as i32,
+        );
+    }
+    true
+}
+
 // ---------------------------------------------------------------------------
 // IDCT dispatch
 // ---------------------------------------------------------------------------

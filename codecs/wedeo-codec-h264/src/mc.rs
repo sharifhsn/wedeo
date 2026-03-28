@@ -1069,6 +1069,76 @@ pub fn mc_chroma(
     }
 }
 
+/// Perform chroma MC avg (bi-prediction averaging) into an existing destination.
+///
+/// Reads the existing dst pixels, performs bilinear MC from `ref_uv`, and
+/// averages the two: `dst[i] = (dst[i] + mc_result[i] + 1) >> 1`.
+///
+/// Used for unweighted B-frame chroma bi-prediction, replacing the
+/// mc_chroma-into-tmp + avg_pixels_inplace pattern.
+#[allow(clippy::too_many_arguments)]
+pub fn mc_chroma_avg(
+    dst: &mut [u8],
+    dst_stride: usize,
+    ref_uv: &[u8],
+    ref_stride: usize,
+    ref_x: i32,
+    ref_y_pos: i32,
+    dx: u8,
+    dy: u8,
+    block_w: usize,
+    block_h: usize,
+    pic_width: u32,
+    pic_height: u32,
+) {
+    debug_assert!(dx < 8 && dy < 8);
+
+    // Try NEON assembly for interior blocks with matching strides.
+    #[cfg(has_asm)]
+    if crate::asm_dispatch::mc_chroma_avg_asm(
+        dst, dst_stride, ref_uv, ref_stride, ref_x, ref_y_pos,
+        dx, dy, block_w, block_h, pic_width as i32, pic_height as i32,
+    ) {
+        return;
+    }
+
+    let pw = pic_width as i32;
+    let ph = pic_height as i32;
+
+    let a = (8 - dx as i32) * (8 - dy as i32);
+    let b = (dx as i32) * (8 - dy as i32);
+    let c = (8 - dx as i32) * (dy as i32);
+    let d = (dx as i32) * (dy as i32);
+
+    for j in 0..block_h {
+        for i in 0..block_w {
+            let sx = ref_x + i as i32;
+            let sy = ref_y_pos + j as i32;
+
+            let mc_val = if d != 0 {
+                let s00 = get_ref_pixel(ref_uv, ref_stride, sx, sy, pw, ph) as i32;
+                let s10 = get_ref_pixel(ref_uv, ref_stride, sx + 1, sy, pw, ph) as i32;
+                let s01 = get_ref_pixel(ref_uv, ref_stride, sx, sy + 1, pw, ph) as i32;
+                let s11 = get_ref_pixel(ref_uv, ref_stride, sx + 1, sy + 1, pw, ph) as i32;
+                ((a * s00 + b * s10 + c * s01 + d * s11 + 32) >> 6) as u8
+            } else if b + c != 0 {
+                let e = b + c;
+                let (step_x, step_y): (i32, i32) = if c != 0 { (0, 1) } else { (1, 0) };
+                let s0 = get_ref_pixel(ref_uv, ref_stride, sx, sy, pw, ph) as i32;
+                let s1 = get_ref_pixel(ref_uv, ref_stride, sx + step_x, sy + step_y, pw, ph) as i32;
+                ((a * s0 + e * s1 + 32) >> 6) as u8
+            } else {
+                let s0 = get_ref_pixel(ref_uv, ref_stride, sx, sy, pw, ph) as i32;
+                ((a * s0 + 32) >> 6) as u8
+            };
+
+            let idx = j * dst_stride + i;
+            let existing = dst[idx] as u16;
+            dst[idx] = ((existing + mc_val as u16 + 1) >> 1) as u8;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // MV to reference position conversion
 // ---------------------------------------------------------------------------
