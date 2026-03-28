@@ -239,12 +239,12 @@ fn avg_qp(qp_p: u8, qp_q: u8) -> u8 {
 }
 
 /// Compute alpha and beta thresholds from QP and offsets.
-/// Returns (alpha, beta), or (0, 0) if no filtering needed.
+/// Returns (alpha, beta, index_a). alpha=0 or beta=0 means no filtering needed.
 #[inline]
-fn get_thresholds(qp: u8, alpha_c0_offset: i32, beta_offset: i32) -> (i32, i32) {
+fn get_thresholds(qp: u8, alpha_c0_offset: i32, beta_offset: i32) -> (i32, i32, usize) {
     let index_a = clip3(0, 51, qp as i32 + alpha_c0_offset) as usize;
     let index_b = clip3(0, 51, qp as i32 + beta_offset) as usize;
-    (ALPHA_TABLE[index_a], BETA_TABLE[index_b])
+    (ALPHA_TABLE[index_a], BETA_TABLE[index_b], index_a)
 }
 
 /// Get tc0 value from the table for a given QP, offset, and bS (1-3).
@@ -564,10 +564,11 @@ fn filter_mb_edge_luma(
     mb_x: u32,
     mb_y: u32,
 ) {
-    let (alpha, beta) = get_thresholds(qp, alpha_offset, beta_offset);
+    let (alpha, beta, index_a) = get_thresholds(qp, alpha_offset, beta_offset);
     if alpha == 0 || beta == 0 {
         return;
     }
+    let _ = index_a; // used by #[cfg(has_asm)] below
 
     // For vertical edges: fixed x = edge*4, varying y.
     // For horizontal edges: fixed y = edge*4, varying x.
@@ -580,13 +581,10 @@ fn filter_mb_edge_luma(
 
     // Try NEON assembly: processes all 16 pixel pairs in one call.
     #[cfg(has_asm)]
-    {
-        let index_a = clip3(0, 51, qp as i32 + alpha_offset) as usize;
-        if crate::asm_dispatch::deblock_luma_edge_asm(
-            plane, base, stride, is_vertical, bs, index_a, alpha, beta,
-        ) {
-            return;
-        }
+    if crate::asm_dispatch::deblock_luma_edge_asm(
+        plane, base, stride, is_vertical, bs, index_a, alpha, beta,
+    ) {
+        return;
     }
 
     for i in 0..4u8 {
@@ -693,10 +691,11 @@ fn filter_mb_edge_chroma(
     alpha_offset: i32,
     beta_offset: i32,
 ) {
-    let (alpha, beta) = get_thresholds(qp, alpha_offset, beta_offset);
+    let (alpha, beta, index_a) = get_thresholds(qp, alpha_offset, beta_offset);
     if alpha == 0 || beta == 0 {
         return;
     }
+    let _ = index_a;
 
     let edge_pixel_offset = if is_vertical {
         edge * 4
@@ -705,15 +704,11 @@ fn filter_mb_edge_chroma(
     };
     let base = mb_base_offset + edge_pixel_offset;
 
-    // Try NEON assembly: processes all 8 chroma pixel pairs in one call.
     #[cfg(has_asm)]
-    {
-        let index_a = clip3(0, 51, qp as i32 + alpha_offset) as usize;
-        if crate::asm_dispatch::deblock_chroma_edge_asm(
-            plane, base, stride, is_vertical, bs, index_a, alpha, beta,
-        ) {
-            return;
-        }
+    if crate::asm_dispatch::deblock_chroma_edge_asm(
+        plane, base, stride, is_vertical, bs, index_a, alpha, beta,
+    ) {
+        return;
     }
 
     let step = if is_vertical { 1 } else { stride };
@@ -980,7 +975,7 @@ fn filter_mbaff_edge_luma(
     alpha_offset: i32,
     beta_offset: i32,
 ) {
-    let (alpha, beta) = get_thresholds(qp, alpha_offset, beta_offset);
+    let (alpha, beta, _) = get_thresholds(qp, alpha_offset, beta_offset);
     if alpha == 0 || beta == 0 {
         return;
     }
@@ -1040,7 +1035,7 @@ fn filter_mbaff_edge_chroma(
     alpha_offset: i32,
     beta_offset: i32,
 ) {
-    let (alpha, beta) = get_thresholds(qp, alpha_offset, beta_offset);
+    let (alpha, beta, _) = get_thresholds(qp, alpha_offset, beta_offset);
     if alpha == 0 || beta == 0 {
         return;
     }
@@ -2255,12 +2250,12 @@ mod tests {
     #[test]
     fn get_thresholds_clamping() {
         // QP 0 + offset -10 should clamp to index 0
-        let (alpha, beta) = get_thresholds(0, -10, -10);
+        let (alpha, beta, _) = get_thresholds(0, -10, -10);
         assert_eq!(alpha, 0);
         assert_eq!(beta, 0);
 
         // QP 51 + offset +10 should clamp to index 51
-        let (alpha, beta) = get_thresholds(51, 10, 10);
+        let (alpha, beta, _) = get_thresholds(51, 10, 10);
         assert_eq!(alpha, 255);
         assert_eq!(beta, 18);
     }
@@ -2274,7 +2269,7 @@ mod tests {
         // QP=35: alpha=45, beta=10
         // |p0-q0|=20 < 45, |p1-p0|=10 == beta => fails threshold
         // Use QP=36 where beta=11 so |p1-p0|=10 < 11
-        let (alpha, beta) = get_thresholds(36, 0, 0);
+        let (alpha, beta, _) = get_thresholds(36, 0, 0);
         assert_eq!(alpha, 50);
         assert_eq!(beta, 11);
 
@@ -2302,7 +2297,7 @@ mod tests {
         // Craft pixels where |p0-q0| < (alpha >> 2) + 2 and |p2-p0| < beta
         // to trigger full strong filtering.
         // QP=40: alpha=80, beta=13
-        let (alpha, beta) = get_thresholds(40, 0, 0);
+        let (alpha, beta, _) = get_thresholds(40, 0, 0);
         assert_eq!(alpha, 80);
         assert_eq!(beta, 13);
 
@@ -2350,7 +2345,7 @@ mod tests {
         let tc0 = get_tc0(30, 0, 2);
         assert_eq!(tc0, 1);
 
-        let (alpha, beta) = get_thresholds(30, 0, 0);
+        let (alpha, beta, _) = get_thresholds(30, 0, 0);
         // alpha=25, beta=8
 
         // p2=120, p1=125, p0=130, q0=135, q1=140, q2=145
@@ -2376,7 +2371,7 @@ mod tests {
     fn normal_filter_luma_with_p1_q1() {
         // Use QP=40 where beta=13 so |p2-p0| < beta triggers p1 filtering
         let tc0 = get_tc0(40, 0, 2);
-        let (alpha, beta) = get_thresholds(40, 0, 0);
+        let (alpha, beta, _) = get_thresholds(40, 0, 0);
         // alpha=80, beta=13
 
         // p2=128, p1=130, p0=132, q0=138, q1=140, q2=142
@@ -2411,7 +2406,7 @@ mod tests {
 
     #[test]
     fn strong_filter_chroma_basic() {
-        let (alpha, beta) = get_thresholds(35, 0, 0);
+        let (alpha, beta, _) = get_thresholds(35, 0, 0);
 
         // p1=125, p0=130, q0=135, q1=140
         // |p0-q0|=5 < alpha, |p1-p0|=5 < beta, |q1-q0|=5 < beta
@@ -2424,7 +2419,7 @@ mod tests {
 
     #[test]
     fn normal_filter_chroma_basic() {
-        let (alpha, beta) = get_thresholds(35, 0, 0);
+        let (alpha, beta, _) = get_thresholds(35, 0, 0);
         let tc = get_tc0(35, 0, 2) + 1;
 
         let result = filter_normal_chroma(130, 125, 135, 140, alpha, beta, tc);
@@ -2715,7 +2710,7 @@ mod tests {
         let tc0 = get_tc0(30, 0, 1);
         assert_eq!(tc0, 1);
 
-        let (alpha, beta) = get_thresholds(30, 0, 0);
+        let (alpha, beta, _) = get_thresholds(30, 0, 0);
 
         // Small difference at boundary: p0=130, q0=135, p1=128, q1=137, p2=126, q2=139
         // |p0-q0|=5 < 25=alpha, |p1-p0|=2 < 8=beta, |q1-q0|=2 < 8=beta => filter
