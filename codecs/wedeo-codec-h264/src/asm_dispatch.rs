@@ -82,52 +82,49 @@ pub fn mc_luma_asm(
     pic_w: i32,
     pic_h: i32,
 ) -> bool {
-    // FFmpeg qpel takes a single stride for both src and dst.
     if dst_stride != ref_stride {
         return false;
     }
-
-    // Check that the filter window stays within picture bounds.
     if !is_interior(ref_x, ref_y_pos, dx, dy, block_w, block_h, pic_w, pic_h) {
         return false;
     }
+    mc_luma_dispatch(
+        dst, ref_y, ref_stride, ref_x, ref_y_pos, dx, dy, block_w, block_h,
+        &asm_ffi::QPEL_PUT_16, &asm_ffi::QPEL_PUT_8, fullpel_put,
+    )
+}
 
-    // Determine which table to use based on block dimensions.
-    // Square 16×16 and 8×8 are direct. Non-square 16×8 and 8×16 decompose
-    // into two 8×8 calls.
-    let stride = ref_stride as isize;
-    let idx = dy as usize * 4 + dx as usize;
-    debug_assert!(idx < 16);
-
-    match (block_w, block_h) {
-        (16, 16) => {
-            mc_luma_single(dst, ref_y, ref_stride, ref_x, ref_y_pos, idx, &asm_ffi::QPEL_PUT_16, stride, 16, 16)
-        }
-        (8, 8) => {
-            mc_luma_single(dst, ref_y, ref_stride, ref_x, ref_y_pos, idx, &asm_ffi::QPEL_PUT_8, stride, 8, 8)
-        }
-        (16, 8) => {
-            // Split width: left 8×8 + right 8×8
-            let src_off = ref_y_pos as usize * ref_stride + ref_x as usize;
-            mc_luma_half(dst, ref_y, src_off, ref_stride, idx, &asm_ffi::QPEL_PUT_8, stride, 8, 0)
-        }
-        (8, 16) => {
-            // Split height: top 8×8 + bottom 8×8
-            let src_off = ref_y_pos as usize * ref_stride + ref_x as usize;
-            mc_luma_half(dst, ref_y, src_off, ref_stride, idx, &asm_ffi::QPEL_PUT_8, stride, 0, 8)
-        }
-        _ => false,
+/// Fullpel (mc00) put: copy src to dst.
+#[inline]
+fn fullpel_put(dst: &mut [u8], ref_y: &[u8], src_off: usize, stride: usize, w: usize, h: usize) {
+    for j in 0..h {
+        let d = j * stride;
+        let s = src_off + j * stride;
+        dst[d..d + w].copy_from_slice(&ref_y[s..s + w]);
     }
 }
 
-/// Execute a single MC call for a square block.
+/// Fullpel (mc00) avg: average src with existing dst.
+#[inline]
+fn fullpel_avg(dst: &mut [u8], ref_y: &[u8], src_off: usize, stride: usize, w: usize, h: usize) {
+    for j in 0..h {
+        for i in 0..w {
+            let d = j * stride + i;
+            let s = src_off + j * stride + i;
+            dst[d] = ((dst[d] as u16 + ref_y[s] as u16 + 1) >> 1) as u8;
+        }
+    }
+}
+
+/// Dispatch a single square MC block (8×8 or 16×16) to NEON or fullpel fallback.
 #[inline]
 #[allow(clippy::too_many_arguments)]
-fn mc_luma_single(
+fn mc_dispatch_single(
     dst: &mut [u8], ref_y: &[u8], ref_stride: usize,
     ref_x: i32, ref_y_pos: i32, idx: usize,
     table: &[Option<asm_ffi::QpelFn>; 16], stride: isize,
     block_w: usize, block_h: usize,
+    fullpel: fn(&mut [u8], &[u8], usize, usize, usize, usize),
 ) -> bool {
     let src_off = ref_y_pos as usize * ref_stride + ref_x as usize;
     match table[idx] {
@@ -137,55 +134,70 @@ fn mc_luma_single(
             true
         }
         None => {
-            // mc00 (fullpel copy)
-            for j in 0..block_h {
-                let d = j * ref_stride;
-                let s = src_off + j * ref_stride;
-                dst[d..d + block_w].copy_from_slice(&ref_y[s..s + block_w]);
-            }
+            fullpel(dst, ref_y, src_off, ref_stride, block_w, block_h);
             true
         }
     }
 }
 
-/// Execute two 8×8 MC calls for a non-square block (16×8 or 8×16).
-/// `col_off` is the horizontal offset for the second call (8 for 16×8, 0 for 8×16).
-/// `row_off` is the vertical offset in rows (0 for 16×8, 8 for 8×16).
+/// Dispatch two 8×8 MC calls for a non-square block (16×8 or 8×16).
 #[inline]
 #[allow(clippy::too_many_arguments)]
-fn mc_luma_half(
+fn mc_dispatch_half(
     dst: &mut [u8], ref_y: &[u8], src_off: usize, ref_stride: usize,
     idx: usize, table: &[Option<asm_ffi::QpelFn>; 16], stride: isize,
     col_off: usize, row_off: usize,
+    fullpel: fn(&mut [u8], &[u8], usize, usize, usize, usize),
 ) -> bool {
-    let stride_off = row_off * ref_stride;
+    let off2 = col_off + row_off * ref_stride;
     match table[idx] {
         Some(func) => {
             // SAFETY: Interior check covered the full non-square window.
             unsafe {
                 func(dst.as_mut_ptr(), ref_y[src_off..].as_ptr(), stride);
                 func(
-                    dst[col_off + stride_off..].as_mut_ptr(),
-                    ref_y[src_off + col_off + stride_off..].as_ptr(),
+                    dst[off2..].as_mut_ptr(),
+                    ref_y[src_off + off2..].as_ptr(),
                     stride,
                 );
             }
             true
         }
         None => {
-            // mc00 (fullpel copy) for both halves
-            for j in 0..8 {
-                let d = j * ref_stride;
-                let s = src_off + j * ref_stride;
-                dst[d..d + 8].copy_from_slice(&ref_y[s..s + 8]);
-            }
-            for j in 0..8 {
-                let d = col_off + stride_off + j * ref_stride;
-                let s = src_off + col_off + stride_off + j * ref_stride;
-                dst[d..d + 8].copy_from_slice(&ref_y[s..s + 8]);
-            }
+            fullpel(dst, ref_y, src_off, ref_stride, 8, 8);
+            fullpel(&mut dst[off2..], ref_y, src_off + off2, ref_stride, 8, 8);
             true
         }
+    }
+}
+
+/// Common dispatch logic for mc_luma_asm / mc_avg_asm.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn mc_luma_dispatch(
+    dst: &mut [u8], ref_y: &[u8], ref_stride: usize,
+    ref_x: i32, ref_y_pos: i32, dx: u8, dy: u8,
+    block_w: usize, block_h: usize,
+    put_16: &[Option<asm_ffi::QpelFn>; 16],
+    put_8: &[Option<asm_ffi::QpelFn>; 16],
+    fullpel: fn(&mut [u8], &[u8], usize, usize, usize, usize),
+) -> bool {
+    let stride = ref_stride as isize;
+    let idx = dy as usize * 4 + dx as usize;
+    debug_assert!(idx < 16);
+
+    match (block_w, block_h) {
+        (16, 16) => mc_dispatch_single(dst, ref_y, ref_stride, ref_x, ref_y_pos, idx, put_16, stride, 16, 16, fullpel),
+        (8, 8)   => mc_dispatch_single(dst, ref_y, ref_stride, ref_x, ref_y_pos, idx, put_8, stride, 8, 8, fullpel),
+        (16, 8) => {
+            let src_off = ref_y_pos as usize * ref_stride + ref_x as usize;
+            mc_dispatch_half(dst, ref_y, src_off, ref_stride, idx, put_8, stride, 8, 0, fullpel)
+        }
+        (8, 16) => {
+            let src_off = ref_y_pos as usize * ref_stride + ref_x as usize;
+            mc_dispatch_half(dst, ref_y, src_off, ref_stride, idx, put_8, stride, 0, 8, fullpel)
+        }
+        _ => false,
     }
 }
 
@@ -194,7 +206,7 @@ fn mc_luma_half(
 /// Same constraints as `mc_luma_asm`. The `avg` variant reads the existing
 /// dst pixels and averages them with the MC result.
 #[inline]
-#[allow(clippy::too_many_arguments)] // Mirrors mc_luma signature
+#[allow(clippy::too_many_arguments)]
 pub fn mc_avg_asm(
     dst: &mut [u8],
     dst_stride: usize,
@@ -215,104 +227,10 @@ pub fn mc_avg_asm(
     if !is_interior(ref_x, ref_y_pos, dx, dy, block_w, block_h, pic_w, pic_h) {
         return false;
     }
-
-    let stride = ref_stride as isize;
-    let idx = dy as usize * 4 + dx as usize;
-
-    match (block_w, block_h) {
-        (16, 16) => {
-            mc_avg_single(dst, ref_y, ref_stride, ref_x, ref_y_pos, idx, &asm_ffi::QPEL_AVG_16, stride, 16, 16)
-        }
-        (8, 8) => {
-            mc_avg_single(dst, ref_y, ref_stride, ref_x, ref_y_pos, idx, &asm_ffi::QPEL_AVG_8, stride, 8, 8)
-        }
-        (16, 8) => {
-            let src_off = ref_y_pos as usize * ref_stride + ref_x as usize;
-            mc_avg_half(dst, ref_y, src_off, ref_stride, idx, &asm_ffi::QPEL_AVG_8, stride, 8, 0)
-        }
-        (8, 16) => {
-            let src_off = ref_y_pos as usize * ref_stride + ref_x as usize;
-            mc_avg_half(dst, ref_y, src_off, ref_stride, idx, &asm_ffi::QPEL_AVG_8, stride, 0, 8)
-        }
-        _ => false,
-    }
-}
-
-#[inline]
-#[allow(clippy::too_many_arguments)]
-fn mc_avg_single(
-    dst: &mut [u8], ref_y: &[u8], ref_stride: usize,
-    ref_x: i32, ref_y_pos: i32, idx: usize,
-    table: &[Option<asm_ffi::QpelFn>; 16], stride: isize,
-    block_w: usize, block_h: usize,
-) -> bool {
-    let src_off = ref_y_pos as usize * ref_stride + ref_x as usize;
-    match table[idx] {
-        Some(func) => {
-            // SAFETY: Interior check passed, block dims match function.
-            unsafe { func(dst.as_mut_ptr(), ref_y[src_off..].as_ptr(), stride); }
-            true
-        }
-        None => {
-            // mc00 avg: average with existing dst
-            for j in 0..block_h {
-                for i in 0..block_w {
-                    let d = j * ref_stride + i;
-                    let s = src_off + j * ref_stride + i;
-                    let a = dst[d] as u16;
-                    let b = ref_y[s] as u16;
-                    dst[d] = ((a + b + 1) >> 1) as u8;
-                }
-            }
-            true
-        }
-    }
-}
-
-#[inline]
-#[allow(clippy::too_many_arguments)]
-fn mc_avg_half(
-    dst: &mut [u8], ref_y: &[u8], src_off: usize, ref_stride: usize,
-    idx: usize, table: &[Option<asm_ffi::QpelFn>; 16], stride: isize,
-    col_off: usize, row_off: usize,
-) -> bool {
-    let stride_off = row_off * ref_stride;
-    match table[idx] {
-        Some(func) => {
-            // SAFETY: Interior check covered the full non-square window.
-            unsafe {
-                func(dst.as_mut_ptr(), ref_y[src_off..].as_ptr(), stride);
-                func(
-                    dst[col_off + stride_off..].as_mut_ptr(),
-                    ref_y[src_off + col_off + stride_off..].as_ptr(),
-                    stride,
-                );
-            }
-            true
-        }
-        None => {
-            // mc00 avg for both halves
-            for j in 0..8 {
-                for i in 0..8 {
-                    let d = j * ref_stride + i;
-                    let s = src_off + j * ref_stride + i;
-                    let a = dst[d] as u16;
-                    let b = ref_y[s] as u16;
-                    dst[d] = ((a + b + 1) >> 1) as u8;
-                }
-            }
-            for j in 0..8 {
-                for i in 0..8 {
-                    let d = col_off + stride_off + j * ref_stride + i;
-                    let s = src_off + col_off + stride_off + j * ref_stride + i;
-                    let a = dst[d] as u16;
-                    let b = ref_y[s] as u16;
-                    dst[d] = ((a + b + 1) >> 1) as u8;
-                }
-            }
-            true
-        }
-    }
+    mc_luma_dispatch(
+        dst, ref_y, ref_stride, ref_x, ref_y_pos, dx, dy, block_w, block_h,
+        &asm_ffi::QPEL_AVG_16, &asm_ffi::QPEL_AVG_8, fullpel_avg,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -347,41 +265,11 @@ pub fn mc_chroma_asm(
         return false;
     }
 
-    // Chroma bilinear reads src[x..x+block_w+1] and src[y..y+block_h+1].
-    // Check bounds: need ref_x >= 0, ref_y >= 0,
-    // ref_x + block_w + 1 <= pic_w, ref_y + block_h + 1 <= pic_h.
-    let dx_extra = if dx > 0 { 1 } else { 0 };
-    let dy_extra = if dy > 0 { 1 } else { 0 };
-    if ref_x < 0
-        || ref_y_pos < 0
-        || ref_x + block_w as i32 + dx_extra > pic_w
-        || ref_y_pos + block_h as i32 + dy_extra > pic_h
-    {
+    if !is_interior_chroma(ref_x, ref_y_pos, dx, dy, block_w, block_h, pic_w, pic_h) {
         return false;
     }
 
-    let func: ChromaMcFn = match block_w {
-        8 => asm_ffi::ff_put_h264_chroma_mc8_neon,
-        4 => asm_ffi::ff_put_h264_chroma_mc4_neon,
-        2 => asm_ffi::ff_put_h264_chroma_mc2_neon,
-        _ => return false,
-    };
-
-    let src_off = ref_y_pos as usize * ref_stride + ref_x as usize;
-    let stride = ref_stride as isize;
-
-    // SAFETY: Bounds checked above, block dimensions match function expectations.
-    unsafe {
-        func(
-            dst.as_mut_ptr(),
-            ref_uv[src_off..].as_ptr(),
-            stride,
-            block_h as i32,
-            dx as i32,
-            dy as i32,
-        );
-    }
-    true
+    mc_chroma_dispatch(dst, ref_uv, ref_stride, ref_x, ref_y_pos, dx, dy, block_w, block_h, false)
 }
 
 /// Try to perform chroma MC avg (bi-prediction) via NEON assembly.
@@ -407,33 +295,54 @@ pub fn mc_chroma_avg_asm(
     if dst_stride != ref_stride {
         return false;
     }
-
-    let dx_extra = if dx > 0 { 1 } else { 0 };
-    let dy_extra = if dy > 0 { 1 } else { 0 };
-    if ref_x < 0
-        || ref_y_pos < 0
-        || ref_x + block_w as i32 + dx_extra > pic_w
-        || ref_y_pos + block_h as i32 + dy_extra > pic_h
-    {
+    if !is_interior_chroma(ref_x, ref_y_pos, dx, dy, block_w, block_h, pic_w, pic_h) {
         return false;
     }
 
-    let func: ChromaMcFn = match block_w {
-        8 => asm_ffi::ff_avg_h264_chroma_mc8_neon,
-        4 => asm_ffi::ff_avg_h264_chroma_mc4_neon,
-        2 => asm_ffi::ff_avg_h264_chroma_mc2_neon,
+    mc_chroma_dispatch(dst, ref_uv, ref_stride, ref_x, ref_y_pos, dx, dy, block_w, block_h, true)
+}
+
+/// Bounds check for chroma MC: bilinear filter reads one extra pixel in each
+/// sub-pel direction.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn is_interior_chroma(
+    ref_x: i32, ref_y: i32, dx: u8, dy: u8,
+    block_w: usize, block_h: usize, pic_w: i32, pic_h: i32,
+) -> bool {
+    let dx_extra = if dx > 0 { 1 } else { 0 };
+    let dy_extra = if dy > 0 { 1 } else { 0 };
+    ref_x >= 0
+        && ref_y >= 0
+        && ref_x + block_w as i32 + dx_extra <= pic_w
+        && ref_y + block_h as i32 + dy_extra <= pic_h
+}
+
+/// Shared dispatch for chroma put/avg.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn mc_chroma_dispatch(
+    dst: &mut [u8], ref_uv: &[u8], ref_stride: usize,
+    ref_x: i32, ref_y_pos: i32, dx: u8, dy: u8,
+    block_w: usize, block_h: usize, avg: bool,
+) -> bool {
+    let func: ChromaMcFn = match (block_w, avg) {
+        (8, false) => asm_ffi::ff_put_h264_chroma_mc8_neon,
+        (4, false) => asm_ffi::ff_put_h264_chroma_mc4_neon,
+        (2, false) => asm_ffi::ff_put_h264_chroma_mc2_neon,
+        (8, true) => asm_ffi::ff_avg_h264_chroma_mc8_neon,
+        (4, true) => asm_ffi::ff_avg_h264_chroma_mc4_neon,
+        (2, true) => asm_ffi::ff_avg_h264_chroma_mc2_neon,
         _ => return false,
     };
 
     let src_off = ref_y_pos as usize * ref_stride + ref_x as usize;
-    let stride = ref_stride as isize;
-
-    // SAFETY: Bounds checked above, block dimensions match function expectations.
+    // SAFETY: Bounds checked by is_interior_chroma, block dims match function.
     unsafe {
         func(
             dst.as_mut_ptr(),
             ref_uv[src_off..].as_ptr(),
-            stride,
+            ref_stride as isize,
             block_h as i32,
             dx as i32,
             dy as i32,
@@ -491,8 +400,9 @@ pub fn deblock_luma_edge_asm(
     alpha: i32,
     beta: i32,
 ) -> bool {
-    let all_intra = bs.iter().all(|&b| b == 4);
-    let any_intra = bs.contains(&4);
+    let intra_count = bs.iter().filter(|&&b| b == 4).count();
+    let all_intra = intra_count == 4;
+    let any_intra = intra_count > 0;
 
     if all_intra {
         // All bS=4: use intra (strong) NEON filter
@@ -551,8 +461,9 @@ pub fn deblock_chroma_edge_asm(
     alpha: i32,
     beta: i32,
 ) -> bool {
-    let all_intra = bs.iter().all(|&b| b == 4);
-    let any_intra = bs.contains(&4);
+    let intra_count = bs.iter().filter(|&&b| b == 4).count();
+    let all_intra = intra_count == 4;
+    let any_intra = intra_count > 0;
 
     if all_intra {
         let pix = &mut plane[base..];
