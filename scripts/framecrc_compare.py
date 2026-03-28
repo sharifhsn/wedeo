@@ -25,7 +25,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from ffmpeg_debug import (
+from wedeo_utils import (
     decode_yuv,
     find_wedeo_binary,
     get_video_info,

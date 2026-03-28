@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from ffmpeg_debug import find_wedeo_binary
+from wedeo_utils import find_wedeo_binary
 from framecrc_compare import compare_one
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
