@@ -63,7 +63,7 @@ fn is_interior(
 /// fall back to the scalar Rust implementation.
 ///
 /// Conditions for assembly dispatch:
-/// 1. Block size is 16×16 or 8×8 (assembly only supports these fixed sizes)
+/// 1. Block size is 16×16, 8×8, 16×8, or 8×16 (16×8 and 8×16 decompose into 2× 8×8)
 /// 2. Block is "interior" — the 6-tap filter window doesn't touch picture edges
 /// 3. dst_stride == ref_stride (FFmpeg takes a single stride for both)
 #[inline]
@@ -82,12 +82,6 @@ pub fn mc_luma_asm(
     pic_w: i32,
     pic_h: i32,
 ) -> bool {
-    // Only 16×16 and 8×8 blocks have assembly implementations.
-    // H.264 also uses 4×{4,8,16}, 8×{4,16}, 16×8 etc. — these fall back.
-    if block_w != block_h || (block_w != 16 && block_w != 8) {
-        return false;
-    }
-
     // FFmpeg qpel takes a single stride for both src and dst.
     if dst_stride != ref_stride {
         return false;
@@ -98,37 +92,97 @@ pub fn mc_luma_asm(
         return false;
     }
 
+    // Determine which table to use based on block dimensions.
+    // Square 16×16 and 8×8 are direct. Non-square 16×8 and 8×16 decompose
+    // into two 8×8 calls.
+    let stride = ref_stride as isize;
     let idx = dy as usize * 4 + dx as usize;
     debug_assert!(idx < 16);
 
-    let table = if block_w == 16 {
-        &asm_ffi::QPEL_PUT_16
-    } else {
-        &asm_ffi::QPEL_PUT_8
-    };
+    match (block_w, block_h) {
+        (16, 16) => {
+            mc_luma_single(dst, ref_y, ref_stride, ref_x, ref_y_pos, idx, &asm_ffi::QPEL_PUT_16, stride, 16, 16)
+        }
+        (8, 8) => {
+            mc_luma_single(dst, ref_y, ref_stride, ref_x, ref_y_pos, idx, &asm_ffi::QPEL_PUT_8, stride, 8, 8)
+        }
+        (16, 8) => {
+            // Split width: left 8×8 + right 8×8
+            let src_off = ref_y_pos as usize * ref_stride + ref_x as usize;
+            mc_luma_half(dst, ref_y, src_off, ref_stride, idx, &asm_ffi::QPEL_PUT_8, stride, 8, 0)
+        }
+        (8, 16) => {
+            // Split height: top 8×8 + bottom 8×8
+            let src_off = ref_y_pos as usize * ref_stride + ref_x as usize;
+            mc_luma_half(dst, ref_y, src_off, ref_stride, idx, &asm_ffi::QPEL_PUT_8, stride, 0, 8)
+        }
+        _ => false,
+    }
+}
 
-    let stride = ref_stride as isize;
-
+/// Execute a single MC call for a square block.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn mc_luma_single(
+    dst: &mut [u8], ref_y: &[u8], ref_stride: usize,
+    ref_x: i32, ref_y_pos: i32, idx: usize,
+    table: &[Option<asm_ffi::QpelFn>; 16], stride: isize,
+    block_w: usize, block_h: usize,
+) -> bool {
+    let src_off = ref_y_pos as usize * ref_stride + ref_x as usize;
     match table[idx] {
         Some(func) => {
-            let src_off = ref_y_pos as usize * ref_stride + ref_x as usize;
-            // SAFETY: We verified the block is interior (no out-of-bounds reads),
-            // block_w matches the function's expected width (16 or 8),
-            // and dst has at least block_h * dst_stride bytes.
+            // SAFETY: Interior check passed, block dims match function.
+            unsafe { func(dst.as_mut_ptr(), ref_y[src_off..].as_ptr(), stride); }
+            true
+        }
+        None => {
+            // mc00 (fullpel copy)
+            for j in 0..block_h {
+                let d = j * ref_stride;
+                let s = src_off + j * ref_stride;
+                dst[d..d + block_w].copy_from_slice(&ref_y[s..s + block_w]);
+            }
+            true
+        }
+    }
+}
+
+/// Execute two 8×8 MC calls for a non-square block (16×8 or 8×16).
+/// `col_off` is the horizontal offset for the second call (8 for 16×8, 0 for 8×16).
+/// `row_off` is the vertical offset in rows (0 for 16×8, 8 for 8×16).
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn mc_luma_half(
+    dst: &mut [u8], ref_y: &[u8], src_off: usize, ref_stride: usize,
+    idx: usize, table: &[Option<asm_ffi::QpelFn>; 16], stride: isize,
+    col_off: usize, row_off: usize,
+) -> bool {
+    let stride_off = row_off * ref_stride;
+    match table[idx] {
+        Some(func) => {
+            // SAFETY: Interior check covered the full non-square window.
             unsafe {
                 func(dst.as_mut_ptr(), ref_y[src_off..].as_ptr(), stride);
+                func(
+                    dst[col_off + stride_off..].as_mut_ptr(),
+                    ref_y[src_off + col_off + stride_off..].as_ptr(),
+                    stride,
+                );
             }
             true
         }
         None => {
-            // mc00 (fullpel copy): do a simple memcpy per row.
-            // This is already fast — no need for assembly.
-            debug_assert!(dx == 0 && dy == 0);
-            let src_off = ref_y_pos as usize * ref_stride + ref_x as usize;
-            for j in 0..block_h {
-                let d = j * dst_stride;
+            // mc00 (fullpel copy) for both halves
+            for j in 0..8 {
+                let d = j * ref_stride;
                 let s = src_off + j * ref_stride;
-                dst[d..d + block_w].copy_from_slice(&ref_y[s..s + block_w]);
+                dst[d..d + 8].copy_from_slice(&ref_y[s..s + 8]);
+            }
+            for j in 0..8 {
+                let d = col_off + stride_off + j * ref_stride;
+                let s = src_off + col_off + stride_off + j * ref_stride;
+                dst[d..d + 8].copy_from_slice(&ref_y[s..s + 8]);
             }
             true
         }
@@ -155,9 +209,6 @@ pub fn mc_avg_asm(
     pic_w: i32,
     pic_h: i32,
 ) -> bool {
-    if block_w != block_h || (block_w != 16 && block_w != 8) {
-        return false;
-    }
     if dst_stride != ref_stride {
         return false;
     }
@@ -165,32 +216,95 @@ pub fn mc_avg_asm(
         return false;
     }
 
-    let idx = dy as usize * 4 + dx as usize;
-    let table = if block_w == 16 {
-        &asm_ffi::QPEL_AVG_16
-    } else {
-        &asm_ffi::QPEL_AVG_8
-    };
-
     let stride = ref_stride as isize;
+    let idx = dy as usize * 4 + dx as usize;
 
+    match (block_w, block_h) {
+        (16, 16) => {
+            mc_avg_single(dst, ref_y, ref_stride, ref_x, ref_y_pos, idx, &asm_ffi::QPEL_AVG_16, stride, 16, 16)
+        }
+        (8, 8) => {
+            mc_avg_single(dst, ref_y, ref_stride, ref_x, ref_y_pos, idx, &asm_ffi::QPEL_AVG_8, stride, 8, 8)
+        }
+        (16, 8) => {
+            let src_off = ref_y_pos as usize * ref_stride + ref_x as usize;
+            mc_avg_half(dst, ref_y, src_off, ref_stride, idx, &asm_ffi::QPEL_AVG_8, stride, 8, 0)
+        }
+        (8, 16) => {
+            let src_off = ref_y_pos as usize * ref_stride + ref_x as usize;
+            mc_avg_half(dst, ref_y, src_off, ref_stride, idx, &asm_ffi::QPEL_AVG_8, stride, 0, 8)
+        }
+        _ => false,
+    }
+}
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn mc_avg_single(
+    dst: &mut [u8], ref_y: &[u8], ref_stride: usize,
+    ref_x: i32, ref_y_pos: i32, idx: usize,
+    table: &[Option<asm_ffi::QpelFn>; 16], stride: isize,
+    block_w: usize, block_h: usize,
+) -> bool {
+    let src_off = ref_y_pos as usize * ref_stride + ref_x as usize;
     match table[idx] {
         Some(func) => {
-            let src_off = ref_y_pos as usize * ref_stride + ref_x as usize;
-            // SAFETY: Same as mc_luma_asm.
+            // SAFETY: Interior check passed, block dims match function.
+            unsafe { func(dst.as_mut_ptr(), ref_y[src_off..].as_ptr(), stride); }
+            true
+        }
+        None => {
+            // mc00 avg: average with existing dst
+            for j in 0..block_h {
+                for i in 0..block_w {
+                    let d = j * ref_stride + i;
+                    let s = src_off + j * ref_stride + i;
+                    let a = dst[d] as u16;
+                    let b = ref_y[s] as u16;
+                    dst[d] = ((a + b + 1) >> 1) as u8;
+                }
+            }
+            true
+        }
+    }
+}
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn mc_avg_half(
+    dst: &mut [u8], ref_y: &[u8], src_off: usize, ref_stride: usize,
+    idx: usize, table: &[Option<asm_ffi::QpelFn>; 16], stride: isize,
+    col_off: usize, row_off: usize,
+) -> bool {
+    let stride_off = row_off * ref_stride;
+    match table[idx] {
+        Some(func) => {
+            // SAFETY: Interior check covered the full non-square window.
             unsafe {
                 func(dst.as_mut_ptr(), ref_y[src_off..].as_ptr(), stride);
+                func(
+                    dst[col_off + stride_off..].as_mut_ptr(),
+                    ref_y[src_off + col_off + stride_off..].as_ptr(),
+                    stride,
+                );
             }
             true
         }
         None => {
-            // mc00 avg: copy + average with existing dst.
-            debug_assert!(dx == 0 && dy == 0);
-            let src_off = ref_y_pos as usize * ref_stride + ref_x as usize;
-            for j in 0..block_h {
-                for i in 0..block_w {
-                    let d = j * dst_stride + i;
+            // mc00 avg for both halves
+            for j in 0..8 {
+                for i in 0..8 {
+                    let d = j * ref_stride + i;
                     let s = src_off + j * ref_stride + i;
+                    let a = dst[d] as u16;
+                    let b = ref_y[s] as u16;
+                    dst[d] = ((a + b + 1) >> 1) as u8;
+                }
+            }
+            for j in 0..8 {
+                for i in 0..8 {
+                    let d = col_off + stride_off + j * ref_stride + i;
+                    let s = src_off + col_off + stride_off + j * ref_stride + i;
                     let a = dst[d] as u16;
                     let b = ref_y[s] as u16;
                     dst[d] = ((a + b + 1) >> 1) as u8;
