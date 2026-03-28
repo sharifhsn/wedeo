@@ -125,5 +125,5 @@ Every PR must include these sections:
 
 ## License
 
-By contributing, you agree that your contributions will be dual-licensed under
-MIT and Apache-2.0, consistent with the project license.
+By contributing, you agree that your contributions will be licensed under
+LGPL-2.1-or-later, consistent with the project license.

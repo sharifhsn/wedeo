@@ -23,7 +23,9 @@ resolver = "3"
 version = "0.1.0"
 edition = "2024"
 license = "LGPL-2.1-or-later"
-description = "Clean-room Rust rewrite of FFmpeg"
+description = "AI-generated Rust rewrite of FFmpeg"
+repository = "https://github.com/sharifhsn/wedeo"
+readme = "README.md"
 
 [workspace.dependencies]
 bitflags = "2"

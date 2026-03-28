@@ -1,0 +1,27 @@
+name: New codec or format
+description: Propose implementing a new codec or container format
+labels: [enhancement, codec]
+body:
+  - type: input
+    id: codec
+    attributes:
+      label: Codec or format name
+      placeholder: "e.g., HEVC, VP9, Matroska"
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Why this codec, what FATE tests cover it, any relevant FFmpeg source files.
+    validations:
+      required: true
+  - type: dropdown
+    id: contributor
+    attributes:
+      label: Are you planning to implement this?
+      options:
+        - "Yes, I'll submit a PR"
+        - "No, this is a request"
+    validations:
+      required: true

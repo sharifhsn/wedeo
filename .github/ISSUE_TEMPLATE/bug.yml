@@ -1,0 +1,31 @@
+name: Bug report
+description: Decode output differs from FFmpeg, crash, or incorrect behavior
+labels: [bug]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened
+      placeholder: Describe the issue.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction
+      description: Input file and commands to reproduce.
+      placeholder: |
+        cargo run --release --bin wedeo-framecrc -- input.264
+        ffmpeg -bitexact -i input.264 -f framecrc -
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      placeholder: What should happen (e.g., framecrc output should match FFmpeg).
+  - type: input
+    id: version
+    attributes:
+      label: wedeo version
+      placeholder: "git rev: abc1234 or cargo version"

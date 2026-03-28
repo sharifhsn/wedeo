@@ -1,0 +1,3 @@
+# Use default rustfmt settings. This file exists so contributors know
+# formatting is enforced, and tools can discover the project root.
+edition = "2024"

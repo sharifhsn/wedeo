@@ -11,8 +11,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  check:
-    name: Check
+  lint:
+    name: Lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -20,12 +20,20 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@nextest
-      - name: Format
-        run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
-      - name: Test
+      - name: Format check
+        run: cargo fmt --all --check
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - name: Unit & integration tests
         run: cargo nextest run --profile ci
       - name: Upload test results
         if: always()
@@ -33,27 +41,106 @@ jobs:
         with:
           name: test-results
           path: target/nextest/ci/junit.xml
-      - name: Build release
-        run: cargo build --release
 
   fate:
-    name: FATE
+    name: FATE Conformance
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
-      - name: Fetch FATE suite
-        run: ./scripts/fetch-fate-suite.sh
-      - name: FATE tests
-        run: cargo nextest run --profile fate -p wedeo-fate
+
+      # Only fetch h264-conformance subset (~134 MB, not the full 1.2 GB suite)
+      - name: Cache FATE H.264 samples
+        uses: actions/cache@v4
+        id: fate-cache
+        with:
+          path: fate-suite/h264-conformance
+          key: fate-h264-conformance-v1
+
+      - name: Fetch FATE H.264 samples
+        if: steps.fate-cache.outputs.cache-hit != 'true'
+        timeout-minutes: 10
+        run: |
+          mkdir -p fate-suite
+          rsync -a rsync://fate-suite.ffmpeg.org/fate-suite/h264-conformance fate-suite/
+
+      - name: Build release
+        run: cargo build --release --bin wedeo-framecrc -p wedeo-fate
+
+      - name: FATE tests (Rust)
+        run: cargo nextest run --profile ci -p wedeo-fate
         env:
           FATE_SUITE: ./fate-suite
+
+      - name: FATE conformance (framecrc vs FFmpeg)
+        id: fate-framecrc
+        run: |
+          set -o pipefail
+          python3 scripts/suite_runner.py \
+            --suite fate-cavlc,fate-cabac \
+            2>&1 | tee /tmp/fate-results.txt
+
+      - name: Post FATE summary
+        if: always()
+        run: |
+          echo '## FATE H.264 Conformance' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          if [ -f /tmp/fate-results.txt ]; then
+            cat /tmp/fate-results.txt >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'No results (build or download may have failed)' >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload FATE results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: fate-results
-          path: target/nextest/fate/junit.xml
+          path: target/nextest/ci/junit.xml
+
+  jvt-conformance:
+    name: JVT Conformance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # JVT vectors are static (keyed by manifest hash) — cache across runs
+      - name: Cache JVT vectors
+        uses: actions/cache@v4
+        with:
+          path: jvt-vectors
+          key: jvt-vectors-${{ hashFiles('test_suites/h264/*.json') }}
+
+      - name: Build wedeo-framecrc
+        run: cargo build --release --bin wedeo-framecrc -p wedeo-fate
+
+      - name: Download JVT vectors
+        continue-on-error: true  # ITU servers can be flaky
+        timeout-minutes: 10
+        run: python3 scripts/fetch_jvt.py --jobs 8
+
+      - name: Run JVT conformance (yuv420p)
+        id: conformance
+        run: |
+          set -o pipefail
+          python3 scripts/suite_runner.py \
+            --suite jvt-avc-v1,jvt-fr-ext \
+            --format yuv420p \
+            2>&1 | tee /tmp/jvt-results.txt
+
+      - name: Post summary
+        if: always()
+        run: |
+          echo '## JVT H.264 Conformance' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          if [ -f /tmp/jvt-results.txt ]; then
+            cat /tmp/jvt-results.txt >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'No results (build or download may have failed)' >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
