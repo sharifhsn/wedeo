@@ -19,7 +19,7 @@ against FFmpeg's FATE test suite. 16 crates, ~47K lines of Rust.
 - scripts/suite_runner.py — unified conformance runner
 - scripts/conformance_full.py — FATE conformance report
 - tests/fate/ — Rust FATE test harness
-- FFmpeg/ — reference C source (git submodule, n8.0.1)
+- FFmpeg/ — reference C source (git submodule, n8.1)
 
 ## Build and verify
 

@@ -18,12 +18,10 @@ fn build_asm() {
     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap();
     let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap();
 
-    match arch.as_str() {
-        "aarch64" => build_aarch64(&os),
-        // Future: "arm" => build_arm(&os),
-        // Future: "x86_64" | "x86" => build_x86(&os, &arch),
-        _ => {} // Silent fallback to pure Rust
+    if arch == "aarch64" {
+        build_aarch64(&os);
     }
+    // Future: "arm", "x86_64", "x86" — silent fallback to pure Rust
 }
 
 #[cfg(feature = "asm")]

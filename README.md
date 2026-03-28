@@ -138,7 +138,7 @@ Pre-commit hook available: `pip install pre-commit && pre-commit install`
 
 ## FFmpeg reference
 
-The `FFmpeg/` submodule is pinned to `n8.0.1`. Optional — only needed to read
+The `FFmpeg/` submodule is pinned to `n8.1`. Optional — only needed to read
 the C source or build a debug FFmpeg for development:
 
 ```bash
