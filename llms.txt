@@ -1,6 +1,6 @@
 # wedeo
 
-> Rust rewrite of FFmpeg. No bindgen, no c2rust, no FFI.
+> AI-generated Rust rewrite of FFmpeg.
 
 wedeo translates FFmpeg's C source into idiomatic Rust, verified bit-for-bit
 against FFmpeg's FATE test suite. 16 crates, ~47K lines of Rust.

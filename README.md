@@ -1,7 +1,6 @@
 # wedeo
 
-Rust rewrite of FFmpeg. No bindgen, no c2rust, no FFI. Pure Rust,
-translated directly from FFmpeg's C source, verified against FFmpeg's output
+AI-generated Rust rewrite of FFmpeg, verified against FFmpeg's output
 bit-for-bit.
 
 **This codebase is AI-generated.** Written by Claude (Anthropic) via
@@ -65,7 +64,7 @@ ffmpeg -bitexact -i input.264 -f framecrc -
 ### FATE testing
 
 ```bash
-./scripts/fetch-fate-suite.sh                    # ~134 MB H.264 subset
+./scripts/fetch-fate-suite.sh                    # downloads full suite (~1.2 GB)
 FATE_SUITE=./fate-suite cargo nextest run -p wedeo-fate
 ```
 
