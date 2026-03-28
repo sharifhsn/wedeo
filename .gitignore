@@ -4,6 +4,9 @@
 # FATE test samples (download via scripts/fetch-fate-suite.sh)
 /fate-suite
 
+# JVT conformance vectors (download via scripts/fetch_jvt.py)
+/jvt-vectors
+
 # Planning artifacts
 start.json
 
@@ -27,6 +30,7 @@ Thumbs.db
 .conformance-cache.json
 scripts/.conformance_snapshot.json
 scripts/.conformance_delta_*.json
+scripts/.suite_*_snapshot.json
 
 # Benchmark baselines (local, not shared)
 .bench_baselines/

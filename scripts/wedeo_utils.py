@@ -10,6 +10,7 @@ Not intended to be run directly — import from other scripts:
 """
 
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -42,7 +43,12 @@ def newest_source_mtime(extra_dirs: list[Path] | None = None) -> float:
 
 
 def find_ffmpeg_binary() -> Path:
-    """Find the debug FFmpeg binary (ffmpeg_g preferred, then ffmpeg in FFmpeg/).
+    """Find an FFmpeg binary: local debug build preferred, then system PATH.
+
+    Search order:
+      1. FFmpeg/ffmpeg_g  (local debug build — best for reproducibility)
+      2. FFmpeg/ffmpeg     (local release build)
+      3. System PATH       (CI / contributor machines)
 
     Exits with an actionable error message if not found.
     """
@@ -53,9 +59,14 @@ def find_ffmpeg_binary() -> Path:
     for c in candidates:
         if c.exists():
             return c.resolve()
+    # Fall back to system ffmpeg (e.g. CI runners, contributor machines)
+    system = shutil.which("ffmpeg")
+    if system:
+        return Path(system)
     print(
-        "Error: FFmpeg debug binary not found at FFmpeg/ffmpeg_g\n"
-        "Build with: cd FFmpeg && ./configure --disable-optimizations "
+        "Error: FFmpeg not found (checked FFmpeg/ffmpeg_g, FFmpeg/ffmpeg, PATH)\n"
+        "Install system ffmpeg or build locally:\n"
+        "  cd FFmpeg && ./configure --disable-optimizations "
         "--enable-debug=3 --disable-stripping --disable-asm && make ffmpeg",
         file=sys.stderr,
     )
