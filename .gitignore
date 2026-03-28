@@ -33,3 +33,74 @@ scripts/.conformance_delta_*.json
 
 # Claude Code ephemeral session state
 .claude/primer.md
+.claude/projects/
+
+# === Development-only files (kept locally, not published) ===
+
+# Debugging & analysis scripts
+/scripts/cabac_*.py
+/scripts/mb_*.py
+/scripts/mv_compare.py
+/scripts/deblock_*.py
+/scripts/neighbor_debug.py
+/scripts/bs_compare.py
+/scripts/bitpos_compare.py
+/scripts/nnz_compare.py
+/scripts/ffmpeg_*.py
+/scripts/lldb_*.py
+/scripts/poc_*.py
+/scripts/dpb_compare.py
+/scripts/frame_order*.py
+/scripts/frame_type_map.py
+/scripts/mmco_trace.py
+/scripts/compare_mvs.py
+/scripts/bskip_mv_compare.py
+/scripts/check_direct_mode.py
+/scripts/classify_*.py
+/scripts/stream_features.py
+/scripts/probe_h264_features.py
+/scripts/extract_coeffs.py
+/scripts/coeff_compare_8x8.py
+/scripts/transform_flag_compare.py
+/scripts/pixel_compare_mb.py
+/scripts/view_yuv.py
+/scripts/yuv_first_diff.py
+/scripts/test_file.py
+/scripts/trace_grep.sh
+/scripts/fix_stale_tracing_features.sh
+/scripts/shodh_watchdog.sh
+/scripts/scrape_atomics_book.py
+/scripts/build_cabac_trace.sh
+/scripts/wedeo-trace.sh
+/scripts/verify_*.py
+/scripts/frext_triage.py
+/scripts/audit_*.py
+/scripts/bench_ab.py
+/scripts/conformance_diff.py
+/scripts/conformance_delta.py
+/scripts/conformance_parse.py
+/scripts/conformance_report.py
+/scripts/conformance_frext.py
+/scripts/conformance_snapshot.py
+/scripts/dual_extract.py
+/scripts/fix_stale_tracing_features.py
+/scripts/mbaff_*.py
+/scripts/pair_row_diff.py
+/scripts/reflist_compare.py
+/scripts/sps_flags.py
+/scripts/build/
+/scripts/.conformance_baseline.json
+/scripts/.conformance_cabac_snapshot.json
+/scripts/.conformance_frext_snapshot.json
+/scripts/*.lldb
+
+# Large reference docs (not redistributable)
+/h264-spec.md
+/memory-setup.md
+/DEBUG_NOTES.md
+/CONFORMANCE_STATE.md
+/docs/
+
+# Internal planning & session state
+/plans/
+/tasks/
