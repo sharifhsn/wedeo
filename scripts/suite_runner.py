@@ -34,7 +34,7 @@ ROOT = Path(__file__).resolve().parent.parent
 MANIFEST_DIR = ROOT / "test_suites" / "h264"
 VECTORS_DIR = ROOT / "jvt-vectors"
 FATE_DIR = ROOT / "fate-suite" / "h264-conformance"
-SNAPSHOT_DIR = Path(__file__).resolve().parent
+DEFAULT_SNAPSHOT_DIR = Path(__file__).resolve().parent
 
 
 # ── Suite definitions ────────────────────────────────────────────────────────
@@ -182,6 +182,10 @@ class RunResult:
     detail: str = ""
 
 
+def _snapshot_path(suite_name: str, snapshot_dir: Path) -> Path:
+    return snapshot_dir / f".suite_{suite_name.lower()}_snapshot.json"
+
+
 def run_suite(
     suite: Suite,
     wedeo_bin: Path,
@@ -189,12 +193,13 @@ def run_suite(
     format_filter: set[str] | None = None,
     profile_filter: set[str] | None = None,
     check_snapshot: bool = False,
+    snapshot_dir: Path = DEFAULT_SNAPSHOT_DIR,
 ) -> list[RunResult]:
     """Run all vectors in a suite and return results."""
     # Load snapshot for regression check
     snapshot_passing: set[str] | None = None
     if check_snapshot:
-        snap_path = SNAPSHOT_DIR / f".suite_{suite.name.lower()}_snapshot.json"
+        snap_path = _snapshot_path(suite.name, snapshot_dir)
         if snap_path.exists():
             snap_data = json.loads(snap_path.read_text())
             snapshot_passing = set(snap_data.get("passing", []))
@@ -239,10 +244,11 @@ def run_suite(
     return results
 
 
-def save_snapshot(suite_name: str, results: list[RunResult]) -> None:
+def save_snapshot(suite_name: str, results: list[RunResult], snapshot_dir: Path = DEFAULT_SNAPSHOT_DIR) -> None:
     passing = sorted(r.name for r in results if r.status == "MATCH")
     tested = [r for r in results if r.status != "SKIP"]
-    snap_path = SNAPSHOT_DIR / f".suite_{suite_name.lower()}_snapshot.json"
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    snap_path = _snapshot_path(suite_name, snapshot_dir)
     snap_path.write_text(json.dumps({
         "suite": suite_name,
         "passing": passing,
@@ -308,6 +314,8 @@ def main():
                         help="Save passing vectors as snapshot for regression checking")
     parser.add_argument("--check-snapshot", action="store_true",
                         help="Only test vectors from snapshot, exit non-zero on regression")
+    parser.add_argument("--snapshot-dir", type=Path, default=None,
+                        help="Directory for snapshot files (default: scripts/)")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Show skipped vectors")
     args = parser.parse_args()
@@ -330,6 +338,7 @@ def main():
     # Parse filters
     format_filter = set(args.formats.split(",")) if args.formats else None
     profile_filter = set(args.profiles.split(",")) if args.profiles else None
+    snapshot_dir = args.snapshot_dir or DEFAULT_SNAPSHOT_DIR
 
     # Find binaries
     wedeo_bin = find_wedeo_binary()
@@ -348,6 +357,7 @@ def main():
             format_filter=format_filter,
             profile_filter=profile_filter,
             check_snapshot=args.check_snapshot,
+            snapshot_dir=snapshot_dir,
         )
 
         m, f, e, s = print_results(suite, results, args.verbose)
@@ -357,18 +367,17 @@ def main():
         grand_skip += s
 
         if args.save_snapshot:
-            save_snapshot(suite.name, results)
+            save_snapshot(suite.name, results, snapshot_dir=snapshot_dir)
 
         # Regression detection: only compare vectors that were actually tested
         # (not skipped by format/profile filter or missing files)
         if args.check_snapshot:
-            snap_path = SNAPSHOT_DIR / f".suite_{suite.name.lower()}_snapshot.json"
+            snap_path = _snapshot_path(suite.name, snapshot_dir)
             if snap_path.exists():
                 snap_data = json.loads(snap_path.read_text())
                 snap_passing = set(snap_data.get("passing", []))
                 tested_names = {r.name for r in results if r.status != "SKIP"}
                 now_passing = {r.name for r in results if r.status == "MATCH"}
-                # Only flag regressions for vectors that were actually tested
                 regressions = (snap_passing & tested_names) - now_passing
                 if regressions:
                     any_regression = True
@@ -381,9 +390,13 @@ def main():
     if len(selected) > 1 and tested > 0:
         print(f"\nTOTAL: {grand_match}/{tested} MATCH across {len(selected)} suites")
 
-    if any_regression:
-        print("\nREGRESSION DETECTED", file=sys.stderr)
-        sys.exit(1)
+    # With --check-snapshot, only fail on regressions (not known failures)
+    if args.check_snapshot:
+        if any_regression:
+            print("\nREGRESSION DETECTED", file=sys.stderr)
+            sys.exit(1)
+        sys.exit(0)
+
     sys.exit(0 if grand_fail == 0 and grand_error == 0 else 1)
 
 

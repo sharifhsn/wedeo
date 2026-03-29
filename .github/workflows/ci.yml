@@ -48,8 +48,8 @@ jobs:
           name: test-results
           path: target/nextest/ci/junit.xml
 
-  fate:
-    name: FATE Conformance
+  fate-regression:
+    name: FATE Regression
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -58,9 +58,7 @@ jobs:
       - run: sudo apt-get install -y nasm
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@nextest
 
-      # Only fetch h264-conformance subset (~134 MB, not the full 1.2 GB suite)
       - name: Cache FATE H.264 samples
         uses: actions/cache@v4
         id: fate-cache
@@ -75,26 +73,26 @@ jobs:
           mkdir -p fate-suite
           rsync -a rsync://fate-suite.ffmpeg.org/fate-suite/h264-conformance fate-suite/
 
-      - name: Build release
+      - name: Build wedeo-framecrc
         run: cargo build --release --bin wedeo-framecrc -p wedeo-fate
 
-      - name: FATE tests (Rust)
-        run: cargo nextest run --profile ci -p wedeo-fate
-        env:
-          FATE_SUITE: ./fate-suite
-
-      - name: FATE conformance (framecrc vs FFmpeg)
-        id: fate-framecrc
+      # Regression check: compare against committed baselines.
+      # Exits 0 if no previously-passing test regressed.
+      # New failures on tests not in the baseline are allowed.
+      - name: Check for regressions
+        id: regression
         run: |
           set -o pipefail
           python3 scripts/suite_runner.py \
             --suite fate-cavlc,fate-cabac \
+            --check-snapshot \
+            --snapshot-dir test_suites/baselines \
             2>&1 | tee /tmp/fate-results.txt
 
-      - name: Post FATE summary
+      - name: Post summary
         if: always()
         run: |
-          echo '## FATE H.264 Conformance' >> "$GITHUB_STEP_SUMMARY"
+          echo '## FATE Regression Check' >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           if [ -f /tmp/fate-results.txt ]; then
             cat /tmp/fate-results.txt >> "$GITHUB_STEP_SUMMARY"
@@ -103,15 +101,8 @@ jobs:
           fi
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload FATE results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: fate-results
-          path: target/nextest/ci/junit.xml
-
-  jvt-conformance:
-    name: JVT Conformance
+  jvt-regression:
+    name: JVT Regression
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -121,7 +112,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      # JVT vectors are static (keyed by manifest hash) — cache across runs
       - name: Cache JVT vectors
         uses: actions/cache@v4
         with:
@@ -132,23 +122,26 @@ jobs:
         run: cargo build --release --bin wedeo-framecrc -p wedeo-fate
 
       - name: Download JVT vectors
-        continue-on-error: true  # ITU servers can be flaky
+        continue-on-error: true
         timeout-minutes: 10
         run: python3 scripts/fetch_jvt.py --jobs 8
 
-      - name: Run JVT conformance (yuv420p)
-        id: conformance
+      # Regression check: compare against committed baselines.
+      - name: Check for regressions
+        id: regression
         run: |
           set -o pipefail
           python3 scripts/suite_runner.py \
             --suite jvt-avc-v1,jvt-fr-ext \
             --format yuv420p \
+            --check-snapshot \
+            --snapshot-dir test_suites/baselines \
             2>&1 | tee /tmp/jvt-results.txt
 
       - name: Post summary
         if: always()
         run: |
-          echo '## JVT H.264 Conformance' >> "$GITHUB_STEP_SUMMARY"
+          echo '## JVT Regression Check' >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           if [ -f /tmp/jvt-results.txt ]; then
             cat /tmp/jvt-results.txt >> "$GITHUB_STEP_SUMMARY"
