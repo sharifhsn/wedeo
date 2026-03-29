@@ -3621,56 +3621,120 @@ fn apply_mc_bi_partition(
         // Weighted path: L1 MC into temp buffers, then biweight with dst
         let mut tmp_u = vec![0u8; chroma_w * chroma_h];
         mc::mc_chroma(
-            &mut tmp_u, chroma_w, &rp_l1.u, rp_l1.uv_stride,
-            chroma_ref_x, chroma_ref_y, chroma_dx, chroma_dy,
-            chroma_w, chroma_h, chroma_pic_w, chroma_pic_h,
+            &mut tmp_u,
+            chroma_w,
+            &rp_l1.u,
+            rp_l1.uv_stride,
+            chroma_ref_x,
+            chroma_ref_y,
+            chroma_dx,
+            chroma_dy,
+            chroma_w,
+            chroma_h,
+            chroma_pic_w,
+            chroma_pic_h,
         );
         let mut tmp_v = vec![0u8; chroma_w * chroma_h];
         mc::mc_chroma(
-            &mut tmp_v, chroma_w, &rp_l1.v, rp_l1.uv_stride,
-            chroma_ref_x, chroma_ref_y, chroma_dx, chroma_dy,
-            chroma_w, chroma_h, chroma_pic_w, chroma_pic_h,
+            &mut tmp_v,
+            chroma_w,
+            &rp_l1.v,
+            rp_l1.uv_stride,
+            chroma_ref_x,
+            chroma_ref_y,
+            chroma_dx,
+            chroma_dy,
+            chroma_w,
+            chroma_h,
+            chroma_pic_w,
+            chroma_pic_h,
         );
 
         if use_implicit_weight {
             let w0 = ctx.implicit_weight[l0_idx][l1_idx];
             let w1 = 64 - w0;
             biweight_pixels(
-                &mut ctx.pic.u[chroma_off..], chroma_dst_stride,
-                &tmp_u, chroma_w, chroma_w, chroma_h, 5, w0, w1, 0,
+                &mut ctx.pic.u[chroma_off..],
+                chroma_dst_stride,
+                &tmp_u,
+                chroma_w,
+                chroma_w,
+                chroma_h,
+                5,
+                w0,
+                w1,
+                0,
             );
             biweight_pixels(
-                &mut ctx.pic.v[chroma_off..], chroma_dst_stride,
-                &tmp_v, chroma_w, chroma_w, chroma_h, 5, w0, w1, 0,
+                &mut ctx.pic.v[chroma_off..],
+                chroma_dst_stride,
+                &tmp_v,
+                chroma_w,
+                chroma_w,
+                chroma_h,
+                5,
+                w0,
+                w1,
+                0,
             );
         } else {
             let cw0 = slice_hdr.chroma_weight_l0[l0_idx];
             let cw1 = slice_hdr.chroma_weight_l1[l1_idx];
             let denom = slice_hdr.chroma_log2_weight_denom;
             biweight_pixels(
-                &mut ctx.pic.u[chroma_off..], chroma_dst_stride,
-                &tmp_u, chroma_w, chroma_w, chroma_h,
-                denom, cw0[0].0, cw1[0].0, cw0[0].1 + cw1[0].1,
+                &mut ctx.pic.u[chroma_off..],
+                chroma_dst_stride,
+                &tmp_u,
+                chroma_w,
+                chroma_w,
+                chroma_h,
+                denom,
+                cw0[0].0,
+                cw1[0].0,
+                cw0[0].1 + cw1[0].1,
             );
             biweight_pixels(
-                &mut ctx.pic.v[chroma_off..], chroma_dst_stride,
-                &tmp_v, chroma_w, chroma_w, chroma_h,
-                denom, cw0[1].0, cw1[1].0, cw0[1].1 + cw1[1].1,
+                &mut ctx.pic.v[chroma_off..],
+                chroma_dst_stride,
+                &tmp_v,
+                chroma_w,
+                chroma_w,
+                chroma_h,
+                denom,
+                cw0[1].0,
+                cw1[1].0,
+                cw0[1].1 + cw1[1].1,
             );
         }
     } else {
         // Unweighted: L1 MC + avg directly into dst (avoids temp buffers)
         mc::mc_chroma_avg(
-            &mut ctx.pic.u[chroma_off..], chroma_dst_stride,
-            &rp_l1.u, rp_l1.uv_stride,
-            chroma_ref_x, chroma_ref_y, chroma_dx, chroma_dy,
-            chroma_w, chroma_h, chroma_pic_w, chroma_pic_h,
+            &mut ctx.pic.u[chroma_off..],
+            chroma_dst_stride,
+            &rp_l1.u,
+            rp_l1.uv_stride,
+            chroma_ref_x,
+            chroma_ref_y,
+            chroma_dx,
+            chroma_dy,
+            chroma_w,
+            chroma_h,
+            chroma_pic_w,
+            chroma_pic_h,
         );
         mc::mc_chroma_avg(
-            &mut ctx.pic.v[chroma_off..], chroma_dst_stride,
-            &rp_l1.v, rp_l1.uv_stride,
-            chroma_ref_x, chroma_ref_y, chroma_dx, chroma_dy,
-            chroma_w, chroma_h, chroma_pic_w, chroma_pic_h,
+            &mut ctx.pic.v[chroma_off..],
+            chroma_dst_stride,
+            &rp_l1.v,
+            rp_l1.uv_stride,
+            chroma_ref_x,
+            chroma_ref_y,
+            chroma_dx,
+            chroma_dy,
+            chroma_w,
+            chroma_h,
+            chroma_pic_w,
+            chroma_pic_h,
         );
     }
 }

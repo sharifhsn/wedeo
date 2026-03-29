@@ -89,8 +89,18 @@ pub fn mc_luma_asm(
         return false;
     }
     mc_luma_dispatch(
-        dst, ref_y, ref_stride, ref_x, ref_y_pos, dx, dy, block_w, block_h,
-        &asm_ffi::QPEL_PUT_16, &asm_ffi::QPEL_PUT_8, fullpel_put,
+        dst,
+        ref_y,
+        ref_stride,
+        ref_x,
+        ref_y_pos,
+        dx,
+        dy,
+        block_w,
+        block_h,
+        &asm_ffi::QPEL_PUT_16,
+        &asm_ffi::QPEL_PUT_8,
+        fullpel_put,
     )
 }
 
@@ -120,17 +130,25 @@ fn fullpel_avg(dst: &mut [u8], ref_y: &[u8], src_off: usize, stride: usize, w: u
 #[inline]
 #[allow(clippy::too_many_arguments)]
 fn mc_dispatch_single(
-    dst: &mut [u8], ref_y: &[u8], ref_stride: usize,
-    ref_x: i32, ref_y_pos: i32, idx: usize,
-    table: &[Option<asm_ffi::QpelFn>; 16], stride: isize,
-    block_w: usize, block_h: usize,
+    dst: &mut [u8],
+    ref_y: &[u8],
+    ref_stride: usize,
+    ref_x: i32,
+    ref_y_pos: i32,
+    idx: usize,
+    table: &[Option<asm_ffi::QpelFn>; 16],
+    stride: isize,
+    block_w: usize,
+    block_h: usize,
     fullpel: fn(&mut [u8], &[u8], usize, usize, usize, usize),
 ) -> bool {
     let src_off = ref_y_pos as usize * ref_stride + ref_x as usize;
     match table[idx] {
         Some(func) => {
             // SAFETY: Interior check passed, block dims match function.
-            unsafe { func(dst.as_mut_ptr(), ref_y[src_off..].as_ptr(), stride); }
+            unsafe {
+                func(dst.as_mut_ptr(), ref_y[src_off..].as_ptr(), stride);
+            }
             true
         }
         None => {
@@ -144,9 +162,15 @@ fn mc_dispatch_single(
 #[inline]
 #[allow(clippy::too_many_arguments)]
 fn mc_dispatch_half(
-    dst: &mut [u8], ref_y: &[u8], src_off: usize, ref_stride: usize,
-    idx: usize, table: &[Option<asm_ffi::QpelFn>; 16], stride: isize,
-    col_off: usize, row_off: usize,
+    dst: &mut [u8],
+    ref_y: &[u8],
+    src_off: usize,
+    ref_stride: usize,
+    idx: usize,
+    table: &[Option<asm_ffi::QpelFn>; 16],
+    stride: isize,
+    col_off: usize,
+    row_off: usize,
     fullpel: fn(&mut [u8], &[u8], usize, usize, usize, usize),
 ) -> bool {
     let off2 = col_off + row_off * ref_stride;
@@ -175,9 +199,15 @@ fn mc_dispatch_half(
 #[inline]
 #[allow(clippy::too_many_arguments)]
 fn mc_luma_dispatch(
-    dst: &mut [u8], ref_y: &[u8], ref_stride: usize,
-    ref_x: i32, ref_y_pos: i32, dx: u8, dy: u8,
-    block_w: usize, block_h: usize,
+    dst: &mut [u8],
+    ref_y: &[u8],
+    ref_stride: usize,
+    ref_x: i32,
+    ref_y_pos: i32,
+    dx: u8,
+    dy: u8,
+    block_w: usize,
+    block_h: usize,
     put_16: &[Option<asm_ffi::QpelFn>; 16],
     put_8: &[Option<asm_ffi::QpelFn>; 16],
     fullpel: fn(&mut [u8], &[u8], usize, usize, usize, usize),
@@ -187,15 +217,23 @@ fn mc_luma_dispatch(
     debug_assert!(idx < 16);
 
     match (block_w, block_h) {
-        (16, 16) => mc_dispatch_single(dst, ref_y, ref_stride, ref_x, ref_y_pos, idx, put_16, stride, 16, 16, fullpel),
-        (8, 8)   => mc_dispatch_single(dst, ref_y, ref_stride, ref_x, ref_y_pos, idx, put_8, stride, 8, 8, fullpel),
+        (16, 16) => mc_dispatch_single(
+            dst, ref_y, ref_stride, ref_x, ref_y_pos, idx, put_16, stride, 16, 16, fullpel,
+        ),
+        (8, 8) => mc_dispatch_single(
+            dst, ref_y, ref_stride, ref_x, ref_y_pos, idx, put_8, stride, 8, 8, fullpel,
+        ),
         (16, 8) => {
             let src_off = ref_y_pos as usize * ref_stride + ref_x as usize;
-            mc_dispatch_half(dst, ref_y, src_off, ref_stride, idx, put_8, stride, 8, 0, fullpel)
+            mc_dispatch_half(
+                dst, ref_y, src_off, ref_stride, idx, put_8, stride, 8, 0, fullpel,
+            )
         }
         (8, 16) => {
             let src_off = ref_y_pos as usize * ref_stride + ref_x as usize;
-            mc_dispatch_half(dst, ref_y, src_off, ref_stride, idx, put_8, stride, 0, 8, fullpel)
+            mc_dispatch_half(
+                dst, ref_y, src_off, ref_stride, idx, put_8, stride, 0, 8, fullpel,
+            )
         }
         _ => false,
     }
@@ -228,8 +266,18 @@ pub fn mc_avg_asm(
         return false;
     }
     mc_luma_dispatch(
-        dst, ref_y, ref_stride, ref_x, ref_y_pos, dx, dy, block_w, block_h,
-        &asm_ffi::QPEL_AVG_16, &asm_ffi::QPEL_AVG_8, fullpel_avg,
+        dst,
+        ref_y,
+        ref_stride,
+        ref_x,
+        ref_y_pos,
+        dx,
+        dy,
+        block_w,
+        block_h,
+        &asm_ffi::QPEL_AVG_16,
+        &asm_ffi::QPEL_AVG_8,
+        fullpel_avg,
     )
 }
 
@@ -238,8 +286,7 @@ pub fn mc_avg_asm(
 // ---------------------------------------------------------------------------
 
 /// Chroma MC function type: `fn(dst, src, stride, h, x, y)`.
-type ChromaMcFn =
-    unsafe extern "C" fn(*mut u8, *const u8, isize, i32, i32, i32);
+type ChromaMcFn = unsafe extern "C" fn(*mut u8, *const u8, isize, i32, i32, i32);
 
 /// Try to perform chroma MC via NEON assembly.
 ///
@@ -269,7 +316,9 @@ pub fn mc_chroma_asm(
         return false;
     }
 
-    mc_chroma_dispatch(dst, ref_uv, ref_stride, ref_x, ref_y_pos, dx, dy, block_w, block_h, false)
+    mc_chroma_dispatch(
+        dst, ref_uv, ref_stride, ref_x, ref_y_pos, dx, dy, block_w, block_h, false,
+    )
 }
 
 /// Try to perform chroma MC avg (bi-prediction) via NEON assembly.
@@ -299,7 +348,9 @@ pub fn mc_chroma_avg_asm(
         return false;
     }
 
-    mc_chroma_dispatch(dst, ref_uv, ref_stride, ref_x, ref_y_pos, dx, dy, block_w, block_h, true)
+    mc_chroma_dispatch(
+        dst, ref_uv, ref_stride, ref_x, ref_y_pos, dx, dy, block_w, block_h, true,
+    )
 }
 
 /// Bounds check for chroma MC: bilinear filter reads one extra pixel in each
@@ -307,8 +358,14 @@ pub fn mc_chroma_avg_asm(
 #[inline]
 #[allow(clippy::too_many_arguments)]
 fn is_interior_chroma(
-    ref_x: i32, ref_y: i32, dx: u8, dy: u8,
-    block_w: usize, block_h: usize, pic_w: i32, pic_h: i32,
+    ref_x: i32,
+    ref_y: i32,
+    dx: u8,
+    dy: u8,
+    block_w: usize,
+    block_h: usize,
+    pic_w: i32,
+    pic_h: i32,
 ) -> bool {
     let dx_extra = if dx > 0 { 1 } else { 0 };
     let dy_extra = if dy > 0 { 1 } else { 0 };
@@ -322,9 +379,16 @@ fn is_interior_chroma(
 #[inline]
 #[allow(clippy::too_many_arguments)]
 fn mc_chroma_dispatch(
-    dst: &mut [u8], ref_uv: &[u8], ref_stride: usize,
-    ref_x: i32, ref_y_pos: i32, dx: u8, dy: u8,
-    block_w: usize, block_h: usize, avg: bool,
+    dst: &mut [u8],
+    ref_uv: &[u8],
+    ref_stride: usize,
+    ref_x: i32,
+    ref_y_pos: i32,
+    dx: u8,
+    dy: u8,
+    block_w: usize,
+    block_h: usize,
+    avg: bool,
 ) -> bool {
     let func: ChromaMcFn = match (block_w, avg) {
         (8, false) => asm_ffi::ff_put_h264_chroma_mc8_neon,
@@ -438,9 +502,21 @@ pub fn deblock_luma_edge_asm(
     // SAFETY: tc0 is a valid 4-byte array. Same base/stride guarantees as above.
     unsafe {
         if is_vertical {
-            asm_ffi::ff_h264_h_loop_filter_luma_neon(pix.as_mut_ptr(), s, alpha, beta, tc0.as_ptr());
+            asm_ffi::ff_h264_h_loop_filter_luma_neon(
+                pix.as_mut_ptr(),
+                s,
+                alpha,
+                beta,
+                tc0.as_ptr(),
+            );
         } else {
-            asm_ffi::ff_h264_v_loop_filter_luma_neon(pix.as_mut_ptr(), s, alpha, beta, tc0.as_ptr());
+            asm_ffi::ff_h264_v_loop_filter_luma_neon(
+                pix.as_mut_ptr(),
+                s,
+                alpha,
+                beta,
+                tc0.as_ptr(),
+            );
         }
     }
     true
@@ -496,9 +572,21 @@ pub fn deblock_chroma_edge_asm(
     // SAFETY: Same as luma. Chroma normal filter processes 8 pixel pairs.
     unsafe {
         if is_vertical {
-            asm_ffi::ff_h264_h_loop_filter_chroma_neon(pix.as_mut_ptr(), s, alpha, beta, tc0.as_ptr());
+            asm_ffi::ff_h264_h_loop_filter_chroma_neon(
+                pix.as_mut_ptr(),
+                s,
+                alpha,
+                beta,
+                tc0.as_ptr(),
+            );
         } else {
-            asm_ffi::ff_h264_v_loop_filter_chroma_neon(pix.as_mut_ptr(), s, alpha, beta, tc0.as_ptr());
+            asm_ffi::ff_h264_v_loop_filter_chroma_neon(
+                pix.as_mut_ptr(),
+                s,
+                alpha,
+                beta,
+                tc0.as_ptr(),
+            );
         }
     }
     true
@@ -547,11 +635,7 @@ pub fn idct4x4_dc_add_asm(dst: &mut [u8], stride: usize, dc: &mut i16) {
     // computes (dc + 32) >> 6, matching the scalar path. The function zeros
     // block[0] via `strh w3=0, [x1]`.
     unsafe {
-        asm_ffi::ff_h264_idct_dc_add_neon(
-            dst.as_mut_ptr(),
-            dc as *mut i16,
-            stride as i32,
-        );
+        asm_ffi::ff_h264_idct_dc_add_neon(dst.as_mut_ptr(), dc as *mut i16, stride as i32);
     }
 }
 
@@ -560,11 +644,7 @@ pub fn idct4x4_dc_add_asm(dst: &mut [u8], stride: usize, dc: &mut i16) {
 pub fn idct8x8_dc_add_asm(dst: &mut [u8], stride: usize, dc: &mut i16) {
     // SAFETY: Same as 4x4 dc_add — only touches [x1].
     unsafe {
-        asm_ffi::ff_h264_idct8_dc_add_neon(
-            dst.as_mut_ptr(),
-            dc as *mut i16,
-            stride as i32,
-        );
+        asm_ffi::ff_h264_idct8_dc_add_neon(dst.as_mut_ptr(), dc as *mut i16, stride as i32);
     }
 }
 
@@ -580,11 +660,7 @@ pub fn idct4x4_add_asm(dst: &mut [u8], stride: usize, coeffs: &mut [i16; 16]) {
     // all 16 coefficients, performs the butterfly + srshr + add-to-dst, and
     // zeros the block via st1 of zero vectors.
     unsafe {
-        asm_ffi::ff_h264_idct_add_neon(
-            dst.as_mut_ptr(),
-            coeffs.as_mut_ptr(),
-            stride as i32,
-        );
+        asm_ffi::ff_h264_idct_add_neon(dst.as_mut_ptr(), coeffs.as_mut_ptr(), stride as i32);
     }
 }
 
@@ -594,10 +670,6 @@ pub fn idct8x8_add_asm(dst: &mut [u8], stride: usize, coeffs: &mut [i16; 64]) {
     transpose_8x8(coeffs);
     // SAFETY: coeffs is a contiguous 128-byte block. Same guarantees as 4x4.
     unsafe {
-        asm_ffi::ff_h264_idct8_add_neon(
-            dst.as_mut_ptr(),
-            coeffs.as_mut_ptr(),
-            stride as i32,
-        );
+        asm_ffi::ff_h264_idct8_add_neon(dst.as_mut_ptr(), coeffs.as_mut_ptr(), stride as i32);
     }
 }

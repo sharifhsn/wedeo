@@ -117,22 +117,52 @@ declare_qpel! {
 
 unsafe extern "C" {
     pub fn ff_put_h264_chroma_mc8_neon(
-        dst: *mut u8, src: *const u8, stride: isize, h: i32, x: i32, y: i32,
+        dst: *mut u8,
+        src: *const u8,
+        stride: isize,
+        h: i32,
+        x: i32,
+        y: i32,
     );
     pub fn ff_put_h264_chroma_mc4_neon(
-        dst: *mut u8, src: *const u8, stride: isize, h: i32, x: i32, y: i32,
+        dst: *mut u8,
+        src: *const u8,
+        stride: isize,
+        h: i32,
+        x: i32,
+        y: i32,
     );
     pub fn ff_put_h264_chroma_mc2_neon(
-        dst: *mut u8, src: *const u8, stride: isize, h: i32, x: i32, y: i32,
+        dst: *mut u8,
+        src: *const u8,
+        stride: isize,
+        h: i32,
+        x: i32,
+        y: i32,
     );
     pub fn ff_avg_h264_chroma_mc8_neon(
-        dst: *mut u8, src: *const u8, stride: isize, h: i32, x: i32, y: i32,
+        dst: *mut u8,
+        src: *const u8,
+        stride: isize,
+        h: i32,
+        x: i32,
+        y: i32,
     );
     pub fn ff_avg_h264_chroma_mc4_neon(
-        dst: *mut u8, src: *const u8, stride: isize, h: i32, x: i32, y: i32,
+        dst: *mut u8,
+        src: *const u8,
+        stride: isize,
+        h: i32,
+        x: i32,
+        y: i32,
     );
     pub fn ff_avg_h264_chroma_mc2_neon(
-        dst: *mut u8, src: *const u8, stride: isize, h: i32, x: i32, y: i32,
+        dst: *mut u8,
+        src: *const u8,
+        stride: isize,
+        h: i32,
+        x: i32,
+        y: i32,
     );
 }
 
@@ -164,28 +194,56 @@ unsafe extern "C" {
 
 unsafe extern "C" {
     pub fn ff_h264_v_loop_filter_luma_neon(
-        pix: *mut u8, stride: isize, alpha: i32, beta: i32, tc0: *const i8,
+        pix: *mut u8,
+        stride: isize,
+        alpha: i32,
+        beta: i32,
+        tc0: *const i8,
     );
     pub fn ff_h264_h_loop_filter_luma_neon(
-        pix: *mut u8, stride: isize, alpha: i32, beta: i32, tc0: *const i8,
+        pix: *mut u8,
+        stride: isize,
+        alpha: i32,
+        beta: i32,
+        tc0: *const i8,
     );
     pub fn ff_h264_v_loop_filter_luma_intra_neon(
-        pix: *mut u8, stride: isize, alpha: i32, beta: i32,
+        pix: *mut u8,
+        stride: isize,
+        alpha: i32,
+        beta: i32,
     );
     pub fn ff_h264_h_loop_filter_luma_intra_neon(
-        pix: *mut u8, stride: isize, alpha: i32, beta: i32,
+        pix: *mut u8,
+        stride: isize,
+        alpha: i32,
+        beta: i32,
     );
     pub fn ff_h264_v_loop_filter_chroma_neon(
-        pix: *mut u8, stride: isize, alpha: i32, beta: i32, tc0: *const i8,
+        pix: *mut u8,
+        stride: isize,
+        alpha: i32,
+        beta: i32,
+        tc0: *const i8,
     );
     pub fn ff_h264_h_loop_filter_chroma_neon(
-        pix: *mut u8, stride: isize, alpha: i32, beta: i32, tc0: *const i8,
+        pix: *mut u8,
+        stride: isize,
+        alpha: i32,
+        beta: i32,
+        tc0: *const i8,
     );
     pub fn ff_h264_v_loop_filter_chroma_intra_neon(
-        pix: *mut u8, stride: isize, alpha: i32, beta: i32,
+        pix: *mut u8,
+        stride: isize,
+        alpha: i32,
+        beta: i32,
     );
     pub fn ff_h264_h_loop_filter_chroma_intra_neon(
-        pix: *mut u8, stride: isize, alpha: i32, beta: i32,
+        pix: *mut u8,
+        stride: isize,
+        alpha: i32,
+        beta: i32,
     );
 }
 
@@ -195,28 +253,58 @@ unsafe extern "C" {
 
 unsafe extern "C" {
     pub fn ff_weight_h264_pixels_16_neon(
-        block: *mut u8, stride: isize, height: i32,
-        log2_denom: i32, weight: i32, offset: i32,
+        block: *mut u8,
+        stride: isize,
+        height: i32,
+        log2_denom: i32,
+        weight: i32,
+        offset: i32,
     );
     pub fn ff_weight_h264_pixels_8_neon(
-        block: *mut u8, stride: isize, height: i32,
-        log2_denom: i32, weight: i32, offset: i32,
+        block: *mut u8,
+        stride: isize,
+        height: i32,
+        log2_denom: i32,
+        weight: i32,
+        offset: i32,
     );
     pub fn ff_weight_h264_pixels_4_neon(
-        block: *mut u8, stride: isize, height: i32,
-        log2_denom: i32, weight: i32, offset: i32,
+        block: *mut u8,
+        stride: isize,
+        height: i32,
+        log2_denom: i32,
+        weight: i32,
+        offset: i32,
     );
     pub fn ff_biweight_h264_pixels_16_neon(
-        dst: *mut u8, src: *mut u8, stride: isize, height: i32,
-        log2_denom: i32, weightd: i32, weights: i32, offset: i32,
+        dst: *mut u8,
+        src: *mut u8,
+        stride: isize,
+        height: i32,
+        log2_denom: i32,
+        weightd: i32,
+        weights: i32,
+        offset: i32,
     );
     pub fn ff_biweight_h264_pixels_8_neon(
-        dst: *mut u8, src: *mut u8, stride: isize, height: i32,
-        log2_denom: i32, weightd: i32, weights: i32, offset: i32,
+        dst: *mut u8,
+        src: *mut u8,
+        stride: isize,
+        height: i32,
+        log2_denom: i32,
+        weightd: i32,
+        weights: i32,
+        offset: i32,
     );
     pub fn ff_biweight_h264_pixels_4_neon(
-        dst: *mut u8, src: *mut u8, stride: isize, height: i32,
-        log2_denom: i32, weightd: i32, weights: i32, offset: i32,
+        dst: *mut u8,
+        src: *mut u8,
+        stride: isize,
+        height: i32,
+        log2_denom: i32,
+        weightd: i32,
+        weights: i32,
+        offset: i32,
     );
 }
 

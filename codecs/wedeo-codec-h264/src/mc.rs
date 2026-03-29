@@ -723,8 +723,18 @@ pub fn mc_luma(
     // Try NEON assembly for interior 16×16 and 8×8 blocks.
     #[cfg(has_asm)]
     if crate::asm_dispatch::mc_luma_asm(
-        dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos,
-        dx, dy, block_w, block_h, pic_width as i32, pic_height as i32,
+        dst,
+        dst_stride,
+        ref_y,
+        ref_stride,
+        ref_x,
+        ref_y_pos,
+        dx,
+        dy,
+        block_w,
+        block_h,
+        pic_width as i32,
+        pic_height as i32,
     ) {
         return;
     }
@@ -1013,14 +1023,37 @@ pub fn mc_chroma(
     // Try NEON assembly for interior blocks with matching strides.
     #[cfg(has_asm)]
     if crate::asm_dispatch::mc_chroma_asm(
-        dst, dst_stride, ref_uv, ref_stride, ref_x, ref_y_pos,
-        dx, dy, block_w, block_h, pic_width as i32, pic_height as i32,
+        dst,
+        dst_stride,
+        ref_uv,
+        ref_stride,
+        ref_x,
+        ref_y_pos,
+        dx,
+        dy,
+        block_w,
+        block_h,
+        pic_width as i32,
+        pic_height as i32,
     ) {
         return;
     }
 
-    chroma_mc_scalar(dst, dst_stride, ref_uv, ref_stride, ref_x, ref_y_pos,
-        dx, dy, block_w, block_h, pic_width as i32, pic_height as i32, false);
+    chroma_mc_scalar(
+        dst,
+        dst_stride,
+        ref_uv,
+        ref_stride,
+        ref_x,
+        ref_y_pos,
+        dx,
+        dy,
+        block_w,
+        block_h,
+        pic_width as i32,
+        pic_height as i32,
+        false,
+    );
 }
 
 /// Perform chroma MC avg (bi-prediction averaging) into an existing destination.
@@ -1049,25 +1082,55 @@ pub fn mc_chroma_avg(
 
     #[cfg(has_asm)]
     if crate::asm_dispatch::mc_chroma_avg_asm(
-        dst, dst_stride, ref_uv, ref_stride, ref_x, ref_y_pos,
-        dx, dy, block_w, block_h, pic_width as i32, pic_height as i32,
+        dst,
+        dst_stride,
+        ref_uv,
+        ref_stride,
+        ref_x,
+        ref_y_pos,
+        dx,
+        dy,
+        block_w,
+        block_h,
+        pic_width as i32,
+        pic_height as i32,
     ) {
         return;
     }
 
-    chroma_mc_scalar(dst, dst_stride, ref_uv, ref_stride, ref_x, ref_y_pos,
-        dx, dy, block_w, block_h, pic_width as i32, pic_height as i32, true);
+    chroma_mc_scalar(
+        dst,
+        dst_stride,
+        ref_uv,
+        ref_stride,
+        ref_x,
+        ref_y_pos,
+        dx,
+        dy,
+        block_w,
+        block_h,
+        pic_width as i32,
+        pic_height as i32,
+        true,
+    );
 }
 
 /// Scalar chroma bilinear MC. When `avg` is true, averages with existing dst.
 #[allow(clippy::too_many_arguments)]
 fn chroma_mc_scalar(
-    dst: &mut [u8], dst_stride: usize,
-    ref_uv: &[u8], ref_stride: usize,
-    ref_x: i32, ref_y_pos: i32,
-    dx: u8, dy: u8,
-    block_w: usize, block_h: usize,
-    pw: i32, ph: i32, avg: bool,
+    dst: &mut [u8],
+    dst_stride: usize,
+    ref_uv: &[u8],
+    ref_stride: usize,
+    ref_x: i32,
+    ref_y_pos: i32,
+    dx: u8,
+    dy: u8,
+    block_w: usize,
+    block_h: usize,
+    pw: i32,
+    ph: i32,
+    avg: bool,
 ) {
     let a = (8 - dx as i32) * (8 - dy as i32);
     let b = (dx as i32) * (8 - dy as i32);

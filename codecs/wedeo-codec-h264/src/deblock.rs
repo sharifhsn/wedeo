@@ -582,7 +582,14 @@ fn filter_mb_edge_luma(
     // Try NEON assembly: processes all 16 pixel pairs in one call.
     #[cfg(has_asm)]
     if crate::asm_dispatch::deblock_luma_edge_asm(
-        plane, base, stride, is_vertical, bs, index_a, alpha, beta,
+        plane,
+        base,
+        stride,
+        is_vertical,
+        bs,
+        index_a,
+        alpha,
+        beta,
     ) {
         return;
     }
@@ -706,7 +713,14 @@ fn filter_mb_edge_chroma(
 
     #[cfg(has_asm)]
     if crate::asm_dispatch::deblock_chroma_edge_asm(
-        plane, base, stride, is_vertical, bs, index_a, alpha, beta,
+        plane,
+        base,
+        stride,
+        is_vertical,
+        bs,
+        index_a,
+        alpha,
+        beta,
     ) {
         return;
     }

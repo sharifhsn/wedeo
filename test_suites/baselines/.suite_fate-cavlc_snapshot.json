@@ -14,7 +14,6 @@
     "CI1_FT_B",
     "CI_MW_D",
     "CVBS3_Sony_C",
-    "CVFC1_Sony_C",
     "CVPCMNL1_SVA_C",
     "CVPCMNL2_SVA_C",
     "CVSE3_Sony_H",
@@ -52,6 +51,6 @@
     "SVA_NL2_E",
     "cvmp_mot_frm0_full_B"
   ],
-  "count": 50,
+  "count": 49,
   "total": 52
 }
