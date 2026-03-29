@@ -326,8 +326,8 @@ mod tests {
     #[test]
     fn chroma_qp_identity_below_30() {
         // For QP 0-29, chroma QP equals luma QP
-        for qp in 0..30 {
-            assert_eq!(CHROMA_QP_TABLE[qp], qp as u8);
+        for (qp, &cqp) in CHROMA_QP_TABLE[..30].iter().enumerate() {
+            assert_eq!(cqp, qp as u8);
         }
     }
 

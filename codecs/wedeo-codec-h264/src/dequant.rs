@@ -320,8 +320,8 @@ mod tests {
         //  table = 10 * 6 << 2 = 240, dequant applies (+32)>>6)
         assert_eq!(coeffs[0], 4);
         // All other coefficients remain 0
-        for i in 1..16 {
-            assert_eq!(coeffs[i], 0, "coeff {i}");
+        for (i, &c) in coeffs[1..].iter().enumerate() {
+            assert_eq!(c, 0, "coeff {}", i + 1);
         }
     }
 
@@ -422,8 +422,8 @@ mod tests {
 
         // (1 * 120 + 32) >> 6 = 152 >> 6 = 2
         assert_eq!(coeffs[0], 2);
-        for i in 1..64 {
-            assert_eq!(coeffs[i], 0, "coeff {i}");
+        for (i, &c) in coeffs[1..].iter().enumerate() {
+            assert_eq!(c, 0, "coeff {}", i + 1);
         }
     }
 }

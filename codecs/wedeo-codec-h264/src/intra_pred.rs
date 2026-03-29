@@ -1498,12 +1498,12 @@ mod tests {
 
         let block = extract_block(&dst, 16, 8, 8);
         // All rows: left half = 20, right half = 40
-        for y in 0..8 {
-            for x in 0..4 {
-                assert_eq!(block[y][x], 20, "mismatch at ({x}, {y})");
+        for (y, row) in block.iter().enumerate() {
+            for (x, &val) in row[..4].iter().enumerate() {
+                assert_eq!(val, 20, "mismatch at ({x}, {y})");
             }
-            for x in 4..8 {
-                assert_eq!(block[y][x], 40, "mismatch at ({x}, {y})");
+            for (x, &val) in row[4..8].iter().enumerate() {
+                assert_eq!(val, 40, "mismatch at ({}, {y})", x + 4);
             }
         }
     }
@@ -1518,14 +1518,14 @@ mod tests {
 
         let block = extract_block(&dst, 16, 8, 8);
         // Top 4 rows: all 30, bottom 4 rows: all 60
-        for y in 0..4 {
-            for x in 0..8 {
-                assert_eq!(block[y][x], 30, "mismatch at ({x}, {y})");
+        for (y, row) in block[..4].iter().enumerate() {
+            for (x, &val) in row.iter().enumerate() {
+                assert_eq!(val, 30, "mismatch at ({x}, {y})");
             }
         }
-        for y in 4..8 {
-            for x in 0..8 {
-                assert_eq!(block[y][x], 60, "mismatch at ({x}, {y})");
+        for (y, row) in block[4..8].iter().enumerate() {
+            for (x, &val) in row.iter().enumerate() {
+                assert_eq!(val, 60, "mismatch at ({}, {})", x, y + 4);
             }
         }
     }

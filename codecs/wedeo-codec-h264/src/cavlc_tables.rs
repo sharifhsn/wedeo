@@ -376,7 +376,7 @@ mod tests {
         let mut bytes = Vec::new();
         let chars: Vec<char> = bits_str.chars().collect();
         // Pad to multiple of 8
-        let padded_len = ((chars.len() + 7) / 8) * 8;
+        let padded_len = chars.len().div_ceil(8) * 8;
         let mut padded = chars.clone();
         padded.resize(padded_len, '0');
         // Add 8 bytes of padding for bitstream reader

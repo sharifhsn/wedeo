@@ -1450,7 +1450,7 @@ mod tests {
 
     /// Helper to build a bitstream from individual bit values.
     fn bits_to_bytes(bits: &[u8]) -> Vec<u8> {
-        let padded_len = ((bits.len() + 7) / 8) * 8 + 64; // pad for BitReadBE
+        let padded_len = bits.len().div_ceil(8) * 8 + 64; // pad for BitReadBE
         let mut padded_bits = bits.to_vec();
         padded_bits.resize(padded_len, 0);
 
@@ -1500,8 +1500,8 @@ mod tests {
         assert_eq!(nz, 1);
         // Single coefficient at position 0 (last scan position = total_coeff + total_zeros - 1 = 0).
         assert_eq!(coeffs[0], 1);
-        for i in 1..16 {
-            assert_eq!(coeffs[i], 0);
+        for (i, &c) in coeffs[1..].iter().enumerate() {
+            assert_eq!(c, 0, "coeff {}", i + 1);
         }
     }
 

@@ -585,8 +585,8 @@ mod tests {
         let mut output = [0i32; 16];
         luma_dc_dequant_idct(&mut output, &input, 128);
 
-        for i in 0..16 {
-            assert_eq!(output[i], 8, "block {i}");
+        for (i, &val) in output.iter().enumerate() {
+            assert_eq!(val, 8, "block {i}");
         }
     }
 
@@ -673,8 +673,8 @@ mod tests {
         let mut output = [0i32; 8];
         chroma422_dc_dequant_idct(&mut output, &coeffs, 128);
 
-        for i in 0..8 {
-            assert_eq!(output[i], 4, "coeff {i}");
+        for (i, &val) in output.iter().enumerate() {
+            assert_eq!(val, 4, "coeff {i}");
         }
     }
 

@@ -2007,6 +2007,7 @@ mod tests {
     // --- Boundary strength tests ---
 
     /// P-slice helper: compute_bs with list_count=1 (no L1 data).
+    #[allow(clippy::too_many_arguments)]
     fn bs_p(
         is_mb_edge: bool,
         p_intra: bool,

@@ -2906,7 +2906,7 @@ mod tests {
     }
 
     fn bits_to_bytes(bits: &[bool]) -> Vec<u8> {
-        let num_bytes = (bits.len() + 7) / 8;
+        let num_bytes = bits.len().div_ceil(8);
         let mut bytes = vec![0u8; num_bytes];
         for (i, &bit) in bits.iter().enumerate() {
             if bit {
