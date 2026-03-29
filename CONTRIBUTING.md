@@ -12,6 +12,10 @@ Contributions are welcome from both humans and AI agents.
    cargo build && cargo nextest run && cargo clippy
    ```
    If nextest is not installed, `cargo test` also works.
+5. (Optional) Install pre-commit hooks for automatic fmt + clippy checks:
+   ```bash
+   pip install pre-commit && pre-commit install
+   ```
 
 ## What we accept
 
