@@ -1,3 +1,5 @@
+#![allow(rustdoc::broken_intra_doc_links)]
+
 #[cfg(has_asm)]
 pub mod asm_dispatch;
 #[cfg(has_asm)]

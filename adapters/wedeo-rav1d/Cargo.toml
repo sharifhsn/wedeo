@@ -8,6 +8,7 @@ keywords.workspace = true
 categories.workspace = true
 rust-version.workspace = true
 description = "rav1d AV1 decoder adapter for wedeo"
+publish = false
 
 
 [dependencies]
@@ -15,6 +16,8 @@ wedeo-core = { workspace = true }
 wedeo-codec = { workspace = true }
 inventory = { workspace = true }
 tracing = { workspace = true }
+# Pinned to git for unreleased aarch64 NEON assembly fixes. Switch to the
+# crates.io release once a version ships with the patches we depend on.
 rav1d = { git = "https://github.com/memorysafety/rav1d", default-features = true }
 libc = "0.2"
 

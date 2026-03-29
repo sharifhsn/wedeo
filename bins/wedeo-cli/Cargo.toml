@@ -8,6 +8,7 @@ keywords.workspace = true
 categories.workspace = true
 rust-version.workspace = true
 description = "CLI tools for wedeo (ffprobe/ffmpeg equivalent)"
+publish = false
 
 [[bin]]
 name = "wedeo-cli"

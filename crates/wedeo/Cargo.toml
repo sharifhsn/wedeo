@@ -1,0 +1,44 @@
+[package]
+name = "wedeo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+description = "AI-generated Rust rewrite of FFmpeg — pure-Rust multimedia framework"
+readme = "README.md"
+
+[features]
+default = ["h264", "pcm", "wav", "h264-format", "mp4", "symphonia"]
+h264 = ["dep:wedeo-codec-h264"]
+pcm = ["dep:wedeo-codec-pcm"]
+wav = ["dep:wedeo-format-wav"]
+h264-format = ["dep:wedeo-format-h264"]
+mp4 = ["dep:wedeo-format-mp4"]
+symphonia = ["dep:wedeo-symphonia"]
+rav1d = ["dep:wedeo-rav1d"]
+
+[dependencies]
+# Framework crates (always present)
+wedeo-core = { workspace = true }
+wedeo-codec = { workspace = true }
+wedeo-format = { workspace = true }
+wedeo-filter = { workspace = true }
+wedeo-resample = { workspace = true }
+wedeo-scale = { workspace = true }
+
+# Implementation crates — linked for inventory registration at link time.
+# Each is optional so users can slim the binary by disabling unused formats.
+wedeo-codec-h264 = { workspace = true, optional = true }
+wedeo-codec-pcm = { workspace = true, optional = true }
+wedeo-format-wav = { workspace = true, optional = true }
+wedeo-format-h264 = { workspace = true, optional = true }
+wedeo-format-mp4 = { workspace = true, optional = true }
+wedeo-symphonia = { workspace = true, optional = true }
+# rav1d excluded from default — depends on a git-only crate.
+wedeo-rav1d = { workspace = true, optional = true }
+
+[lints]
+workspace = true

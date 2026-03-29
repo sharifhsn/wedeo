@@ -8,6 +8,7 @@ keywords.workspace = true
 categories.workspace = true
 rust-version.workspace = true
 description = "FATE test suite harness for wedeo"
+publish = false
 
 [[bin]]
 name = "wedeo-audiogen"

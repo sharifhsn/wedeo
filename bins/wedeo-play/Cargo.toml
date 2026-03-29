@@ -8,6 +8,7 @@ keywords.workspace = true
 categories.workspace = true
 rust-version.workspace = true
 description = "Simple video player for wedeo (decode + display)"
+publish = false
 
 [[bin]]
 name = "wedeo-play"
