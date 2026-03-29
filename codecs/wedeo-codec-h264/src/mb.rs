@@ -3916,8 +3916,10 @@ fn decode_intra8x8(
                 // the previous pair row (mb_y-2), not mb_y-1.
                 let tr_y_opt = if ctx.is_mbaff && ctx.mb_field {
                     if mb_y >= 2 { Some(mb_y - 2) } else { None }
+                } else if mb_y > 0 {
+                    Some(mb_y - 1)
                 } else {
-                    if mb_y > 0 { Some(mb_y - 1) } else { None }
+                    None
                 };
                 if mb_x + 1 < ctx.mb_width
                     && let Some(tr_y) = tr_y_opt
@@ -4125,8 +4127,10 @@ fn decode_intra4x4(
                 let tr_y_opt = if ctx.is_mbaff && ctx.mb_field {
                     // Field mode: above row is from previous pair row
                     if mb_y >= 2 { Some(mb_y - 2) } else { None }
+                } else if mb_y > 0 {
+                    Some(mb_y - 1)
                 } else {
-                    if mb_y > 0 { Some(mb_y - 1) } else { None }
+                    None
                 };
                 if mb_x + 1 < ctx.mb_width
                     && let Some(tr_y) = tr_y_opt

@@ -116,7 +116,7 @@ fn cmp_q(a: Rational, b: Rational) -> Option<Ordering> {
 
 /// Reduce a fraction. Returns (num, den, exact).
 /// Matches FFmpeg's `av_reduce`.
-#[allow(clippy::manual_checked_ops)]
+#[allow(unknown_lints, clippy::manual_checked_ops)]
 pub fn reduce(num: i64, den: i64, max: i64) -> (i32, i32, bool) {
     // Convergents: a0 and a1, each with .num and .den components.
     // These track the numerator and denominator of successive convergents

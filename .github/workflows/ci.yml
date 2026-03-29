@@ -19,9 +19,8 @@ jobs:
         with:
           submodules: false
       - run: sudo apt-get install -y nasm libasound2-dev
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: nightly-2026-02-25
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Clippy
@@ -37,9 +36,7 @@ jobs:
         with:
           submodules: false
       - run: sudo apt-get install -y nasm libasound2-dev
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: nightly-2026-02-25
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
       - name: Unit & integration tests
@@ -59,9 +56,7 @@ jobs:
         with:
           submodules: false
       - run: sudo apt-get install -y nasm libasound2-dev ffmpeg
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: nightly-2026-02-25
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
       - name: Cache FATE H.264 samples
@@ -121,9 +116,7 @@ jobs:
         with:
           submodules: false
       - run: sudo apt-get install -y nasm libasound2-dev
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: nightly-2026-02-25
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
       - name: Cache JVT vectors
