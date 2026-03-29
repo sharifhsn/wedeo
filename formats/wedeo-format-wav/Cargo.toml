@@ -14,7 +14,6 @@ description = "WAV format muxer for wedeo"
 wedeo-core = { workspace = true }
 wedeo-format = { workspace = true }
 inventory = { workspace = true }
-tracing = { workspace = true }
 
 [lints]
 workspace = true

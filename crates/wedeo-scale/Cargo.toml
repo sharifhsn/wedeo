@@ -13,7 +13,6 @@ description = "Video scaling for wedeo (libswscale equivalent)"
 [dependencies]
 dcv-color-primitives = "1.0.0"
 wedeo-core = { workspace = true }
-tracing = { workspace = true }
 
 [lints]
 workspace = true

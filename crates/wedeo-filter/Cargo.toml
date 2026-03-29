@@ -14,7 +14,6 @@ description = "Filter framework for wedeo (libavfilter equivalent)"
 wedeo-core = { workspace = true }
 bitflags = { workspace = true }
 inventory = { workspace = true }
-tracing = { workspace = true }
 
 [lints]
 workspace = true

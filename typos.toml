@@ -1,0 +1,25 @@
+[default.extend-words]
+# H.264 spec syntax elements
+ue = "ue"
+# H.264 conformance file prefixes
+BA = "BA"
+# Core Audio Format
+caf = "caf"
+Caf = "Caf"
+CAF = "CAF"
+# Rational numerator field
+numer = "numer"
+# MP4 box name
+trak = "trak"
+# "mis-group" prefix
+mis = "mis"
+# Variable suffixes (e.g., total_nd = no-deblock)
+nd = "nd"
+# ARM Scalable Matrix Extension
+SME = "SME"
+sme = "sme"
+# ARM asm instruction
+ands = "ands"
+
+[files]
+extend-exclude = ["FFmpeg/"]
