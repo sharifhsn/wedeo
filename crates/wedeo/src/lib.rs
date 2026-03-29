@@ -47,7 +47,9 @@
 //! | `h264-format` | yes | H.264 Annex B raw bitstream demuxer |
 //! | `mp4` | yes | MP4/MOV demuxer/muxer |
 //! | `symphonia` | yes | Symphonia audio backend (AAC, FLAC, MP3, Vorbis, Opus, etc.) |
-//! | `rav1d` | no | rav1d AV1 decoder (requires git dependency) |
+//!
+//! AV1 decoding via rav1d is available by depending on `wedeo-rav1d` directly
+//! (requires a git dependency — not yet on crates.io).
 //!
 //! ## Architecture
 //!
@@ -82,8 +84,8 @@ use wedeo_format_h264 as _;
 use wedeo_format_mp4 as _;
 #[cfg(feature = "wav")]
 use wedeo_format_wav as _;
-#[cfg(feature = "rav1d")]
-use wedeo_rav1d as _;
+// Note: wedeo-rav1d (AV1) is not available through this facade because it
+// depends on a git-only crate. Add wedeo-rav1d directly to use AV1 decoding.
 #[cfg(feature = "symphonia")]
 use wedeo_symphonia as _;
 

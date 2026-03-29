@@ -18,7 +18,6 @@ wav = ["dep:wedeo-format-wav"]
 h264-format = ["dep:wedeo-format-h264"]
 mp4 = ["dep:wedeo-format-mp4"]
 symphonia = ["dep:wedeo-symphonia"]
-rav1d = ["dep:wedeo-rav1d"]
 
 [dependencies]
 # Framework crates (always present)
@@ -37,8 +36,9 @@ wedeo-format-wav = { workspace = true, optional = true }
 wedeo-format-h264 = { workspace = true, optional = true }
 wedeo-format-mp4 = { workspace = true, optional = true }
 wedeo-symphonia = { workspace = true, optional = true }
-# rav1d excluded from default — depends on a git-only crate.
-wedeo-rav1d = { workspace = true, optional = true }
+# Note: wedeo-rav1d (AV1 via rav1d) is not included here because it depends
+# on a git-only crate and cannot be published to crates.io. To use AV1
+# decoding, depend on wedeo-rav1d directly from the git repository.
 
 [lints]
 workspace = true
