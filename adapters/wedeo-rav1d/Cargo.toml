@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
+rust-version.workspace = true
 description = "rav1d AV1 decoder adapter for wedeo"
 
 
@@ -16,3 +17,6 @@ inventory = { workspace = true }
 tracing = { workspace = true }
 rav1d = { git = "https://github.com/memorysafety/rav1d", default-features = true }
 libc = "0.2"
+
+[lints]
+workspace = true

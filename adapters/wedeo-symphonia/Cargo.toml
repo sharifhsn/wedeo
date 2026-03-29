@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
+rust-version.workspace = true
 description = "Symphonia audio backend adapter for wedeo"
 
 
@@ -34,3 +35,6 @@ symphonia = { version = "0.5.5", default-features = false, features = [
     "opt-simd",
 ] }
 opus-decoder = "0.1.1"
+
+[lints]
+workspace = true

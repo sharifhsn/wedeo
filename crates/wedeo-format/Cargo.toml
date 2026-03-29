@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
+rust-version.workspace = true
 description = "Format framework for wedeo (libavformat equivalent)"
 
 
@@ -15,3 +16,6 @@ wedeo-codec = { workspace = true }
 bitflags = { workspace = true }
 inventory = { workspace = true }
 tracing = { workspace = true }
+
+[lints]
+workspace = true

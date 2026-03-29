@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
+rust-version.workspace = true
 description = "Simple video player for wedeo (decode + display)"
 
 [[bin]]
@@ -28,3 +29,6 @@ wedeo-symphonia = { workspace = true }
 cpal = { workspace = true }
 minifb = { workspace = true }
 ringbuf = { workspace = true }
+
+[lints]
+workspace = true

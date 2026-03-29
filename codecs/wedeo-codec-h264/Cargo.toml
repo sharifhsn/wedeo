@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
+rust-version.workspace = true
 description = "H.264/AVC video codec for wedeo"
 
 [features]
@@ -28,3 +29,6 @@ divan = { workspace = true }
 [[bench]]
 name = "h264_bench"
 harness = false
+
+[lints]
+workspace = true

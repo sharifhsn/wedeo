@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
+rust-version.workspace = true
 description = "MP4/MOV format demuxer and muxer for wedeo"
 
 
@@ -15,3 +16,6 @@ wedeo-codec = { workspace = true }
 wedeo-format = { workspace = true }
 inventory = { workspace = true }
 tracing = { workspace = true }
+
+[lints]
+workspace = true

@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
+rust-version.workspace = true
 description = "Core types for wedeo (libavutil equivalent)"
 
 
@@ -16,3 +17,6 @@ bitflags = { workspace = true }
 tracing = { workspace = true }
 v_frame = "0.5.1"
 yuvxyb = "0.5.0"
+
+[lints]
+workspace = true

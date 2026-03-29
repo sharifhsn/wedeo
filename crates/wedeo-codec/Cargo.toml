@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
+rust-version.workspace = true
 description = "Codec framework for wedeo (libavcodec equivalent)"
 
 
@@ -15,3 +16,6 @@ bitflags = { workspace = true }
 inventory = { workspace = true }
 tracing = { workspace = true }
 av-bitstream = "0.2.1"
+
+[lints]
+workspace = true
