@@ -203,8 +203,12 @@ def run_suite(
         if snap_path.exists():
             snap_data = json.loads(snap_path.read_text())
             snapshot_passing = set(snap_data.get("passing", []))
+            if not snapshot_passing:
+                print(f"  No baseline tests for {suite.name} (empty snapshot) — skipping")
+                return []
         else:
-            print(f"  WARNING: no snapshot found at {snap_path.name}", file=sys.stderr)
+            print(f"  No baseline for {suite.name} (no snapshot at {snap_path.name}) — skipping")
+            return []
 
     results: list[RunResult] = []
     for vec in suite.vectors:

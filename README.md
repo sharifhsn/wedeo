@@ -127,12 +127,20 @@ themselves via `inventory` at link time — no central enum.
 
 ## CI
 
-Four parallel jobs run on every PR:
+Four parallel jobs run on every PR (all required to merge):
 
 - **Lint** — clippy + rustfmt
 - **Test** — 462 unit and integration tests via nextest
-- **FATE** — 79 H.264 conformance files, framecrc comparison vs system FFmpeg
-- **JVT** — 204 ITU vectors, MD5 comparison (no FFmpeg required)
+- **FATE Regression** — no previously-passing FATE test may regress (framecrc vs FFmpeg)
+- **JVT Regression** — no previously-passing JVT test may regress (MD5 vs ITU checksums)
+
+Conformance baselines are committed in `test_suites/baselines/`. To update
+after expanding coverage:
+
+```bash
+python3 scripts/suite_runner.py --suite fate-cavlc,fate-cabac \
+  --save-snapshot --snapshot-dir test_suites/baselines
+```
 
 Pre-commit hook available: `pip install pre-commit && pre-commit install`
 
