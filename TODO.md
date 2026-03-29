@@ -17,44 +17,11 @@
 - [x] **Pixel format conversion** — wedeo-scale now wraps dcv-color-primitives for I420/NV12↔RGB24/BGR24/RGBA/BGRA conversions. Converter struct with metadata preservation. 11 unit tests.
 
 ### Video codecs (native Rust, no existing crate covers these)
-- [~] **H.264 decoder** — 50/51 progressive CAVLC conformance BITEXACT (98%), all 17 Baseline pass. Only FM1_FT_E (FMO) remains. See `H264.md` for detailed status.
-  - [x] Wire P-frame inter prediction (mb_skip_run + P_SKIP + coded P-MB types 0-4)
-  - [x] Fix demuxer access unit grouping (SPS/AUD/first_mb_in_slice boundaries)
-  - [x] Write FATE integration tests (4 bitexact + 4 frame count regression tests)
-  - [x] Add per-MB debug infrastructure (tracing in mb.rs, scripts/mb_compare.py)
-  - [x] Fix BAMQ1 ±1 pixel diffs — IDCT pass order was row-major column-first instead of row-first
-  - [x] Fix multi-slice OOB panic — skip run bounds check prevents mb_y >= mb_height
-  - [x] Fix DPB IDR marking — current entry survives dpb.clear() to be marked ShortTerm
-  - [x] Fix CAVLC ref_idx desync — use slice header's num_ref_idx_l0_active, not PPS default
-  - [x] Fix ref list frame_num wrap-around — pic_num with MaxFrameNum per spec 8.2.4.1
-  - [x] Fix MV neighbor C availability — only use C from already-decoded MBs
-  - [x] Fix slice loop early-exit — parse mb_skip_run before RBSP exhaustion check
-  - [x] Fix intra4x4 neighbor modes from inter MBs — store DC_PRED(2) not -1 (7 files)
-  - [x] Fix multi-slice neighbor availability — slice_table + per-MB top_available (BASQP1 + I-frames)
-  - [x] Fix slice-aware MV prediction — cross-slice MV neighbors unavailable
-  - [x] Fix RBSP exhaustion margin — 8→1 bit, prevents dropping last MB of slice (SVA_Base_B/FM1_E/CL1_E)
-  - [x] Fix BA1_FT_C luma — MV neighbor C/D slice check for all blk_y values
-  - [x] Fix chroma V ±1 rounding — CHROMA_QP_TABLE had transcription error at index 36 (extra 33)
-  - [x] Fix deblocking filter diffs — TC0_TABLE had transcription error at QP 26 (missing [1,1,1] entry)
-  - [x] Implement B-frame decode — spatial direct prediction, bi-directional MC, DPB reordering
-  - [x] Fix B-frame deblocking — L1 data in MbDeblockInfo, two-permutation BS check, canonical picture IDs
-  - [x] Implement I_PCM macroblock decode — byte-align + read 384 raw bytes, QP tracking fix
-  - [x] Implement pred_weight_table parsing — consume weight bits for weighted P/B slices
-  - [x] Implement direct_8x8_inference_flag=0 — per-4x4 col_zero_flag in spatial direct
-  - [x] Fix ref_pic_list_modification wrap — modular arithmetic mod MaxFrameNum
-  - [x] Fix frame crop offset — apply SPS crop_left/crop_top in frame output
-  - [x] Fix sliding window FrameNumWrap — evict smallest FrameNumWrap, not smallest raw frame_num
-  - [x] Implement weighted prediction application — weights parsed and applied for P+B uni-directional
-  - [x] Fix MMCO-5 last_pocs reset + barrier-aware drain — MR4/MR5 now BITEXACT
-  - [x] Fix L1 neighbor D fallback same-MB slice_table bypass — CVBS3/CVSE3/CVSEFDFT3 now BITEXACT
-  - [x] HCBP1/HCBP2 15-ref hierarchical — now BITEXACT
-  - [x] Fix output reorder for non-Baseline without VUI — set reorder_depth=1, fixed CVWP1/CVWP2/CVBS3/CVSE3/CVSEFDFT3/MR4/MR5/cvmp (8 files)
-  - [x] Fix ref_pic_list_modification — pre-size list, allow duplicates, DPB-based deblock identity (CVWP5 BITEXACT)
-  - [x] Fix CVWP3 spatial direct — intra MBs left ref=-2 (PART_NOT_AVAILABLE) instead of -1 (LIST_NOT_USED) in mv_ctx
-  - [x] Fix HCMP1 hierarchical B — already BITEXACT (prior fix)
-  - [x] Fix CVFC1 cross-slice C→D fallback — neighbor_c() didn't check slice_table for D (top-left) fallback
-  - [ ] Fix FMO (Flexible Macroblock Ordering) — FM1_FT_E has num_slice_groups>1
-- [ ] **AV1 decoder via rav1d** — wrap Prossimo's rav1d (pure Rust AV1 decoder, port of dav1d) behind wedeo traits, similar to how symphonia is wrapped. Create `adapters/wedeo-rav1d/` with `Decoder` impl. Needs: new `CodecId::Av1` variant, AV1 OBU probe in demuxer, frame type mapping. rav1d handles all decode internally; wedeo just needs the trait bridge and pixel format conversion. Consider using a git worktree (`feat/rav1d-integration`) since it touches workspace Cargo.toml.
+- [x] **H.264 decoder** — 79/79 progressive BITEXACT (52 CAVLC + 27 CABAC), 23/55 FRext. See `H264.md` for detailed status.
+  - [ ] FMO (Flexible Macroblock Ordering) — out of scope, rarely used
+  - [ ] Interlaced (MBAFF/PAFF) — partial, CABAC engine correct, pixel reconstruction in progress
+  - [ ] 10-bit / 4:2:2 — not yet implemented
+- [x] **AV1 decoder via rav1d** — `adapters/wedeo-rav1d/` wraps rav1d behind wedeo `Decoder` trait.
 - [ ] **Video player with audio** — extend `bins/wedeo-play/` with audio playback (currently video-only via minifb). Needs: audio output backend (cpal or rodio crate), A/V sync (PTS-based with audio clock as master), demuxer that handles both audio+video streams (MP4/MKV via symphonia). Consider using a git worktree (`feat/video-player-audio`) since it may need new Frame fields in wedeo-core.
 - [ ] **VP9 decoder** — second priority for WebM support. Reference: `FFmpeg/libavcodec/vp9*.c`.
 - [ ] **HEVC decoder** — similar to H.264 but more complex (CTU/CTB structure).
@@ -67,7 +34,7 @@
 
 - [ ] **Filter graph data flow** — the filter trait and graph skeleton exist but have no format negotiation or frame queues. Needed before real transcode pipelines work.
 - [ ] **Interruptible I/O** — needed for network streams and cancellation.
-- [ ] **Buffer pool** — for high-throughput decode. Currently every frame allocates a new buffer.
+- [x] **Buffer pool** — `BufferPool` for `PictureBuffer` reuse via `SharedPicture::Drop` reclaim.
 - [ ] **Error context** — add "where/why" info to errors. Currently errors are flat enums with no call-site context.
 - [ ] **Demuxer read_close** — the Demuxer trait has no cleanup method. Not critical (Rust's Drop handles most cases) but FFmpeg has it.
 - [ ] **Chapters/programs** — the DemuxerHeader has no chapter or program info. Needed for Matroska/MP4 chapter support.
