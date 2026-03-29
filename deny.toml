@@ -1,0 +1,46 @@
+# cargo-deny configuration — https://embarkstudios.github.io/cargo-deny/
+# Run: cargo deny check
+
+[graph]
+all-features = true
+
+[advisories]
+ignore = [
+    { id = "RUSTSEC-2024-0384", reason = "instant is transitive via minifb — no upgrade available" },
+    { id = "RUSTSEC-2024-0436", reason = "paste is transitive via rav1d — no upgrade available" },
+]
+
+[licenses]
+confidence-threshold = 0.8
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "MIT-0",
+    "CC0-1.0",
+    "Unlicense",
+    "MPL-2.0",
+    "LGPL-2.1-or-later",
+    "Apache-2.0 WITH LLVM-exception",
+    "Unicode-3.0",
+]
+
+[[licenses.clarify]]
+crate = "ring"
+expression = "MIT AND ISC AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"  # workspace path deps trigger false positives
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = [
+    "https://github.com/memorysafety/rav1d",
+]
