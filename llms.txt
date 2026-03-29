@@ -15,7 +15,7 @@ against FFmpeg's FATE test suite. 16 crates, ~47K lines of Rust.
 ## Key files for AI agents
 
 - CLAUDE.md — canonical rules, build commands, debugging procedures
-- codecs/wedeo-codec-h264/src/ — H.264 decoder (29K lines, 18 modules)
+- codecs/wedeo-codec-h264/src/ — H.264 decoder (30K lines, 25 modules)
 - scripts/suite_runner.py — unified conformance runner
 - scripts/conformance_full.py — FATE conformance report
 - tests/fate/ — Rust FATE test harness

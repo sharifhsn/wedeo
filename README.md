@@ -28,7 +28,7 @@ FFmpeg's output.
 
 ### H.264 decoder
 
-The H.264 decoder is ~29K lines of Rust across 18 modules. It implements:
+The H.264 decoder is ~30K lines of Rust across 25 modules. It implements:
 
 - CAVLC and CABAC entropy coding
 - All intra prediction modes (4x4, 8x8, 16x16, chroma)
@@ -99,7 +99,7 @@ wedeo/
     wedeo-resample/      libswresample (rubato)
     wedeo-scale/         libswscale (dcv-color-primitives)
   codecs/
-    wedeo-codec-h264/    H.264 decoder — 29K lines, NEON assembly, 55 benchmarks
+    wedeo-codec-h264/    H.264 decoder — 30K lines, NEON assembly, 55 benchmarks
     wedeo-codec-pcm/     PCM codec — 17 formats
   formats/
     wedeo-format-h264/   H.264 Annex B demuxer
@@ -127,12 +127,13 @@ themselves via `inventory` at link time — no central enum.
 
 ## CI
 
-Four parallel jobs run on every PR (all required to merge):
+Five parallel jobs run on every PR (all required to merge):
 
 - **Lint** — clippy + rustfmt
 - **Test** — 462 unit and integration tests via nextest
 - **FATE Regression** — no previously-passing FATE test may regress (framecrc vs FFmpeg)
 - **JVT Regression** — no previously-passing JVT test may regress (MD5 vs ITU checksums)
+- **Deny** — license allow-list and advisory audit via cargo-deny
 
 Conformance baselines are committed in `test_suites/baselines/`. To update
 after expanding coverage:
