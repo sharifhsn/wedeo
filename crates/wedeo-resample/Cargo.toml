@@ -3,6 +3,9 @@ name = "wedeo-resample"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Audio resampling for wedeo (libswresample equivalent)"
 
 

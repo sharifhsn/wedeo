@@ -3,6 +3,9 @@ name = "wedeo-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Core types for wedeo (libavutil equivalent)"
 
 

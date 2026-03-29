@@ -26,6 +26,8 @@ license = "LGPL-2.1-or-later"
 description = "AI-generated Rust rewrite of FFmpeg"
 repository = "https://github.com/sharifhsn/wedeo"
 readme = "README.md"
+keywords = ["video", "ffmpeg", "h264", "codec", "multimedia"]
+categories = ["multimedia::video", "multimedia::encoding"]
 
 [workspace.dependencies]
 bitflags = "2"

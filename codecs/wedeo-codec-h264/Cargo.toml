@@ -3,6 +3,9 @@ name = "wedeo-codec-h264"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "H.264/AVC video codec for wedeo"
 
 [features]

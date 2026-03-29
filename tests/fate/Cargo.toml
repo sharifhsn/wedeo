@@ -3,6 +3,9 @@ name = "wedeo-fate"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "FATE test suite harness for wedeo"
 
 [[bin]]

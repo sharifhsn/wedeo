@@ -3,6 +3,9 @@ name = "wedeo-play"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Simple video player for wedeo (decode + display)"
 
 [[bin]]

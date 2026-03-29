@@ -3,6 +3,9 @@ name = "wedeo-codec-pcm"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "PCM audio codec for wedeo"
 
 

@@ -3,6 +3,9 @@ name = "wedeo-format-mp4"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "MP4/MOV format demuxer and muxer for wedeo"
 
 

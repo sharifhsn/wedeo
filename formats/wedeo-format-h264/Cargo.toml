@@ -3,6 +3,9 @@ name = "wedeo-format-h264"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "H.264 Annex B raw bitstream demuxer for wedeo"
 
 
