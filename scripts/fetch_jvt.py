@@ -77,7 +77,6 @@ def fetch_one(suite_name: str, vector: dict, dry_run: bool) -> str:
         if expected_md5:
             actual_md5 = hashlib.md5(tmp_path.read_bytes()).hexdigest()
             if actual_md5 != expected_md5:
-                tmp_path.unlink(missing_ok=True)
                 return f"  FAIL  {name} (md5 mismatch: expected {expected_md5}, got {actual_md5})"
 
         # Extract the target file from the zip
@@ -98,7 +97,6 @@ def fetch_one(suite_name: str, vector: dict, dry_run: bool) -> str:
                     match = info
 
             if match is None:
-                tmp_path.unlink(missing_ok=True)
                 members = [i.filename for i in zf.infolist() if not i.is_dir()]
                 return f"  FAIL  {name} ('{target_name}' not in zip: {members[:5]})"
 

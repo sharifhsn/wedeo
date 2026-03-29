@@ -373,21 +373,16 @@ def main():
         if args.save_snapshot:
             save_snapshot(suite.name, results, snapshot_dir=snapshot_dir)
 
-        # Regression detection: only compare vectors that were actually tested
-        # (not skipped by format/profile filter or missing files)
-        if args.check_snapshot:
-            snap_path = _snapshot_path(suite.name, snapshot_dir)
-            if snap_path.exists():
-                snap_data = json.loads(snap_path.read_text())
-                snap_passing = set(snap_data.get("passing", []))
-                tested_names = {r.name for r in results if r.status != "SKIP"}
-                now_passing = {r.name for r in results if r.status == "MATCH"}
-                regressions = (snap_passing & tested_names) - now_passing
-                if regressions:
-                    any_regression = True
-                    print(f"\n  REGRESSIONS in {suite.name}:")
-                    for name in sorted(regressions):
-                        print(f"    - {name}")
+        # Regression detection: compare tested results against baseline
+        if args.check_snapshot and results:
+            tested_names = {r.name for r in results if r.status != "SKIP"}
+            now_passing = {r.name for r in results if r.status == "MATCH"}
+            baseline = tested_names - now_passing  # vectors that were in baseline but didn't pass
+            if baseline:
+                any_regression = True
+                print(f"\n  REGRESSIONS in {suite.name}:")
+                for name in sorted(baseline):
+                    print(f"    - {name}")
 
     # Grand total
     tested = grand_match + grand_fail + grand_error
