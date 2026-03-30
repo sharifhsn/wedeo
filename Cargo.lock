@@ -2179,7 +2179,6 @@ dependencies = [
  "wedeo-format-h264",
  "wedeo-format-mp4",
  "wedeo-format-wav",
- "wedeo-rav1d",
  "wedeo-resample",
  "wedeo-scale",
  "wedeo-symphonia",
