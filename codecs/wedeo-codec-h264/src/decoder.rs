@@ -135,8 +135,6 @@ pub struct H264Decoder {
     /// Crop offsets in pixels from the active SPS.
     crop_left: u32,
     crop_top: u32,
-    /// Output frame counter for sequential PTS assignment during reordering.
-    output_frame_counter: i64,
     /// Delayed picture buffer for POC-ordered output (matching FFmpeg's
     /// `delayed_pic`). Frames are inserted here and the minimum-POC frame
     /// is output when `delayed_pics.len() > reorder_depth`.
@@ -298,7 +296,6 @@ impl H264Decoder {
             last_pocs: [i64::MIN; 16],
             crop_left: 0,
             crop_top: 0,
-            output_frame_counter: 0,
             delayed_pics: Vec::new(),
             current_dpb_idx: None,
         };
@@ -681,7 +678,7 @@ impl H264Decoder {
 
     /// Process a single NAL unit.
     #[tracing::instrument(skip_all, fields(nal_type = ?nalu.nal_type))]
-    fn process_nal(&mut self, nalu: &NalUnit, _pkt_pts: i64) -> Result<()> {
+    fn process_nal(&mut self, nalu: &NalUnit, pkt_pts: i64) -> Result<()> {
         match nalu.nal_type {
             NalUnitType::Sps => match parse_sps(&nalu.data) {
                 Ok(sps) => {
@@ -759,7 +756,9 @@ impl H264Decoder {
                     // Start new frame context
                     self.current_fdc =
                         Some(FrameDecodeContext::new(&sps, &pps, Some(&self.buffer_pool)));
-                    self.current_pts = self.frame_num as i64;
+                    // Store the packet PTS for this frame, matching FFmpeg's
+                    // ff_decode_frame_props which copies pkt->pts to frame->pts.
+                    self.current_pts = pkt_pts;
                     self.current_is_idr = is_idr;
                     self.current_frame_num_h264 = hdr.frame_num;
                     self.current_nal_ref_idc = nalu.nal_ref_idc;
@@ -1146,6 +1145,7 @@ impl H264Decoder {
             let seq_id = self.next_dispatch_id;
             self.next_dispatch_id += 1;
 
+            let pkt_pts = self.current_pts;
             self.pool.submit(Box::new(FrameWork {
                 fdc,
                 slices,
@@ -1159,6 +1159,7 @@ impl H264Decoder {
                 ref_list_l0,
                 ref_list_l1,
                 dpb_idx,
+                pkt_pts,
             }));
 
             self.in_flight_queue.push_back(InFlightFrame {
@@ -1227,7 +1228,7 @@ impl H264Decoder {
         let frame = self.fdc_to_frame(
             &mut in_flight.fdc,
             &in_flight.last_hdr,
-            in_flight.poc as i64,
+            in_flight.pkt_pts,
         );
         debug!(
             poc = in_flight.poc,
@@ -1260,9 +1261,10 @@ impl H264Decoder {
                     .map(|(i, _)| i)
                     .unwrap()
             };
-            let (_, mut f, _) = self.delayed_pics.remove(out_idx);
-            f.pts = self.output_frame_counter;
-            self.output_frame_counter += 1;
+            let (_, f, _) = self.delayed_pics.remove(out_idx);
+            // Frame already carries the correct PTS from the packet
+            // (set in fdc_to_frame). Matching FFmpeg, which never
+            // overwrites frame->pts during delayed_pic output.
             self.output_queue.push_back(f);
         }
 
@@ -2624,9 +2626,8 @@ impl Decoder for H264Decoder {
                             .map(|(i, _)| i)
                             .unwrap()
                     };
-                    let (_, mut f, _) = self.delayed_pics.remove(out_idx);
-                    f.pts = self.output_frame_counter;
-                    self.output_frame_counter += 1;
+                    let (_, f, _) = self.delayed_pics.remove(out_idx);
+                    // Frame already carries the correct PTS from the packet.
                     self.output_queue.push_back(f);
                 }
 
@@ -2666,7 +2667,6 @@ impl Decoder for H264Decoder {
         self.reorder_depth = 0;
         self.has_bitstream_restriction = false;
         self.last_pocs = [i64::MIN; 16];
-        self.output_frame_counter = 0;
         self.delayed_pics.clear();
         // SPS/PPS are retained across flush (matching FFmpeg behavior).
     }

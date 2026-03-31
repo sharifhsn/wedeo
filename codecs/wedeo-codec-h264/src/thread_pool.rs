@@ -63,6 +63,8 @@ pub(crate) struct FrameWork {
     pub ref_list_l0: Vec<usize>,
     pub ref_list_l1: Vec<usize>,
     pub dpb_idx: Option<usize>,
+    /// Packet PTS from the demuxer, propagated to the output frame.
+    pub pkt_pts: i64,
 }
 
 /// Result of a completed frame decode.
@@ -82,6 +84,8 @@ pub(crate) struct InFlightDecode {
     pub ref_list_l0: Vec<usize>,
     pub ref_list_l1: Vec<usize>,
     pub dpb_idx: Option<usize>,
+    /// Packet PTS from the demuxer, propagated to the output frame.
+    pub pkt_pts: i64,
 }
 
 /// Persistent thread pool for frame decode workers.
@@ -257,5 +261,6 @@ fn decode_frame(fw: FrameWork) -> Box<InFlightDecode> {
         ref_list_l0: fw.ref_list_l0,
         ref_list_l1: fw.ref_list_l1,
         dpb_idx: fw.dpb_idx,
+        pkt_pts: fw.pkt_pts,
     })
 }
