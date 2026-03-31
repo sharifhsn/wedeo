@@ -1225,11 +1225,7 @@ impl H264Decoder {
         frame_mmco_reset: bool,
         out_of_order: usize,
     ) {
-        let frame = self.fdc_to_frame(
-            &mut in_flight.fdc,
-            &in_flight.last_hdr,
-            in_flight.pkt_pts,
-        );
+        let frame = self.fdc_to_frame(&mut in_flight.fdc, &in_flight.last_hdr, in_flight.pkt_pts);
         debug!(
             poc = in_flight.poc,
             reorder_depth = self.reorder_depth,

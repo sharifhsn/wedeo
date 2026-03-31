@@ -25,12 +25,12 @@ use wedeo_rav1d as _;
 use wedeo_symphonia as _;
 
 use wedeo_codec::decoder::DecoderBuilder;
-use wedeo_core::{MediaType, Packet};
 use wedeo_core::error::Error;
 use wedeo_core::frame::{ColorRange, ColorSpace, Frame, FramePlane};
 use wedeo_core::pixel_format::PixelFormat;
 use wedeo_core::rational::Rational;
 use wedeo_core::sample_format::SampleFormat;
+use wedeo_core::{MediaType, Packet};
 use wedeo_format::context::InputContext;
 use wedeo_resample::{Quality, Resampler};
 
@@ -505,8 +505,8 @@ fn run(path: &str, initial_scale: Option<usize>) -> wedeo_core::Result<()> {
                     // Update audio clock (matching ffplay sdl_audio_callback line 2570).
                     // Compute the PTS of the audio currently being played:
                     // base_pts + (samples_read - samples_at_base_pts) / (rate * ch)
-                    let total_read = samples_read.fetch_add(filled as u64, Ordering::Relaxed)
-                        + filled as u64;
+                    let total_read =
+                        samples_read.fetch_add(filled as u64, Ordering::Relaxed) + filled as u64;
                     let total_written = samples_written.load(Ordering::Relaxed);
                     let base_pts = f64::from_bits(pts_shared.load(Ordering::Relaxed));
                     // Samples still in the ring buffer (not yet played).
@@ -852,14 +852,17 @@ impl App {
                 // vp_duration: PTS gap to next frame (ffplay line 1609-1619).
                 let duration = if self.pending_video.len() > 1 {
                     let d = self.pending_video[1].pts_sec - self.pending_video[0].pts_sec;
-                    if d > 0.0 && d < 10.0 { d } else { self.frame_duration }
+                    if d > 0.0 && d < 10.0 {
+                        d
+                    } else {
+                        self.frame_duration
+                    }
                 } else {
                     self.frame_duration
                 };
 
                 // compute_target_delay: A/V sync adjustment (ffplay line 1673).
-                let delay =
-                    self.compute_target_delay(duration, self.pending_video[0].pts_sec);
+                let delay = self.compute_target_delay(duration, self.pending_video[0].pts_sec);
 
                 let ft = self.frame_timer.unwrap();
                 let time = now.duration_since(ft).as_secs_f64();
@@ -871,11 +874,7 @@ impl App {
                 self.frame_timer = Some(ft + Duration::from_secs_f64(delay));
 
                 // Snap if way behind (ffplay lines 1682-1683).
-                if delay > 0.0
-                    && now
-                        .duration_since(self.frame_timer.unwrap())
-                        .as_secs_f64()
-                        > 0.1
+                if delay > 0.0 && now.duration_since(self.frame_timer.unwrap()).as_secs_f64() > 0.1
                 {
                     self.frame_timer = Some(now);
                 }
@@ -890,7 +889,11 @@ impl App {
                 if self.pending_video.len() > 1 {
                     let next_dur = {
                         let d = self.pending_video[1].pts_sec - self.pending_video[0].pts_sec;
-                        if d > 0.0 && d < 10.0 { d } else { self.frame_duration }
+                        if d > 0.0 && d < 10.0 {
+                            d
+                        } else {
+                            self.frame_duration
+                        }
                     };
                     let ft = self.frame_timer.unwrap();
                     if now.duration_since(ft).as_secs_f64() > next_dur {
@@ -922,7 +925,9 @@ impl App {
             let fps = self.fps_frame_count as f64 / elapsed.as_secs_f64();
             eprintln!(
                 "fps={fps:.1} displayed={} dropped={} pending={}",
-                self.fps_frame_count, self.fps_dropped, self.pending_video.len()
+                self.fps_frame_count,
+                self.fps_dropped,
+                self.pending_video.len()
             );
             self.fps_frame_count = 0;
             self.fps_dropped = 0;
@@ -1089,7 +1094,11 @@ impl ApplicationHandler for App {
         if let (Some(ft), Some(front)) = (self.frame_timer, self.pending_video.front()) {
             let duration = if self.pending_video.len() > 1 {
                 let d = self.pending_video[1].pts_sec - front.pts_sec;
-                if d > 0.0 && d < 10.0 { d } else { self.frame_duration }
+                if d > 0.0 && d < 10.0 {
+                    d
+                } else {
+                    self.frame_duration
+                }
             } else {
                 self.frame_duration
             };
@@ -1124,7 +1133,6 @@ impl ApplicationHandler for App {
         } else {
             event_loop.set_control_flow(ControlFlow::Poll);
         }
-
     }
 }
 
@@ -1215,31 +1223,30 @@ impl GpuState {
         });
 
         // Bind group layout.
-        let bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("yuv_bgl"),
-                entries: &[
-                    bgl_texture(0),
-                    bgl_texture(1),
-                    bgl_texture(2),
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 3,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("yuv_bgl"),
+            entries: &[
+                bgl_texture(0),
+                bgl_texture(1),
+                bgl_texture(2),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
                     },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 4,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                ],
-            });
+                    count: None,
+                },
+            ],
+        });
 
         let bind_group = create_bind_group(
             &device,
@@ -1332,7 +1339,13 @@ impl GpuState {
     }
 
     fn upload_frame(&self, frame: &VideoFrame) {
-        upload_plane(&self.queue, &self.y_tex, frame.width, frame.height, &frame.y_data);
+        upload_plane(
+            &self.queue,
+            &self.y_tex,
+            frame.width,
+            frame.height,
+            &frame.y_data,
+        );
         upload_plane(
             &self.queue,
             &self.u_tex,
@@ -1380,7 +1393,11 @@ fn create_yuv_textures(
 ) -> (wgpu::Texture, wgpu::Texture, wgpu::Texture) {
     let y = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("Y"),
-        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -1392,7 +1409,11 @@ fn create_yuv_textures(
     let ch = height / 2;
     let u = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("U"),
-        size: wgpu::Extent3d { width: cw, height: ch, depth_or_array_layers: 1 },
+        size: wgpu::Extent3d {
+            width: cw,
+            height: ch,
+            depth_or_array_layers: 1,
+        },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -1402,7 +1423,11 @@ fn create_yuv_textures(
     });
     let v = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("V"),
-        size: wgpu::Extent3d { width: cw, height: ch, depth_or_array_layers: 1 },
+        size: wgpu::Extent3d {
+            width: cw,
+            height: ch,
+            depth_or_array_layers: 1,
+        },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -1429,16 +1454,37 @@ fn create_bind_group(
         label: Some("yuv_bg"),
         layout,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&y_view) },
-            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&u_view) },
-            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&v_view) },
-            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(sampler) },
-            wgpu::BindGroupEntry { binding: 4, resource: params_buf.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&y_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&u_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(&v_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: params_buf.as_entire_binding(),
+            },
         ],
     })
 }
 
-fn upload_plane(queue: &wgpu::Queue, texture: &wgpu::Texture, width: u32, height: u32, data: &[u8]) {
+fn upload_plane(
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    width: u32,
+    height: u32,
+    data: &[u8],
+) {
     queue.write_texture(
         wgpu::TexelCopyTextureInfo {
             texture,
@@ -1544,10 +1590,10 @@ fn read_thread_fn(args: ReadThreadArgs) {
         // Self-throttle: if both streams have enough buffered packets,
         // sleep 10ms to avoid unbounded queue growth. Matches ffplay's
         // stream_has_enough_packets check (lines 2854, 3131-3141).
-        let video_enough = video_idx.is_none()
-            || video_pkt_count.load(Ordering::Relaxed) > MIN_FRAMES;
-        let audio_enough = audio_idx.is_none()
-            || audio_pkt_count.load(Ordering::Relaxed) > MIN_FRAMES;
+        let video_enough =
+            video_idx.is_none() || video_pkt_count.load(Ordering::Relaxed) > MIN_FRAMES;
+        let audio_enough =
+            audio_idx.is_none() || audio_pkt_count.load(Ordering::Relaxed) > MIN_FRAMES;
         if video_enough && audio_enough {
             thread::sleep(Duration::from_millis(10));
             continue; // re-check commands after sleep
@@ -1648,7 +1694,11 @@ fn drain_video_frames(
                 let u_data = extract_plane(&video.planes[1], w / 2, h / 2);
                 let v_data = extract_plane(&video.planes[2], w / 2, h / 2);
 
-                let color_matrix = if video.color_space == ColorSpace::Bt709 { 1 } else { 0 };
+                let color_matrix = if video.color_space == ColorSpace::Bt709 {
+                    1
+                } else {
+                    0
+                };
                 let full_range = if video.color_range == ColorRange::Jpeg
                     || video.format == PixelFormat::Yuvj420p
                 {
