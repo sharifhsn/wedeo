@@ -25,8 +25,6 @@ use wedeo_core::pixel_format::PixelFormat;
 struct Rav1eEncoderWrapper {
     ctx: Context<u8>,
     pending_packets: VecDeque<Packet>,
-    width: u32,
-    height: u32,
     /// Raw OBU sequence header bytes (for MP4 av1C extradata).
     sequence_header: Vec<u8>,
 }
@@ -115,8 +113,6 @@ impl Rav1eEncoderWrapper {
         Ok(Self {
             ctx,
             pending_packets: VecDeque::new(),
-            width: builder.width,
-            height: builder.height,
             sequence_header,
         })
     }
@@ -124,9 +120,6 @@ impl Rav1eEncoderWrapper {
     /// Convert a wedeo Frame to a rav1e Frame by copying Y/U/V plane data.
     fn convert_frame(&self, frame: &Frame) -> Result<rav1e::prelude::Frame<u8>> {
         let video = frame.video().ok_or(Error::InvalidData)?;
-        let w = self.width as usize;
-        let h = self.height as usize;
-
         let mut enc_frame = self.ctx.new_frame();
 
         // Y plane
