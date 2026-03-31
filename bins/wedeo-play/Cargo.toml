@@ -28,8 +28,10 @@ wedeo-format-mp4 = { workspace = true }
 wedeo-rav1d = { workspace = true }
 wedeo-symphonia = { workspace = true }
 cpal = { workspace = true }
-minifb = { workspace = true }
+pollster = { workspace = true }
 ringbuf = { workspace = true }
+wgpu = { workspace = true }
+winit = { workspace = true }
 
 [lints]
 workspace = true
