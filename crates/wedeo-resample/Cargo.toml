@@ -13,7 +13,7 @@ description = "Audio resampling for wedeo (libswresample equivalent)"
 [dependencies]
 wedeo-core = { workspace = true }
 rubato = "1"
-audioadapter-buffers = "2"
+audioadapter-buffers = "3"
 
 [lints]
 workspace = true

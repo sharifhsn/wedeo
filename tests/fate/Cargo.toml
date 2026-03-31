@@ -32,7 +32,7 @@ wedeo-rav1d = { workspace = true }
 wedeo-rav1e = { workspace = true }
 tracing-subscriber = { workspace = true }
 adler2 = "2.0.1"
-md-5 = "0.10.6"
+md-5 = "0.11.0"
 
 [lints]
 workspace = true
