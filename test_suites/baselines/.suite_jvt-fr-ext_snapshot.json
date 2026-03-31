@@ -1,0 +1,31 @@
+{
+  "suite": "JVT-FR-EXT",
+  "passing": [
+    "FRExt1_Panasonic_D",
+    "FRExt3_Panasonic_E",
+    "FRExt_MMCO4_Sony_B",
+    "HCAFR1_HHI_C",
+    "HCAFR2_HHI_A",
+    "HCAFR3_HHI_A",
+    "HCAFR4_HHI_A",
+    "HCHP2_HHI_A",
+    "HPCADQ_BRCM_B",
+    "HPCALQ_BRCM_B",
+    "HPCAMOLQ_BRCM_B",
+    "HPCANL_BRCM_C",
+    "HPCAQ2LQ_BRCM_B",
+    "HPCA_BRCM_C",
+    "HPCVMOLQ_BRCM_B",
+    "HPCVNL_BRCM_A",
+    "HPCV_BRCM_A",
+    "alphaconformanceG",
+    "brcm_freh3",
+    "brcm_freh8",
+    "brcm_freh9",
+    "freh12_b",
+    "freh1_b",
+    "freh2_b"
+  ],
+  "count": 24,
+  "total": 46
+}
