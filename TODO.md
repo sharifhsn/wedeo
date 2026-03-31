@@ -22,13 +22,36 @@
   - [ ] Interlaced (MBAFF/PAFF) — partial, CABAC engine correct, pixel reconstruction in progress
   - [ ] 10-bit / 4:2:2 — not yet implemented
 - [x] **AV1 decoder via rav1d** — `adapters/wedeo-rav1d/` wraps rav1d behind wedeo `Decoder` trait.
-- [ ] **Video player with audio** — extend `bins/wedeo-play/` with audio playback (currently video-only via minifb). Needs: audio output backend (cpal or rodio crate), A/V sync (PTS-based with audio clock as master), demuxer that handles both audio+video streams (MP4/MKV via symphonia). Consider using a git worktree (`feat/video-player-audio`) since it may need new Frame fields in wedeo-core.
+- [x] **Video player with audio** — `bins/wedeo-play/` has full A/V playback: cpal audio output, PTS-based A/V sync (audio clock master), resampling via wedeo-resample, 5.1→stereo downmix, volume control, pause/seek. Supports H.264/AV1 video + symphonia audio codecs.
 - [ ] **VP9 decoder** — second priority for WebM support. Reference: `FFmpeg/libavcodec/vp9*.c`.
 - [ ] **HEVC decoder** — similar to H.264 but more complex (CTU/CTB structure).
 
 ### Video muxers
 - [ ] **MP4/MOV muxer** — needed for any useful video output. No existing pure-Rust MP4 muxer crate.
 - [ ] **MKV/WebM muxer** — `matroska` crate (0.30.0, 143K downloads, by tuffy) is a demuxer only. Muxer needs to be written.
+
+## Player performance
+
+**Target: smooth 1080p24 playback with A/V sync ≤ ±40ms.**
+
+Benchmark (Simpsons Movie 1080p trailer, 1920x800 H.264 @ 23.976fps, 3288 frames):
+
+| Component | Current | Budget (41.7ms/frame) | Status |
+|-----------|---------|----------------------|--------|
+| H.264 decode | 8.5ms | < 28ms (67%) | OK |
+| YUV→RGBA + display | bottleneck at --scale 3 | < 14ms (33%) | FAIL |
+| A/V drift | audible desync | ≤ ±40ms | FAIL |
+| FFmpeg -threads 1 | 3.2ms/frame (reference) | — | — |
+
+Root cause: `rgba_to_minifb` does per-pixel nearest-neighbor blit into a 5760x2400 buffer
+at `--scale 3`, plus CPU-side YUV→RGBA conversion. FFmpeg's ffplay avoids both by uploading
+YUV directly to SDL textures (GPU does color conversion + scaling for free).
+
+Improvements (ordered by impact):
+- [x] Default `--scale 1` for HD content; let the window manager handle scaling
+- [ ] Upload YUV textures to GPU directly (requires replacing minifb with SDL2/wgpu)
+- [ ] Move YUV→RGBA conversion off the decode thread (pipeline it)
+- [ ] SIMD for MC lowpass filters (NEON on Apple Silicon)
 
 ## Infrastructure (ongoing)
 
