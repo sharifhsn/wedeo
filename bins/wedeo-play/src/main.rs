@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::env;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -32,7 +32,6 @@ use wedeo_core::pixel_format::PixelFormat;
 use wedeo_core::rational::Rational;
 use wedeo_core::sample_format::SampleFormat;
 use wedeo_format::context::InputContext;
-use wedeo_format::demuxer::SeekFlags;
 use wedeo_resample::{Quality, Resampler};
 
 // ---------------------------------------------------------------------------
@@ -110,6 +109,65 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 "#;
 
 // ---------------------------------------------------------------------------
+// Audio clock — port of ffplay's Clock struct (lines 138-146)
+// ---------------------------------------------------------------------------
+
+/// Audio clock using ffplay's pts_drift model.
+///
+/// The key insight: `pts_drift = pts - wall_time`. Between updates,
+/// `get()` interpolates: `pts_drift + current_wall_time`. During pause,
+/// it returns the frozen `pts` directly.
+///
+/// Reference: ffplay.c lines 138-146 (Clock struct), 1428-1438 (get_clock),
+/// 1440-1452 (set_clock_at/set_clock).
+struct AudioClock {
+    /// `pts - wall_time` when last set. Enables interpolation between updates.
+    pts_drift: f64,
+    /// Wall-clock time (seconds since process start) when last updated.
+    last_updated: f64,
+    /// The raw PTS value (returned directly when paused).
+    pts: f64,
+    /// Whether the clock is frozen (paused).
+    paused: bool,
+}
+
+impl AudioClock {
+    fn new() -> Self {
+        Self {
+            pts_drift: 0.0,
+            last_updated: 0.0,
+            pts: 0.0,
+            paused: false,
+        }
+    }
+
+    /// Set the clock to `pts` at wall-clock time `time`.
+    /// Matches ffplay's `set_clock_at` (line 1440).
+    fn set_at(&mut self, pts: f64, time: f64) {
+        self.pts = pts;
+        self.last_updated = time;
+        self.pts_drift = pts - time;
+    }
+
+    /// Get the current clock value.
+    /// Matches ffplay's `get_clock` (line 1428).
+    fn get(&self, now: f64) -> f64 {
+        if self.paused {
+            self.pts
+        } else {
+            self.pts_drift + now
+        }
+    }
+}
+
+/// Get wall-clock time in seconds (monotonic, relative to process start).
+fn wall_time() -> f64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let start = START.get_or_init(Instant::now);
+    start.elapsed().as_secs_f64()
+}
+
+// ---------------------------------------------------------------------------
 // Data structures
 // ---------------------------------------------------------------------------
 
@@ -125,9 +183,8 @@ struct VideoFrame {
     full_range: u32,
 }
 
-/// Commands sent from the main thread to the decode thread.
+/// Commands sent from the main thread to the read thread.
 enum Command {
-    Seek(f64),
     Quit,
 }
 
@@ -136,8 +193,6 @@ struct ReadThreadArgs {
     ctx: InputContext,
     video_idx: Option<usize>,
     audio_idx: Option<usize>,
-    vid_time_base: Rational,
-    audio_time_base: Rational,
     video_pkt_tx: Option<mpsc::Sender<PacketMsg>>,
     audio_pkt_tx: Option<mpsc::Sender<PacketMsg>>,
     event_tx: mpsc::Sender<DecodeEvent>,
@@ -177,14 +232,12 @@ struct AudioData {
 
 /// Non-blocking events from decode thread.
 enum DecodeEvent {
-    SeekComplete,
     Eof,
 }
 
 /// Messages sent to per-stream decode threads.
 enum PacketMsg {
     Packet(Packet),
-    Flush,
 }
 
 // ---------------------------------------------------------------------------
@@ -230,9 +283,10 @@ struct App {
     cmd_tx: mpsc::Sender<Command>,
 
     // Audio shared state
-    audio_clock: Arc<AtomicU64>,
+    audio_clock: Arc<Mutex<AudioClock>>,
+    audio_pts_shared: Arc<AtomicU64>,
+    audio_samples_written: Arc<AtomicU64>,
     volume: Arc<AtomicU32>,
-    seeking: Arc<AtomicBool>,
     rb_prod: <HeapRb<f32> as Split>::Prod,
     audio_stream: Option<cpal::Stream>,
 
@@ -248,9 +302,6 @@ struct App {
     audio_playing: bool,
     first_audio_pts: Option<f64>,
     paused: bool,
-    playback_start: Option<Instant>,
-    first_video_pts: f64,
-    pause_offset: Duration,
     pause_start: Option<Instant>,
     current_volume: f32,
     has_first_frame: bool,
@@ -376,10 +427,8 @@ fn run(path: &str, initial_scale: Option<usize>) -> wedeo_core::Result<()> {
         .transpose()?;
 
     // Audio output via cpal.
-    let audio_clock = Arc::new(AtomicU64::new(0));
+    let audio_clock = Arc::new(Mutex::new(AudioClock::new()));
     let volume = Arc::new(AtomicU32::new(f32::to_bits(1.0)));
-    let seeking = Arc::new(AtomicBool::new(false));
-
     let cpal_device = if has_audio {
         let host = cpal::default_host();
         Some(
@@ -412,7 +461,15 @@ fn run(path: &str, initial_scale: Option<usize>) -> wedeo_core::Result<()> {
     let rb = HeapRb::<f32>::new(rb_capacity);
     let (rb_prod, rb_cons) = rb.split();
 
-    // Build cpal output stream with volume and seeking support.
+    // Shared audio PTS: audio decode thread writes the PTS of the latest chunk
+    // pushed to the ring buffer; cpal callback reads it to update the clock.
+    // This tracks the PTS of audio "near the head" of the ring buffer.
+    let audio_pts_shared = Arc::new(AtomicU64::new(f64::to_bits(0.0)));
+    // Cumulative sample counter for precise PTS interpolation within the ring buffer.
+    let audio_samples_written = Arc::new(AtomicU64::new(0));
+    let audio_samples_read = Arc::new(AtomicU64::new(0));
+
+    // Build cpal output stream with volume support.
     let audio_stream: Option<cpal::Stream>;
     if has_audio {
         let stream_config = cpal::StreamConfig {
@@ -423,7 +480,11 @@ fn run(path: &str, initial_scale: Option<usize>) -> wedeo_core::Result<()> {
 
         let clock = audio_clock.clone();
         let vol = volume.clone();
-        let seek_flag = seeking.clone();
+        let pts_shared = audio_pts_shared.clone();
+        let samples_written = audio_samples_written.clone();
+        let samples_read = audio_samples_read.clone();
+        let cb_rate = device_sample_rate as f64;
+        let cb_ch = device_channels as f64;
         let mut audio_consumer = rb_cons;
 
         let stream = cpal_device
@@ -432,12 +493,6 @@ fn run(path: &str, initial_scale: Option<usize>) -> wedeo_core::Result<()> {
             .build_output_stream(
                 &stream_config,
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    if seek_flag.load(Ordering::Relaxed) {
-                        // Drain ring buffer, output silence, don't advance clock.
-                        audio_consumer.pop_slice(data);
-                        data.fill(0.0);
-                        return;
-                    }
                     let gain = f32::from_bits(vol.load(Ordering::Relaxed));
                     let filled = audio_consumer.pop_slice(data);
                     for sample in &mut data[..filled] {
@@ -446,7 +501,23 @@ fn run(path: &str, initial_scale: Option<usize>) -> wedeo_core::Result<()> {
                     for sample in &mut data[filled..] {
                         *sample = 0.0;
                     }
-                    clock.fetch_add(filled as u64, Ordering::Relaxed);
+
+                    // Update audio clock (matching ffplay sdl_audio_callback line 2570).
+                    // Compute the PTS of the audio currently being played:
+                    // base_pts + (samples_read - samples_at_base_pts) / (rate * ch)
+                    let total_read = samples_read.fetch_add(filled as u64, Ordering::Relaxed)
+                        + filled as u64;
+                    let total_written = samples_written.load(Ordering::Relaxed);
+                    let base_pts = f64::from_bits(pts_shared.load(Ordering::Relaxed));
+                    // Samples still in the ring buffer (not yet played).
+                    let buffered = total_written.saturating_sub(total_read);
+                    // The PTS of what's actually playing = base_pts minus
+                    // the duration of buffered samples.
+                    let playing_pts = base_pts - buffered as f64 / (cb_rate * cb_ch);
+                    let now = wall_time();
+                    if let Ok(mut clk) = clock.try_lock() {
+                        clk.set_at(playing_pts, now);
+                    }
                 },
                 |err| eprintln!("Audio error: {err}"),
                 None,
@@ -539,8 +610,6 @@ fn run(path: &str, initial_scale: Option<usize>) -> wedeo_core::Result<()> {
             ctx,
             video_idx,
             audio_idx,
-            vid_time_base,
-            audio_time_base,
             video_pkt_tx,
             audio_pkt_tx,
             event_tx,
@@ -566,8 +635,9 @@ fn run(path: &str, initial_scale: Option<usize>) -> wedeo_core::Result<()> {
         event_rx,
         cmd_tx,
         audio_clock,
+        audio_pts_shared,
+        audio_samples_written,
         volume,
-        seeking,
         rb_prod,
         audio_stream,
         window: None,
@@ -579,9 +649,6 @@ fn run(path: &str, initial_scale: Option<usize>) -> wedeo_core::Result<()> {
         audio_playing: false,
         first_audio_pts: None,
         paused: false,
-        playback_start: None,
-        first_video_pts: 0.0,
-        pause_offset: Duration::ZERO,
         pause_start: None,
         current_volume: 1.0,
         has_first_frame: false,
@@ -619,6 +686,8 @@ impl App {
         // Push any pending audio first.
         if !self.pending_audio.is_empty() {
             let pushed = self.rb_prod.push_slice(&self.pending_audio);
+            self.audio_samples_written
+                .fetch_add(pushed as u64, Ordering::Relaxed);
             if pushed >= self.pending_audio.len() {
                 self.pending_audio.clear();
             } else {
@@ -636,7 +705,16 @@ impl App {
                     if self.first_audio_pts.is_none() {
                         self.first_audio_pts = Some(pts_sec);
                     }
+                    // Update shared PTS for the cpal callback's clock.
+                    // PTS represents the END of this chunk (after all samples play).
+                    let chunk_duration = samples.len() as f64
+                        / (self.device_sample_rate as f64 * self.device_channels as f64);
+                    let end_pts = pts_sec + chunk_duration;
+                    self.audio_pts_shared
+                        .store(f64::to_bits(end_pts), Ordering::Relaxed);
                     let pushed = self.rb_prod.push_slice(&samples);
+                    self.audio_samples_written
+                        .fetch_add(pushed as u64, Ordering::Relaxed);
                     if pushed < samples.len() {
                         self.pending_audio.extend_from_slice(&samples[pushed..]);
                         break;
@@ -657,10 +735,9 @@ impl App {
             }
         }
 
-        // Poll events (SeekComplete, Eof).
+        // Poll events.
         while let Ok(evt) = self.event_rx.try_recv() {
             match evt {
-                DecodeEvent::SeekComplete => {}
                 DecodeEvent::Eof => self.eof = true,
             }
         }
@@ -678,74 +755,40 @@ impl App {
         }
     }
 
+    /// Pause/unpause matching ffplay's stream_toggle_pause (line 1540).
     fn toggle_pause(&mut self) {
-        self.paused = !self.paused;
         if self.paused {
-            if let Some(ref s) = self.audio_stream {
-                let _ = s.pause();
+            // Unpausing — adjust frame_timer for pause duration
+            // (matches ffplay stream_toggle_pause line 1543).
+            let now_inst = Instant::now();
+            if let (Some(ft), Some(ps)) = (self.frame_timer, self.pause_start) {
+                self.frame_timer = Some(ft + now_inst.duration_since(ps));
             }
-            self.pause_start = Some(Instant::now());
-        } else {
+            // Re-anchor audio clock pts_drift to current wall time
+            // (matches ffplay line 1547: set_clock(vidclk, get_clock(vidclk))).
+            {
+                let now = wall_time();
+                let mut clk = self.audio_clock.lock().unwrap();
+                let pts = clk.get(now);
+                clk.paused = false;
+                clk.set_at(pts, now);
+            }
+            // Resume audio stream.
             if self.audio_playing
                 && let Some(ref s) = self.audio_stream
             {
                 let _ = s.play();
             }
-            if let Some(ps) = self.pause_start.take() {
-                self.pause_offset += ps.elapsed();
-            }
-        }
-    }
-
-    fn handle_seek(&mut self, delta: f64) {
-        let current_time = if self.has_audio && self.audio_playing {
-            let consumed = self.audio_clock.load(Ordering::Relaxed);
-            let clock_secs =
-                consumed as f64 / (self.device_sample_rate as f64 * self.device_channels as f64);
-            self.first_audio_pts.unwrap_or(0.0) + clock_secs
-        } else if let Some(start) = self.playback_start {
-            let elapsed = start.elapsed().saturating_sub(self.pause_offset);
-            let elapsed = if let Some(ps) = self.pause_start {
-                elapsed.saturating_sub(ps.elapsed())
-            } else {
-                elapsed
-            };
-            self.first_video_pts + elapsed.as_secs_f64()
+            self.pause_start = None;
         } else {
-            0.0
-        };
-        let target = (current_time + delta).max(0.0);
-
-        self.seeking.store(true, Ordering::Relaxed);
-        let _ = self.cmd_tx.send(Command::Seek(target));
-
-        // Drain all channels until SeekComplete.
-        loop {
-            // Drain video and audio.
-            while self.video_rx.try_recv().is_ok() {}
-            while self.audio_rx.try_recv().is_ok() {}
-            match self.event_rx.recv() {
-                Ok(DecodeEvent::SeekComplete) => break,
-                Ok(_) => continue,
-                Err(_) => break,
+            // Pausing — freeze audio and record pause start.
+            if let Some(ref s) = self.audio_stream {
+                let _ = s.pause();
             }
-        }
-
-        // Reset state.
-        self.pending_video.clear();
-        self.pending_audio.clear();
-        self.audio_clock.store(0, Ordering::Relaxed);
-        self.first_audio_pts = None;
-        self.eof = false;
-        self.audio_playing = false;
-        self.playback_start = None;
-        self.first_video_pts = 0.0;
-        self.pause_offset = Duration::ZERO;
-        self.frame_timer = None; // Reset so frame pacing restarts after seek.
-        if self.paused {
+            self.audio_clock.lock().unwrap().paused = true;
             self.pause_start = Some(Instant::now());
         }
-        self.seeking.store(false, Ordering::Relaxed);
+        self.paused = !self.paused;
     }
 
     /// Compute target delay for A/V sync (port of ffplay's compute_target_delay).
@@ -760,13 +803,10 @@ impl App {
             return delay; // no audio master — use nominal delay
         }
 
-        // Audio clock: samples consumed by cpal, minus estimated hardware latency.
-        let consumed = self.audio_clock.load(Ordering::Relaxed);
-        let buffered_samples = self.rb_prod.capacity().get() - self.rb_prod.vacant_len();
-        let effective = consumed.saturating_sub(buffered_samples as u64 / 2);
-        let audio_time =
-            effective as f64 / (self.device_sample_rate as f64 * self.device_channels as f64);
-        let master_clock = self.first_audio_pts.unwrap_or(0.0) + audio_time;
+        // Audio clock: ffplay's pts_drift model (line 1428/1587).
+        // The cpal callback updates the clock with the PTS of the audio
+        // currently playing. get() interpolates between updates.
+        let master_clock = self.audio_clock.lock().unwrap().get(wall_time());
         let diff = video_pts - master_clock;
 
         let sync_threshold = delay.clamp(SYNC_THRESHOLD_MIN, SYNC_THRESHOLD_MAX);
@@ -801,6 +841,11 @@ impl App {
 
             'retry: loop {
                 if self.pending_video.is_empty() {
+                    break;
+                }
+
+                // Skip frame timing when paused (ffplay line 1668: goto display).
+                if self.paused {
                     break;
                 }
 
@@ -1020,8 +1065,6 @@ impl ApplicationHandler for App {
                             self.volume
                                 .store(f32::to_bits(self.current_volume), Ordering::Relaxed);
                         }
-                        Key::Named(NamedKey::ArrowRight) => self.handle_seek(5.0),
-                        Key::Named(NamedKey::ArrowLeft) => self.handle_seek(-5.0),
                         _ => {}
                     }
                 }
@@ -1468,8 +1511,6 @@ fn read_thread_fn(args: ReadThreadArgs) {
         mut ctx,
         video_idx,
         audio_idx,
-        vid_time_base,
-        audio_time_base,
         video_pkt_tx,
         audio_pkt_tx,
         event_tx,
@@ -1497,31 +1538,6 @@ fn read_thread_fn(args: ReadThreadArgs) {
         if let Some(cmd) = cmd {
             match cmd {
                 Command::Quit => break,
-                Command::Seek(target_sec) => {
-                    let seek_idx = audio_idx.or(video_idx).unwrap_or(0);
-                    let seek_tb = if audio_idx.is_some() {
-                        audio_time_base
-                    } else {
-                        vid_time_base
-                    };
-                    let timestamp = sec_to_pts(target_sec, seek_tb);
-                    let _ = ctx.seek(seek_idx, timestamp, SeekFlags::BACKWARD);
-                    // Signal decode threads to flush their decoders.
-                    if let Some(ref tx) = video_pkt_tx {
-                        let _ = tx.send(PacketMsg::Flush);
-                    }
-                    if let Some(ref tx) = audio_pkt_tx {
-                        let _ = tx.send(PacketMsg::Flush);
-                    }
-                    // Reset packet counts after flush.
-                    video_pkt_count.store(0, Ordering::Relaxed);
-                    audio_pkt_count.store(0, Ordering::Relaxed);
-                    eof = false;
-                    if event_tx.send(DecodeEvent::SeekComplete).is_err() {
-                        break;
-                    }
-                    continue;
-                }
             }
         }
 
@@ -1593,10 +1609,6 @@ fn video_decode_thread(args: VideoDecodeArgs) {
                 if decoder.send_packet(Some(&packet)).is_ok() {
                     drain_video_frames(&mut *decoder, vid_time_base, &frame_tx);
                 }
-            }
-            Ok(PacketMsg::Flush) => {
-                pkt_count.store(0, Ordering::Relaxed);
-                decoder.flush();
             }
             Err(mpsc::RecvError) => {
                 // Channel closed (EOF or quit) — flush decoder.
@@ -1719,13 +1731,6 @@ fn audio_decode_thread(args: AudioDecodeArgs) {
                     );
                 }
             }
-            Ok(PacketMsg::Flush) => {
-                pkt_count.store(0, Ordering::Relaxed);
-                decoder.flush();
-                if let Some(ref mut rs) = resampler {
-                    rs.reset();
-                }
-            }
             Err(mpsc::RecvError) => {
                 // Channel closed (EOF or quit) — flush decoder + resampler.
                 let _ = decoder.send_packet(None);
@@ -1787,14 +1792,6 @@ fn pts_to_sec(pts: i64, time_base: Rational) -> f64 {
         pts as f64 * time_base.num as f64 / time_base.den as f64
     } else {
         0.0
-    }
-}
-
-fn sec_to_pts(sec: f64, time_base: Rational) -> i64 {
-    if time_base.num > 0 && time_base.den > 0 {
-        (sec * time_base.den as f64 / time_base.num as f64) as i64
-    } else {
-        0
     }
 }
 
