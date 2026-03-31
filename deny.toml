@@ -27,6 +27,7 @@ allow = [
     "LGPL-2.1-or-later",
     "Apache-2.0 WITH LLVM-exception",
     "Unicode-3.0",
+    "NCSA",
 ]
 
 [[licenses.clarify]]
