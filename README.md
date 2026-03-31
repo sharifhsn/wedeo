@@ -25,7 +25,7 @@ FFmpeg, and despite incorporating FFmpeg's assembly code, is significantly slowe
 | FLAC, WavPack | bitexact | Via symphonia adapter |
 | Vorbis, AAC, MP3 | ~120-140 dB SNR | Lossy codecs, float precision only |
 | AV1 | bitexact | Via rav1d adapter |
-| MP4 demuxer | working | H.264 + AAC tracks |
+| MP4 demuxer | working | H.264, AV1, AAC tracks |
 | Video player | 24fps 0-drop | GPU (wgpu), ffplay-style A/V sync, pause, volume |
 
 ### H.264 decoder
@@ -62,6 +62,37 @@ subset. Major gaps for parity:
 - **Infrastructure** — no interruptible I/O (network streams), no chapter/program support, no `avformat_find_stream_info` equivalent
 
 ## Quick start
+
+### Install the CLI
+
+```bash
+# From source (includes AV1 support via rav1d)
+cargo install --git https://github.com/sharifhsn/wedeo wedeo-cli
+```
+
+### Play a video
+
+```bash
+# Also from source — AV1, H.264, and audio all work
+cargo install --git https://github.com/sharifhsn/wedeo wedeo-play
+wedeo-play video.mp4
+```
+
+### Use as a library
+
+```toml
+# Cargo.toml — core crates are on crates.io
+[dependencies]
+wedeo = "0.1.2"
+wedeo-codec-h264 = "0.1.2"    # H.264 decoder
+wedeo-format-mp4 = "0.1.2"    # MP4 demuxer
+wedeo-symphonia = "0.1.2"     # audio codecs (AAC, MP3, FLAC, etc.)
+
+# AV1 requires a git dependency (rav1d is not yet on crates.io)
+wedeo-rav1d = { git = "https://github.com/sharifhsn/wedeo" }
+```
+
+### Build and test locally
 
 ```bash
 cargo build
