@@ -226,6 +226,7 @@ pub fn parse_stsd(io: &mut BufferedIo, _payload_size: u64) -> Result<StsdEntry> 
 
     match &fourcc {
         b"avc1" | b"avc3" => parse_avc1_entry(io, fourcc, entry_payload),
+        b"av01" => parse_av01_entry(io, fourcc, entry_payload),
         b"mp4a" => parse_mp4a_entry(io, fourcc, entry_payload),
         _ => {
             // Unknown codec — skip the entry
@@ -284,6 +285,70 @@ fn parse_avc1_entry(io: &mut BufferedIo, fourcc: [u8; 4], payload_size: u64) -> 
                 io.skip(sub_payload)?;
             }
             consumed += sub.header_size as u64 + sub_payload;
+        }
+    }
+
+    // Skip any remaining bytes
+    let actual_end = io.tell()?;
+    if actual_end < end_pos {
+        io.skip(end_pos - actual_end)?;
+    }
+
+    Ok(StsdEntry {
+        fourcc,
+        width,
+        height,
+        channel_count: 0,
+        sample_rate: 0,
+        extradata,
+    })
+}
+
+/// Parse an AV1 sample entry (av01) — VisualSampleEntry + av1C sub-box.
+///
+/// The av1C (AV1CodecConfigurationRecord) has a 4-byte header followed by
+/// configOBUs (raw OBU data, typically a sequence header). We extract only
+/// the configOBUs as extradata because rav1d expects raw OBU input.
+fn parse_av01_entry(io: &mut BufferedIo, fourcc: [u8; 4], payload_size: u64) -> Result<StsdEntry> {
+    let start_pos = io.tell()?;
+
+    // VisualSampleEntry fields (identical layout to avc1)
+    io.skip(6)?; // reserved
+    io.skip(2)?; // data_reference_index
+    io.skip(2)?; // pre_defined
+    io.skip(2)?; // reserved
+    io.skip(12)?; // pre_defined
+    let width = io.read_u16be()?;
+    let height = io.read_u16be()?;
+    io.skip(4)?; // horiz_resolution
+    io.skip(4)?; // vert_resolution
+    io.skip(4)?; // reserved
+    io.skip(2)?; // frame_count
+    io.skip(32)?; // compressorname
+    io.skip(2)?; // depth
+    io.skip(2)?; // pre_defined
+
+    // Parse sub-boxes looking for av1C
+    let mut extradata = Vec::new();
+    let end_pos = start_pos + payload_size;
+
+    loop {
+        let current = io.tell()?;
+        if current + 8 > end_pos {
+            break;
+        }
+        let sub = read_box_header(io)?;
+        let sub_payload = sub.payload_size().unwrap_or(0);
+        if &sub.box_type == b"av1C" && sub_payload >= 4 {
+            // Skip the 4-byte AV1CodecConfigurationRecord header
+            // (marker, version, profile/level/flags) — only keep configOBUs.
+            io.skip(4)?;
+            let obu_len = sub_payload as usize - 4;
+            if obu_len > 0 {
+                extradata = io.read_bytes(obu_len)?;
+            }
+        } else if sub_payload > 0 {
+            io.skip(sub_payload)?;
         }
     }
 

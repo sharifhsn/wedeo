@@ -302,6 +302,7 @@ impl Demuxer for Mp4Demuxer {
             if tps.is_video() {
                 let codec_id = match &stsd.fourcc {
                     b"avc1" | b"avc3" => CodecId::H264,
+                    b"av01" => CodecId::Av1,
                     _ => continue,
                 };
                 let mut params = CodecParameters::new(codec_id, MediaType::Video);
