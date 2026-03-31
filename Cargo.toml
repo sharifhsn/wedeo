@@ -44,7 +44,10 @@ cc = "1"
 
 cpal = "0.17"
 minifb = "0.28"
+pollster = "0.4"
 ringbuf = "0.4"
+wgpu = "29"
+winit = "0.30"
 wedeo-core = { path = "crates/wedeo-core", version = "0.1.0" }
 wedeo-codec = { path = "crates/wedeo-codec", version = "0.1.0" }
 wedeo-format = { path = "crates/wedeo-format", version = "0.1.0" }
