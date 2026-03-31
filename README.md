@@ -25,6 +25,7 @@ FFmpeg's output.
 | Vorbis, AAC, MP3 | ~120-140 dB SNR | Lossy codecs, float precision only |
 | AV1 | bitexact | Via rav1d adapter |
 | MP4 demuxer | working | H.264 + AAC tracks |
+| **Video player** | **24fps 0-drop** | GPU (wgpu), ffplay-style A/V sync, pause, volume |
 
 ### H.264 decoder
 
@@ -110,7 +111,7 @@ wedeo/
     wedeo-rav1d/         Wraps rav1d (AV1)
   bins/
     wedeo-cli/           CLI tool
-    wedeo-play/          Video player (decode + display)
+    wedeo-play/          Video player — wgpu+winit, ffplay-style A/V sync
   tests/
     fate/                FATE cross-validation harness
   scripts/

@@ -22,7 +22,8 @@
   - [ ] Interlaced (MBAFF/PAFF) — partial, CABAC engine correct, pixel reconstruction in progress
   - [ ] 10-bit / 4:2:2 — not yet implemented
 - [x] **AV1 decoder via rav1d** — `adapters/wedeo-rav1d/` wraps rav1d behind wedeo `Decoder` trait.
-- [x] **Video player with audio** — `bins/wedeo-play/` has full A/V playback: cpal audio output, PTS-based A/V sync (audio clock master), resampling via wedeo-resample, 5.1→stereo downmix, volume control, pause/seek. Supports H.264/AV1 video + symphonia audio codecs.
+- [x] **Video player with audio** — `bins/wedeo-play/` has full A/V playback: wgpu+winit GPU rendering, cpal audio output, ffplay-style A/V sync (pts_drift audio clock), resampling via wedeo-resample, 5.1→stereo downmix, volume control, pause. Supports H.264/AV1 video + symphonia audio codecs.
+  - [ ] Seek — removed (was buggy), needs proper reimplementation with ffplay serial mechanism
 - [ ] **VP9 decoder** — second priority for WebM support. Reference: `FFmpeg/libavcodec/vp9*.c`.
 - [ ] **HEVC decoder** — similar to H.264 but more complex (CTU/CTB structure).
 
@@ -32,26 +33,16 @@
 
 ## Player performance
 
-**Target: smooth 1080p24 playback with A/V sync ≤ ±40ms.**
+**Target: smooth 1080p24 playback with A/V sync ≤ ±40ms. ACHIEVED.**
 
-Benchmark (Simpsons Movie 1080p trailer, 1920x800 H.264 @ 23.976fps, 3288 frames):
+Current (v0.1.1, wgpu+winit, ffplay pts_drift clock):
+- 24.0fps steady, 0 frame drops on 1080p H.264 @ 23.976fps
+- A/V sync drift: <40ms (within ffplay's correction threshold)
+- GPU YUV→RGB via WGSL shader (BT.601/709, MPEG/JPEG range)
+- 3-thread architecture matching ffplay (read, video decode, audio decode)
 
-| Component | Current | Budget (41.7ms/frame) | Status |
-|-----------|---------|----------------------|--------|
-| H.264 decode | 8.5ms | < 28ms (67%) | OK |
-| YUV→RGBA + display | bottleneck at --scale 3 | < 14ms (33%) | FAIL |
-| A/V drift | audible desync | ≤ ±40ms | FAIL |
-| FFmpeg -threads 1 | 3.2ms/frame (reference) | — | — |
-
-Root cause: `rgba_to_minifb` does per-pixel nearest-neighbor blit into a 5760x2400 buffer
-at `--scale 3`, plus CPU-side YUV→RGBA conversion. FFmpeg's ffplay avoids both by uploading
-YUV directly to SDL textures (GPU does color conversion + scaling for free).
-
-Improvements (ordered by impact):
-- [x] Default `--scale 1` for HD content; let the window manager handle scaling
-- [ ] Upload YUV textures to GPU directly (requires replacing minifb with SDL2/wgpu)
-- [ ] Move YUV→RGBA conversion off the decode thread (pipeline it)
-- [ ] SIMD for MC lowpass filters (NEON on Apple Silicon)
+Remaining optimizations:
+- [ ] SIMD for MC lowpass filters (NEON on Apple Silicon) — 3x slower at qpel(2,2) vs (0,0)
 
 ## Infrastructure (ongoing)
 

@@ -31,6 +31,8 @@ against FFmpeg's FATE test suite. 16 crates, ~47K lines of Rust.
 
 H.264 decoder: 79/79 progressive conformance BITEXACT, expanding to MBAFF
 interlaced and FRext profiles. Performance optimization via aarch64 NEON.
+Video player (wedeo-play): GPU-accelerated via wgpu+winit, ffplay-style
+A/V sync with pts_drift audio clock, 24fps 0-drop 1080p playback.
 
 ## Philosophy
 
