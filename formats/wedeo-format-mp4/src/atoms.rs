@@ -329,6 +329,7 @@ fn write_stbl(track: &TrackState) -> Vec<u8> {
 fn write_stsd(track: &TrackState) -> Vec<u8> {
     let entry = match track.codec_id {
         CodecId::H264 => write_avc1_entry(track),
+        CodecId::Av1 => write_av01_entry(track),
         CodecId::Aac => write_mp4a_entry(track),
         _ => write_generic_audio_entry(track),
     };
@@ -448,6 +449,46 @@ fn write_avc1_entry(track: &TrackState) -> Vec<u8> {
     }
 
     mp4_box(b"avc1", &c)
+}
+
+/// av01 sample entry for AV1.
+fn write_av01_entry(track: &TrackState) -> Vec<u8> {
+    let mut c = Vec::with_capacity(86 + 12 + track.extradata.len());
+    c.extend_from_slice(&[0u8; 6]); // reserved
+    c.extend_from_slice(&1u16.to_be_bytes()); // data_reference_index
+    c.extend_from_slice(&0u16.to_be_bytes()); // pre_defined
+    c.extend_from_slice(&0u16.to_be_bytes()); // reserved
+    c.extend_from_slice(&[0u8; 12]); // pre_defined
+    c.extend_from_slice(&(track.width as u16).to_be_bytes());
+    c.extend_from_slice(&(track.height as u16).to_be_bytes());
+    c.extend_from_slice(&0x0048_0000u32.to_be_bytes()); // horiz resolution 72 dpi
+    c.extend_from_slice(&0x0048_0000u32.to_be_bytes()); // vert resolution 72 dpi
+    c.extend_from_slice(&0u32.to_be_bytes()); // reserved
+    c.extend_from_slice(&1u16.to_be_bytes()); // frame_count
+    c.extend_from_slice(&[0u8; 32]); // compressorname
+    c.extend_from_slice(&0x0018u16.to_be_bytes()); // depth = 24
+    c.extend_from_slice(&(-1i16).to_be_bytes()); // pre_defined = -1
+
+    // av1C box: if extradata starts with the av1C marker byte (0x81),
+    // it's a full AV1CodecConfigurationRecord (from rav1e's
+    // container_sequence_header). Otherwise it's raw configOBUs
+    // (from the demuxer, which strips the 4-byte header), and we
+    // prepend default header bytes for 8-bit 420p Profile 0.
+    if !track.extradata.is_empty() {
+        let av1c_content = if track.extradata.len() >= 4 && track.extradata[0] == 0x81 {
+            // Already a full AV1CodecConfigurationRecord
+            track.extradata.clone()
+        } else {
+            // Raw configOBUs — prepend av1C header for 8-bit 420p Profile 0
+            let mut buf = Vec::with_capacity(4 + track.extradata.len());
+            buf.extend_from_slice(&[0x81, 0x04, 0x0C, 0x00]);
+            buf.extend_from_slice(&track.extradata);
+            buf
+        };
+        c.extend_from_slice(&mp4_box(b"av1C", &av1c_content));
+    }
+
+    mp4_box(b"av01", &c)
 }
 
 /// mp4a sample entry for AAC.

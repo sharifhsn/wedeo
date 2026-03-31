@@ -8,6 +8,7 @@ use wedeo_format_h264 as _;
 use wedeo_format_mp4 as _;
 use wedeo_format_wav as _;
 use wedeo_rav1d as _;
+use wedeo_rav1e as _;
 use wedeo_symphonia as _;
 
 use wedeo_codec::decoder::DecoderBuilder;

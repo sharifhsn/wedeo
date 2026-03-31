@@ -1,0 +1,20 @@
+[package]
+name = "wedeo-rav1e"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+description = "rav1e AV1 encoder adapter for wedeo"
+
+[dependencies]
+wedeo-core = { workspace = true }
+wedeo-codec = { workspace = true }
+inventory = { workspace = true }
+tracing = { workspace = true }
+rav1e = "0.8"
+
+[lints]
+workspace = true

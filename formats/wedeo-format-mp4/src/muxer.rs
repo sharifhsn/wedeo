@@ -160,6 +160,9 @@ impl Muxer for Mp4Muxer {
                         return Err(Error::InvalidData);
                     }
                 }
+                CodecId::Av1 if track.extradata.is_empty() => {
+                    return Err(Error::InvalidArgument);
+                }
                 CodecId::Aac if track.extradata.is_empty() => {
                     return Err(Error::InvalidArgument);
                 }
@@ -331,6 +334,7 @@ fn is_supported_codec(codec_id: CodecId) -> bool {
     matches!(
         codec_id,
         CodecId::H264
+            | CodecId::Av1
             | CodecId::Aac
             | CodecId::PcmS16be
             | CodecId::PcmS16le
