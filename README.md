@@ -1,22 +1,23 @@
 # wedeo
 
-AI-generated Rust rewrite of FFmpeg, verified against FFmpeg's output
+Rust rewrite of FFmpeg, verified against FFmpeg's output
 bit-for-bit.
 
 **This codebase is AI-generated.** Written by Claude (Anthropic) via
 [Claude Code](https://claude.ai/claude-code), directed and reviewed by a
 human. The AI reads FFmpeg's C source and reimplements it in Rust. Every
-conformance claim below is verified by automated CI on every commit — not
-vibes, not benchmarks-on-my-machine, actual bit-for-bit comparison against
-FFmpeg's output.
+conformance claim below is verified by automated CI on every commit, comparing
+to FFmpeg's output.
+
+The intention of this project is to push the boundaries of what is possible with
+AI rewriting codebases in Rust. It provides no additional features compared to
+FFmpeg, and despite incorporating FFmpeg's assembly code, is significantly slower.
 
 ## Status
 
-16 workspace crates. ~47K lines of Rust. 462 tests. 0 clippy warnings.
-
 | Component | Conformance | Notes |
 |-----------|-------------|-------|
-| **H.264 decode** | **79/79 BITEXACT** | CAVLC + CABAC, Baseline through High profile |
+| H.264 decode | 79/79 BITEXACT | CAVLC + CABAC, Baseline through High profile |
 | H.264 FRext | 23/55 bitexact | Progressive 4:2:0 8-bit done; MBAFF/PAFF/10-bit remaining |
 | H.264 NEON (aarch64) | 1.75x speedup | MC, IDCT, deblock — FFmpeg's vendored assembly via `cc` |
 | WAV demuxer + PCM | bitexact | RIFF/RIFX/RF64/BW64, 17 PCM formats, 13/13 FATE files |
@@ -25,7 +26,7 @@ FFmpeg's output.
 | Vorbis, AAC, MP3 | ~120-140 dB SNR | Lossy codecs, float precision only |
 | AV1 | bitexact | Via rav1d adapter |
 | MP4 demuxer | working | H.264 + AAC tracks |
-| **Video player** | **24fps 0-drop** | GPU (wgpu), ffplay-style A/V sync, pause, volume |
+| Video player | 24fps 0-drop | GPU (wgpu), ffplay-style A/V sync, pause, volume |
 
 ### H.264 decoder
 
@@ -47,6 +48,19 @@ The H.264 decoder is ~30K lines of Rust across 25 modules. It implements:
 Architecture details: [H264.md](H264.md).
 Known FFmpeg behavioral differences: [DIVERGENCES.md](DIVERGENCES.md).
 
+### Not yet implemented
+
+FFmpeg has hundreds of codecs and formats. wedeo currently covers a small
+subset. Major gaps for parity:
+
+- **Video codecs** — VP9, HEVC/H.265, MPEG-2, MPEG-4 Part 2, VP8, Theora. H.264 is missing interlaced (MBAFF/PAFF), 10-bit, and 4:2:2/4:4:4.
+- **Video encoding** — no encoders exist yet (H.264, H.265, AV1 via rav1e)
+- **Muxers** — only WAV. No MP4/MOV, MKV/WebM, or MPEG-TS muxer.
+- **Demuxers** — no MKV/WebM, MPEG-TS, FLV, or AVI demuxer (MP4 and WAV only, plus symphonia-backed formats)
+- **Filters** — trait skeleton exists but no functional filter graph (no scale, crop, overlay, fps, etc.)
+- **Player** — no seek, no subtitle rendering, no hardware-accelerated decode
+- **Infrastructure** — no interruptible I/O (network streams), no chapter/program support, no `avformat_find_stream_info` equivalent
+
 ## Quick start
 
 ```bash
@@ -63,6 +77,8 @@ ffmpeg -bitexact -i input.264 -f framecrc -
 ```
 
 ### FATE testing
+
+FFmpeg's native test suite.
 
 ```bash
 ./scripts/fetch-fate-suite.sh                    # downloads full suite (~1.2 GB)
