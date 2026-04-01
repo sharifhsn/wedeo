@@ -4,7 +4,7 @@ Rust rewrite of FFmpeg, verified against FFmpeg's output
 bit-for-bit.
 
 **This codebase is AI-generated.** Written by Claude (Anthropic) via
-[Claude Code](https://claude.ai/claude-code), directed and reviewed by a
+[Claude Code](https://claude.ai/claude-code), directed by a
 human. The AI reads FFmpeg's C source and reimplements it in Rust. Every
 conformance claim below is verified by automated CI on every commit, comparing
 to FFmpeg's output.
