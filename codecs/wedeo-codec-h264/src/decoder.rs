@@ -9,7 +9,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
-use tracing::{debug, trace, warn};
 use wedeo_codec::bitstream::{BitRead, BitReadBE, get_ue_golomb};
 use wedeo_codec::decoder::{CodecParameters, Decoder, DecoderDescriptor};
 use wedeo_codec::descriptor::{CodecCapabilities, CodecDescriptor, CodecProperties};
@@ -567,15 +566,6 @@ impl H264Decoder {
             return;
         }
 
-        debug!(
-            frame_num,
-            prev_frame_num = self.prev_frame_num_h264,
-            max_frame_num,
-            max_refs = sps.max_num_ref_frames,
-            gaps_allowed = sps.gaps_in_frame_num_allowed,
-            "frame_num gap detected"
-        );
-
         if !sps.gaps_in_frame_num_allowed {
             self.last_pocs = [i64::MIN; 16];
         }
@@ -677,36 +667,16 @@ impl H264Decoder {
     }
 
     /// Process a single NAL unit.
-    #[tracing::instrument(skip_all, fields(nal_type = ?nalu.nal_type))]
     fn process_nal(&mut self, nalu: &NalUnit, pkt_pts: i64) -> Result<()> {
         match nalu.nal_type {
-            NalUnitType::Sps => match parse_sps(&nalu.data) {
-                Ok(sps) => {
-                    let id = sps.sps_id as usize;
-                    debug!(
-                        sps_id = id,
-                        width = sps.width(),
-                        height = sps.height(),
-                        frame_mbs_only = sps.frame_mbs_only_flag,
-                        mb_aff = sps.mb_aff,
-                        "SPS parsed"
-                    );
-                    self.apply_sps(&sps);
-                    self.sps_list[id] = Some(sps);
-                }
-                Err(e) => {
-                    warn!(error = ?e, "SPS parse failed");
-                }
+            NalUnitType::Sps => if let Ok(sps) = parse_sps(&nalu.data) {
+                let id = sps.sps_id as usize;
+                self.apply_sps(&sps);
+                self.sps_list[id] = Some(sps);
             },
-            NalUnitType::Pps => match parse_pps(&nalu.data, &self.sps_list) {
-                Ok(pps) => {
-                    let id = pps.pps_id as usize;
-                    debug!(pps_id = id, sps_id = pps.sps_id, "PPS parsed");
-                    self.pps_list[id] = Some(pps);
-                }
-                Err(e) => {
-                    warn!(error = ?e, "PPS parse failed");
-                }
+            NalUnitType::Pps => if let Ok(pps) = parse_pps(&nalu.data, &self.sps_list) {
+                let id = pps.pps_id as usize;
+                self.pps_list[id] = Some(pps);
             },
             NalUnitType::Idr | NalUnitType::Slice => {
                 // Parse slice header
@@ -732,26 +702,6 @@ impl H264Decoder {
                 if hdr.first_mb_in_slice == 0 {
                     // Flush any in-progress frame and store in DPB
                     self.finish_current_frame();
-
-                    debug!(
-                        slice_type = ?hdr.slice_type,
-                        first_mb = hdr.first_mb_in_slice,
-                        frame_num = hdr.frame_num,
-                        poc = self.current_poc,
-                        pps_id = hdr.pps_id,
-                        slice_qp = hdr.slice_qp,
-                        num_ref_l0 = hdr.num_ref_idx_l0_active,
-                        num_ref_l1 = hdr.num_ref_idx_l1_active,
-                        deblock_idc = hdr.disable_deblocking_filter_idc,
-                        cabac_init_idc = hdr.cabac_init_idc,
-                        direct_spatial = hdr.direct_spatial_mv_pred_flag,
-                        weighted_bipred_idc = hdr.weighted_bipred_idc,
-                        mmco_count = hdr.mmco_ops.len(),
-                        is_idr,
-                        use_weight = hdr.use_weight,
-                        use_weight_chroma = hdr.use_weight_chroma,
-                        "SLICE"
-                    );
 
                     // Start new frame context
                     self.current_fdc =
@@ -828,25 +778,10 @@ impl H264Decoder {
                     self.ref_list_l0 =
                         refs::build_ref_list_p(&self.dpb, &hdr, hdr.frame_num, max_frame_num);
                     self.ref_list_l1.clear();
-                    debug!(
-                        poc = self.current_poc,
-                        l0_len = self.ref_list_l0.len(),
-                        l0_pocs = ?self.ref_list_l0.iter().map(|&i| self.dpb.get(i).map(|e| e.poc)).collect::<Vec<_>>(),
-                        l0_frame_nums = ?self.ref_list_l0.iter().map(|&i| self.dpb.get(i).map(|e| e.frame_num)).collect::<Vec<_>>(),
-                        "REFLIST"
-                    );
                 } else if hdr.slice_type.is_b() {
                     let max_frame_num_b = 1u32 << sps.log2_max_frame_num;
                     let (l0, l1) =
                         refs::build_ref_list_b(&self.dpb, &hdr, self.current_poc, max_frame_num_b);
-                    debug!(
-                        poc = self.current_poc,
-                        l0_len = l0.len(),
-                        l1_len = l1.len(),
-                        l0_pocs = ?l0.iter().map(|&i| self.dpb.get(i).map(|e| e.poc)).collect::<Vec<_>>(),
-                        l1_pocs = ?l1.iter().map(|&i| self.dpb.get(i).map(|e| e.poc)).collect::<Vec<_>>(),
-                        "REFLIST"
-                    );
                     self.ref_list_l0 = l0;
                     self.ref_list_l1 = l1;
                 } else {
@@ -938,34 +873,6 @@ impl H264Decoder {
                         // Pre-compute implicit weights for weighted_bipred_idc=2
                         if pps.weighted_bipred_idc == 2 {
                             fdc.compute_implicit_weights();
-                        }
-                    }
-
-                    if hdr.slice_type.is_p() || hdr.slice_type.is_b() {
-                        for &dpb_idx in &self.ref_list_l0 {
-                            if let Some(e) = self.dpb.get(dpb_idx) {
-                                // SAFETY: Ref frames are joined — PROGRESS_COMPLETE.
-                                let pic = unsafe { e.pic.data() };
-                                let s = pic.y_stride;
-                                let row128: Vec<u8> = (155..166usize)
-                                    .map(|x| {
-                                        if 128 < pic.height as usize && x < pic.width as usize {
-                                            pic.y[128 * s + x]
-                                        } else {
-                                            0
-                                        }
-                                    })
-                                    .collect();
-                                trace!(
-                                    frame_num = self.frame_num,
-                                    dpb_idx,
-                                    ref_frame_num = e.frame_num,
-                                    ref_poc = e.poc,
-                                    status = ?e.status,
-                                    row128 = ?row128,
-                                    "ref_pic_list L0 entry"
-                                );
-                            }
                         }
                     }
 
@@ -1197,7 +1104,6 @@ impl H264Decoder {
                             self.result_buffer.insert(result.sequence_id, result.decode);
                         }
                         None => {
-                            warn!("pool result channel closed unexpectedly");
                             return;
                         }
                     }
@@ -1226,11 +1132,6 @@ impl H264Decoder {
         out_of_order: usize,
     ) {
         let frame = self.fdc_to_frame(&mut in_flight.fdc, &in_flight.last_hdr, in_flight.pkt_pts);
-        debug!(
-            poc = in_flight.poc,
-            reorder_depth = self.reorder_depth,
-            "frame complete"
-        );
 
         // Add to delayed_pics and flush output
         self.delayed_pics
@@ -1297,20 +1198,6 @@ impl H264Decoder {
                 vec![-1i8; total_blocks]
             };
 
-            {
-                let px = 10 * 16;
-                let py = 2 * 16;
-                let s = fdc.pic.y_stride;
-                let val = fdc.pic.y[py * s + px];
-                let val2 = fdc.pic.y[py * s + px + 2];
-                tracing::trace!(
-                    mb10_2_pixel0 = val,
-                    mb10_2_pixel2 = val2,
-                    y_ptr = ?fdc.pic.y.as_ptr(),
-                    "DPB store check"
-                );
-            }
-
             let mb_intra: Vec<bool> = fdc.mb_info.iter().map(|info| info.is_intra).collect();
             (mv_info, ref_info, mv_info_l1, ref_info_l1, mb_intra)
         };
@@ -1373,18 +1260,6 @@ impl H264Decoder {
 
         let mut mmco_did_reset = false;
         if let Some(dpb_idx) = dpb_idx {
-            {
-                let e = self.dpb.get(dpb_idx).unwrap();
-                // SAFETY: Decode + deblock complete — picture is PROGRESS_COMPLETE.
-                let pic = unsafe { e.pic.data() };
-                tracing::trace!(
-                    dpb_idx,
-                    h264_frame_num = e.frame_num,
-                    y_ptr = ?pic.y.as_ptr(),
-                    pixel_160_32 = pic.y[32 * pic.y_stride + 160],
-                    "DPB stored entry"
-                );
-            }
             let (sps_max_refs, max_frame_num) = self
                 .sps_list
                 .iter()
@@ -1404,55 +1279,9 @@ impl H264Decoder {
             );
         }
 
-        // DPB summary log
-        {
-            let st_fns: Vec<u32> = self
-                .dpb
-                .entries
-                .iter()
-                .filter_map(|e| {
-                    e.as_ref()
-                        .and_then(|e| (e.status == RefStatus::ShortTerm).then_some(e.frame_num))
-                })
-                .collect();
-            let lt_fns: Vec<u32> = self
-                .dpb
-                .entries
-                .iter()
-                .filter_map(|e| {
-                    e.as_ref().and_then(|e| {
-                        (e.status == RefStatus::LongTerm).then_some(e.long_term_frame_idx)
-                    })
-                })
-                .collect();
-            let st_pocs: Vec<i32> = self
-                .dpb
-                .entries
-                .iter()
-                .filter_map(|e| {
-                    e.as_ref()
-                        .and_then(|e| (e.status == RefStatus::ShortTerm).then_some(e.poc))
-                })
-                .collect();
-            debug!(
-                frame_num = in_flight.frame_num_h264,
-                poc = in_flight.poc,
-                short_term_count = st_fns.len(),
-                short_term_pocs = ?st_pocs,
-                short_term_fns = ?st_fns,
-                long_term_count = lt_fns.len(),
-                long_term_indices = ?lt_fns,
-                "DPB"
-            );
-        }
-
         // MMCO-5 (Reset) overrides the pre-dispatch state updates.
         // Safe because ref frames (which have MMCO) are joined immediately.
         if mmco_did_reset {
-            debug!(
-                h264_fn = in_flight.frame_num_h264,
-                "MMCO-5 reset: prev_frame_num/poc/offset → 0"
-            );
             self.prev_frame_num_h264 = 0;
             self.prev_poc_msb = 0;
             self.prev_poc_lsb = 0;
@@ -1465,7 +1294,6 @@ impl H264Decoder {
     /// Dispatches to CAVLC or CABAC slice decode based on PPS entropy_coding_mode_flag.
     /// Returns the number of MBs decoded in this slice.
     #[allow(clippy::too_many_arguments)] // H.264 slice decode needs all parameters
-    #[tracing::instrument(skip_all, fields(first_mb = hdr.first_mb_in_slice, slice_type = ?hdr.slice_type))]
     pub(crate) fn decode_slice_into(
         rbsp: &[u8],
         hdr: &SliceHeader,
@@ -1506,7 +1334,6 @@ impl H264Decoder {
         padded.extend_from_slice(rbsp);
         padded.resize(rbsp.len() + 8, 0);
         let mut br = BitReadBE::new(&padded);
-        tracing::debug!(header_bits = hdr.header_bits, "slice header size");
         br.skip_bits(hdr.header_bits);
 
         // Decode macroblocks for this slice
@@ -1565,8 +1392,6 @@ impl H264Decoder {
                     Err(_) if br.consumed() + 8 >= rbsp_bits => break,
                     Err(e) => return Err(e),
                 };
-                trace!(mb_addr, mb_skip_run, bits = br.consumed(), "mb_skip_run");
-
                 // Process skipped MBs
                 for _ in 0..mb_skip_run {
                     if mb_addr >= total_mbs {
@@ -1646,22 +1471,6 @@ impl H264Decoder {
             if mb_addr.is_multiple_of(mb_width) {
                 inline_deblock_row(fdc, mb_addr / mb_width - 1, mb_width, deblock_enabled);
             }
-        }
-
-        // Validate bitstream position: after decoding all MBs in this slice,
-        // the reader should be near the end of the RBSP (within ~16 bits for
-        // the trailing RBSP stop bit and alignment padding). Large discrepancies
-        // indicate a CAVLC desync.
-        let bits_remaining = rbsp_bits.saturating_sub(br.consumed());
-        if bits_remaining > 16 {
-            warn!(
-                first_mb,
-                bits_remaining,
-                consumed = br.consumed(),
-                rbsp_bits,
-                mbs_decoded,
-                "CAVLC desync: slice ended with excess bits remaining"
-            );
         }
 
         Ok(mbs_decoded)
@@ -1777,7 +1586,6 @@ impl H264Decoder {
                             Err(_) if br.consumed() + 8 >= rbsp_bits => break 'pair_loop,
                             Err(e) => return Err(e),
                         };
-                        trace!(mb_x, cur_y, mb_skip_run, "MBAFF mb_skip_run");
                     }
 
                     if mb_skip_run > 0 {
@@ -1842,19 +1650,6 @@ impl H264Decoder {
                 mb_x = 0;
                 mb_y += 2;
             }
-        }
-
-        // Validate bitstream position
-        let bits_remaining = rbsp_bits.saturating_sub(br.consumed());
-        if bits_remaining > 16 {
-            warn!(
-                first_mb,
-                bits_remaining,
-                consumed = br.consumed(),
-                rbsp_bits,
-                mbs_decoded,
-                "CAVLC MBAFF desync: slice ended with excess bits remaining"
-            );
         }
 
         Ok(mbs_decoded)
@@ -1948,12 +1743,6 @@ impl H264Decoder {
 
                 // For inter slices: decode skip flag
                 if is_inter_slice {
-                    trace!(
-                        "CABAC_SKIP_DECODE mb_x={} mb_y={} is_b={}",
-                        mb_x,
-                        mb_y,
-                        hdr.slice_type.is_b()
-                    );
                     let nb = crate::mb::compute_mbaff_neighbors(
                         mb_x,
                         mb_y,
@@ -2086,8 +1875,6 @@ impl H264Decoder {
                 }
             }
         }
-
-        debug!(first_mb, mbs_decoded, "CABAC slice decoded");
 
         Ok(mbs_decoded)
     }
@@ -2351,15 +2138,6 @@ impl H264Decoder {
                     && fdc.slice_table[(mb_addr - mb_width) as usize] == fdc.current_slice;
 
                 // Decode coded MB via CABAC
-                trace!(
-                    "MBAFF_MB_START mb_x={} mb_y={} mb_field={} pos={} low={} range={}",
-                    mb_x,
-                    cur_y,
-                    mb_field_decoding_flag,
-                    reader.pos(),
-                    reader.low(),
-                    reader.range()
-                );
                 let mut cache = CabacDecodeCache::new();
                 let nb = crate::mb::compute_mbaff_neighbors(
                     mb_x,
@@ -2419,16 +2197,6 @@ impl H264Decoder {
             bot_left_nz = fdc.neighbor_ctx.left_nz;
             bot_left_modes = fdc.neighbor_ctx.left_intra4x4_mode;
             bot_left_avail = fdc.neighbor_ctx.left_available;
-
-            // Trace CABAC state after each pair for divergence detection
-            trace!(
-                "MBAFF_PAIR_DONE mb_x={} mb_y={} pos={} low={} range={}",
-                mb_x,
-                mb_y,
-                reader.pos(),
-                reader.low(),
-                reader.range()
-            );
 
             // Check terminate after both MBs of pair
             if reader.get_cabac_terminate() {
@@ -2566,7 +2334,6 @@ fn remove_epb(data: &[u8]) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 
 impl Decoder for H264Decoder {
-    #[tracing::instrument(skip_all, fields(has_packet = packet.is_some()))]
     fn send_packet(&mut self, packet: Option<&Packet>) -> Result<()> {
         match packet {
             Some(pkt) => {
@@ -2581,13 +2348,7 @@ impl Decoder for H264Decoder {
                 };
 
                 for nalu in &nalus {
-                    if let Err(e) = self.process_nal(nalu, pts) {
-                        warn!(
-                            error = ?e,
-                            nal_type = ?nalu.nal_type,
-                            "NAL decode error"
-                        );
-                    }
+                    let _ = self.process_nal(nalu, pts);
                 }
 
                 Ok(())
@@ -2633,7 +2394,6 @@ impl Decoder for H264Decoder {
         }
     }
 
-    #[tracing::instrument(skip_all)]
     fn receive_frame(&mut self) -> Result<Frame> {
         if let Some(frame) = self.output_queue.pop_front() {
             Ok(frame)

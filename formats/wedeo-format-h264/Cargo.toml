@@ -16,7 +16,6 @@ wedeo-format = { workspace = true }
 wedeo-codec = { workspace = true }
 wedeo-codec-h264 = { workspace = true }
 inventory = { workspace = true }
-tracing = { workspace = true }
 
 [lints]
 workspace = true

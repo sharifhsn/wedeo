@@ -9,7 +9,6 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use tracing::{debug, trace};
 
 use crate::tables::CHROMA_QP_TABLE;
 
@@ -561,8 +560,6 @@ fn filter_mb_edge_luma(
     qp: u8,
     alpha_offset: i32,
     beta_offset: i32,
-    mb_x: u32,
-    mb_y: u32,
 ) {
     let (alpha, beta, index_a) = get_thresholds(qp, alpha_offset, beta_offset);
     if alpha == 0 || beta == 0 {
@@ -618,35 +615,11 @@ fn filter_mb_edge_luma(
             let q1 = plane[off + step] as i32;
             let q2 = plane[off + 2 * step] as i32;
 
-            trace!(
-                mb_x,
-                mb_y,
-                is_vertical,
-                edge,
-                i,
-                d,
-                cur_bs,
-                p0,
-                p1,
-                p2,
-                q0,
-                q1,
-                q2,
-                alpha,
-                beta,
-                qp,
-                "DEBLOCK_PIXEL_IN"
-            );
-
             if cur_bs < 4 {
                 let tc0 = get_tc0(qp, alpha_offset, cur_bs);
                 if let Some((new_p0, new_p1, new_q0, new_q1)) =
                     filter_normal_luma(p0, p1, p2, q0, q1, q2, alpha, beta, tc0)
                 {
-                    trace!(
-                        mb_x,
-                        mb_y, is_vertical, edge, i, d, new_p0, new_q0, tc0, "DEBLOCK_PIXEL_OUT"
-                    );
                     plane[off - step] = new_p0;
                     plane[off - 2 * step] = new_p1;
                     plane[off] = new_q0;
@@ -658,10 +631,6 @@ fn filter_mb_edge_luma(
                 if let Some((new_p0, new_p1, new_p2, new_q0, new_q1, new_q2)) =
                     filter_strong_luma(p0, p1, p2, p3, q0, q1, q2, q3, alpha, beta)
                 {
-                    trace!(
-                        mb_x,
-                        mb_y, is_vertical, edge, i, d, new_p0, new_q0, "DEBLOCK_PIXEL_OUT"
-                    );
                     plane[off - step] = new_p0;
                     plane[off - 2 * step] = new_p1;
                     plane[off - 3 * step] = new_p2;
@@ -1456,8 +1425,6 @@ fn deblock_mbaff_horiz_edge0(
             qp,
             alpha_c0_offset,
             beta_offset,
-            mb_x,
-            mb_y,
         );
 
         // Chroma
@@ -1537,14 +1504,6 @@ fn deblock_mb(
     let chroma_qp_index_offset = params.chroma_qp_index_offset;
 
     // Compute field-aware pixel offsets and strides for this MB.
-    trace!(
-        mb_x,
-        mb_y,
-        cur_mb_field,
-        cur_qp,
-        y_stride = pic.y_stride,
-        "DEBLOCK_MB_START"
-    );
     let (luma_base, luma_stride) = deblock_luma_offset(pic.y_stride, mb_x, mb_y, cur_mb_field);
     let (chroma_base_u, chroma_stride) =
         deblock_chroma_offset(pic.uv_stride, mb_x, mb_y, cur_mb_field);
@@ -1614,14 +1573,6 @@ fn deblock_mb(
         };
         let luma_bs = compute_luma_bs(is_vertical, mb_info, mb_x, mb_y, mb_width);
 
-        trace!(
-            mb_x, mb_y, is_vertical,
-            bs0 = ?luma_bs[0], bs1 = ?luma_bs[1], bs2 = ?luma_bs[2], bs3 = ?luma_bs[3],
-            cur_qp,
-            alpha_c0_offset, beta_offset,
-            "DEBLOCK_EDGE"
-        );
-
         // --- Luma edges ---
         for (edge, &bs_edge) in luma_bs.iter().enumerate() {
             if bs_edge == [0, 0, 0, 0] {
@@ -1656,8 +1607,6 @@ fn deblock_mb(
                 qp,
                 alpha_c0_offset,
                 beta_offset,
-                mb_x,
-                mb_y,
             );
         }
 
@@ -1727,7 +1676,6 @@ fn deblock_mb(
 /// * `mb_info` - per-macroblock deblocking info (mb_width * mb_height entries, raster order)
 /// * `slice_table` - per-macroblock slice number (same layout as mb_info)
 /// * `slice_params` - deblocking parameters for each slice
-#[tracing::instrument(skip_all, fields(mb_width = pic.mb_width, mb_height = pic.mb_height))]
 pub fn deblock_frame(
     pic: &mut PictureBuffer,
     mb_info: &[MbDeblockInfo],
@@ -1737,8 +1685,6 @@ pub fn deblock_frame(
 ) {
     let mb_width = pic.mb_width;
     let mb_height = pic.mb_height;
-
-    debug!(mb_width, mb_height, is_mbaff, "deblocking frame");
 
     debug_assert_eq!(
         mb_info.len(),
@@ -1917,7 +1863,7 @@ fn deblock_frame_sequential(
     }
 }
 
-/// Check idc and deblock a single MB, with tracing.
+/// Check idc and deblock a single MB.
 fn deblock_mb_if_enabled(
     pic: &mut PictureBuffer,
     mb_info: &[MbDeblockInfo],
@@ -1937,30 +1883,6 @@ fn deblock_mb_if_enabled(
     }
 
     deblock_mb(pic, mb_info, mb_x, mb_y, slice_table, slice_params);
-
-    {
-        let mb_field = mb_info[mb_idx].mb_field;
-        let (y_base, y_stride) = deblock_luma_offset(pic.y_stride, mb_x, mb_y, mb_field);
-        let (u_base, uv_stride) = deblock_chroma_offset(pic.uv_stride, mb_x, mb_y, mb_field);
-        let (v_base, _) = deblock_chroma_offset(pic.uv_stride, mb_x, mb_y, mb_field);
-        let y_sum = deblock_plane_sum(&pic.y, y_base, y_stride, 16);
-        let u_sum = deblock_plane_sum(&pic.u, u_base, uv_stride, 8);
-        let v_sum = deblock_plane_sum(&pic.v, v_base, uv_stride, 8);
-        tracing::trace!(mb_x, mb_y, y_sum, u_sum, v_sum, "MB_DEBLOCK");
-    }
-}
-
-/// Compute pixel sum for a macroblock region (for deblock tracing).
-/// Uses pre-computed base offset and stride (field-aware for MBAFF).
-fn deblock_plane_sum(plane: &[u8], base_offset: usize, stride: usize, size: u32) -> u32 {
-    let mut sum = 0u32;
-    for dy in 0..size as usize {
-        let row_start = base_offset + dy * stride;
-        for dx in 0..size as usize {
-            sum = sum.wrapping_add(plane[row_start + dx] as u32);
-        }
-    }
-    sum
 }
 
 // ---------------------------------------------------------------------------

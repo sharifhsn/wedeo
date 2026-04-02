@@ -5,7 +5,6 @@
 // Reference: ITU-T H.264 Section 9.2, FFmpeg libavcodec/h264_cavlc.c
 // (`decode_residual`, `ff_h264_decode_mb_cavlc`)
 
-use tracing::{trace, warn};
 use wedeo_codec::bitstream::{BitRead, BitReadBE, get_se_golomb, get_ue_golomb};
 use wedeo_core::error::{Error, Result};
 
@@ -312,7 +311,6 @@ fn get_level_prefix(br: &mut BitReadBE<'_>) -> Result<u32> {
     // Peek 32 bits and count leading zeros.
     let buf = br.peek_bits_32(32);
     if buf == 0 {
-        trace!(bits_consumed = br.consumed(), "CAVLC error site 325");
         return Err(Error::InvalidData);
     }
     let lz = buf.leading_zeros();
@@ -357,7 +355,6 @@ pub fn decode_residual(
     }
 
     if total_coeff as usize > max_coeff {
-        trace!(bits_consumed = br.consumed(), "CAVLC error site 369");
         return Err(Error::InvalidData);
     }
 
@@ -405,7 +402,6 @@ pub fn decode_residual(
             let prefix = get_level_prefix(br)?;
 
             if prefix > 25 + 3 {
-                trace!(bits_consumed = br.consumed(), "CAVLC error site 416");
                 return Err(Error::InvalidData);
             }
 
@@ -516,26 +512,21 @@ pub fn decode_residual(
         };
 
         if coeff_idx >= max_coeff {
-            trace!(bits_consumed = br.consumed(), "CAVLC error site 526");
             return Err(Error::InvalidData);
         }
         coeffs[coeff_idx] = level as i16;
 
         zeros_left -= run;
         if zeros_left < 0 {
-            trace!(bits_consumed = br.consumed(), "CAVLC error site 532");
             return Err(Error::InvalidData);
         }
 
         if !is_last {
-            coeff_idx = coeff_idx.checked_sub((1 + run) as usize).ok_or_else(|| {
-                trace!(bits_consumed = br.consumed(), "CAVLC error site 538");
-                Error::InvalidData
-            })?;
+            coeff_idx = coeff_idx
+                .checked_sub((1 + run) as usize)
+                .ok_or(Error::InvalidData)?;
         }
     }
-
-    tracing::trace!(nc, total_coeff, trailing_ones, "CAVLC residual");
 
     Ok((coeffs, total_coeff))
 }
@@ -750,7 +741,6 @@ const P_SUB_MB_PARTITION_COUNT: [u8; 4] = [1, 2, 2, 4];
 /// - Residual coefficient decoding via decode_residual
 ///
 /// Reference: FFmpeg `ff_h264_decode_mb_cavlc` in h264_cavlc.c.
-#[tracing::instrument(skip_all, fields(mb_x, mb_y = _mb_y, slice_type = ?slice_type))]
 #[allow(clippy::too_many_arguments)]
 pub fn decode_mb_cavlc(
     br: &mut BitReadBE<'_>,
@@ -779,7 +769,6 @@ pub fn decode_mb_cavlc(
                 mt -= 1;
             }
             if mt > 25 {
-                trace!(bits_consumed = br.consumed(), "CAVLC error site 772");
                 return Err(Error::InvalidData);
             }
             is_intra = true;
@@ -795,7 +784,6 @@ pub fn decode_mb_cavlc(
                 // Intra macroblock in P-slice (offset by 5)
                 let mt = raw_mb_type - 5;
                 if mt > 25 {
-                    trace!(bits_consumed = br.consumed(), "CAVLC error site 787");
                     return Err(Error::InvalidData);
                 }
                 is_intra = true;
@@ -814,7 +802,6 @@ pub fn decode_mb_cavlc(
             } else {
                 let mt = raw_mb_type - 23;
                 if mt > 25 {
-                    trace!(bits_consumed = br.consumed(), "CAVLC error site 805");
                     return Err(Error::InvalidData);
                 }
                 is_intra = true;
@@ -824,16 +811,6 @@ pub fn decode_mb_cavlc(
     }
     mb.is_intra = is_intra;
     let mut dct8x8_allowed = pps.transform_8x8_mode;
-
-    trace!(
-        raw_mb_type,
-        bits_consumed = br.consumed(),
-        is_intra,
-        is_pcm = mb.is_pcm,
-        is_intra4x4 = mb.is_intra4x4,
-        is_intra16x16 = mb.is_intra16x16,
-        "MB type parsed"
-    );
 
     // 2. Handle I_PCM
     if mb.is_pcm {
@@ -877,12 +854,6 @@ pub fn decode_mb_cavlc(
     }
 
     // 3. Intra prediction modes
-    trace!(
-        bits_after_mb_type = br.consumed(),
-        mb_x,
-        mb_y = _mb_y,
-        "intra4x4 modes start"
-    );
     if mb.is_intra4x4 {
         // High profile: read transform_size_8x8_flag before prediction modes.
         // Reference: FFmpeg h264_cavlc.c:773-775
@@ -961,12 +932,10 @@ pub fn decode_mb_cavlc(
         }
     }
 
-    tracing::trace!(bits_after_pred_modes = br.consumed(), "CAVLC MB header");
     if is_intra && decode_chroma {
         // Parse chroma intra prediction mode (absent for monochrome).
         mb.chroma_pred_mode = get_ue_golomb(br)? as u8;
         if mb.chroma_pred_mode > 3 {
-            trace!(bits_consumed = br.consumed(), "CAVLC error site 915");
             return Err(Error::InvalidData);
         }
     }
@@ -994,7 +963,6 @@ pub fn decode_mb_cavlc(
                 for i in 0..4 {
                     let sub_mt = get_ue_golomb(br)?;
                     if sub_mt >= 4 {
-                        trace!(bits_consumed = br.consumed(), "CAVLC error site 951");
                         return Err(Error::InvalidData);
                     }
                     mb.sub_mb_type[i] = sub_mt as u8;
@@ -1041,7 +1009,6 @@ pub fn decode_mb_cavlc(
             for i in 0..4 {
                 let sub_mt = get_ue_golomb(br)?;
                 if sub_mt >= 13 {
-                    trace!(bits_consumed = br.consumed(), "CAVLC error site 991");
                     return Err(Error::InvalidData);
                 }
                 mb.sub_mb_type[i] = sub_mt as u8;
@@ -1143,12 +1110,10 @@ pub fn decode_mb_cavlc(
     }
 
     // 5. CBP
-    tracing::trace!(bits_before_cbp = br.consumed(), "CAVLC MB header");
     if !mb.is_intra16x16 {
         let cbp_code = get_ue_golomb(br)?;
         if decode_chroma {
             if cbp_code > 47 {
-                trace!(bits_consumed = br.consumed(), "CAVLC error site 1077");
                 return Err(Error::InvalidData);
             }
             mb.cbp = if mb.is_intra4x4 || (is_intra && !mb.is_intra16x16) {
@@ -1159,7 +1124,6 @@ pub fn decode_mb_cavlc(
         } else {
             // Monochrome: 16-entry gray tables, no chroma CBP bits.
             if cbp_code > 15 {
-                trace!(bits_consumed = br.consumed(), "CAVLC error: gray cbp > 15");
                 return Err(Error::InvalidData);
             }
             mb.cbp = if mb.is_intra4x4 || (is_intra && !mb.is_intra16x16) {
@@ -1184,24 +1148,10 @@ pub fn decode_mb_cavlc(
     if dct8x8_allowed && (mb.cbp & 15) != 0 && !is_intra {
         mb.transform_size_8x8_flag = br.get_bit();
     }
-    trace!(
-        mb_x,
-        t8x8 = mb.transform_size_8x8_flag,
-        dct8x8_allowed,
-        is_intra,
-        cbp = mb.cbp,
-        "TRANSFORM_FLAG"
-    );
 
     // 6. mb_qp_delta and residual coefficients
-    tracing::trace!(bits_before_qp_delta = br.consumed(), "CAVLC MB header");
     if mb.cbp > 0 || mb.is_intra16x16 {
         mb.mb_qp_delta = get_se_golomb(br)?;
-        tracing::trace!(
-            bits_after_qp_delta = br.consumed(),
-            mb_qp_delta = mb.mb_qp_delta,
-            "CAVLC MB header"
-        );
         decode_residual_blocks(br, &mut mb, neighbor, mb_x, pps, mb_field)?;
     }
 
@@ -1211,7 +1161,6 @@ pub fn decode_mb_cavlc(
 /// Decode intra mb_type and fill in the Macroblock fields.
 fn decode_intra_mb_type(mb: &mut Macroblock, mt: u32) -> Result<()> {
     if mt > 25 {
-        trace!("CAVLC error site 1107");
         return Err(Error::InvalidData);
     }
 
@@ -1249,12 +1198,6 @@ fn read_ref_idx(br: &mut BitReadBE<'_>, ref_count: u32) -> Result<u32> {
     } else {
         let val = get_ue_golomb(br)?;
         if val >= ref_count {
-            warn!(
-                val,
-                ref_count,
-                bits_consumed = br.consumed(),
-                "CAVLC ref_idx out of range"
-            );
             return Err(Error::InvalidData);
         }
         Ok(val)
@@ -1337,14 +1280,6 @@ fn decode_residual_blocks(
                         + mb.non_zero_count[SCAN_TO_RASTER[i8x8 * 4 + 3]];
                     mb.non_zero_count[r0] = nz_sum.min(16);
                 }
-                trace!(
-                    mb_x,
-                    i8x8,
-                    dc = buf[0],
-                    coeff_sum = buf.iter().map(|&c| c.unsigned_abs() as u32).sum::<u32>(),
-                    nnz = mb.non_zero_count[SCAN_TO_RASTER[i8x8 * 4]],
-                    "COEFF_8X8"
-                );
             } else {
                 for i4x4 in 0..4 {
                     let scan_idx = i8x8 * 4 + i4x4;
@@ -1406,35 +1341,6 @@ fn decode_residual_blocks(
         for i in 16..24 {
             mb.non_zero_count[i] = 0;
         }
-    }
-
-    // Per-MB coefficient summary for pipeline-stage tracing
-    {
-        let luma_sum: u32 = if mb.transform_size_8x8_flag {
-            mb.luma_8x8_coeffs
-                .iter()
-                .flat_map(|c| c.iter())
-                .map(|&c| c.unsigned_abs() as u32)
-                .sum()
-        } else {
-            mb.luma_coeffs
-                .iter()
-                .flat_map(|c| c.iter())
-                .map(|&c| c.unsigned_abs() as u32)
-                .sum()
-        };
-        let chroma_dc_cb: i16 = mb.chroma_dc[0].iter().sum();
-        let chroma_dc_cr: i16 = mb.chroma_dc[1].iter().sum();
-        trace!(
-            mb_x,
-            t8x8 = mb.transform_size_8x8_flag,
-            luma_sum,
-            chroma_dc_cb,
-            chroma_dc_cr,
-            cbp,
-            i16x16 = mb.is_intra16x16,
-            "COEFF"
-        );
     }
 
     Ok(())
