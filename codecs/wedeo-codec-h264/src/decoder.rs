@@ -39,15 +39,25 @@ use crate::thread_pool::{DecodeThreadPool, FrameWork, InFlightDecode, SliceWorkU
 /// Number of frame-decode worker threads.
 /// Reads `WEDEO_THREADS` env var (1 = single-threaded, 0 or unset = auto).
 fn decode_thread_count() -> usize {
-    if let Some(n) = std::env::var("WEDEO_THREADS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-    {
-        return n.clamp(1, 4);
-    }
-    std::thread::available_parallelism()
-        .map(|n| n.get().clamp(1, 4))
-        .unwrap_or(2)
+    static COUNT: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        if let Some(n) = std::env::var("WEDEO_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            return n.clamp(1, 4);
+        }
+        std::thread::available_parallelism()
+            .map(|n| n.get().clamp(1, 4))
+            .unwrap_or(2)
+    });
+    *COUNT
+}
+
+/// Whether deblocking is enabled (WEDEO_NO_DEBLOCK env var absent).
+fn deblock_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("WEDEO_NO_DEBLOCK").is_err());
+    *ENABLED
 }
 
 // ---------------------------------------------------------------------------
@@ -939,7 +949,7 @@ impl H264Decoder {
                 return;
             }
 
-            let deblock_enabled = std::env::var("WEDEO_NO_DEBLOCK").is_err();
+            let deblock_enabled = deblock_enabled();
             let poc = self.current_poc;
             let frame_num_h264 = self.current_frame_num_h264;
             let nal_ref_idc = self.current_nal_ref_idc;
@@ -1356,7 +1366,7 @@ impl H264Decoder {
             );
         }
 
-        let deblock_enabled = std::env::var("WEDEO_NO_DEBLOCK").is_err();
+        let deblock_enabled = deblock_enabled();
         let mut mb_addr = first_mb;
 
         while mb_addr < total_mbs {
@@ -1500,7 +1510,7 @@ impl H264Decoder {
         let mb_height = sps.mb_height;
         let total_mbs = mb_width * mb_height;
         let first_mb = hdr.first_mb_in_slice;
-        let deblock_enabled = std::env::var("WEDEO_NO_DEBLOCK").is_err();
+        let deblock_enabled = deblock_enabled();
 
         // For MBAFF, first_mb_in_slice is in pair units.
         let mut mb_x = first_mb % mb_width;
@@ -1707,7 +1717,7 @@ impl H264Decoder {
         let mut mbs_decoded = 0u32;
         let is_inter_slice = hdr.slice_type.is_p() || hdr.slice_type.is_b();
         let is_mbaff = !sps.frame_mbs_only_flag;
-        let deblock_enabled = std::env::var("WEDEO_NO_DEBLOCK").is_err();
+        let deblock_enabled = deblock_enabled();
 
         if is_mbaff {
             mbs_decoded = Self::decode_slice_cabac_mbaff(
@@ -1916,7 +1926,7 @@ impl H264Decoder {
 
         let mut mbs_decoded = 0u32;
         let mut mb_field_decoding_flag = false;
-        let deblock_enabled = std::env::var("WEDEO_NO_DEBLOCK").is_err();
+        let deblock_enabled = deblock_enabled();
 
         // Two separate left-side contexts for MBAFF: one for top MBs, one for bottom MBs.
         // After each pair, the top row's left context holds the top MB's right edge,
