@@ -12,7 +12,6 @@
 // `mpsc::Receiver<FrameResult>` on main thread. Results may arrive
 // out of order; callers use `sequence_id` for FIFO ordering.
 
-use std::cell::UnsafeCell;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
@@ -192,15 +191,13 @@ fn worker_loop(
 
 /// Decode a single frame from a FrameWork.
 ///
-/// Single-slice frames use the fast sequential path (identical to the
-/// original code, zero overhead). Multi-slice frames dispatch slices in
-/// parallel via `std::thread::scope`, then run a serial deblock pass.
+/// Multi-slice parallel decode is disabled: the `decode_frame_multi_slice`
+/// path has unsound `unsafe impl Sync` (shared bi_scratch/qp/mc_scratch
+/// without synchronization) and does not enforce slice boundaries
+/// (`next_slice_first_mb` is computed but never checked in the decode loop).
+/// All frames use the sequential path until these issues are resolved.
 fn decode_frame(fw: FrameWork) -> Box<InFlightDecode> {
-    if fw.slices.len() <= 1 {
-        decode_frame_sequential(fw)
-    } else {
-        decode_frame_multi_slice(fw)
-    }
+    decode_frame_sequential(fw)
 }
 
 /// Fast path: single-slice frame decode. Identical to the original code.
@@ -255,179 +252,6 @@ fn decode_frame_sequential(fw: FrameWork) -> Box<InFlightDecode> {
         dpb_idx: fw.dpb_idx,
         pkt_pts: fw.pkt_pts,
     })
-}
-
-/// Wrapper around `UnsafeCell<FrameDecodeContext>` that implements `Sync`.
-///
-/// SAFETY: Multi-slice parallel decode guarantees that each slice writes to
-/// a disjoint range of MB addresses. The shared arrays (`pic`, `mb_info`,
-/// `mv_ctx`, `slice_table`, `transform_8x8`, `mb_field_flag`) are indexed
-/// by MB address, so concurrent writes never overlap. The `neighbor_ctx`
-/// top-row arrays are written after each MB row — slices starting at row
-/// boundaries means each column position is written by exactly one slice.
-///
-/// Per-slice state (`qp`, `last_qscale_diff`, `current_slice`, `mc_scratch`,
-/// `bi_scratch_*`, `neighbor_ctx.left_*`) is stored in separate
-/// `SliceLocalState` structs, not in the shared FDC.
-struct SyncFdc(UnsafeCell<FrameDecodeContext>);
-
-// SAFETY: See SyncFdc doc comment — disjoint MB ranges guarantee no data races.
-unsafe impl Sync for SyncFdc {}
-
-/// Multi-slice parallel decode using `std::thread::scope`.
-///
-/// Each slice gets its own scoped thread. Inline deblocking is DISABLED
-/// during parallel decode (slices may decode rows out of order). After all
-/// slices complete, a serial deblock pass processes the entire frame.
-///
-/// This matches FFmpeg's `postpone_filter` model for multi-slice frames.
-fn decode_frame_multi_slice(fw: FrameWork) -> Box<InFlightDecode> {
-    let mut fdc = fw.fdc;
-    let deblock_enabled = fw.deblock_enabled;
-    let poc = fw.poc;
-    let frame_num_h264 = fw.frame_num_h264;
-    let nal_ref_idc = fw.nal_ref_idc;
-    let is_idr = fw.is_idr;
-    let last_hdr = fw.last_hdr;
-    let ref_list_l0 = fw.ref_list_l0;
-    let ref_list_l1 = fw.ref_list_l1;
-    let dpb_idx = fw.dpb_idx;
-    let pkt_pts = fw.pkt_pts;
-
-    // Disable inline deblocking for multi-slice — we'll do a full serial
-    // pass after all slices complete. Set the env var marker that
-    // decode_slice_into checks.
-    //
-    // We achieve this by temporarily setting WEDEO_NO_DEBLOCK. But that's
-    // a global env var — instead, we pass deblock_enabled=false through the
-    // decode path. The inline_deblock_row function in decoder.rs checks
-    // a local `deblock_enabled` variable, not the env var. Since we call
-    // decode_slice_into which reads from env, we need a different approach.
-    //
-    // Actually, looking at the code: `deblock_enabled` is a local variable
-    // in decode_slice_cavlc/cabac computed from env var at slice start.
-    // For multi-slice parallel, each thread reads that env var independently.
-    // We need to suppress inline deblock for multi-slice frames.
-    //
-    // Approach: set a flag on FDC that the decode loops check.
-    fdc.postpone_deblock = true;
-
-    let slices = fw.slices;
-    let sync_fdc = SyncFdc(UnsafeCell::new(fdc));
-
-    std::thread::scope(|s| {
-        let mut handles = Vec::with_capacity(slices.len());
-
-        for (i, slice) in slices.into_iter().enumerate() {
-            let fdc_ref = &sync_fdc;
-            handles.push(s.spawn(move || {
-                // SAFETY: Each slice writes to disjoint MB ranges (guaranteed by
-                // next_slice_first_mb boundaries). See SyncFdc doc comment.
-                let fdc = unsafe { &mut *fdc_ref.0.get() };
-
-                // Create a slice-local copy of mutable per-slice state.
-                // We must not share qp, last_qscale_diff, mc_scratch, or
-                // neighbor_ctx left-side state across threads.
-                //
-                // For multi-slice, each slice starts fresh: qp comes from
-                // slice header (set by decode_slice_into), last_qscale_diff=0
-                // (set by decode_slice_into), mc_scratch is per-call.
-                //
-                // The tricky part: neighbor_ctx. The top-row arrays are shared
-                // (indexed by column), but left-side arrays are per-slice.
-                // Since slices start at row boundaries in practice, and
-                // decode_slice calls new_row() at each row start (resetting
-                // left state), this is safe.
-
-                apply_slice_state(fdc, &slice);
-
-                let _ = H264Decoder::decode_slice_into(
-                    &slice.rbsp,
-                    &slice.hdr,
-                    &slice.sps,
-                    &slice.pps,
-                    fdc,
-                    &slice.ref_pics_l0,
-                    &slice.ref_pics_l1,
-                );
-
-                let _ = i; // suppress unused warning
-            }));
-        }
-
-        // All threads join at scope exit
-        for h in handles {
-            let _ = h.join();
-        }
-    });
-
-    let mut fdc = sync_fdc.0.into_inner();
-    fdc.postpone_deblock = false;
-
-    // Serial deblock pass over the entire frame (all MBs now decoded).
-    if deblock_enabled {
-        let mb_height = fdc.mb_height;
-        let mb_width = fdc.mb_width;
-        if fdc.is_mbaff {
-            let pair_rows = mb_height / 2;
-            for pr in 0..pair_rows {
-                deblock::deblock_row_mbaff(
-                    &mut fdc.pic,
-                    &fdc.mb_info,
-                    &fdc.slice_table,
-                    &fdc.slice_deblock_params,
-                    pr,
-                    mb_width,
-                );
-            }
-        } else {
-            for row in 0..mb_height {
-                deblock::deblock_row(
-                    &mut fdc.pic,
-                    &fdc.mb_info,
-                    &fdc.slice_table,
-                    &fdc.slice_deblock_params,
-                    row,
-                    mb_width,
-                );
-            }
-        }
-    }
-    fdc.pic.mark_complete();
-
-    Box::new(InFlightDecode {
-        fdc,
-        poc,
-        frame_num_h264,
-        nal_ref_idc,
-        is_idr,
-        last_hdr,
-        ref_list_l0,
-        ref_list_l1,
-        dpb_idx,
-        pkt_pts,
-    })
-}
-
-/// Apply per-slice FDC state from a SliceWorkUnit snapshot.
-#[inline]
-fn apply_slice_state(fdc: &mut FrameDecodeContext, slice: &SliceWorkUnit) {
-    fdc.current_slice = slice.slice_idx;
-    fdc.cur_l0_ref_poc = slice.cur_l0_ref_poc.clone();
-    fdc.cur_l0_ref_dpb = slice.cur_l0_ref_dpb.clone();
-    fdc.cur_l1_ref_poc = slice.cur_l1_ref_poc.clone();
-    fdc.cur_l1_ref_dpb = slice.cur_l1_ref_dpb.clone();
-    fdc.col_mv = slice.col_mv.clone();
-    fdc.col_ref = slice.col_ref.clone();
-    fdc.col_mv_l1 = slice.col_mv_l1.clone();
-    fdc.col_ref_l1 = slice.col_ref_l1.clone();
-    fdc.col_mb_intra = slice.col_mb_intra.clone();
-    fdc.col_poc = slice.col_poc;
-    fdc.col_l1_is_long_term = slice.col_l1_is_long_term;
-    fdc.col_ref_poc_l0 = slice.col_ref_poc_l0.clone();
-    fdc.col_ref_poc_l1 = slice.col_ref_poc_l1.clone();
-    fdc.implicit_weight = slice.implicit_weight.clone();
-    fdc.cur_poc = slice.cur_poc;
 }
 
 /// Deblock the last row (deferred by inline deblock's 1-row delay).
