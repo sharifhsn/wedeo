@@ -74,6 +74,7 @@ const BLOCK_INDEX_TO_XY: [(u32, u32); 16] = [
 /// Maps block index (0..15) to a raster-order index (row-major 4x4 grid)
 /// for neighbor context lookups.
 /// raster_idx = blk_y * 4 + blk_x
+#[inline]
 fn block_to_raster(block: usize) -> usize {
     let (bx, by) = BLOCK_INDEX_TO_XY[block];
     (by * 4 + bx) as usize
@@ -453,6 +454,16 @@ pub struct FrameDecodeContext {
     pub mb_field: bool,
     /// Pre-allocated scratch buffers for motion compensation (eliminates per-call heap allocs).
     pub mc_scratch: mc::McScratch,
+    /// Pre-allocated scratch buffer for bi-prediction luma L1 (max 16x16 = 256 bytes).
+    pub bi_scratch_y: [u8; 256],
+    /// Pre-allocated scratch buffer for bi-prediction chroma-U L1 (max 8x8 = 64 bytes).
+    pub bi_scratch_u: [u8; 64],
+    /// Pre-allocated scratch buffer for bi-prediction chroma-V L1 (max 8x8 = 64 bytes).
+    pub bi_scratch_v: [u8; 64],
+    /// When true, inline deblocking is suppressed during decode.
+    /// Used by the multi-slice parallel decode path, which runs a serial
+    /// deblock pass after all slices complete (FFmpeg's `postpone_filter` model).
+    pub postpone_deblock: bool,
 }
 
 impl FrameDecodeContext {
@@ -554,6 +565,10 @@ impl FrameDecodeContext {
             is_mbaff: !sps.frame_mbs_only_flag,
             mb_field: false,
             mc_scratch: mc::McScratch::new(),
+            bi_scratch_y: [0u8; 256],
+            bi_scratch_u: [0u8; 64],
+            bi_scratch_v: [0u8; 64],
+            postpone_deblock: false,
         }
     }
 
@@ -775,6 +790,7 @@ fn chroma_mb_offset(pic: &PictureBuffer, mb_x: u32, mb_y: u32, mb_field: bool) -
 /// Uses offset/stride addressing for MBAFF field-mode compatibility.
 /// `offset` is the block's top-left position in the luma buffer.
 /// `stride` is the field-adjusted stride (doubled in field mode).
+#[inline]
 fn gather_top_luma(
     plane: &[u8],
     offset: usize,
@@ -799,6 +815,7 @@ fn gather_top_luma(
 /// Gather the left 4 neighbor pixels for a 4x4 luma block.
 ///
 /// Uses offset/stride addressing. `offset` is the block's top-left.
+#[inline]
 fn gather_left_luma(plane: &[u8], offset: usize, stride: usize, has_left: bool) -> [u8; 4] {
     let mut left = [128u8; 4];
     if has_left {
@@ -3515,9 +3532,10 @@ fn apply_mc_bi_partition(
     let l1_dx = (mvx1 & 3) as u8;
     let l1_dy = (mvy1 & 3) as u8;
 
-    let mut tmp_y = vec![0u8; block_w * block_h];
+    let tmp_y = &mut ctx.bi_scratch_y[..block_w * block_h];
+    tmp_y.fill(0);
     mc::mc_luma(
-        &mut tmp_y,
+        tmp_y,
         block_w,
         &rp_l1.y,
         rp_l1.y_stride,
@@ -3547,7 +3565,7 @@ fn apply_mc_bi_partition(
         biweight_pixels(
             &mut ctx.pic.y[luma_offset..],
             luma_dst_stride,
-            &tmp_y,
+            tmp_y,
             block_w,
             block_w,
             block_h,
@@ -3566,7 +3584,7 @@ fn apply_mc_bi_partition(
         biweight_pixels(
             &mut ctx.pic.y[luma_offset..],
             luma_dst_stride,
-            &tmp_y,
+            tmp_y,
             block_w,
             block_w,
             block_h,
@@ -3579,7 +3597,7 @@ fn apply_mc_bi_partition(
         mc::avg_pixels_inplace(
             &mut ctx.pic.y[luma_offset..],
             luma_dst_stride,
-            &tmp_y,
+            tmp_y,
             block_w,
             block_w,
             block_h,
@@ -3618,10 +3636,12 @@ fn apply_mc_bi_partition(
         && l1_idx < slice_hdr.chroma_weight_l1.len();
 
     if use_implicit_weight || use_explicit_weight {
-        // Weighted path: L1 MC into temp buffers, then biweight with dst
-        let mut tmp_u = vec![0u8; chroma_w * chroma_h];
+        // Weighted path: L1 MC into scratch buffers, then biweight with dst
+        let chroma_pix = chroma_w * chroma_h;
+        let tmp_u = &mut ctx.bi_scratch_u[..chroma_pix];
+        tmp_u.fill(0);
         mc::mc_chroma(
-            &mut tmp_u,
+            tmp_u,
             chroma_w,
             &rp_l1.u,
             rp_l1.uv_stride,
@@ -3634,9 +3654,10 @@ fn apply_mc_bi_partition(
             chroma_pic_w,
             chroma_pic_h,
         );
-        let mut tmp_v = vec![0u8; chroma_w * chroma_h];
+        let tmp_v = &mut ctx.bi_scratch_v[..chroma_pix];
+        tmp_v.fill(0);
         mc::mc_chroma(
-            &mut tmp_v,
+            tmp_v,
             chroma_w,
             &rp_l1.v,
             rp_l1.uv_stride,
@@ -3656,7 +3677,7 @@ fn apply_mc_bi_partition(
             biweight_pixels(
                 &mut ctx.pic.u[chroma_off..],
                 chroma_dst_stride,
-                &tmp_u,
+                tmp_u,
                 chroma_w,
                 chroma_w,
                 chroma_h,
@@ -3668,7 +3689,7 @@ fn apply_mc_bi_partition(
             biweight_pixels(
                 &mut ctx.pic.v[chroma_off..],
                 chroma_dst_stride,
-                &tmp_v,
+                tmp_v,
                 chroma_w,
                 chroma_w,
                 chroma_h,
@@ -3684,7 +3705,7 @@ fn apply_mc_bi_partition(
             biweight_pixels(
                 &mut ctx.pic.u[chroma_off..],
                 chroma_dst_stride,
-                &tmp_u,
+                tmp_u,
                 chroma_w,
                 chroma_w,
                 chroma_h,
@@ -3696,7 +3717,7 @@ fn apply_mc_bi_partition(
             biweight_pixels(
                 &mut ctx.pic.v[chroma_off..],
                 chroma_dst_stride,
-                &tmp_v,
+                tmp_v,
                 chroma_w,
                 chroma_w,
                 chroma_h,

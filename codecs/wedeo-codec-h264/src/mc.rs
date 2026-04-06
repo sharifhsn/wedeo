@@ -104,6 +104,78 @@ fn filter6(a: i32, b: i32, c: i32, d: i32, e: i32, f: i32) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
+// Interior block detection — skips extract_ref_block for ~90% of MC ops
+// ---------------------------------------------------------------------------
+
+/// Fixed-width block copy from reference plane. W must be a compile-time constant
+/// so the compiler can emit optimal load/store pairs (e.g. ldp/stp for W=16 on ARM64).
+#[inline(always)]
+fn copy_block_direct<const W: usize>(
+    dst: &mut [u8],
+    dst_stride: usize,
+    src: &[u8],
+    src_stride: usize,
+    src_offset: usize,
+    block_h: usize,
+) {
+    // SAFETY: caller guarantees is_interior — all reads/writes are in bounds.
+    unsafe {
+        let src_ptr = src.as_ptr().add(src_offset);
+        let dst_ptr = dst.as_mut_ptr();
+        for j in 0..block_h {
+            std::ptr::copy_nonoverlapping(
+                src_ptr.add(j * src_stride),
+                dst_ptr.add(j * dst_stride),
+                W,
+            );
+        }
+    }
+}
+
+/// Generic block copy for non-standard widths.
+#[inline]
+fn copy_block_direct_generic(
+    dst: &mut [u8],
+    dst_stride: usize,
+    src: &[u8],
+    src_stride: usize,
+    src_offset: usize,
+    block_w: usize,
+    block_h: usize,
+) {
+    // SAFETY: caller guarantees is_interior — all reads/writes are in bounds.
+    unsafe {
+        let src_ptr = src.as_ptr().add(src_offset);
+        let dst_ptr = dst.as_mut_ptr();
+        for j in 0..block_h {
+            std::ptr::copy_nonoverlapping(
+                src_ptr.add(j * src_stride),
+                dst_ptr.add(j * dst_stride),
+                block_w,
+            );
+        }
+    }
+}
+
+/// Check if a block plus its filter tap margin fits entirely within the picture.
+/// When true, we can read directly from the reference plane without edge clamping.
+#[inline(always)]
+fn is_interior(
+    ref_x: i32,
+    ref_y: i32,
+    block_w: usize,
+    block_h: usize,
+    pic_w: i32,
+    pic_h: i32,
+    tap_margin: i32,
+) -> bool {
+    ref_x - tap_margin >= 0
+        && ref_y - tap_margin >= 0
+        && ref_x + block_w as i32 + tap_margin <= pic_w
+        && ref_y + block_h as i32 + tap_margin <= pic_h
+}
+
+// ---------------------------------------------------------------------------
 // Edge-clamped reference block extraction
 // ---------------------------------------------------------------------------
 
@@ -111,6 +183,7 @@ fn filter6(a: i32, b: i32, c: i32, d: i32, e: i32, f: i32) -> i32 {
 /// buffer. The output has `out_w` columns and `out_h` rows, stride = `out_w`.
 ///
 /// `rx`, `ry` are the top-left position (may be negative for edge cases).
+#[inline]
 #[allow(clippy::too_many_arguments)] // MC primitives inherently need position + dimension + picture size params
 fn extract_ref_block(
     out: &mut [i32],
@@ -123,11 +196,25 @@ fn extract_ref_block(
     pic_w: i32,
     pic_h: i32,
 ) {
-    for j in 0..out_h {
-        let sy = ry + j as i32;
-        for i in 0..out_w {
-            let sx = rx + i as i32;
-            out[j * out_w + i] = get_ref_pixel(ref_data, ref_stride, sx, sy, pic_w, pic_h) as i32;
+    // Fast path: if the entire block is within picture bounds, skip clamping.
+    if rx >= 0 && ry >= 0 && rx + out_w as i32 <= pic_w && ry + out_h as i32 <= pic_h {
+        let rx = rx as usize;
+        let ry = ry as usize;
+        for j in 0..out_h {
+            let src_row = (ry + j) * ref_stride + rx;
+            let dst_row = j * out_w;
+            for i in 0..out_w {
+                out[dst_row + i] = ref_data[src_row + i] as i32;
+            }
+        }
+    } else {
+        for j in 0..out_h {
+            let sy = ry + j as i32;
+            for i in 0..out_w {
+                let sx = rx + i as i32;
+                out[j * out_w + i] =
+                    get_ref_pixel(ref_data, ref_stride, sx, sy, pic_w, pic_h) as i32;
+            }
         }
     }
 }
@@ -136,12 +223,31 @@ fn extract_ref_block(
 // Luma half-pel lowpass filters
 // ---------------------------------------------------------------------------
 
+/// Fixed-width horizontal lowpass on i32 extracted buffer for auto-vectorization.
+#[inline(always)]
+fn h_lowpass_w<const W: usize>(
+    dst: &mut [u8],
+    dst_stride: usize,
+    src: &[i32],
+    src_stride: usize,
+    block_h: usize,
+) {
+    for j in 0..block_h {
+        for i in 0..W {
+            let s = &src[j * src_stride + i..];
+            let val = filter6(s[0], s[1], s[2], s[3], s[4], s[5]);
+            dst[j * dst_stride + i] = clip_u8((val + 16) >> 5);
+        }
+    }
+}
+
 /// Horizontal half-pel lowpass: apply the 6-tap filter across each row.
 ///
 /// Input: `src` is an edge-clamped block of size `(block_w + 5) x block_h`,
 /// stride = `src_stride`.
 /// Output: `dst` is `block_w x block_h`, stride = `dst_stride`.
 /// Each output sample is `clip((filter6(...) + 16) >> 5)`.
+#[inline]
 fn h_lowpass(
     dst: &mut [u8],
     dst_stride: usize,
@@ -150,30 +256,33 @@ fn h_lowpass(
     block_w: usize,
     block_h: usize,
 ) {
-    for j in 0..block_h {
-        for i in 0..block_w {
-            let s = &src[j * src_stride + i..];
-            let val = filter6(s[0], s[1], s[2], s[3], s[4], s[5]);
-            dst[j * dst_stride + i] = clip_u8((val + 16) >> 5);
+    match block_w {
+        4 => h_lowpass_w::<4>(dst, dst_stride, src, src_stride, block_h),
+        8 => h_lowpass_w::<8>(dst, dst_stride, src, src_stride, block_h),
+        16 => h_lowpass_w::<16>(dst, dst_stride, src, src_stride, block_h),
+        _ => {
+            for j in 0..block_h {
+                for i in 0..block_w {
+                    let s = &src[j * src_stride + i..];
+                    let val = filter6(s[0], s[1], s[2], s[3], s[4], s[5]);
+                    dst[j * dst_stride + i] = clip_u8((val + 16) >> 5);
+                }
+            }
         }
     }
 }
 
-/// Vertical half-pel lowpass: apply the 6-tap filter down each column.
-///
-/// Input: `src` is an edge-clamped block of size `block_w x (block_h + 5)`,
-/// stride = `src_stride`.
-/// Output: `dst` is `block_w x block_h`, stride = `dst_stride`.
-fn v_lowpass(
+/// Fixed-width vertical lowpass on i32 extracted buffer for auto-vectorization.
+#[inline(always)]
+fn v_lowpass_w<const W: usize>(
     dst: &mut [u8],
     dst_stride: usize,
     src: &[i32],
     src_stride: usize,
-    block_w: usize,
     block_h: usize,
 ) {
-    for i in 0..block_w {
-        for j in 0..block_h {
+    for j in 0..block_h {
+        for i in 0..W {
             let a = src[(j) * src_stride + i];
             let b = src[(j + 1) * src_stride + i];
             let c = src[(j + 2) * src_stride + i];
@@ -186,12 +295,83 @@ fn v_lowpass(
     }
 }
 
+/// Vertical half-pel lowpass: apply the 6-tap filter down each column.
+///
+/// Input: `src` is an edge-clamped block of size `block_w x (block_h + 5)`,
+/// stride = `src_stride`.
+/// Output: `dst` is `block_w x block_h`, stride = `dst_stride`.
+#[inline]
+fn v_lowpass(
+    dst: &mut [u8],
+    dst_stride: usize,
+    src: &[i32],
+    src_stride: usize,
+    block_w: usize,
+    block_h: usize,
+) {
+    match block_w {
+        4 => v_lowpass_w::<4>(dst, dst_stride, src, src_stride, block_h),
+        8 => v_lowpass_w::<8>(dst, dst_stride, src, src_stride, block_h),
+        16 => v_lowpass_w::<16>(dst, dst_stride, src, src_stride, block_h),
+        _ => {
+            for j in 0..block_h {
+                for i in 0..block_w {
+                    let a = src[(j) * src_stride + i];
+                    let b = src[(j + 1) * src_stride + i];
+                    let c = src[(j + 2) * src_stride + i];
+                    let d = src[(j + 3) * src_stride + i];
+                    let e = src[(j + 4) * src_stride + i];
+                    let f = src[(j + 5) * src_stride + i];
+                    let val = filter6(a, b, c, d, e, f);
+                    dst[j * dst_stride + i] = clip_u8((val + 16) >> 5);
+                }
+            }
+        }
+    }
+}
+
+/// Fixed-width 2D half-pel lowpass on i32 extracted buffer for auto-vectorization.
+#[inline(always)]
+fn hv_lowpass_w<const W: usize>(
+    dst: &mut [u8],
+    dst_stride: usize,
+    src: &[i32],
+    src_stride: usize,
+    block_h: usize,
+    tmp: &mut [i32],
+) {
+    let tmp_h = block_h + 5;
+
+    // First pass: horizontal filter into tmp.
+    for j in 0..tmp_h {
+        for i in 0..W {
+            let s = &src[j * src_stride + i..];
+            tmp[j * W + i] = filter6(s[0], s[1], s[2], s[3], s[4], s[5]);
+        }
+    }
+
+    // Second pass: vertical filter on the tmp buffer.
+    for j in 0..block_h {
+        for i in 0..W {
+            let a = tmp[(j) * W + i];
+            let b = tmp[(j + 1) * W + i];
+            let c = tmp[(j + 2) * W + i];
+            let d = tmp[(j + 3) * W + i];
+            let e = tmp[(j + 4) * W + i];
+            let f = tmp[(j + 5) * W + i];
+            let val = filter6(a, b, c, d, e, f);
+            dst[j * dst_stride + i] = clip_u8((val + 512) >> 10);
+        }
+    }
+}
+
 /// 2D half-pel lowpass (the "j" position in the spec): horizontal first pass
 /// into a temporary i16 buffer, then vertical second pass.
 ///
 /// Input: `src` is an edge-clamped block of size `(block_w + 5) x (block_h + 5)`,
 /// stride = `src_stride`.
 /// Output: `dst` is `block_w x block_h`, stride = `dst_stride`.
+#[inline]
 fn hv_lowpass(
     dst: &mut [u8],
     dst_stride: usize,
@@ -201,24 +381,326 @@ fn hv_lowpass(
     block_h: usize,
     tmp: &mut [i32],
 ) {
-    // First pass: horizontal filter into tmp.
-    // We need (block_h + 5) rows of horizontally-filtered output so the
-    // vertical pass has enough taps.
+    match block_w {
+        4 => hv_lowpass_w::<4>(dst, dst_stride, src, src_stride, block_h, tmp),
+        8 => hv_lowpass_w::<8>(dst, dst_stride, src, src_stride, block_h, tmp),
+        16 => hv_lowpass_w::<16>(dst, dst_stride, src, src_stride, block_h, tmp),
+        _ => {
+            let tmp_h = block_h + 5;
+            let tmp_stride = block_w;
+            for j in 0..tmp_h {
+                for i in 0..block_w {
+                    let s = &src[j * src_stride + i..];
+                    tmp[j * tmp_stride + i] = filter6(s[0], s[1], s[2], s[3], s[4], s[5]);
+                }
+            }
+            for j in 0..block_h {
+                for i in 0..block_w {
+                    let a = tmp[(j) * tmp_stride + i];
+                    let b = tmp[(j + 1) * tmp_stride + i];
+                    let c = tmp[(j + 2) * tmp_stride + i];
+                    let d = tmp[(j + 3) * tmp_stride + i];
+                    let e = tmp[(j + 4) * tmp_stride + i];
+                    let f = tmp[(j + 5) * tmp_stride + i];
+                    let val = filter6(a, b, c, d, e, f);
+                    dst[j * dst_stride + i] = clip_u8((val + 512) >> 10);
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Direct-from-reference filter functions (interior blocks only)
+// ---------------------------------------------------------------------------
+// These read directly from &[u8] reference data, skipping the intermediate
+// i32 extraction buffer. For interior blocks (~90% of all MC operations),
+// this eliminates the biggest bottleneck: the u8→i32 copy in extract_ref_block.
+
+/// Fixed-width horizontal lowpass for auto-vectorization.
+/// W is the block width (compile-time constant).
+#[inline(always)]
+fn h_lowpass_direct_w<const W: usize>(
+    dst: &mut [u8],
+    dst_stride: usize,
+    src: &[u8],
+    src_stride: usize,
+    src_offset: usize,
+    block_h: usize,
+) {
+    for j in 0..block_h {
+        let row = src_offset + j * src_stride;
+        for i in 0..W {
+            let off = row + i;
+            // SAFETY: caller guarantees all accesses are in-bounds (interior block check).
+            // The 6-tap filter reads src[off..off+6], and is_interior ensures
+            // ref_x - 2 >= 0 and ref_x + block_w + 3 <= pic_w, so all 6 taps are valid.
+            unsafe {
+                let a = *src.get_unchecked(off) as i32;
+                let b = *src.get_unchecked(off + 1) as i32;
+                let c = *src.get_unchecked(off + 2) as i32;
+                let d = *src.get_unchecked(off + 3) as i32;
+                let e = *src.get_unchecked(off + 4) as i32;
+                let f = *src.get_unchecked(off + 5) as i32;
+                let val = filter6(a, b, c, d, e, f);
+                *dst.get_unchecked_mut(j * dst_stride + i) = clip_u8((val + 16) >> 5);
+            }
+        }
+    }
+}
+
+/// Horizontal lowpass reading directly from u8 reference data.
+/// For interior blocks only — caller must ensure all reads are in-bounds.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn h_lowpass_direct(
+    dst: &mut [u8],
+    dst_stride: usize,
+    src: &[u8],
+    src_stride: usize,
+    src_offset: usize,
+    block_w: usize,
+    block_h: usize,
+) {
+    match block_w {
+        4 => h_lowpass_direct_w::<4>(dst, dst_stride, src, src_stride, src_offset, block_h),
+        8 => h_lowpass_direct_w::<8>(dst, dst_stride, src, src_stride, src_offset, block_h),
+        16 => h_lowpass_direct_w::<16>(dst, dst_stride, src, src_stride, src_offset, block_h),
+        _ => h_lowpass_direct_w_generic(
+            dst, dst_stride, src, src_stride, src_offset, block_w, block_h,
+        ),
+    }
+}
+
+/// Generic fallback for non-standard block widths.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn h_lowpass_direct_w_generic(
+    dst: &mut [u8],
+    dst_stride: usize,
+    src: &[u8],
+    src_stride: usize,
+    src_offset: usize,
+    block_w: usize,
+    block_h: usize,
+) {
+    for j in 0..block_h {
+        let row = src_offset + j * src_stride;
+        for i in 0..block_w {
+            let off = row + i;
+            // SAFETY: caller guarantees all accesses are in-bounds (interior block check).
+            unsafe {
+                let a = *src.get_unchecked(off) as i32;
+                let b = *src.get_unchecked(off + 1) as i32;
+                let c = *src.get_unchecked(off + 2) as i32;
+                let d = *src.get_unchecked(off + 3) as i32;
+                let e = *src.get_unchecked(off + 4) as i32;
+                let f = *src.get_unchecked(off + 5) as i32;
+                let val = filter6(a, b, c, d, e, f);
+                *dst.get_unchecked_mut(j * dst_stride + i) = clip_u8((val + 16) >> 5);
+            }
+        }
+    }
+}
+
+/// Fixed-width vertical lowpass for auto-vectorization.
+/// W is the block width (compile-time constant).
+#[inline(always)]
+fn v_lowpass_direct_w<const W: usize>(
+    dst: &mut [u8],
+    dst_stride: usize,
+    src: &[u8],
+    src_stride: usize,
+    src_offset: usize,
+    block_h: usize,
+) {
+    for j in 0..block_h {
+        for i in 0..W {
+            let base = src_offset + j * src_stride + i;
+            // SAFETY: caller guarantees all accesses are in-bounds (interior block check).
+            // The 6-tap filter reads 6 rows starting at base, stepping by src_stride.
+            // is_interior ensures ref_y - 2 >= 0 and ref_y + block_h + 3 <= pic_h.
+            unsafe {
+                let a = *src.get_unchecked(base) as i32;
+                let b = *src.get_unchecked(base + src_stride) as i32;
+                let c = *src.get_unchecked(base + 2 * src_stride) as i32;
+                let d = *src.get_unchecked(base + 3 * src_stride) as i32;
+                let e = *src.get_unchecked(base + 4 * src_stride) as i32;
+                let f = *src.get_unchecked(base + 5 * src_stride) as i32;
+                let val = filter6(a, b, c, d, e, f);
+                *dst.get_unchecked_mut(j * dst_stride + i) = clip_u8((val + 16) >> 5);
+            }
+        }
+    }
+}
+
+/// Vertical lowpass reading directly from u8 reference data.
+/// For interior blocks only — caller must ensure all reads are in-bounds.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn v_lowpass_direct(
+    dst: &mut [u8],
+    dst_stride: usize,
+    src: &[u8],
+    src_stride: usize,
+    src_offset: usize,
+    block_w: usize,
+    block_h: usize,
+) {
+    match block_w {
+        4 => v_lowpass_direct_w::<4>(dst, dst_stride, src, src_stride, src_offset, block_h),
+        8 => v_lowpass_direct_w::<8>(dst, dst_stride, src, src_stride, src_offset, block_h),
+        16 => v_lowpass_direct_w::<16>(dst, dst_stride, src, src_stride, src_offset, block_h),
+        _ => v_lowpass_direct_w_generic(
+            dst, dst_stride, src, src_stride, src_offset, block_w, block_h,
+        ),
+    }
+}
+
+/// Generic fallback for non-standard block widths.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn v_lowpass_direct_w_generic(
+    dst: &mut [u8],
+    dst_stride: usize,
+    src: &[u8],
+    src_stride: usize,
+    src_offset: usize,
+    block_w: usize,
+    block_h: usize,
+) {
+    for j in 0..block_h {
+        for i in 0..block_w {
+            let base = src_offset + j * src_stride + i;
+            // SAFETY: caller guarantees all accesses are in-bounds (interior block check).
+            unsafe {
+                let a = *src.get_unchecked(base) as i32;
+                let b = *src.get_unchecked(base + src_stride) as i32;
+                let c = *src.get_unchecked(base + 2 * src_stride) as i32;
+                let d = *src.get_unchecked(base + 3 * src_stride) as i32;
+                let e = *src.get_unchecked(base + 4 * src_stride) as i32;
+                let f = *src.get_unchecked(base + 5 * src_stride) as i32;
+                let val = filter6(a, b, c, d, e, f);
+                *dst.get_unchecked_mut(j * dst_stride + i) = clip_u8((val + 16) >> 5);
+            }
+        }
+    }
+}
+
+/// Fixed-width 2D half-pel lowpass for auto-vectorization.
+/// W is the block width (compile-time constant).
+#[inline(always)]
+fn hv_lowpass_direct_w<const W: usize>(
+    dst: &mut [u8],
+    dst_stride: usize,
+    src: &[u8],
+    src_stride: usize,
+    src_offset: usize,
+    block_h: usize,
+    tmp: &mut [i32],
+) {
+    let tmp_h = block_h + 5;
+
+    // First pass: horizontal filter from u8 reference into i32 tmp.
+    for j in 0..tmp_h {
+        let row = src_offset + j * src_stride;
+        for i in 0..W {
+            let off = row + i;
+            // SAFETY: caller guarantees all accesses are in-bounds (interior block check).
+            // is_interior with tap_margin=2 ensures ref_x-2..ref_x+block_w+3 and
+            // ref_y-2..ref_y+block_h+3 are all within picture bounds.
+            unsafe {
+                let a = *src.get_unchecked(off) as i32;
+                let b = *src.get_unchecked(off + 1) as i32;
+                let c = *src.get_unchecked(off + 2) as i32;
+                let d = *src.get_unchecked(off + 3) as i32;
+                let e = *src.get_unchecked(off + 4) as i32;
+                let f = *src.get_unchecked(off + 5) as i32;
+                *tmp.get_unchecked_mut(j * W + i) = filter6(a, b, c, d, e, f);
+            }
+        }
+    }
+
+    // Second pass: vertical filter on the tmp buffer — row-major for cache locality.
+    for j in 0..block_h {
+        for i in 0..W {
+            // SAFETY: tmp is pre-allocated to at least (block_h + 5) * W elements,
+            // and j + 5 < tmp_h = block_h + 5, so all accesses are in-bounds.
+            unsafe {
+                let a = *tmp.get_unchecked(j * W + i);
+                let b = *tmp.get_unchecked((j + 1) * W + i);
+                let c = *tmp.get_unchecked((j + 2) * W + i);
+                let d = *tmp.get_unchecked((j + 3) * W + i);
+                let e = *tmp.get_unchecked((j + 4) * W + i);
+                let f = *tmp.get_unchecked((j + 5) * W + i);
+                let val = filter6(a, b, c, d, e, f);
+                *dst.get_unchecked_mut(j * dst_stride + i) = clip_u8((val + 512) >> 10);
+            }
+        }
+    }
+}
+
+/// 2D half-pel lowpass reading directly from u8 reference data.
+/// First pass: horizontal filter from &[u8] → &mut [i32] tmp.
+/// Second pass: vertical filter from &[i32] tmp → &mut [u8] dst.
+/// For interior blocks only — caller must ensure all reads are in-bounds.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn hv_lowpass_direct(
+    dst: &mut [u8],
+    dst_stride: usize,
+    src: &[u8],
+    src_stride: usize,
+    src_offset: usize,
+    block_w: usize,
+    block_h: usize,
+    tmp: &mut [i32],
+) {
+    match block_w {
+        4 => hv_lowpass_direct_w::<4>(dst, dst_stride, src, src_stride, src_offset, block_h, tmp),
+        8 => hv_lowpass_direct_w::<8>(dst, dst_stride, src, src_stride, src_offset, block_h, tmp),
+        16 => hv_lowpass_direct_w::<16>(dst, dst_stride, src, src_stride, src_offset, block_h, tmp),
+        _ => hv_lowpass_direct_w_generic(
+            dst, dst_stride, src, src_stride, src_offset, block_w, block_h, tmp,
+        ),
+    }
+}
+
+/// Generic fallback for non-standard block widths.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn hv_lowpass_direct_w_generic(
+    dst: &mut [u8],
+    dst_stride: usize,
+    src: &[u8],
+    src_stride: usize,
+    src_offset: usize,
+    block_w: usize,
+    block_h: usize,
+    tmp: &mut [i32],
+) {
     let tmp_h = block_h + 5;
     let tmp_stride = block_w;
 
     for j in 0..tmp_h {
+        let row = src_offset + j * src_stride;
         for i in 0..block_w {
-            let s = &src[j * src_stride + i..];
-            // No shift/clip here — the intermediate values stay as i32.
-            tmp[j * tmp_stride + i] = filter6(s[0], s[1], s[2], s[3], s[4], s[5]);
+            let off = row + i;
+            // SAFETY: caller guarantees all accesses are in-bounds (interior block check).
+            unsafe {
+                let a = *src.get_unchecked(off) as i32;
+                let b = *src.get_unchecked(off + 1) as i32;
+                let c = *src.get_unchecked(off + 2) as i32;
+                let d = *src.get_unchecked(off + 3) as i32;
+                let e = *src.get_unchecked(off + 4) as i32;
+                let f = *src.get_unchecked(off + 5) as i32;
+                *tmp.get_unchecked_mut(j * tmp_stride + i) = filter6(a, b, c, d, e, f);
+            }
         }
     }
 
-    // Second pass: vertical filter on the tmp buffer.
-    // The rounding for the two-pass filter is (512) >> 10.
-    for i in 0..block_w {
-        for j in 0..block_h {
+    for j in 0..block_h {
+        for i in 0..block_w {
             let a = tmp[(j) * tmp_stride + i];
             let b = tmp[(j + 1) * tmp_stride + i];
             let c = tmp[(j + 2) * tmp_stride + i];
@@ -235,7 +717,28 @@ fn hv_lowpass(
 // Pixel averaging (for quarter-pel from half-pel + integer/half-pel)
 // ---------------------------------------------------------------------------
 
+/// Fixed-width pixel averaging for auto-vectorization.
+#[inline(always)]
+fn avg_pixels_w<const W: usize>(
+    dst: &mut [u8],
+    dst_stride: usize,
+    a: &[u8],
+    a_stride: usize,
+    b: &[u8],
+    b_stride: usize,
+    block_h: usize,
+) {
+    for j in 0..block_h {
+        for i in 0..W {
+            let va = a[j * a_stride + i] as u16;
+            let vb = b[j * b_stride + i] as u16;
+            dst[j * dst_stride + i] = ((va + vb + 1) >> 1) as u8;
+        }
+    }
+}
+
 /// Average two pixel buffers: `dst[i] = (a[i] + b[i] + 1) >> 1`.
+#[inline]
 #[allow(clippy::too_many_arguments)] // Two source buffers plus destination each need data + stride
 fn avg_pixels(
     dst: &mut [u8],
@@ -247,11 +750,18 @@ fn avg_pixels(
     block_w: usize,
     block_h: usize,
 ) {
-    for j in 0..block_h {
-        for i in 0..block_w {
-            let va = a[j * a_stride + i] as u16;
-            let vb = b[j * b_stride + i] as u16;
-            dst[j * dst_stride + i] = ((va + vb + 1) >> 1) as u8;
+    match block_w {
+        4 => avg_pixels_w::<4>(dst, dst_stride, a, a_stride, b, b_stride, block_h),
+        8 => avg_pixels_w::<8>(dst, dst_stride, a, a_stride, b, b_stride, block_h),
+        16 => avg_pixels_w::<16>(dst, dst_stride, a, a_stride, b, b_stride, block_h),
+        _ => {
+            for j in 0..block_h {
+                for i in 0..block_w {
+                    let va = a[j * a_stride + i] as u16;
+                    let vb = b[j * b_stride + i] as u16;
+                    dst[j * dst_stride + i] = ((va + vb + 1) >> 1) as u8;
+                }
+            }
         }
     }
 }
@@ -296,40 +806,61 @@ fn qpel_h_avg(
     full_pel_col_offset: usize,
     scratch: &mut McScratch,
 ) {
-    let src_w = block_w + 5;
-    let src_h = block_h;
-    let needed = src_w * src_h;
-    scratch.ref_buf[..needed].fill(0);
-    extract_ref_block(
-        &mut scratch.ref_buf[..needed],
-        ref_y,
-        ref_stride,
-        ref_x - 2,
-        ref_y_pos,
-        src_w,
-        src_h,
-        pw,
-        ph,
-    );
-
     let pix = block_w * block_h;
-    scratch.half_a[..pix].fill(0);
-    h_lowpass(
-        &mut scratch.half_a[..pix],
-        block_w,
-        &scratch.ref_buf[..needed],
-        src_w,
-        block_w,
-        block_h,
-    );
 
-    scratch.half_b[..pix].fill(0);
-    for j in 0..block_h {
-        for i in 0..block_w {
-            scratch.half_b[j * block_w + i] =
-                scratch.ref_buf[j * src_w + i + full_pel_col_offset] as u8;
+    if is_interior(ref_x, ref_y_pos, block_w, block_h, pw, ph, 3) {
+        // Interior fast path — read directly from reference.
+        let src_offset = ref_y_pos as usize * ref_stride + (ref_x - 2) as usize;
+        h_lowpass_direct(
+            &mut scratch.half_a[..pix],
+            block_w,
+            ref_y,
+            ref_stride,
+            src_offset,
+            block_w,
+            block_h,
+        );
+        // Full-pel column at full_pel_col_offset within the extraction window.
+        // full_pel_col_offset is 2 for (1,0) or 3 for (3,0), relative to ref_x-2.
+        let fp_x = (ref_x - 2) as usize + full_pel_col_offset;
+        for j in 0..block_h {
+            let row_start = (ref_y_pos as usize + j) * ref_stride + fp_x;
+            for i in 0..block_w {
+                scratch.half_b[j * block_w + i] = ref_y[row_start + i];
+            }
+        }
+    } else {
+        // Edge fallback — extract + filter.
+        let src_w = block_w + 5;
+        let src_h = block_h;
+        let needed = src_w * src_h;
+        extract_ref_block(
+            &mut scratch.ref_buf[..needed],
+            ref_y,
+            ref_stride,
+            ref_x - 2,
+            ref_y_pos,
+            src_w,
+            src_h,
+            pw,
+            ph,
+        );
+        h_lowpass(
+            &mut scratch.half_a[..pix],
+            block_w,
+            &scratch.ref_buf[..needed],
+            src_w,
+            block_w,
+            block_h,
+        );
+        for j in 0..block_h {
+            for i in 0..block_w {
+                scratch.half_b[j * block_w + i] =
+                    scratch.ref_buf[j * src_w + i + full_pel_col_offset] as u8;
+            }
         }
     }
+
     avg_pixels(
         dst,
         dst_stride,
@@ -362,40 +893,61 @@ fn qpel_v_avg(
     full_pel_row_offset: usize,
     scratch: &mut McScratch,
 ) {
-    let src_w = block_w;
-    let src_h = block_h + 5;
-    let needed = src_w * src_h;
-    scratch.ref_buf[..needed].fill(0);
-    extract_ref_block(
-        &mut scratch.ref_buf[..needed],
-        ref_y,
-        ref_stride,
-        ref_x,
-        ref_y_pos - 2,
-        src_w,
-        src_h,
-        pw,
-        ph,
-    );
-
     let pix = block_w * block_h;
-    scratch.half_a[..pix].fill(0);
-    v_lowpass(
-        &mut scratch.half_a[..pix],
-        block_w,
-        &scratch.ref_buf[..needed],
-        src_w,
-        block_w,
-        block_h,
-    );
 
-    scratch.half_b[..pix].fill(0);
-    for j in 0..block_h {
-        for i in 0..block_w {
-            scratch.half_b[j * block_w + i] =
-                scratch.ref_buf[(j + full_pel_row_offset) * src_w + i] as u8;
+    if is_interior(ref_x, ref_y_pos, block_w, block_h, pw, ph, 3) {
+        // Interior fast path — read directly from reference.
+        let src_offset = (ref_y_pos - 2) as usize * ref_stride + ref_x as usize;
+        v_lowpass_direct(
+            &mut scratch.half_a[..pix],
+            block_w,
+            ref_y,
+            ref_stride,
+            src_offset,
+            block_w,
+            block_h,
+        );
+        // Full-pel row at full_pel_row_offset within the extraction window.
+        // full_pel_row_offset is 2 for (0,1) or 3 for (0,3), relative to ref_y-2.
+        let fp_y = (ref_y_pos - 2) as usize + full_pel_row_offset;
+        for j in 0..block_h {
+            let row_start = (fp_y + j) * ref_stride + ref_x as usize;
+            for i in 0..block_w {
+                scratch.half_b[j * block_w + i] = ref_y[row_start + i];
+            }
+        }
+    } else {
+        // Edge fallback — extract + filter.
+        let src_w = block_w;
+        let src_h = block_h + 5;
+        let needed = src_w * src_h;
+        extract_ref_block(
+            &mut scratch.ref_buf[..needed],
+            ref_y,
+            ref_stride,
+            ref_x,
+            ref_y_pos - 2,
+            src_w,
+            src_h,
+            pw,
+            ph,
+        );
+        v_lowpass(
+            &mut scratch.half_a[..pix],
+            block_w,
+            &scratch.ref_buf[..needed],
+            src_w,
+            block_w,
+            block_h,
+        );
+        for j in 0..block_h {
+            for i in 0..block_w {
+                scratch.half_b[j * block_w + i] =
+                    scratch.ref_buf[(j + full_pel_row_offset) * src_w + i] as u8;
+            }
         }
     }
+
     avg_pixels(
         dst,
         dst_stride,
@@ -433,57 +985,90 @@ fn qpel_diagonal(
 ) {
     let pix = block_w * block_h;
 
-    // First extract → ref_buf, h_lowpass → half_a
-    let src_h_w = block_w + 5;
-    let src_h_h = block_h;
-    let needed_h = src_h_w * src_h_h;
-    scratch.ref_buf[..needed_h].fill(0);
-    extract_ref_block(
-        &mut scratch.ref_buf[..needed_h],
-        ref_y,
-        ref_stride,
-        ref_x - 2,
-        ref_y_pos + h_row_delta,
-        src_h_w,
-        src_h_h,
-        pw,
-        ph,
-    );
-    scratch.half_a[..pix].fill(0);
-    h_lowpass(
-        &mut scratch.half_a[..pix],
-        block_w,
-        &scratch.ref_buf[..needed_h],
-        src_h_w,
-        block_w,
-        block_h,
-    );
+    // The h_lowpass needs tap_margin=2 horizontally at row ref_y_pos+h_row_delta.
+    // The v_lowpass needs tap_margin=2 vertically at col ref_x+v_col_delta.
+    // For interior check, we need both regions to be in-bounds.
+    // h_lowpass region: x in [ref_x-2 .. ref_x+block_w+2], y in [ref_y+h_row_delta .. ref_y+h_row_delta+block_h-1]
+    // v_lowpass region: x in [ref_x+v_col_delta .. ref_x+v_col_delta+block_w-1], y in [ref_y-2 .. ref_y+block_h+2]
+    // Combined: we need ref_x-2 >= 0, ref_x+block_w+2 <= pw (h margin),
+    //           ref_y-2 >= 0, ref_y+block_h+h_row_delta <= ph (covers both),
+    //           ref_x+v_col_delta+block_w <= pw, ref_y+block_h+2 <= ph
+    // Simplify: is_interior with margin=2 on the base position covers both if h_row_delta and v_col_delta are 0 or 1.
+    let interior = is_interior(ref_x, ref_y_pos, block_w, block_h, pw, ph, 3)
+        && ref_y_pos + h_row_delta + block_h as i32 <= ph
+        && ref_x + v_col_delta + block_w as i32 <= pw;
 
-    // Second extract → ref_buf2, v_lowpass → half_b
-    let src_v_w = block_w;
-    let src_v_h = block_h + 5;
-    let needed_v = src_v_w * src_v_h;
-    scratch.ref_buf2[..needed_v].fill(0);
-    extract_ref_block(
-        &mut scratch.ref_buf2[..needed_v],
-        ref_y,
-        ref_stride,
-        ref_x + v_col_delta,
-        ref_y_pos - 2,
-        src_v_w,
-        src_v_h,
-        pw,
-        ph,
-    );
-    scratch.half_b[..pix].fill(0);
-    v_lowpass(
-        &mut scratch.half_b[..pix],
-        block_w,
-        &scratch.ref_buf2[..needed_v],
-        src_v_w,
-        block_w,
-        block_h,
-    );
+    if interior {
+        // Interior fast path — h_lowpass and v_lowpass directly from reference.
+        let h_src_offset = (ref_y_pos + h_row_delta) as usize * ref_stride + (ref_x - 2) as usize;
+        h_lowpass_direct(
+            &mut scratch.half_a[..pix],
+            block_w,
+            ref_y,
+            ref_stride,
+            h_src_offset,
+            block_w,
+            block_h,
+        );
+
+        let v_src_offset = (ref_y_pos - 2) as usize * ref_stride + (ref_x + v_col_delta) as usize;
+        v_lowpass_direct(
+            &mut scratch.half_b[..pix],
+            block_w,
+            ref_y,
+            ref_stride,
+            v_src_offset,
+            block_w,
+            block_h,
+        );
+    } else {
+        // Edge fallback — extract + filter.
+        let src_h_w = block_w + 5;
+        let src_h_h = block_h;
+        let needed_h = src_h_w * src_h_h;
+        extract_ref_block(
+            &mut scratch.ref_buf[..needed_h],
+            ref_y,
+            ref_stride,
+            ref_x - 2,
+            ref_y_pos + h_row_delta,
+            src_h_w,
+            src_h_h,
+            pw,
+            ph,
+        );
+        h_lowpass(
+            &mut scratch.half_a[..pix],
+            block_w,
+            &scratch.ref_buf[..needed_h],
+            src_h_w,
+            block_w,
+            block_h,
+        );
+
+        let src_v_w = block_w;
+        let src_v_h = block_h + 5;
+        let needed_v = src_v_w * src_v_h;
+        extract_ref_block(
+            &mut scratch.ref_buf2[..needed_v],
+            ref_y,
+            ref_stride,
+            ref_x + v_col_delta,
+            ref_y_pos - 2,
+            src_v_w,
+            src_v_h,
+            pw,
+            ph,
+        );
+        v_lowpass(
+            &mut scratch.half_b[..pix],
+            block_w,
+            &scratch.ref_buf2[..needed_v],
+            src_v_w,
+            block_w,
+            block_h,
+        );
+    }
 
     avg_pixels(
         dst,
@@ -518,59 +1103,84 @@ fn qpel_mixed_h_hv(
 ) {
     let pix = block_w * block_h;
 
-    // h_lowpass extract → ref_buf, filter → half_a
-    let src_h_w = block_w + 5;
-    let src_h_h = block_h;
-    let needed_h = src_h_w * src_h_h;
-    scratch.ref_buf[..needed_h].fill(0);
-    extract_ref_block(
-        &mut scratch.ref_buf[..needed_h],
-        ref_y,
-        ref_stride,
-        ref_x - 2,
-        ref_y_pos + h_row_delta,
-        src_h_w,
-        src_h_h,
-        pw,
-        ph,
-    );
-    scratch.half_a[..pix].fill(0);
-    h_lowpass(
-        &mut scratch.half_a[..pix],
-        block_w,
-        &scratch.ref_buf[..needed_h],
-        src_h_w,
-        block_w,
-        block_h,
-    );
+    // Interior check: 6-tap filter needs margin=3. h_row_delta shifts the h_lowpass row by 0 or 1.
+    let interior = is_interior(ref_x, ref_y_pos, block_w, block_h, pw, ph, 3)
+        && ref_y_pos + h_row_delta + block_h as i32 <= ph;
 
-    // hv_lowpass extract → ref_buf2, hv_lowpass uses ref_buf as tmp → half_b
-    let src_hv_w = block_w + 5;
-    let src_hv_h = block_h + 5;
-    let needed_hv = src_hv_w * src_hv_h;
-    scratch.ref_buf2[..needed_hv].fill(0);
-    extract_ref_block(
-        &mut scratch.ref_buf2[..needed_hv],
-        ref_y,
-        ref_stride,
-        ref_x - 2,
-        ref_y_pos - 2,
-        src_hv_w,
-        src_hv_h,
-        pw,
-        ph,
-    );
-    scratch.half_b[..pix].fill(0);
-    // hv_lowpass reads from ref_buf2, uses ref_buf as tmp (ref_buf is free after h_lowpass consumed it)
-    hv_lowpass(
-        &mut scratch.half_b[..pix],
-        block_w,
-        &scratch.ref_buf2[..needed_hv],
-        src_hv_w,
-        block_w,
-        block_h,
-        &mut scratch.ref_buf,
-    );
+    if interior {
+        // Interior fast path — both filters read directly from reference.
+        let h_src_offset = (ref_y_pos + h_row_delta) as usize * ref_stride + (ref_x - 2) as usize;
+        h_lowpass_direct(
+            &mut scratch.half_a[..pix],
+            block_w,
+            ref_y,
+            ref_stride,
+            h_src_offset,
+            block_w,
+            block_h,
+        );
+
+        let hv_src_offset = (ref_y_pos - 2) as usize * ref_stride + (ref_x - 2) as usize;
+        hv_lowpass_direct(
+            &mut scratch.half_b[..pix],
+            block_w,
+            ref_y,
+            ref_stride,
+            hv_src_offset,
+            block_w,
+            block_h,
+            &mut scratch.ref_buf,
+        );
+    } else {
+        // Edge fallback — extract + filter.
+        let src_h_w = block_w + 5;
+        let src_h_h = block_h;
+        let needed_h = src_h_w * src_h_h;
+        extract_ref_block(
+            &mut scratch.ref_buf[..needed_h],
+            ref_y,
+            ref_stride,
+            ref_x - 2,
+            ref_y_pos + h_row_delta,
+            src_h_w,
+            src_h_h,
+            pw,
+            ph,
+        );
+        h_lowpass(
+            &mut scratch.half_a[..pix],
+            block_w,
+            &scratch.ref_buf[..needed_h],
+            src_h_w,
+            block_w,
+            block_h,
+        );
+
+        let src_hv_w = block_w + 5;
+        let src_hv_h = block_h + 5;
+        let needed_hv = src_hv_w * src_hv_h;
+        extract_ref_block(
+            &mut scratch.ref_buf2[..needed_hv],
+            ref_y,
+            ref_stride,
+            ref_x - 2,
+            ref_y_pos - 2,
+            src_hv_w,
+            src_hv_h,
+            pw,
+            ph,
+        );
+        // hv_lowpass reads from ref_buf2, uses ref_buf as tmp (ref_buf is free after h_lowpass consumed it)
+        hv_lowpass(
+            &mut scratch.half_b[..pix],
+            block_w,
+            &scratch.ref_buf2[..needed_hv],
+            src_hv_w,
+            block_w,
+            block_h,
+            &mut scratch.ref_buf,
+        );
+    }
 
     avg_pixels(
         dst,
@@ -605,59 +1215,84 @@ fn qpel_mixed_v_hv(
 ) {
     let pix = block_w * block_h;
 
-    // v_lowpass extract → ref_buf, filter → half_a
-    let src_v_w = block_w;
-    let src_v_h = block_h + 5;
-    let needed_v = src_v_w * src_v_h;
-    scratch.ref_buf[..needed_v].fill(0);
-    extract_ref_block(
-        &mut scratch.ref_buf[..needed_v],
-        ref_y,
-        ref_stride,
-        ref_x + v_col_delta,
-        ref_y_pos - 2,
-        src_v_w,
-        src_v_h,
-        pw,
-        ph,
-    );
-    scratch.half_a[..pix].fill(0);
-    v_lowpass(
-        &mut scratch.half_a[..pix],
-        block_w,
-        &scratch.ref_buf[..needed_v],
-        src_v_w,
-        block_w,
-        block_h,
-    );
+    // Interior check: 6-tap filter needs margin=3. v_col_delta shifts the v_lowpass column by 0 or 1.
+    let interior = is_interior(ref_x, ref_y_pos, block_w, block_h, pw, ph, 3)
+        && ref_x + v_col_delta + block_w as i32 <= pw;
 
-    // hv_lowpass extract → ref_buf2, hv_lowpass uses ref_buf as tmp → half_b
-    let src_hv_w = block_w + 5;
-    let src_hv_h = block_h + 5;
-    let needed_hv = src_hv_w * src_hv_h;
-    scratch.ref_buf2[..needed_hv].fill(0);
-    extract_ref_block(
-        &mut scratch.ref_buf2[..needed_hv],
-        ref_y,
-        ref_stride,
-        ref_x - 2,
-        ref_y_pos - 2,
-        src_hv_w,
-        src_hv_h,
-        pw,
-        ph,
-    );
-    scratch.half_b[..pix].fill(0);
-    // hv_lowpass reads from ref_buf2, uses ref_buf as tmp (ref_buf is free after v_lowpass consumed it)
-    hv_lowpass(
-        &mut scratch.half_b[..pix],
-        block_w,
-        &scratch.ref_buf2[..needed_hv],
-        src_hv_w,
-        block_w,
-        block_h,
-        &mut scratch.ref_buf,
-    );
+    if interior {
+        // Interior fast path — both filters read directly from reference.
+        let v_src_offset = (ref_y_pos - 2) as usize * ref_stride + (ref_x + v_col_delta) as usize;
+        v_lowpass_direct(
+            &mut scratch.half_a[..pix],
+            block_w,
+            ref_y,
+            ref_stride,
+            v_src_offset,
+            block_w,
+            block_h,
+        );
+
+        let hv_src_offset = (ref_y_pos - 2) as usize * ref_stride + (ref_x - 2) as usize;
+        hv_lowpass_direct(
+            &mut scratch.half_b[..pix],
+            block_w,
+            ref_y,
+            ref_stride,
+            hv_src_offset,
+            block_w,
+            block_h,
+            &mut scratch.ref_buf,
+        );
+    } else {
+        // Edge fallback — extract + filter.
+        let src_v_w = block_w;
+        let src_v_h = block_h + 5;
+        let needed_v = src_v_w * src_v_h;
+        extract_ref_block(
+            &mut scratch.ref_buf[..needed_v],
+            ref_y,
+            ref_stride,
+            ref_x + v_col_delta,
+            ref_y_pos - 2,
+            src_v_w,
+            src_v_h,
+            pw,
+            ph,
+        );
+        v_lowpass(
+            &mut scratch.half_a[..pix],
+            block_w,
+            &scratch.ref_buf[..needed_v],
+            src_v_w,
+            block_w,
+            block_h,
+        );
+
+        let src_hv_w = block_w + 5;
+        let src_hv_h = block_h + 5;
+        let needed_hv = src_hv_w * src_hv_h;
+        extract_ref_block(
+            &mut scratch.ref_buf2[..needed_hv],
+            ref_y,
+            ref_stride,
+            ref_x - 2,
+            ref_y_pos - 2,
+            src_hv_w,
+            src_hv_h,
+            pw,
+            ph,
+        );
+        // hv_lowpass reads from ref_buf2, uses ref_buf as tmp (ref_buf is free after v_lowpass consumed it)
+        hv_lowpass(
+            &mut scratch.half_b[..pix],
+            block_w,
+            &scratch.ref_buf2[..needed_hv],
+            src_hv_w,
+            block_w,
+            block_h,
+            &mut scratch.ref_buf,
+        );
+    }
 
     avg_pixels(
         dst,
@@ -749,24 +1384,45 @@ pub fn mc_luma(
         // (0,0): full-pel copy
         // ------------------------------------------------------------------
         (0, 0) => {
-            let src_w = block_w;
-            let src_h = block_h;
-            let needed = src_w * src_h;
-            scratch.ref_buf[..needed].fill(0);
-            extract_ref_block(
-                &mut scratch.ref_buf[..needed],
-                ref_y,
-                ref_stride,
-                ref_x,
-                ref_y_pos,
-                src_w,
-                src_h,
-                pw,
-                ph,
-            );
-            for j in 0..block_h {
-                for i in 0..block_w {
-                    dst[j * dst_stride + i] = scratch.ref_buf[j * src_w + i] as u8;
+            if is_interior(ref_x, ref_y_pos, block_w, block_h, pw, ph, 0) {
+                // Interior fast path — direct copy from reference, no intermediate buffer.
+                let src_offset = ref_y_pos as usize * ref_stride + ref_x as usize;
+                // Dispatch to fixed-width copy so the compiler can inline memcpy
+                // with a compile-time constant size (e.g. ldp/stp for 16 bytes on ARM64).
+                match block_w {
+                    16 => copy_block_direct::<16>(
+                        dst, dst_stride, ref_y, ref_stride, src_offset, block_h,
+                    ),
+                    8 => copy_block_direct::<8>(
+                        dst, dst_stride, ref_y, ref_stride, src_offset, block_h,
+                    ),
+                    4 => copy_block_direct::<4>(
+                        dst, dst_stride, ref_y, ref_stride, src_offset, block_h,
+                    ),
+                    _ => copy_block_direct_generic(
+                        dst, dst_stride, ref_y, ref_stride, src_offset, block_w, block_h,
+                    ),
+                }
+            } else {
+                // Edge fallback — extract + copy (existing code).
+                let src_w = block_w;
+                let src_h = block_h;
+                let needed = src_w * src_h;
+                extract_ref_block(
+                    &mut scratch.ref_buf[..needed],
+                    ref_y,
+                    ref_stride,
+                    ref_x,
+                    ref_y_pos,
+                    src_w,
+                    src_h,
+                    pw,
+                    ph,
+                );
+                for j in 0..block_h {
+                    for i in 0..block_w {
+                        dst[j * dst_stride + i] = scratch.ref_buf[j * src_w + i] as u8;
+                    }
                 }
             }
         }
@@ -775,88 +1431,121 @@ pub fn mc_luma(
         // (2,0): horizontal half-pel (the "b" position)
         // ------------------------------------------------------------------
         (2, 0) => {
-            let src_w = block_w + 5;
-            let src_h = block_h;
-            let needed = src_w * src_h;
-            scratch.ref_buf[..needed].fill(0);
-            extract_ref_block(
-                &mut scratch.ref_buf[..needed],
-                ref_y,
-                ref_stride,
-                ref_x - 2,
-                ref_y_pos,
-                src_w,
-                src_h,
-                pw,
-                ph,
-            );
-            h_lowpass(
-                dst,
-                dst_stride,
-                &scratch.ref_buf[..needed],
-                src_w,
-                block_w,
-                block_h,
-            );
+            if is_interior(ref_x, ref_y_pos, block_w, block_h, pw, ph, 3) {
+                // Interior fast path — filter directly from reference.
+                // The 6-tap filter needs 2 pixels before and 3 after, tap_margin=3 covers both.
+                let src_offset = ref_y_pos as usize * ref_stride + (ref_x - 2) as usize;
+                h_lowpass_direct(
+                    dst, dst_stride, ref_y, ref_stride, src_offset, block_w, block_h,
+                );
+            } else {
+                // Edge fallback — extract + filter.
+                let src_w = block_w + 5;
+                let src_h = block_h;
+                let needed = src_w * src_h;
+                extract_ref_block(
+                    &mut scratch.ref_buf[..needed],
+                    ref_y,
+                    ref_stride,
+                    ref_x - 2,
+                    ref_y_pos,
+                    src_w,
+                    src_h,
+                    pw,
+                    ph,
+                );
+                h_lowpass(
+                    dst,
+                    dst_stride,
+                    &scratch.ref_buf[..needed],
+                    src_w,
+                    block_w,
+                    block_h,
+                );
+            }
         }
 
         // ------------------------------------------------------------------
         // (0,2): vertical half-pel (the "h" position)
         // ------------------------------------------------------------------
         (0, 2) => {
-            let src_w = block_w;
-            let src_h = block_h + 5;
-            let needed = src_w * src_h;
-            scratch.ref_buf[..needed].fill(0);
-            extract_ref_block(
-                &mut scratch.ref_buf[..needed],
-                ref_y,
-                ref_stride,
-                ref_x,
-                ref_y_pos - 2,
-                src_w,
-                src_h,
-                pw,
-                ph,
-            );
-            v_lowpass(
-                dst,
-                dst_stride,
-                &scratch.ref_buf[..needed],
-                src_w,
-                block_w,
-                block_h,
-            );
+            if is_interior(ref_x, ref_y_pos, block_w, block_h, pw, ph, 3) {
+                // Interior fast path — filter directly from reference.
+                let src_offset = (ref_y_pos - 2) as usize * ref_stride + ref_x as usize;
+                v_lowpass_direct(
+                    dst, dst_stride, ref_y, ref_stride, src_offset, block_w, block_h,
+                );
+            } else {
+                // Edge fallback — extract + filter.
+                let src_w = block_w;
+                let src_h = block_h + 5;
+                let needed = src_w * src_h;
+                extract_ref_block(
+                    &mut scratch.ref_buf[..needed],
+                    ref_y,
+                    ref_stride,
+                    ref_x,
+                    ref_y_pos - 2,
+                    src_w,
+                    src_h,
+                    pw,
+                    ph,
+                );
+                v_lowpass(
+                    dst,
+                    dst_stride,
+                    &scratch.ref_buf[..needed],
+                    src_w,
+                    block_w,
+                    block_h,
+                );
+            }
         }
 
         // ------------------------------------------------------------------
         // (2,2): 2D half-pel (the "j" position)
         // ------------------------------------------------------------------
         (2, 2) => {
-            let src_w = block_w + 5;
-            let src_h = block_h + 5;
-            let needed = src_w * src_h;
-            scratch.ref_buf[..needed].fill(0);
-            extract_ref_block(
-                &mut scratch.ref_buf[..needed],
-                ref_y,
-                ref_stride,
-                ref_x - 2,
-                ref_y_pos - 2,
-                src_w,
-                src_h,
-                pw,
-                ph,
-            );
-            hv_lowpass(
-                dst,
-                dst_stride,
-                &scratch.ref_buf[..needed],
-                src_w,
-                block_w,
-                block_h,
-                &mut scratch.ref_buf2,
-            );
+            if is_interior(ref_x, ref_y_pos, block_w, block_h, pw, ph, 3) {
+                // Interior fast path — 2D filter directly from reference.
+                // The HV filter needs (block_w+5) x (block_h+5) pixels starting at (ref_x-2, ref_y-2).
+                let src_offset = (ref_y_pos - 2) as usize * ref_stride + (ref_x - 2) as usize;
+                hv_lowpass_direct(
+                    dst,
+                    dst_stride,
+                    ref_y,
+                    ref_stride,
+                    src_offset,
+                    block_w,
+                    block_h,
+                    &mut scratch.ref_buf2,
+                );
+            } else {
+                // Edge fallback — extract + filter.
+                let src_w = block_w + 5;
+                let src_h = block_h + 5;
+                let needed = src_w * src_h;
+                extract_ref_block(
+                    &mut scratch.ref_buf[..needed],
+                    ref_y,
+                    ref_stride,
+                    ref_x - 2,
+                    ref_y_pos - 2,
+                    src_w,
+                    src_h,
+                    pw,
+                    ph,
+                );
+                hv_lowpass(
+                    dst,
+                    dst_stride,
+                    &scratch.ref_buf[..needed],
+                    src_w,
+                    block_w,
+                    block_h,
+                    &mut scratch.ref_buf2,
+                );
+            }
         }
 
         // ------------------------------------------------------------------
@@ -963,6 +1652,24 @@ pub fn mc_luma(
 // B-frame weighted prediction helper
 // ---------------------------------------------------------------------------
 
+/// Fixed-width in-place averaging for auto-vectorization.
+#[inline(always)]
+fn mc_avg_w<const W: usize>(
+    dst: &mut [u8],
+    dst_stride: usize,
+    pred2: &[u8],
+    pred2_stride: usize,
+    block_h: usize,
+) {
+    for j in 0..block_h {
+        for i in 0..W {
+            let a = dst[j * dst_stride + i] as u16;
+            let b = pred2[j * pred2_stride + i] as u16;
+            dst[j * dst_stride + i] = ((a + b + 1) >> 1) as u8;
+        }
+    }
+}
+
 /// Average `dst` with a second prediction (for B-frame bi-prediction).
 ///
 /// After this call, `dst[i] = (dst[i] + pred2[i] + 1) >> 1`.
@@ -974,11 +1681,18 @@ pub fn mc_avg(
     block_w: usize,
     block_h: usize,
 ) {
-    for j in 0..block_h {
-        for i in 0..block_w {
-            let a = dst[j * dst_stride + i] as u16;
-            let b = pred2[j * pred2_stride + i] as u16;
-            dst[j * dst_stride + i] = ((a + b + 1) >> 1) as u8;
+    match block_w {
+        4 => mc_avg_w::<4>(dst, dst_stride, pred2, pred2_stride, block_h),
+        8 => mc_avg_w::<8>(dst, dst_stride, pred2, pred2_stride, block_h),
+        16 => mc_avg_w::<16>(dst, dst_stride, pred2, pred2_stride, block_h),
+        _ => {
+            for j in 0..block_h {
+                for i in 0..block_w {
+                    let a = dst[j * dst_stride + i] as u16;
+                    let b = pred2[j * pred2_stride + i] as u16;
+                    dst[j * dst_stride + i] = ((a + b + 1) >> 1) as u8;
+                }
+            }
         }
     }
 }
@@ -1115,6 +1829,115 @@ pub fn mc_chroma_avg(
     );
 }
 
+/// Fixed-width chroma bilinear MC (4-tap) for auto-vectorization.
+/// For interior blocks with d != 0 (full bilinear interpolation).
+#[inline(always)]
+#[allow(clippy::too_many_arguments)] // Bilinear filter needs 4 weights + src/dst/stride/size params
+fn chroma_mc_bilinear_w<const W: usize>(
+    dst: &mut [u8],
+    dst_stride: usize,
+    ref_uv: &[u8],
+    ref_stride: usize,
+    src_offset: usize,
+    block_h: usize,
+    a: i32,
+    b: i32,
+    c: i32,
+    d: i32,
+    avg: bool,
+) {
+    for j in 0..block_h {
+        for i in 0..W {
+            let off = src_offset + j * ref_stride + i;
+            // SAFETY: caller verified is_interior with tap_margin=1, so all accesses
+            // from off to off + ref_stride + 1 are in-bounds.
+            unsafe {
+                let s00 = *ref_uv.get_unchecked(off) as i32;
+                let s10 = *ref_uv.get_unchecked(off + 1) as i32;
+                let s01 = *ref_uv.get_unchecked(off + ref_stride) as i32;
+                let s11 = *ref_uv.get_unchecked(off + ref_stride + 1) as i32;
+                let val = ((a * s00 + b * s10 + c * s01 + d * s11 + 32) >> 6) as u8;
+                let idx = j * dst_stride + i;
+                if avg {
+                    *dst.get_unchecked_mut(idx) =
+                        ((*dst.get_unchecked(idx) as u16 + val as u16 + 1) >> 1) as u8;
+                } else {
+                    *dst.get_unchecked_mut(idx) = val;
+                }
+            }
+        }
+    }
+}
+
+/// Fixed-width chroma 2-tap MC for auto-vectorization.
+/// For interior blocks with b + c != 0 but d == 0.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)] // 2-tap filter needs weights + src/dst/stride/size params
+fn chroma_mc_2tap_w<const W: usize>(
+    dst: &mut [u8],
+    dst_stride: usize,
+    ref_uv: &[u8],
+    ref_stride: usize,
+    src_offset: usize,
+    block_h: usize,
+    a: i32,
+    e: i32,
+    step: usize,
+    avg: bool,
+) {
+    for j in 0..block_h {
+        for i in 0..W {
+            let off = src_offset + j * ref_stride + i;
+            // SAFETY: caller verified is_interior with tap_margin=1.
+            unsafe {
+                let s0 = *ref_uv.get_unchecked(off) as i32;
+                let s1 = *ref_uv.get_unchecked(off + step) as i32;
+                let val = ((a * s0 + e * s1 + 32) >> 6) as u8;
+                let idx = j * dst_stride + i;
+                if avg {
+                    *dst.get_unchecked_mut(idx) =
+                        ((*dst.get_unchecked(idx) as u16 + val as u16 + 1) >> 1) as u8;
+                } else {
+                    *dst.get_unchecked_mut(idx) = val;
+                }
+            }
+        }
+    }
+}
+
+/// Fixed-width chroma full-pel copy for auto-vectorization.
+/// For interior blocks with dx == 0 && dy == 0.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)] // Copy needs src/dst/stride/size + weight + avg flag
+fn chroma_mc_copy_w<const W: usize>(
+    dst: &mut [u8],
+    dst_stride: usize,
+    ref_uv: &[u8],
+    ref_stride: usize,
+    src_offset: usize,
+    block_h: usize,
+    a: i32,
+    avg: bool,
+) {
+    for j in 0..block_h {
+        for i in 0..W {
+            let off = src_offset + j * ref_stride + i;
+            // SAFETY: caller verified is_interior with tap_margin=1.
+            unsafe {
+                let s0 = *ref_uv.get_unchecked(off) as i32;
+                let val = ((a * s0 + 32) >> 6) as u8;
+                let idx = j * dst_stride + i;
+                if avg {
+                    *dst.get_unchecked_mut(idx) =
+                        ((*dst.get_unchecked(idx) as u16 + val as u16 + 1) >> 1) as u8;
+                } else {
+                    *dst.get_unchecked_mut(idx) = val;
+                }
+            }
+        }
+    }
+}
+
 /// Scalar chroma bilinear MC. When `avg` is true, averages with existing dst.
 #[allow(clippy::too_many_arguments)]
 fn chroma_mc_scalar(
@@ -1137,33 +1960,218 @@ fn chroma_mc_scalar(
     let c = (8 - dx as i32) * (dy as i32);
     let d = (dx as i32) * (dy as i32);
 
+    // Bilinear filter reads at most 1 pixel beyond the block in each direction.
+    if is_interior(ref_x, ref_y_pos, block_w, block_h, pw, ph, 1) {
+        // Interior fast path — no clamping needed for any pixel access.
+        let src_offset = ref_y_pos as usize * ref_stride + ref_x as usize;
+
+        // Dispatch to fixed-width specializations for auto-vectorization.
+        if d != 0 {
+            match block_w {
+                2 => chroma_mc_bilinear_w::<2>(
+                    dst, dst_stride, ref_uv, ref_stride, src_offset, block_h, a, b, c, d, avg,
+                ),
+                4 => chroma_mc_bilinear_w::<4>(
+                    dst, dst_stride, ref_uv, ref_stride, src_offset, block_h, a, b, c, d, avg,
+                ),
+                8 => chroma_mc_bilinear_w::<8>(
+                    dst, dst_stride, ref_uv, ref_stride, src_offset, block_h, a, b, c, d, avg,
+                ),
+                _ => chroma_mc_bilinear_generic(
+                    dst, dst_stride, ref_uv, ref_stride, src_offset, block_w, block_h, a, b, c, d,
+                    avg,
+                ),
+            }
+        } else if b + c != 0 {
+            let e = b + c;
+            let step = if c != 0 { ref_stride } else { 1 };
+            match block_w {
+                2 => chroma_mc_2tap_w::<2>(
+                    dst, dst_stride, ref_uv, ref_stride, src_offset, block_h, a, e, step, avg,
+                ),
+                4 => chroma_mc_2tap_w::<4>(
+                    dst, dst_stride, ref_uv, ref_stride, src_offset, block_h, a, e, step, avg,
+                ),
+                8 => chroma_mc_2tap_w::<8>(
+                    dst, dst_stride, ref_uv, ref_stride, src_offset, block_h, a, e, step, avg,
+                ),
+                _ => chroma_mc_2tap_generic(
+                    dst, dst_stride, ref_uv, ref_stride, src_offset, block_w, block_h, a, e, step,
+                    avg,
+                ),
+            }
+        } else if !avg {
+            // Pure full-pel copy: a==64, (64*s0+32)>>6 == s0. Use fixed-width memcpy.
+            match block_w {
+                8 => {
+                    copy_block_direct::<8>(dst, dst_stride, ref_uv, ref_stride, src_offset, block_h)
+                }
+                4 => {
+                    copy_block_direct::<4>(dst, dst_stride, ref_uv, ref_stride, src_offset, block_h)
+                }
+                2 => {
+                    copy_block_direct::<2>(dst, dst_stride, ref_uv, ref_stride, src_offset, block_h)
+                }
+                _ => copy_block_direct_generic(
+                    dst, dst_stride, ref_uv, ref_stride, src_offset, block_w, block_h,
+                ),
+            }
+        } else {
+            // Full-pel avg: copy + average with existing dst.
+            match block_w {
+                2 => chroma_mc_copy_w::<2>(
+                    dst, dst_stride, ref_uv, ref_stride, src_offset, block_h, a, avg,
+                ),
+                4 => chroma_mc_copy_w::<4>(
+                    dst, dst_stride, ref_uv, ref_stride, src_offset, block_h, a, avg,
+                ),
+                8 => chroma_mc_copy_w::<8>(
+                    dst, dst_stride, ref_uv, ref_stride, src_offset, block_h, a, avg,
+                ),
+                _ => chroma_mc_copy_generic(
+                    dst, dst_stride, ref_uv, ref_stride, src_offset, block_w, block_h, a, avg,
+                ),
+            }
+        }
+    } else {
+        // Edge fallback — use get_ref_pixel with clamping.
+        for j in 0..block_h {
+            for i in 0..block_w {
+                let sx = ref_x + i as i32;
+                let sy = ref_y_pos + j as i32;
+
+                let mc_val = if d != 0 {
+                    let s00 = get_ref_pixel(ref_uv, ref_stride, sx, sy, pw, ph) as i32;
+                    let s10 = get_ref_pixel(ref_uv, ref_stride, sx + 1, sy, pw, ph) as i32;
+                    let s01 = get_ref_pixel(ref_uv, ref_stride, sx, sy + 1, pw, ph) as i32;
+                    let s11 = get_ref_pixel(ref_uv, ref_stride, sx + 1, sy + 1, pw, ph) as i32;
+                    ((a * s00 + b * s10 + c * s01 + d * s11 + 32) >> 6) as u8
+                } else if b + c != 0 {
+                    let e = b + c;
+                    let (step_x, step_y): (i32, i32) = if c != 0 { (0, 1) } else { (1, 0) };
+                    let s0 = get_ref_pixel(ref_uv, ref_stride, sx, sy, pw, ph) as i32;
+                    let s1 =
+                        get_ref_pixel(ref_uv, ref_stride, sx + step_x, sy + step_y, pw, ph) as i32;
+                    ((a * s0 + e * s1 + 32) >> 6) as u8
+                } else {
+                    let s0 = get_ref_pixel(ref_uv, ref_stride, sx, sy, pw, ph) as i32;
+                    ((a * s0 + 32) >> 6) as u8
+                };
+
+                let idx = j * dst_stride + i;
+                if avg {
+                    dst[idx] = ((dst[idx] as u16 + mc_val as u16 + 1) >> 1) as u8;
+                } else {
+                    dst[idx] = mc_val;
+                }
+            }
+        }
+    }
+}
+
+/// Generic fallback for chroma bilinear (4-tap) with non-standard block width.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn chroma_mc_bilinear_generic(
+    dst: &mut [u8],
+    dst_stride: usize,
+    ref_uv: &[u8],
+    ref_stride: usize,
+    src_offset: usize,
+    block_w: usize,
+    block_h: usize,
+    a: i32,
+    b: i32,
+    c: i32,
+    d: i32,
+    avg: bool,
+) {
     for j in 0..block_h {
         for i in 0..block_w {
-            let sx = ref_x + i as i32;
-            let sy = ref_y_pos + j as i32;
+            let off = src_offset + j * ref_stride + i;
+            // SAFETY: caller verified is_interior with tap_margin=1.
+            unsafe {
+                let s00 = *ref_uv.get_unchecked(off) as i32;
+                let s10 = *ref_uv.get_unchecked(off + 1) as i32;
+                let s01 = *ref_uv.get_unchecked(off + ref_stride) as i32;
+                let s11 = *ref_uv.get_unchecked(off + ref_stride + 1) as i32;
+                let val = ((a * s00 + b * s10 + c * s01 + d * s11 + 32) >> 6) as u8;
+                let idx = j * dst_stride + i;
+                if avg {
+                    *dst.get_unchecked_mut(idx) =
+                        ((*dst.get_unchecked(idx) as u16 + val as u16 + 1) >> 1) as u8;
+                } else {
+                    *dst.get_unchecked_mut(idx) = val;
+                }
+            }
+        }
+    }
+}
 
-            let mc_val = if d != 0 {
-                let s00 = get_ref_pixel(ref_uv, ref_stride, sx, sy, pw, ph) as i32;
-                let s10 = get_ref_pixel(ref_uv, ref_stride, sx + 1, sy, pw, ph) as i32;
-                let s01 = get_ref_pixel(ref_uv, ref_stride, sx, sy + 1, pw, ph) as i32;
-                let s11 = get_ref_pixel(ref_uv, ref_stride, sx + 1, sy + 1, pw, ph) as i32;
-                ((a * s00 + b * s10 + c * s01 + d * s11 + 32) >> 6) as u8
-            } else if b + c != 0 {
-                let e = b + c;
-                let (step_x, step_y): (i32, i32) = if c != 0 { (0, 1) } else { (1, 0) };
-                let s0 = get_ref_pixel(ref_uv, ref_stride, sx, sy, pw, ph) as i32;
-                let s1 = get_ref_pixel(ref_uv, ref_stride, sx + step_x, sy + step_y, pw, ph) as i32;
-                ((a * s0 + e * s1 + 32) >> 6) as u8
-            } else {
-                let s0 = get_ref_pixel(ref_uv, ref_stride, sx, sy, pw, ph) as i32;
-                ((a * s0 + 32) >> 6) as u8
-            };
+/// Generic fallback for chroma 2-tap with non-standard block width.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn chroma_mc_2tap_generic(
+    dst: &mut [u8],
+    dst_stride: usize,
+    ref_uv: &[u8],
+    ref_stride: usize,
+    src_offset: usize,
+    block_w: usize,
+    block_h: usize,
+    a: i32,
+    e: i32,
+    step: usize,
+    avg: bool,
+) {
+    for j in 0..block_h {
+        for i in 0..block_w {
+            let off = src_offset + j * ref_stride + i;
+            // SAFETY: caller verified is_interior with tap_margin=1.
+            unsafe {
+                let s0 = *ref_uv.get_unchecked(off) as i32;
+                let s1 = *ref_uv.get_unchecked(off + step) as i32;
+                let val = ((a * s0 + e * s1 + 32) >> 6) as u8;
+                let idx = j * dst_stride + i;
+                if avg {
+                    *dst.get_unchecked_mut(idx) =
+                        ((*dst.get_unchecked(idx) as u16 + val as u16 + 1) >> 1) as u8;
+                } else {
+                    *dst.get_unchecked_mut(idx) = val;
+                }
+            }
+        }
+    }
+}
 
-            let idx = j * dst_stride + i;
-            if avg {
-                dst[idx] = ((dst[idx] as u16 + mc_val as u16 + 1) >> 1) as u8;
-            } else {
-                dst[idx] = mc_val;
+/// Generic fallback for chroma full-pel copy with non-standard block width.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn chroma_mc_copy_generic(
+    dst: &mut [u8],
+    dst_stride: usize,
+    ref_uv: &[u8],
+    ref_stride: usize,
+    src_offset: usize,
+    block_w: usize,
+    block_h: usize,
+    a: i32,
+    avg: bool,
+) {
+    for j in 0..block_h {
+        for i in 0..block_w {
+            let off = src_offset + j * ref_stride + i;
+            // SAFETY: caller verified is_interior with tap_margin=1.
+            unsafe {
+                let s0 = *ref_uv.get_unchecked(off) as i32;
+                let val = ((a * s0 + 32) >> 6) as u8;
+                let idx = j * dst_stride + i;
+                if avg {
+                    *dst.get_unchecked_mut(idx) =
+                        ((*dst.get_unchecked(idx) as u16 + val as u16 + 1) >> 1) as u8;
+                } else {
+                    *dst.get_unchecked_mut(idx) = val;
+                }
             }
         }
     }
@@ -1335,6 +2343,26 @@ pub fn mc_block(
 // Bi-directional averaging (in-place)
 // ---------------------------------------------------------------------------
 
+/// Fixed-width in-place pixel averaging for auto-vectorization.
+#[inline(always)]
+fn avg_pixels_inplace_w<const W: usize>(
+    dst: &mut [u8],
+    dst_stride: usize,
+    src: &[u8],
+    src_stride: usize,
+    h: usize,
+) {
+    for row in 0..h {
+        let d_off = row * dst_stride;
+        let s_off = row * src_stride;
+        for col in 0..W {
+            let a = dst[d_off + col] as u16;
+            let b = src[s_off + col] as u16;
+            dst[d_off + col] = ((a + b + 1) >> 1) as u8;
+        }
+    }
+}
+
 /// Average dst with src in-place: dst[i] = (dst[i] + src[i] + 1) >> 1.
 ///
 /// Used for unweighted bi-directional prediction (weighted_bipred_idc == 0).
@@ -1347,13 +2375,21 @@ pub fn avg_pixels_inplace(
     w: usize,
     h: usize,
 ) {
-    for row in 0..h {
-        let d_off = row * dst_stride;
-        let s_off = row * src_stride;
-        for col in 0..w {
-            let a = dst[d_off + col] as u16;
-            let b = src[s_off + col] as u16;
-            dst[d_off + col] = ((a + b + 1) >> 1) as u8;
+    match w {
+        2 => avg_pixels_inplace_w::<2>(dst, dst_stride, src, src_stride, h),
+        4 => avg_pixels_inplace_w::<4>(dst, dst_stride, src, src_stride, h),
+        8 => avg_pixels_inplace_w::<8>(dst, dst_stride, src, src_stride, h),
+        16 => avg_pixels_inplace_w::<16>(dst, dst_stride, src, src_stride, h),
+        _ => {
+            for row in 0..h {
+                let d_off = row * dst_stride;
+                let s_off = row * src_stride;
+                for col in 0..w {
+                    let a = dst[d_off + col] as u16;
+                    let b = src[s_off + col] as u16;
+                    dst[d_off + col] = ((a + b + 1) >> 1) as u8;
+                }
+            }
         }
     }
 }

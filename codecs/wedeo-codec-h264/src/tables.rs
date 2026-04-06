@@ -44,7 +44,7 @@ pub const FIELD_SCAN_8X8: [u8; 64] = [
 ///
 /// From FFmpeg `zigzag_scan8x8_cavlc` in h264_slice.c (non-transposed variant).
 /// Formula: `zigzag_scan8x8_cavlc[i] = zigzag_scan8x8[(i/4) + 16*(i%4)]`.
-pub const ZIGZAG_SCAN_8X8_CAVLC: [[usize; 16]; 4] = [
+pub const ZIGZAG_SCAN_8X8_CAVLC: [[u8; 16]; 4] = [
     // Sub-scan 0 (indices 0-15)
     [0, 9, 17, 18, 12, 40, 27, 7, 35, 57, 29, 30, 58, 38, 53, 47],
     // Sub-scan 1 (indices 16-31)
@@ -430,8 +430,8 @@ mod tests {
         for sub in &ZIGZAG_SCAN_8X8_CAVLC {
             for &pos in sub {
                 assert!(pos < 64, "position {pos} out of range");
-                assert!(!seen[pos], "position {pos} appears twice");
-                seen[pos] = true;
+                assert!(!seen[pos as usize], "position {pos} appears twice");
+                seen[pos as usize] = true;
             }
         }
         assert!(seen.iter().all(|&s| s), "not all positions covered");

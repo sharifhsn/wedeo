@@ -130,18 +130,18 @@ impl Dpb {
         poc: i32,
         frame_num: u32,
     ) -> Option<usize> {
-        let total_blocks =
-            (pic.mb_height() as usize) * (unsafe { pic.data() }.mb_width as usize) * 16;
+        // Use zero-capacity Vecs for MV/ref data — finalize_entry replaces them.
+        // This avoids allocating ~1.5MB that would be immediately overwritten.
         let entry = DpbEntry {
             pic,
             poc,
             frame_num,
             status: RefStatus::Unused,
             long_term_frame_idx: 0,
-            mv_info: vec![[0i16; 2]; total_blocks],
-            ref_info: vec![-1i8; total_blocks],
-            mv_info_l1: vec![[0i16; 2]; total_blocks],
-            ref_info_l1: vec![-1i8; total_blocks],
+            mv_info: Vec::new(),
+            ref_info: Vec::new(),
+            mv_info_l1: Vec::new(),
+            ref_info_l1: Vec::new(),
             mb_intra: Vec::new(),
             needs_output: false,
             ref_poc_l0: Vec::new(),

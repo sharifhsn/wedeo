@@ -56,16 +56,24 @@ pub fn idct4x4_add(dst: &mut [u8], stride: usize, coeffs: &mut [i16; 16]) {
     }
 
     // Second pass: column transform and add to destination
+    // SAFETY: assert bounds once so the compiler can elide per-pixel checks.
+    assert!(3 * stride + 3 < dst.len());
     for i in 0..4 {
         let z0 = coeffs[i] as i32 + coeffs[i + 8] as i32;
         let z1 = coeffs[i] as i32 - coeffs[i + 8] as i32;
         let z2 = (coeffs[i + 4] as i32 >> 1) - coeffs[i + 12] as i32;
         let z3 = coeffs[i + 4] as i32 + (coeffs[i + 12] as i32 >> 1);
 
-        dst[i] = (dst[i] as i32 + ((z0 + z3) >> 6)).clamp(0, 255) as u8;
-        dst[stride + i] = (dst[stride + i] as i32 + ((z1 + z2) >> 6)).clamp(0, 255) as u8;
-        dst[2 * stride + i] = (dst[2 * stride + i] as i32 + ((z1 - z2) >> 6)).clamp(0, 255) as u8;
-        dst[3 * stride + i] = (dst[3 * stride + i] as i32 + ((z0 - z3) >> 6)).clamp(0, 255) as u8;
+        // SAFETY: 3*stride+3 < dst.len() proven by the assert above; i<4, stride>=4.
+        unsafe {
+            let p = dst.as_mut_ptr();
+            *p.add(i) = (*p.add(i) as i32 + ((z0 + z3) >> 6)).clamp(0, 255) as u8;
+            *p.add(stride + i) = (*p.add(stride + i) as i32 + ((z1 + z2) >> 6)).clamp(0, 255) as u8;
+            *p.add(2 * stride + i) =
+                (*p.add(2 * stride + i) as i32 + ((z1 - z2) >> 6)).clamp(0, 255) as u8;
+            *p.add(3 * stride + i) =
+                (*p.add(3 * stride + i) as i32 + ((z0 - z3) >> 6)).clamp(0, 255) as u8;
+        }
     }
 
     // Zero the coefficient block (FFmpeg: memset(block, 0, 16 * sizeof(dctcoef)))
@@ -90,9 +98,15 @@ pub fn idct4x4_dc_add(dst: &mut [u8], stride: usize, dc: &mut i16) {
     let val = (*dc as i32 + 32) >> 6;
     *dc = 0;
 
+    // SAFETY: assert bounds once so the compiler can elide per-pixel checks.
+    assert!(3 * stride + 3 < dst.len());
     for j in 0..4 {
         for i in 0..4 {
-            dst[j * stride + i] = (dst[j * stride + i] as i32 + val).clamp(0, 255) as u8;
+            // SAFETY: 3*stride+3 < dst.len() proven by the assert above.
+            unsafe {
+                let p = dst.as_mut_ptr().add(j * stride + i);
+                *p = (*p as i32 + val).clamp(0, 255) as u8;
+            }
         }
     }
 }
@@ -176,6 +190,8 @@ pub fn idct8x8_add(dst: &mut [u8], stride: usize, coeffs: &mut [i16; 64]) {
     }
 
     // Second pass: column transform and add to destination
+    // SAFETY: assert bounds once so the compiler can elide per-pixel checks.
+    assert!(7 * stride + 7 < dst.len());
     for i in 0..8 {
         let a0 = coeffs[i] as i32 + coeffs[i + 32] as i32;
         let a2 = coeffs[i] as i32 - coeffs[i + 32] as i32;
@@ -207,14 +223,24 @@ pub fn idct8x8_add(dst: &mut [u8], stride: usize, coeffs: &mut [i16; 64]) {
         let b5 = (a3 >> 2) - a5;
         let b7 = a7 - (a1 >> 2);
 
-        dst[i] = (dst[i] as i32 + ((b0 + b7) >> 6)).clamp(0, 255) as u8;
-        dst[stride + i] = (dst[stride + i] as i32 + ((b2 + b5) >> 6)).clamp(0, 255) as u8;
-        dst[2 * stride + i] = (dst[2 * stride + i] as i32 + ((b4 + b3) >> 6)).clamp(0, 255) as u8;
-        dst[3 * stride + i] = (dst[3 * stride + i] as i32 + ((b6 + b1) >> 6)).clamp(0, 255) as u8;
-        dst[4 * stride + i] = (dst[4 * stride + i] as i32 + ((b6 - b1) >> 6)).clamp(0, 255) as u8;
-        dst[5 * stride + i] = (dst[5 * stride + i] as i32 + ((b4 - b3) >> 6)).clamp(0, 255) as u8;
-        dst[6 * stride + i] = (dst[6 * stride + i] as i32 + ((b2 - b5) >> 6)).clamp(0, 255) as u8;
-        dst[7 * stride + i] = (dst[7 * stride + i] as i32 + ((b0 - b7) >> 6)).clamp(0, 255) as u8;
+        // SAFETY: 7*stride+7 < dst.len() proven by the assert above; i<8.
+        unsafe {
+            let p = dst.as_mut_ptr();
+            *p.add(i) = (*p.add(i) as i32 + ((b0 + b7) >> 6)).clamp(0, 255) as u8;
+            *p.add(stride + i) = (*p.add(stride + i) as i32 + ((b2 + b5) >> 6)).clamp(0, 255) as u8;
+            *p.add(2 * stride + i) =
+                (*p.add(2 * stride + i) as i32 + ((b4 + b3) >> 6)).clamp(0, 255) as u8;
+            *p.add(3 * stride + i) =
+                (*p.add(3 * stride + i) as i32 + ((b6 + b1) >> 6)).clamp(0, 255) as u8;
+            *p.add(4 * stride + i) =
+                (*p.add(4 * stride + i) as i32 + ((b6 - b1) >> 6)).clamp(0, 255) as u8;
+            *p.add(5 * stride + i) =
+                (*p.add(5 * stride + i) as i32 + ((b4 - b3) >> 6)).clamp(0, 255) as u8;
+            *p.add(6 * stride + i) =
+                (*p.add(6 * stride + i) as i32 + ((b2 - b5) >> 6)).clamp(0, 255) as u8;
+            *p.add(7 * stride + i) =
+                (*p.add(7 * stride + i) as i32 + ((b0 - b7) >> 6)).clamp(0, 255) as u8;
+        }
     }
 
     *coeffs = [0i16; 64];
@@ -234,9 +260,15 @@ pub fn idct8x8_dc_add(dst: &mut [u8], stride: usize, dc: &mut i16) {
     let val = (*dc as i32 + 32) >> 6;
     *dc = 0;
 
+    // SAFETY: assert bounds once so the compiler can elide per-pixel checks.
+    assert!(7 * stride + 7 < dst.len());
     for j in 0..8 {
         for i in 0..8 {
-            dst[j * stride + i] = (dst[j * stride + i] as i32 + val).clamp(0, 255) as u8;
+            // SAFETY: 7*stride+7 < dst.len() proven by the assert above.
+            unsafe {
+                let p = dst.as_mut_ptr().add(j * stride + i);
+                *p = (*p as i32 + val).clamp(0, 255) as u8;
+            }
         }
     }
 }

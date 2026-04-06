@@ -550,6 +550,7 @@ fn filter_strong_chroma(
 /// `bs`: boundary strength for each of the 4 pixel pairs along the edge.
 /// `mb_base_offset`: pre-computed byte offset of the MB's top-left pixel in the Y plane.
 /// `stride`: row stride (doubled for field-mode MBs in MBAFF).
+#[inline]
 #[allow(clippy::too_many_arguments)] // edge filtering requires position, bS, QP, and offsets
 fn filter_mb_edge_luma(
     is_vertical: bool,
@@ -594,6 +595,26 @@ fn filter_mb_edge_luma(
         return;
     }
 
+    // Step size across the edge boundary (hoisted out of inner loop).
+    let step = if is_vertical { 1 } else { stride };
+
+    // Assert bounds for all pixel accesses in the loop.
+    // Max along-edge offset: for vertical, (3*4+3)*stride; for horizontal, 3*4+3.
+    // Max cross-edge read: off + 3*step (q3 for bS=4).
+    // Min cross-edge read: off - 4*step (p3 for bS=4).
+    {
+        let max_along = if is_vertical {
+            (3u32 * 4 + 3) as usize * stride
+        } else {
+            3 * 4 + 3
+        };
+        let max_off = base + max_along;
+        assert!(
+            max_off + 3 * step < plane.len() && base >= 4 * step,
+            "deblock luma edge out of bounds"
+        );
+    }
+
     for i in 0..4u8 {
         let cur_bs = bs[i as usize];
         if cur_bs == 0 {
@@ -608,15 +629,18 @@ fn filter_mb_edge_luma(
                 base + i as usize * 4 + d
             };
 
-            // Step size across the edge boundary.
-            let step = if is_vertical { 1 } else { stride };
-
-            let p0 = plane[off - step] as i32;
-            let p1 = plane[off - 2 * step] as i32;
-            let p2 = plane[off - 3 * step] as i32;
-            let q0 = plane[off] as i32;
-            let q1 = plane[off + step] as i32;
-            let q2 = plane[off + 2 * step] as i32;
+            // SAFETY: bounds proven by the assert above — off is within
+            // [base, base+max_along] and cross-edge +-4*step is in bounds.
+            let (p0, p1, p2, q0, q1, q2);
+            unsafe {
+                let pp = plane.as_ptr();
+                p0 = *pp.add(off - step) as i32;
+                p1 = *pp.add(off - 2 * step) as i32;
+                p2 = *pp.add(off - 3 * step) as i32;
+                q0 = *pp.add(off) as i32;
+                q1 = *pp.add(off + step) as i32;
+                q2 = *pp.add(off + 2 * step) as i32;
+            }
 
             trace!(
                 mb_x,
@@ -647,14 +671,23 @@ fn filter_mb_edge_luma(
                         mb_x,
                         mb_y, is_vertical, edge, i, d, new_p0, new_q0, tc0, "DEBLOCK_PIXEL_OUT"
                     );
-                    plane[off - step] = new_p0;
-                    plane[off - 2 * step] = new_p1;
-                    plane[off] = new_q0;
-                    plane[off + step] = new_q1;
+                    // SAFETY: same bounds proof as reads above.
+                    unsafe {
+                        let pp = plane.as_mut_ptr();
+                        *pp.add(off - step) = new_p0;
+                        *pp.add(off - 2 * step) = new_p1;
+                        *pp.add(off) = new_q0;
+                        *pp.add(off + step) = new_q1;
+                    }
                 }
             } else {
-                let p3 = plane[off - 4 * step] as i32;
-                let q3 = plane[off + 3 * step] as i32;
+                // SAFETY: bounds proven by the assert above (off - 4*step, off + 3*step).
+                let (p3, q3);
+                unsafe {
+                    let pp = plane.as_ptr();
+                    p3 = *pp.add(off - 4 * step) as i32;
+                    q3 = *pp.add(off + 3 * step) as i32;
+                }
                 if let Some((new_p0, new_p1, new_p2, new_q0, new_q1, new_q2)) =
                     filter_strong_luma(p0, p1, p2, p3, q0, q1, q2, q3, alpha, beta)
                 {
@@ -662,12 +695,16 @@ fn filter_mb_edge_luma(
                         mb_x,
                         mb_y, is_vertical, edge, i, d, new_p0, new_q0, "DEBLOCK_PIXEL_OUT"
                     );
-                    plane[off - step] = new_p0;
-                    plane[off - 2 * step] = new_p1;
-                    plane[off - 3 * step] = new_p2;
-                    plane[off] = new_q0;
-                    plane[off + step] = new_q1;
-                    plane[off + 2 * step] = new_q2;
+                    // SAFETY: same bounds proof as reads above.
+                    unsafe {
+                        let pp = plane.as_mut_ptr();
+                        *pp.add(off - step) = new_p0;
+                        *pp.add(off - 2 * step) = new_p1;
+                        *pp.add(off - 3 * step) = new_p2;
+                        *pp.add(off) = new_q0;
+                        *pp.add(off + step) = new_q1;
+                        *pp.add(off + 2 * step) = new_q2;
+                    }
                 }
             }
         }
@@ -794,6 +831,7 @@ fn deblock_nnz(info: &MbDeblockInfo, block_idx: usize) -> u8 {
 ///
 /// `is_vertical`: true = vertical edges (left neighbor), false = horizontal edges (above neighbor).
 /// Returns `bs[edge][pair]` — 4 edges, each with 4 pairs of bS values.
+#[inline]
 fn compute_luma_bs(
     is_vertical: bool,
     mb_info: &[MbDeblockInfo],
@@ -963,6 +1001,7 @@ fn compute_luma_bs(
 /// Each chroma edge has 4 bS values (one per 2-pixel pair along the 8-pixel edge),
 /// mapped 1:1 from the corresponding luma edge's bS values.
 /// Chroma edge 0 corresponds to luma edge 0; chroma edge 1 to luma edge 2.
+#[inline]
 fn derive_chroma_bs(luma_bs: &[[u8; 4]; 4]) -> [[u8; 4]; 2] {
     [luma_bs[0], luma_bs[2]]
 }

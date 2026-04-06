@@ -184,6 +184,11 @@ fn inline_deblock_row(
     mb_width: u32,
     deblock_enabled: bool,
 ) {
+    // Multi-slice parallel decode: skip inline deblock entirely.
+    // A serial deblock pass runs after all slices complete.
+    if fdc.postpone_deblock {
+        return;
+    }
     if deblock_enabled {
         if completed_row > 0 {
             deblock::deblock_row(
@@ -213,6 +218,9 @@ fn inline_deblock_pair_row(
     mb_width: u32,
     deblock_enabled: bool,
 ) {
+    if fdc.postpone_deblock {
+        return;
+    }
     if deblock_enabled {
         if pair_row > 0 {
             deblock::deblock_row_mbaff(
@@ -996,6 +1004,7 @@ impl H264Decoder {
                         col_ref_poc_l1: std::mem::take(&mut fdc.col_ref_poc_l1),
                         implicit_weight: std::mem::take(&mut fdc.implicit_weight),
                         cur_poc: fdc.cur_poc,
+                        next_slice_first_mb: 0, // computed in finish_current_frame
                     });
 
                     self.current_last_hdr = Some(hdr.clone());
@@ -1024,12 +1033,24 @@ impl H264Decoder {
     fn finish_current_frame(&mut self) {
         if let (Some(fdc), Some(last_hdr)) = (self.current_fdc.take(), self.current_last_hdr.take())
         {
-            let slices = std::mem::take(&mut self.pending_slices);
+            let mut slices = std::mem::take(&mut self.pending_slices);
             if slices.is_empty() {
                 // No slices buffered — put FDC back
                 self.current_fdc = Some(fdc);
                 self.current_last_hdr = Some(last_hdr);
                 return;
+            }
+
+            // Compute slice boundaries for parallel decode.
+            // Sort by first_mb_in_slice (should already be ordered, but enforce).
+            slices.sort_by_key(|s| s.hdr.first_mb_in_slice);
+            let total_mbs = fdc.mb_width * fdc.mb_height;
+            for i in 0..slices.len() {
+                slices[i].next_slice_first_mb = if i + 1 < slices.len() {
+                    slices[i + 1].hdr.first_mb_in_slice
+                } else {
+                    total_mbs
+                };
             }
 
             let deblock_enabled = std::env::var("WEDEO_NO_DEBLOCK").is_err();

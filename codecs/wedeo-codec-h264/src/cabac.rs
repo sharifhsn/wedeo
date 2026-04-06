@@ -89,9 +89,9 @@ impl<'a> CabacReader<'a> {
     /// Reference: FFmpeg `refill2` (non-CLZ path, CABAC_BITS=16).
     #[inline(always)]
     fn refill2(&mut self) {
-        // Compute number of consumed bits since last refill
-        let x = (self.low ^ (self.low.wrapping_sub(1))) as u32;
-        let i = 7 - NORM_SHIFT[(x >> (CABAC_BITS - 1)) as usize] as i32;
+        // Compute number of consumed bits since last refill.
+        // Use hardware CTZ instead of a table lookup (FFmpeg's HAVE_FAST_CLZ path).
+        let i = (self.low as u32).trailing_zeros() as i32 - CABAC_BITS as i32;
 
         let b0 = self.byte_at(self.pos) as i32;
         let b1 = self.byte_at(self.pos + 1) as i32;
@@ -102,13 +102,17 @@ impl<'a> CabacReader<'a> {
     }
 
     /// Read a byte from the data buffer, returning 0 if past the end.
+    ///
+    /// SAFETY: The RBSP data is padded with AV_INPUT_BUFFER_PADDING_SIZE (64)
+    /// zero bytes after the end. All CABAC reads stay well within this padding
+    /// because refill reads at most 2 bytes per ~16 decoded bins. We use
+    /// unchecked access to eliminate bounds checks on the hot path.
     #[inline(always)]
     fn byte_at(&self, pos: usize) -> u8 {
-        if pos < self.data.len() {
-            self.data[pos]
-        } else {
-            0
-        }
+        // SAFETY: RBSP is padded with 64 zero bytes after the data. The CABAC
+        // engine refills at most 2 bytes per renormalization cycle, and the
+        // padding guarantees at least 64 bytes are readable beyond data.len().
+        unsafe { *self.data.get_unchecked(pos) }
     }
 
     /// Decode one context-adaptive binary symbol.
@@ -119,10 +123,6 @@ impl<'a> CabacReader<'a> {
     /// Reference: FFmpeg `get_cabac_inline`.
     #[inline]
     pub fn get_cabac(&mut self, state: &mut u8) -> u8 {
-        let pre_state = *state;
-        let pre_low = self.low;
-        let pre_range = self.range;
-
         let s = *state as i32;
         let range_lps = LPS_RANGE[(2 * (self.range & 0xC0) + s) as usize] as i32;
 
@@ -143,30 +143,6 @@ impl<'a> CabacReader<'a> {
             self.refill2();
         }
 
-        {
-            use std::sync::atomic::{AtomicI32, Ordering};
-            static BIN_COUNT: AtomicI32 = AtomicI32::new(0);
-            static MAX_BINS: AtomicI32 = AtomicI32::new(-1);
-            let max = MAX_BINS.load(Ordering::Relaxed);
-            let max = if max < 0 {
-                let v = std::env::var("CABAC_MAX_BINS")
-                    .ok()
-                    .and_then(|s| s.parse::<i32>().ok())
-                    .unwrap_or(10000);
-                MAX_BINS.store(v, Ordering::Relaxed);
-                v
-            } else {
-                max
-            };
-            let n = BIN_COUNT.fetch_add(1, Ordering::Relaxed);
-            if n < max {
-                trace!(
-                    "CABAC_BIN {} state={} low={} range={} -> bit={} post_low={} post_range={}",
-                    n, pre_state, pre_low, pre_range, bit, self.low, self.range
-                );
-            }
-        }
-
         bit as u8
     }
 
@@ -178,9 +154,6 @@ impl<'a> CabacReader<'a> {
     /// Reference: FFmpeg `get_cabac_bypass`.
     #[inline]
     pub fn get_cabac_bypass(&mut self) -> u8 {
-        let pre_low = self.low;
-        let pre_range = self.range;
-
         self.low += self.low;
 
         if self.low & CABAC_MASK == 0 {
@@ -188,38 +161,12 @@ impl<'a> CabacReader<'a> {
         }
 
         let range = self.range << (CABAC_BITS + 1);
-        let bit = if self.low < range {
+        if self.low < range {
             0
         } else {
             self.low -= range;
             1
-        };
-
-        {
-            use std::sync::atomic::{AtomicI32, Ordering};
-            static BYPASS_COUNT: AtomicI32 = AtomicI32::new(0);
-            static MAX_BINS_BP: AtomicI32 = AtomicI32::new(-1);
-            let max = MAX_BINS_BP.load(Ordering::Relaxed);
-            let max = if max < 0 {
-                let v = std::env::var("CABAC_MAX_BINS")
-                    .ok()
-                    .and_then(|s| s.parse::<i32>().ok())
-                    .unwrap_or(10000);
-                MAX_BINS_BP.store(v, Ordering::Relaxed);
-                v
-            } else {
-                max
-            };
-            let n = BYPASS_COUNT.fetch_add(1, Ordering::Relaxed);
-            if n < max {
-                trace!(
-                    "CABAC_BYPASS {} low={} range={} -> bit={} post_low={}",
-                    n, pre_low, pre_range, bit, self.low
-                );
-            }
         }
-
-        bit
     }
 
     /// Decode a bypass symbol and apply it as a sign to `val`.
@@ -231,9 +178,6 @@ impl<'a> CabacReader<'a> {
     /// Reference: FFmpeg `get_cabac_bypass_sign`.
     #[inline]
     pub fn get_cabac_bypass_sign(&mut self, val: i32) -> i32 {
-        let pre_low = self.low;
-        let pre_range = self.range;
-
         self.low += self.low;
 
         if self.low & CABAC_MASK == 0 {
@@ -244,35 +188,7 @@ impl<'a> CabacReader<'a> {
         self.low -= range;
         let mask = self.low >> 31;
         self.low += range & mask;
-        let result = (val ^ mask) - mask;
-
-        {
-            use std::sync::atomic::{AtomicI32, Ordering};
-            static BYPASS_SIGN_COUNT: AtomicI32 = AtomicI32::new(0);
-            static MAX_BINS_BPS: AtomicI32 = AtomicI32::new(-1);
-            let max = MAX_BINS_BPS.load(Ordering::Relaxed);
-            let max = if max < 0 {
-                let v = std::env::var("CABAC_MAX_BINS")
-                    .ok()
-                    .and_then(|s| s.parse::<i32>().ok())
-                    .unwrap_or(10000);
-                MAX_BINS_BPS.store(v, Ordering::Relaxed);
-                v
-            } else {
-                max
-            };
-            let n = BYPASS_SIGN_COUNT.fetch_add(1, Ordering::Relaxed);
-            if n < max {
-                // bit=1 means negative (LPS), bit=0 means positive (MPS)
-                let bit = if mask == 0 { 0 } else { 1 };
-                trace!(
-                    "CABAC_BYPASS_SIGN {} low={} range={} val={} -> bit={} result={} post_low={}",
-                    n, pre_low, pre_range, val, bit, result, self.low
-                );
-            }
-        }
-
-        result
+        (val ^ mask) - mask
     }
 
     /// Check for end-of-slice (terminate symbol).
@@ -283,11 +199,8 @@ impl<'a> CabacReader<'a> {
     /// Reference: FFmpeg `get_cabac_terminate`.
     #[inline]
     pub fn get_cabac_terminate(&mut self) -> bool {
-        let pre_low = self.low;
-        let pre_range = self.range;
-
         self.range -= 2;
-        let result = if self.low < (self.range << (CABAC_BITS + 1)) {
+        if self.low < (self.range << (CABAC_BITS + 1)) {
             // Not terminated: renormalize once
             let shift = ((self.range as u32).wrapping_sub(0x100) >> 31) as i32;
             self.range <<= shift;
@@ -298,19 +211,7 @@ impl<'a> CabacReader<'a> {
             false
         } else {
             true
-        };
-
-        {
-            use std::sync::atomic::{AtomicI32, Ordering};
-            static TERM_COUNT: AtomicI32 = AtomicI32::new(0);
-            let n = TERM_COUNT.fetch_add(1, Ordering::Relaxed);
-            trace!(
-                "CABAC_TERM {} low={} range={} -> result={} post_low={} post_range={}",
-                n, pre_low, pre_range, result as i32, self.low, self.range
-            );
         }
-
-        result
     }
 
     /// Skip `n` bytes and re-initialize the CABAC engine.
@@ -1184,6 +1085,7 @@ fn decode_cabac_b_mb_sub_type(reader: &mut CabacReader, state: &mut [u8; 1024]) 
 ///
 /// Reference: FFmpeg h264_cabac.c:1477-1503.
 #[allow(clippy::too_many_arguments)]
+#[inline]
 fn decode_cabac_mb_ref(
     reader: &mut CabacReader,
     state: &mut [u8; 1024],
@@ -1254,6 +1156,7 @@ fn is_cache_pos_direct(
 /// Decode one component of a motion vector difference using CABAC.
 ///
 /// Reference: FFmpeg h264_cabac.c:1506-1541.
+#[inline]
 fn decode_cabac_mb_mvd_component(
     reader: &mut CabacReader,
     state: &mut [u8; 1024],
@@ -1389,6 +1292,7 @@ const CBF_CTX_BASE: [u16; 14] = [
 ///
 /// Reference: FFmpeg h264_cabac.c:1558-1588 (get_cabac_cbf_ctx).
 #[allow(clippy::too_many_arguments)]
+#[inline]
 fn get_cabac_cbf_ctx(
     cabac_nb: &CabacNeighborCtx,
     left_idx: Option<usize>,
@@ -1633,6 +1537,7 @@ fn get_nz_neighbors(
 /// for AC blocks (where DC is separate) this is `&ZIGZAG_SCAN_4X4[1..]`
 /// (offset by 1 so that scan position 0 maps to raster position 1 in the
 /// zigzag order, skipping the DC position).
+#[inline]
 fn decode_cabac_residual(
     reader: &mut CabacReader,
     state: &mut [u8; 1024],

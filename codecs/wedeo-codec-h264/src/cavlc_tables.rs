@@ -81,21 +81,9 @@ const COEFF_TOKEN_BITS_3: [u8; 4 * 17] = [
     47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
 ];
 
-/// All four coeff_token length tables, indexed by context 0..3.
-const COEFF_TOKEN_LEN: [&[u8; 68]; 4] = [
-    &COEFF_TOKEN_LEN_0,
-    &COEFF_TOKEN_LEN_1,
-    &COEFF_TOKEN_LEN_2,
-    &COEFF_TOKEN_LEN_3,
-];
-
-/// All four coeff_token bit tables, indexed by context 0..3.
-const COEFF_TOKEN_BITS: [&[u8; 68]; 4] = [
-    &COEFF_TOKEN_BITS_0,
-    &COEFF_TOKEN_BITS_1,
-    &COEFF_TOKEN_BITS_2,
-    &COEFF_TOKEN_BITS_3,
-];
+// Note: COEFF_TOKEN_LEN/BITS arrays were replaced by O(1) lookup tables below.
+// The individual per-context arrays (COEFF_TOKEN_LEN_0, etc.) are still used
+// by build_vlc_table and as fallback for rare long codewords.
 
 /// Maps nC value (0..16) to coeff_token table index (0..3).
 /// From FFmpeg's `coeff_token_table_index`.
@@ -202,16 +190,13 @@ const RUN_BEFORE_BITS: [[u8; 16]; 7] = [
 const RUN_BEFORE_COUNT: [u8; 7] = [2, 3, 4, 5, 6, 7, 15];
 
 // ---------------------------------------------------------------------------
-// Generic VLC decoder
+// Generic VLC decoder (fallback for non-coeff_token tables)
 // ---------------------------------------------------------------------------
 
 /// Decode a VLC symbol given (len, bits) table arrays.
 ///
 /// Peeks up to `max_bits` from the bitstream, then scans the table to find
 /// the matching codeword. Returns the table index of the match.
-///
-/// This is a straightforward O(n) scan. For the small tables used in CAVLC
-/// this is fast enough; a precomputed lookup table can replace this later.
 fn decode_vlc(
     br: &mut BitReadBE<'_>,
     lens: &[u8],
@@ -227,7 +212,6 @@ fn decode_vlc(
             continue;
         }
         let code = bits[i] as u32;
-        // Extract the top `len` bits from the peeked value.
         let shift = max_bits - len as u32;
         if (peeked >> shift) == code {
             br.skip_bits(len as usize);
@@ -239,6 +223,198 @@ fn decode_vlc(
 }
 
 // ---------------------------------------------------------------------------
+// O(1) coeff_token lookup tables
+// ---------------------------------------------------------------------------
+//
+// Each entry encodes (total_coeff, trailing_ones, bit_length) in a u16:
+//   bits [15:8] = total_coeff
+//   bits [7:4]  = trailing_ones
+//   bits [3:0]  = bit_length (0 = invalid)
+//
+// Indexed by peeking max_bits and looking up the full peeked value.
+// For contexts 0 and 1 (max_bits=16 and 14), we use a 2-level table:
+//   Level 1: peek 9 bits (512 entries). If bit_length > 0, done.
+//   Level 2: peek full max_bits, look up in a separate table.
+// For contexts 2 and 3 (max_bits=10 and 6), single-level tables suffice.
+
+/// Packed coeff_token lookup entry.
+/// 0 = invalid (need level 2 or error).
+type VlcEntry = u16;
+
+#[inline(always)]
+const fn vlc_pack(total_coeff: u8, trailing_ones: u8, len: u8) -> VlcEntry {
+    ((total_coeff as u16) << 8) | ((trailing_ones as u16) << 4) | (len as u16)
+}
+
+#[inline(always)]
+fn vlc_unpack(e: VlcEntry) -> (u8, u8, u8) {
+    ((e >> 8) as u8, ((e >> 4) & 0xF) as u8, (e & 0xF) as u8)
+}
+
+/// Build a single-level lookup table at compile time.
+/// `peek_bits` = number of bits to peek (table size = 1 << peek_bits).
+const fn build_vlc_table(
+    lens: &[u8; 68],
+    bits: &[u8; 68],
+    count: usize,
+    peek_bits: u32,
+) -> [VlcEntry; 1024] {
+    // Max table size we handle is 1024 (10-bit peek).
+    let table_size = 1u32 << peek_bits;
+    let mut table = [0u16; 1024];
+    let mut i = 0;
+    while i < count {
+        let len = lens[i];
+        if len == 0 || len as u32 > peek_bits {
+            i += 1;
+            continue;
+        }
+        let code = bits[i] as u32;
+        let total_coeff = (i / 4) as u8;
+        let trailing_ones = (i % 4) as u8;
+        let entry = vlc_pack(total_coeff, trailing_ones, len);
+        // Fill all entries where the top `len` bits match `code`.
+        let pad_bits = peek_bits - len as u32;
+        let base = code << pad_bits;
+        let count_fill = 1u32 << pad_bits;
+        let mut j = 0u32;
+        while j < count_fill {
+            let idx = base + j;
+            if (idx as usize) < table_size as usize {
+                table[idx as usize] = entry;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    table
+}
+
+/// Build a small lookup table for chroma DC coeff_token (max 8 bits, 256 entries).
+const fn build_chroma_dc_vlc_table() -> [VlcEntry; 256] {
+    let peek_bits = 8u32;
+    let mut table = [0u16; 256];
+    let lens = &CHROMA_DC_COEFF_TOKEN_LEN;
+    let bits = &CHROMA_DC_COEFF_TOKEN_BITS;
+    let count = 4 * 5;
+    let mut i = 0;
+    while i < count {
+        let len = lens[i];
+        if len == 0 || len as u32 > peek_bits {
+            i += 1;
+            continue;
+        }
+        let code = bits[i] as u32;
+        let total_coeff = (i / 4) as u8;
+        let trailing_ones = (i % 4) as u8;
+        let entry = vlc_pack(total_coeff, trailing_ones, len);
+        let pad_bits = peek_bits - len as u32;
+        let base = code << pad_bits;
+        let count_fill = 1u32 << pad_bits;
+        let mut j = 0u32;
+        while j < count_fill {
+            let idx = base + j;
+            if (idx as usize) < 256 {
+                table[idx as usize] = entry;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    table
+}
+
+// Pre-built lookup tables for each coeff_token context.
+// Context 0 (nC 0-1): max 16 bits. Use 2-level: level1 = 9-bit peek, level2 = 16-bit peek.
+// Context 1 (nC 2-3): max 14 bits. Use 2-level: level1 = 9-bit peek, level2 = 14-bit peek.
+// Context 2 (nC 4-7): max 10 bits. Single-level 10-bit peek (1024 entries).
+// Context 3 (nC >=8): max 6 bits. Single-level 6-bit peek (64 entries, fits in 1024).
+
+// For contexts 0 and 1, the level-1 table (9-bit peek) catches all codes <= 9 bits.
+// Codes > 9 bits fall through to a full-width level-2 table. This keeps level-1 small (512 entries)
+// while the level-2 table is only consulted for rare long codewords.
+
+/// Level-1 table for context 0: 9-bit peek (512 entries).
+const fn build_vlc_table_level1_ctx0() -> [VlcEntry; 512] {
+    let peek_bits = 9u32;
+    let mut table = [0u16; 512];
+    let lens = &COEFF_TOKEN_LEN_0;
+    let bits = &COEFF_TOKEN_BITS_0;
+    let count = 68;
+    let mut i = 0;
+    while i < count {
+        let len = lens[i];
+        if len == 0 || len as u32 > peek_bits {
+            i += 1;
+            continue;
+        }
+        let code = bits[i] as u32;
+        let total_coeff = (i / 4) as u8;
+        let trailing_ones = (i % 4) as u8;
+        let entry = vlc_pack(total_coeff, trailing_ones, len);
+        let pad_bits = peek_bits - len as u32;
+        let base = code << pad_bits;
+        let count_fill = 1u32 << pad_bits;
+        let mut j = 0u32;
+        while j < count_fill {
+            let idx = base + j;
+            if (idx as usize) < 512 {
+                table[idx as usize] = entry;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    table
+}
+
+/// Level-1 table for context 1: 9-bit peek (512 entries).
+const fn build_vlc_table_level1_ctx1() -> [VlcEntry; 512] {
+    let peek_bits = 9u32;
+    let mut table = [0u16; 512];
+    let lens = &COEFF_TOKEN_LEN_1;
+    let bits = &COEFF_TOKEN_BITS_1;
+    let count = 68;
+    let mut i = 0;
+    while i < count {
+        let len = lens[i];
+        if len == 0 || len as u32 > peek_bits {
+            i += 1;
+            continue;
+        }
+        let code = bits[i] as u32;
+        let total_coeff = (i / 4) as u8;
+        let trailing_ones = (i % 4) as u8;
+        let entry = vlc_pack(total_coeff, trailing_ones, len);
+        let pad_bits = peek_bits - len as u32;
+        let base = code << pad_bits;
+        let count_fill = 1u32 << pad_bits;
+        let mut j = 0u32;
+        while j < count_fill {
+            let idx = base + j;
+            if (idx as usize) < 512 {
+                table[idx as usize] = entry;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    table
+}
+
+// Use a larger type for level-2 context 0 (16-bit peek = 65536 entries).
+// This is 128KB but only accessed on cache miss from level-1.
+// Actually, let's keep the O(n) fallback for the rare long codewords to save memory.
+
+static COEFF_TOKEN_LUT_CTX0_L1: [VlcEntry; 512] = build_vlc_table_level1_ctx0();
+static COEFF_TOKEN_LUT_CTX1_L1: [VlcEntry; 512] = build_vlc_table_level1_ctx1();
+static COEFF_TOKEN_LUT_CTX2: [VlcEntry; 1024] =
+    build_vlc_table(&COEFF_TOKEN_LEN_2, &COEFF_TOKEN_BITS_2, 68, 10);
+static COEFF_TOKEN_LUT_CTX3: [VlcEntry; 1024] =
+    build_vlc_table(&COEFF_TOKEN_LEN_3, &COEFF_TOKEN_BITS_3, 68, 6);
+static CHROMA_DC_COEFF_TOKEN_LUT: [VlcEntry; 256] = build_chroma_dc_vlc_table();
+
+// ---------------------------------------------------------------------------
 // Public API: coeff_token
 // ---------------------------------------------------------------------------
 
@@ -246,49 +422,84 @@ fn decode_vlc(
 ///
 /// Returns `(total_coeff, trailing_ones)`.
 ///
+/// Uses O(1) peek-based lookup tables for the common case, falling back to
+/// O(n) scan for rare long codewords in contexts 0 and 1.
+///
 /// nC selection (H.264 spec 9.2.1):
 /// - nC = -1: chroma DC (4:2:0, 2x2 block)
 /// - nC = -2: chroma DC (4:2:2, 2x4 block) — not yet supported
 /// - nC 0..16: luma / chroma AC, mapped to table index via COEFF_TOKEN_TABLE_INDEX
 pub fn read_coeff_token(br: &mut BitReadBE<'_>, nc: i32) -> Result<(u8, u8)> {
     if nc == -1 {
-        // Chroma DC 4:2:0
-        let max_bits = 8;
-        let idx = decode_vlc(
-            br,
-            &CHROMA_DC_COEFF_TOKEN_LEN,
-            &CHROMA_DC_COEFF_TOKEN_BITS,
-            4 * 5,
-            max_bits,
-        )?;
-        let total_coeff = (idx / 4) as u8;
-        let trailing_ones = (idx % 4) as u8;
-        return Ok((total_coeff, trailing_ones));
+        // Chroma DC 4:2:0: O(1) lookup, 8-bit peek.
+        let peeked = br.peek_bits_32(8) as usize;
+        let entry = CHROMA_DC_COEFF_TOKEN_LUT[peeked];
+        if entry != 0 {
+            let (tc, to, len) = vlc_unpack(entry);
+            br.skip_bits(len as usize);
+            return Ok((tc, to));
+        }
+        return Err(Error::InvalidData);
     }
 
     if nc < -1 {
-        // Chroma DC 4:2:2 — not supported for now (Baseline is 4:2:0 only).
         return Err(Error::InvalidData);
     }
 
     let nc_clamped = nc.min(16) as usize;
     let table_idx = COEFF_TOKEN_TABLE_INDEX[nc_clamped] as usize;
-    let lens = COEFF_TOKEN_LEN[table_idx];
-    let bits_tab = COEFF_TOKEN_BITS[table_idx];
 
-    // Maximum codeword length per table: 16, 14, 10, 6
-    let max_bits: u32 = match table_idx {
-        0 => 16,
-        1 => 14,
-        2 => 10,
-        3 => 6,
+    match table_idx {
+        0 => {
+            // nC 0-1: 2-level. Level 1 = 9-bit peek.
+            let peeked9 = br.peek_bits_32(9) as usize;
+            let entry = COEFF_TOKEN_LUT_CTX0_L1[peeked9];
+            if entry != 0 {
+                let (tc, to, len) = vlc_unpack(entry);
+                br.skip_bits(len as usize);
+                return Ok((tc, to));
+            }
+            // Fallback: O(n) scan for codes > 9 bits (rare).
+            let idx = decode_vlc(br, &COEFF_TOKEN_LEN_0, &COEFF_TOKEN_BITS_0, 68, 16)?;
+            Ok(((idx / 4) as u8, (idx % 4) as u8))
+        }
+        1 => {
+            // nC 2-3: 2-level. Level 1 = 9-bit peek.
+            let peeked9 = br.peek_bits_32(9) as usize;
+            let entry = COEFF_TOKEN_LUT_CTX1_L1[peeked9];
+            if entry != 0 {
+                let (tc, to, len) = vlc_unpack(entry);
+                br.skip_bits(len as usize);
+                return Ok((tc, to));
+            }
+            // Fallback: O(n) scan for codes > 9 bits (rare).
+            let idx = decode_vlc(br, &COEFF_TOKEN_LEN_1, &COEFF_TOKEN_BITS_1, 68, 14)?;
+            Ok(((idx / 4) as u8, (idx % 4) as u8))
+        }
+        2 => {
+            // nC 4-7: single-level 10-bit peek.
+            let peeked = br.peek_bits_32(10) as usize;
+            let entry = COEFF_TOKEN_LUT_CTX2[peeked];
+            if entry != 0 {
+                let (tc, to, len) = vlc_unpack(entry);
+                br.skip_bits(len as usize);
+                return Ok((tc, to));
+            }
+            Err(Error::InvalidData)
+        }
+        3 => {
+            // nC >= 8: single-level 6-bit peek.
+            let peeked = br.peek_bits_32(6) as usize;
+            let entry = COEFF_TOKEN_LUT_CTX3[peeked];
+            if entry != 0 {
+                let (tc, to, len) = vlc_unpack(entry);
+                br.skip_bits(len as usize);
+                return Ok((tc, to));
+            }
+            Err(Error::InvalidData)
+        }
         _ => unreachable!(),
-    };
-
-    let idx = decode_vlc(br, lens, bits_tab, 4 * 17, max_bits)?;
-    let total_coeff = (idx / 4) as u8;
-    let trailing_ones = (idx % 4) as u8;
-    Ok((total_coeff, trailing_ones))
+    }
 }
 
 // ---------------------------------------------------------------------------

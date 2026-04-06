@@ -221,6 +221,7 @@ fn merge_nc(left: Option<i32>, top: Option<i32>) -> i32 {
 ///
 /// `block_idx`: raster index of the 4x4 block within the MB:
 ///   0..15 = luma, 16..19 = Cb, 20..23 = Cr.
+#[inline]
 pub fn compute_nc(
     block_idx: usize,
     mb_x: u32,
@@ -655,6 +656,7 @@ const ZIGZAG_SCAN_4X4: [usize; 16] = [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 
 const FIELD_SCAN_4X4: [usize; 16] = [0, 4, 1, 8, 12, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15];
 
 /// Apply zigzag/field descan: convert coefficients from scan order to raster order.
+#[inline]
 fn descan_4x4(scan_order: &[i16; 16], max_coeff: usize, scan_table: &[usize; 16]) -> [i16; 16] {
     let mut raster = [0i16; 16];
     for scan_pos in 0..max_coeff {
@@ -1296,11 +1298,12 @@ fn decode_residual_blocks(
                     let raster_idx = SCAN_TO_RASTER[scan_idx];
                     let nc = compute_nc(raster_idx, mb_x, neighbor, &mb.non_zero_count);
                     let (ac_coeffs_scan, nz) = decode_residual(br, nc, 15)?;
-                    // Descan AC coefficients: scan positions 0..14 map to
-                    // raster positions via zigzag_scan[1..16] (shifted by 1 since DC is separate).
-                    for scan_pos in 0..15 {
-                        mb.luma_coeffs[raster_idx][scan_4x4[scan_pos + 1]] =
-                            ac_coeffs_scan[scan_pos];
+                    // Descan AC coefficients (skip for zero-coefficient blocks).
+                    if nz > 0 {
+                        for scan_pos in 0..15 {
+                            mb.luma_coeffs[raster_idx][scan_4x4[scan_pos + 1]] =
+                                ac_coeffs_scan[scan_pos];
+                        }
                     }
                     mb.non_zero_count[raster_idx] = nz;
                 }
@@ -1321,7 +1324,7 @@ fn decode_residual_blocks(
                     mb.non_zero_count[raster_idx] = nz;
                     // Place coefficients into the 8x8 block using sub-scan table.
                     for scan_pos in 0..16 {
-                        buf[sub_scan[scan_pos]] = block_coeffs_scan[scan_pos];
+                        buf[sub_scan[scan_pos] as usize] = block_coeffs_scan[scan_pos];
                     }
                 }
                 // FFmpeg sums all 4 sub-block NNZ into the FIRST one only:
@@ -1362,8 +1365,10 @@ fn decode_residual_blocks(
                     let raster_idx = SCAN_TO_RASTER[scan_idx];
                     let nc = compute_nc(raster_idx, mb_x, neighbor, &mb.non_zero_count);
                     let (block_coeffs_scan, nz) = decode_residual(br, nc, 16)?;
-                    // Descan from zigzag to raster order.
-                    mb.luma_coeffs[raster_idx] = descan_4x4(&block_coeffs_scan, 16, scan_4x4);
+                    // Descan from zigzag to raster order (skip for zero-coefficient blocks).
+                    if nz > 0 {
+                        mb.luma_coeffs[raster_idx] = descan_4x4(&block_coeffs_scan, 16, scan_4x4);
+                    }
                     mb.non_zero_count[raster_idx] = nz;
                 }
             } else {
