@@ -25,6 +25,8 @@ FFmpeg, and despite incorporating FFmpeg's assembly code, is significantly slowe
 | FLAC, WavPack | bitexact | Via symphonia adapter |
 | Vorbis, AAC, MP3 | ~120-140 dB SNR | Lossy codecs, float precision only |
 | AV1 | bitexact | Via rav1d adapter |
+| VP9 decode | keyframe-only | Native Rust, intra prediction + loop filter |
+| IVF demuxer | working | VP8, VP9, AV1 containers |
 | MP4 demuxer | working | H.264, AV1, AAC tracks |
 | Video player | 24fps 0-drop | GPU (wgpu), ffplay-style A/V sync, pause, volume |
 
@@ -53,10 +55,10 @@ Known FFmpeg behavioral differences: [DIVERGENCES.md](DIVERGENCES.md).
 FFmpeg has hundreds of codecs and formats. wedeo currently covers a small
 subset. Major gaps for parity:
 
-- **Video codecs** — VP9, HEVC/H.265, MPEG-2, MPEG-4 Part 2, VP8, Theora. H.264 is missing interlaced (MBAFF/PAFF), 10-bit, and 4:2:2/4:4:4.
+- **Video codecs** — HEVC/H.265, MPEG-2, MPEG-4 Part 2, VP8, Theora. VP9 is keyframe-only (inter frames deferred). H.264 is missing interlaced (MBAFF/PAFF), 10-bit, and 4:2:2/4:4:4.
 - **Video encoding** — no encoders exist yet (H.264, H.265, AV1 via rav1e)
 - **Muxers** — only WAV. No MP4/MOV, MKV/WebM, or MPEG-TS muxer.
-- **Demuxers** — no MKV/WebM, MPEG-TS, FLV, or AVI demuxer (MP4 and WAV only, plus symphonia-backed formats)
+- **Demuxers** — no MKV/WebM, MPEG-TS, FLV, or AVI demuxer (MP4, WAV, and IVF only, plus symphonia-backed formats)
 - **Filters** — trait skeleton exists but no functional filter graph (no scale, crop, overlay, fps, etc.)
 - **Player** — no seek, no subtitle rendering, no hardware-accelerated decode
 - **Infrastructure** — no interruptible I/O (network streams), no chapter/program support, no `avformat_find_stream_info` equivalent

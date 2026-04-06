@@ -24,7 +24,16 @@
 - [x] **AV1 decoder via rav1d** — `adapters/wedeo-rav1d/` wraps rav1d behind wedeo `Decoder` trait.
 - [x] **Video player with audio** — `bins/wedeo-play/` has full A/V playback: wgpu+winit GPU rendering, cpal audio output, ffplay-style A/V sync (pts_drift audio clock), resampling via wedeo-resample, 5.1→stereo downmix, volume control, pause. Supports H.264/AV1 video + symphonia audio codecs.
   - [ ] Seek — removed (was buggy), needs proper reimplementation with ffplay serial mechanism
-- [ ] **VP9 decoder** — second priority for WebM support. Reference: `FFmpeg/libavcodec/vp9*.c`.
+- [x] **VP9 decoder** — native Rust, IVF/WebM demuxer, bool decoder, intra/inter prediction, IDCT, loop filter. ~5K lines across 12 modules.
+  - [x] VP9 inter prediction — MV parsing/prediction (spatial+temporal), 8-tap subpel MC, compound prediction, reference frame management. 21 bugs fixed 2026-04-03.
+  - [x] VP9 keyframe pixel conformance — 64/64 standard-size keyframes match FFmpeg bit-for-bit
+  - [x] VP9 inter-frame bool decoder parity — symbol counts verified identical to FFmpeg (927 blocks). 4 bugs fixed: mode ctx indexing (1-per-8×8 vs 2-per-8×8), end_x_y edge clamping, MV clamping bounds, MC emu_edge offset (2026-04-05).
+  - [ ] VP9 inter frame pixel conformance — 11/64 quantizer files BITEXACT (high-QP); 53 have small pixel diffs (Y_max ≤203) from remaining MC/reconstruction bugs
+  - [ ] VP9 keyframe odd-size conformance — 39 keyframes with non-8-aligned dimensions (10x, 18x, 34x, 66x, ~200x) mismatch; 74 panic in intra_pred.rs OOB
+  - [ ] VP9 probability adaptation — `adapt_probs` not yet wired up after each frame decode
+  - [ ] VP9 scaled prediction — silently skipped when ref/current dimensions differ
+  - [ ] VP9 10/12-bit support
+  - [ ] VP9 superframe parsing
 - [ ] **HEVC decoder** — similar to H.264 but more complex (CTU/CTB structure).
 
 ### Video muxers

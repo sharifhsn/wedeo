@@ -36,8 +36,7 @@ scripts/.suite_*_snapshot.json
 .bench_baselines/
 
 # Claude Code ephemeral session state
-.claude/primer.md
-.claude/projects/
+.claude/
 
 # === Development-only files (kept locally, not published) ===
 
@@ -104,6 +103,23 @@ scripts/.suite_*_snapshot.json
 /DEBUG_NOTES.md
 /CONFORMANCE_STATE.md
 /docs/
+
+# Diagnostic & debug output
+diag_*.txt
+framecrc_*.txt
+
+# Benchmark artifacts
+/bench_ffmpeg
+/bench_ffmpeg.c
+/bench_ffmpeg_dbg*
+
+# Test media files
+*.mp4
+
+# Investigation notes (ephemeral)
+/PERF_PLAN.md
+/VP9_LOOPFILTER_BUG.md
+/VP9_Spec.md
 
 # Internal planning & session state
 /plans/

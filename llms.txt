@@ -3,7 +3,7 @@
 > AI-generated Rust rewrite of FFmpeg.
 
 wedeo translates FFmpeg's C source into idiomatic Rust, verified bit-for-bit
-against FFmpeg's FATE test suite. 16 crates, ~47K lines of Rust.
+against FFmpeg's FATE test suite. 18 crates, ~52K lines of Rust.
 
 ## Project structure
 
@@ -16,6 +16,7 @@ against FFmpeg's FATE test suite. 16 crates, ~47K lines of Rust.
 
 - CLAUDE.md — canonical rules, build commands, debugging procedures
 - codecs/wedeo-codec-h264/src/ — H.264 decoder (30K lines, 25 modules)
+- codecs/wedeo-codec-vp9/src/ — VP9 decoder (keyframe-only, 12 modules)
 - scripts/suite_runner.py — unified conformance runner
 - scripts/conformance_full.py — FATE conformance report
 - tests/fate/ — Rust FATE test harness
@@ -31,6 +32,8 @@ against FFmpeg's FATE test suite. 16 crates, ~47K lines of Rust.
 
 H.264 decoder: 79/79 progressive conformance BITEXACT, expanding to MBAFF
 interlaced and FRext profiles. Performance optimization via aarch64 NEON.
+VP9 decoder: keyframe-only native Rust decoder with IVF demuxer. Inter
+prediction deferred.
 Video player (wedeo-play): GPU-accelerated via wgpu+winit, ffplay-style
 A/V sync with pts_drift audio clock, 24fps 0-drop 1080p playback.
 
