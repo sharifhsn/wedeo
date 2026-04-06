@@ -70,3 +70,16 @@ pub fn demuxers() -> impl Iterator<Item = &'static dyn DemuxerFactory> {
 pub fn muxers() -> impl Iterator<Item = &'static dyn MuxerFactory> {
     inventory::iter::<&'static dyn MuxerFactory>().copied()
 }
+
+/// Find the best muxer for a given file extension (e.g. "mp4", "wav").
+pub fn guess_muxer_by_extension(ext: &str) -> Option<&'static dyn MuxerFactory> {
+    let ext_lower = ext.to_ascii_lowercase();
+    inventory::iter::<&'static dyn MuxerFactory>()
+        .find(|f| {
+            f.descriptor()
+                .extensions
+                .split(',')
+                .any(|e| e.trim() == ext_lower)
+        })
+        .copied()
+}

@@ -3739,11 +3739,14 @@ dependencies = [
  "wedeo-codec",
  "wedeo-codec-h264",
  "wedeo-codec-pcm",
+ "wedeo-codec-vp9",
  "wedeo-core",
  "wedeo-format",
  "wedeo-format-h264",
+ "wedeo-format-ivf",
  "wedeo-format-mp4",
  "wedeo-format-wav",
+ "wedeo-format-webm",
  "wedeo-rav1d",
  "wedeo-rav1e",
  "wedeo-symphonia",
@@ -3781,6 +3784,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "wedeo-codec-vp9"
+version = "0.2.0"
+dependencies = [
+ "inventory",
+ "tracing",
+ "wedeo-codec",
+ "wedeo-core",
+]
+
+[[package]]
 name = "wedeo-core"
 version = "0.2.0"
 dependencies = [
@@ -3799,11 +3812,14 @@ dependencies = [
  "wedeo-codec",
  "wedeo-codec-h264",
  "wedeo-codec-pcm",
+ "wedeo-codec-vp9",
  "wedeo-core",
  "wedeo-format",
  "wedeo-format-h264",
+ "wedeo-format-ivf",
  "wedeo-format-mp4",
  "wedeo-format-wav",
+ "wedeo-format-webm",
  "wedeo-rav1d",
  "wedeo-rav1e",
  "wedeo-symphonia",
@@ -3842,6 +3858,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "wedeo-format-ivf"
+version = "0.2.0"
+dependencies = [
+ "inventory",
+ "tracing",
+ "wedeo-codec",
+ "wedeo-core",
+ "wedeo-format",
+]
+
+[[package]]
 name = "wedeo-format-mp4"
 version = "0.2.0"
 dependencies = [
@@ -3856,6 +3883,17 @@ name = "wedeo-format-wav"
 version = "0.2.0"
 dependencies = [
  "inventory",
+ "wedeo-core",
+ "wedeo-format",
+]
+
+[[package]]
+name = "wedeo-format-webm"
+version = "0.2.0"
+dependencies = [
+ "inventory",
+ "tracing",
+ "wedeo-codec",
  "wedeo-core",
  "wedeo-format",
 ]

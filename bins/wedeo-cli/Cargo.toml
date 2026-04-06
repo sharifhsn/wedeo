@@ -26,6 +26,9 @@ wedeo-format-mp4 = { workspace = true }
 wedeo-symphonia = { workspace = true }
 wedeo-rav1d = { workspace = true }
 wedeo-rav1e = { workspace = true }
+wedeo-codec-vp9 = { workspace = true }
+wedeo-format-ivf = { workspace = true }
+wedeo-format-webm = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [lints]

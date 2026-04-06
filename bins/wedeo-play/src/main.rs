@@ -1086,6 +1086,13 @@ impl ApplicationHandler for App {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.poll_data();
 
+        // Auto-close when playback is finished: EOF reached and all frames displayed.
+        if self.eof && self.pending_video.is_empty() && self.has_first_frame {
+            let _ = self.cmd_tx.send(Command::Quit);
+            event_loop.exit();
+            return;
+        }
+
         // Compute remaining_time until next frame (ffplay's refresh_loop_wait_event
         // pattern, lines 3393-3408). Default to 10ms (REFRESH_RATE).
         let mut remaining = Duration::from_millis(10);

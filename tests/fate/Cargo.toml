@@ -24,6 +24,9 @@ wedeo-codec = { workspace = true }
 wedeo-format = { workspace = true }
 wedeo-codec-pcm = { workspace = true }
 wedeo-codec-h264 = { workspace = true }
+wedeo-codec-vp9 = { workspace = true }
+wedeo-format-ivf = { workspace = true }
+wedeo-format-webm = { workspace = true }
 wedeo-format-wav = { workspace = true }
 wedeo-format-h264 = { workspace = true }
 wedeo-format-mp4 = { workspace = true }

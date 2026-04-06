@@ -12,6 +12,9 @@ members = [
     "formats/wedeo-format-wav",
     "formats/wedeo-format-h264",
     "formats/wedeo-format-mp4",
+    "codecs/wedeo-codec-vp9",
+    "formats/wedeo-format-ivf",
+    "formats/wedeo-format-webm",
     "adapters/wedeo-symphonia",
     "adapters/wedeo-rav1d",
     "adapters/wedeo-rav1e",
@@ -63,3 +66,6 @@ wedeo-format-mp4 = { path = "formats/wedeo-format-mp4", version = "0.2.0" }
 wedeo-symphonia = { path = "adapters/wedeo-symphonia", version = "0.2.0" }
 wedeo-rav1d = { path = "adapters/wedeo-rav1d", version = "0.2.0" }
 wedeo-rav1e = { path = "adapters/wedeo-rav1e", version = "0.2.0" }
+wedeo-codec-vp9 = { path = "codecs/wedeo-codec-vp9", version = "0.2.0" }
+wedeo-format-ivf = { path = "formats/wedeo-format-ivf", version = "0.2.0" }
+wedeo-format-webm = { path = "formats/wedeo-format-webm", version = "0.2.0" }
