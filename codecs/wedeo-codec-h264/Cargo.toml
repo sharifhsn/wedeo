@@ -17,6 +17,7 @@ asm = []
 wedeo-core = { workspace = true }
 wedeo-codec = { workspace = true }
 inventory = { workspace = true }
+tracing = { workspace = true }
 
 [build-dependencies]
 cc = { workspace = true }

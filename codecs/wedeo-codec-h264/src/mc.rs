@@ -313,6 +313,7 @@ fn qpel_h_avg(
     );
 
     let pix = block_w * block_h;
+    scratch.half_a[..pix].fill(0);
     h_lowpass(
         &mut scratch.half_a[..pix],
         block_w,
@@ -322,6 +323,7 @@ fn qpel_h_avg(
         block_h,
     );
 
+    scratch.half_b[..pix].fill(0);
     for j in 0..block_h {
         for i in 0..block_w {
             scratch.half_b[j * block_w + i] =
@@ -377,6 +379,7 @@ fn qpel_v_avg(
     );
 
     let pix = block_w * block_h;
+    scratch.half_a[..pix].fill(0);
     v_lowpass(
         &mut scratch.half_a[..pix],
         block_w,
@@ -386,6 +389,7 @@ fn qpel_v_avg(
         block_h,
     );
 
+    scratch.half_b[..pix].fill(0);
     for j in 0..block_h {
         for i in 0..block_w {
             scratch.half_b[j * block_w + i] =
@@ -445,6 +449,7 @@ fn qpel_diagonal(
         pw,
         ph,
     );
+    scratch.half_a[..pix].fill(0);
     h_lowpass(
         &mut scratch.half_a[..pix],
         block_w,
@@ -470,6 +475,7 @@ fn qpel_diagonal(
         pw,
         ph,
     );
+    scratch.half_b[..pix].fill(0);
     v_lowpass(
         &mut scratch.half_b[..pix],
         block_w,
@@ -528,6 +534,7 @@ fn qpel_mixed_h_hv(
         pw,
         ph,
     );
+    scratch.half_a[..pix].fill(0);
     h_lowpass(
         &mut scratch.half_a[..pix],
         block_w,
@@ -553,6 +560,7 @@ fn qpel_mixed_h_hv(
         pw,
         ph,
     );
+    scratch.half_b[..pix].fill(0);
     // hv_lowpass reads from ref_buf2, uses ref_buf as tmp (ref_buf is free after h_lowpass consumed it)
     hv_lowpass(
         &mut scratch.half_b[..pix],
@@ -613,6 +621,7 @@ fn qpel_mixed_v_hv(
         pw,
         ph,
     );
+    scratch.half_a[..pix].fill(0);
     v_lowpass(
         &mut scratch.half_a[..pix],
         block_w,
@@ -638,6 +647,7 @@ fn qpel_mixed_v_hv(
         pw,
         ph,
     );
+    scratch.half_b[..pix].fill(0);
     // hv_lowpass reads from ref_buf2, uses ref_buf as tmp (ref_buf is free after v_lowpass consumed it)
     hv_lowpass(
         &mut scratch.half_b[..pix],

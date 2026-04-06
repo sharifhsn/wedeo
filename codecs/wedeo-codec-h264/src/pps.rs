@@ -374,6 +374,31 @@ pub fn parse_pps(data: &[u8], sps_list: &[Option<Sps>; 32]) -> Result<Pps> {
         }
     }
 
+    tracing::debug!(
+        pps_id,
+        sps_id,
+        entropy_coding_mode_flag,
+        transform_8x8_mode,
+        chroma_qp_index_offset_0,
+        chroma_qp_index_offset_1,
+        scaling_matrix_present,
+        pic_init_qp,
+        weighted_pred_flag,
+        weighted_bipred_idc,
+        "PPS parsed"
+    );
+
+    if scaling_matrix_present {
+        tracing::debug!(
+            pps_id,
+            sm4_intra_y_sum = scaling_matrix4[0].iter().map(|&x| x as u32).sum::<u32>(),
+            sm4_inter_y_sum = scaling_matrix4[3].iter().map(|&x| x as u32).sum::<u32>(),
+            sm8_intra_y_sum = scaling_matrix8[0].iter().map(|&x| x as u32).sum::<u32>(),
+            sm8_inter_y_sum = scaling_matrix8[3].iter().map(|&x| x as u32).sum::<u32>(),
+            "PPS_SCALING"
+        );
+    }
+
     Ok(Pps {
         pps_id,
         sps_id,

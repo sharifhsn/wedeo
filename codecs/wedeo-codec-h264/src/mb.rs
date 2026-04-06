@@ -7,6 +7,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use tracing::{debug, trace};
 use wedeo_codec::bitstream::BitReadBE;
 use wedeo_core::error::Result;
 
@@ -23,6 +24,23 @@ use crate::slice::SliceHeader;
 use crate::sps::Sps;
 use crate::tables::CHROMA_QP_TABLE;
 
+// ---------------------------------------------------------------------------
+// Per-MB pixel checksum for pipeline-stage tracing
+// ---------------------------------------------------------------------------
+
+/// Compute a quick sum of all pixel values in an MB-sized block of a plane.
+/// Used for per-MB reconstruction checksums to compare against FFmpeg.
+/// Uses (offset, stride) for MBAFF field-mode compatibility.
+fn mb_plane_sum(plane: &[u8], offset: usize, stride: usize, size: u32) -> u32 {
+    let mut sum = 0u32;
+    for dy in 0..size as usize {
+        let row_start = offset + dy * stride;
+        for dx in 0..size as usize {
+            sum = sum.wrapping_add(plane[row_start + dx] as u32);
+        }
+    }
+    sum
+}
 
 // ---------------------------------------------------------------------------
 // Block scanning order
@@ -477,6 +495,27 @@ impl FrameDecodeContext {
 
         let total_mbs = (mb_width * mb_height) as usize;
 
+        // Log dequant table checksums for diagnosing scaling matrix issues
+        debug!(
+            dq4_intra_y_sum = pps.scaling_matrix4[0]
+                .iter()
+                .map(|&x| x as u32)
+                .sum::<u32>(),
+            dq4_inter_y_sum = pps.scaling_matrix4[3]
+                .iter()
+                .map(|&x| x as u32)
+                .sum::<u32>(),
+            dq8_intra_y_sum = pps.scaling_matrix8[0]
+                .iter()
+                .map(|&x| x as u32)
+                .sum::<u32>(),
+            dq8_inter_y_sum = pps.scaling_matrix8[3]
+                .iter()
+                .map(|&x| x as u32)
+                .sum::<u32>(),
+            scaling_present = pps.scaling_matrix_present,
+            "DEQUANT_TABLES"
+        );
 
         Self {
             pic,
@@ -886,6 +925,12 @@ fn decode_chroma(
             has_left,
         );
 
+        {
+            let mut pred_row0 = [0u8; 8];
+            pred_row0.copy_from_slice(&plane_data[offset..offset + 8]);
+            let plane_name = if plane_idx == 0 { "U" } else { "V" };
+            trace!(mb_x, mb_y, plane = plane_name, row0 = ?pred_row0, "chroma prediction");
+        }
 
         if cbp_chroma > 0 {
             // Chroma DC: inverse Hadamard + dequant (i32 output to avoid i16 overflow)
@@ -937,6 +982,15 @@ fn decode_chroma(
                     }
                 }
 
+                {
+                    let mut final_px = [0u8; 16];
+                    for r in 0..4 {
+                        let off = c_offset + r * c_stride;
+                        final_px[r * 4..r * 4 + 4].copy_from_slice(&plane_data[off..off + 4]);
+                    }
+                    let plane_name = if plane_idx == 0 { "U" } else { "V" };
+                    trace!(mb_x, mb_y, plane = plane_name, blk_x, blk_y, pixels = ?final_px, "chroma final");
+                }
             }
         }
     }
@@ -954,6 +1008,7 @@ fn decode_chroma(
 /// `ref_pics` contains the decoded reference picture buffers for inter prediction
 /// (list 0). Index into this slice corresponds to ref_idx values from CAVLC.
 #[allow(clippy::too_many_arguments)] // H.264 MB decode requires all these parameters
+#[tracing::instrument(skip_all, fields(mb_x, mb_y))]
 pub fn decode_macroblock(
     ctx: &mut FrameDecodeContext,
     br: &mut BitReadBE,
@@ -1060,6 +1115,26 @@ pub fn apply_macroblock(
         }
     }
 
+    trace!(
+        mb_x,
+        mb_y,
+        qp,
+        mb_type = mb.mb_type,
+        cbp = mb.cbp,
+        is_intra4x4 = mb.is_intra4x4,
+        is_intra16x16 = mb.is_intra16x16,
+        t8x8 = mb.transform_size_8x8_flag,
+        "decoded MB"
+    );
+    trace!(
+        mb_x,
+        mb_y,
+        mb_field = ctx.mb_field,
+        has_top,
+        has_left,
+        left_block_option = nb.left_block_option,
+        "INTRA_RECON_START"
+    );
 
     // Decode based on macroblock type
     if mb.is_pcm {
@@ -1162,6 +1237,39 @@ pub fn apply_macroblock(
         .update_after_mb(mb_x, &mb.non_zero_count, &intra4x4_modes);
     ctx.neighbor_ctx.left_available = true;
 
+    // Per-MB pipeline-stage checksum for diffing against FFmpeg.
+    // Captures reconstruction state BEFORE deblocking. Compare with FFmpeg via:
+    //   scripts/mb_recon_compare.py <file> --frame N
+    // To enable: RUST_LOG=wedeo_codec_h264::mb=trace (appears as MB_RECON lines).
+    {
+        let (y_off, y_stride) = luma_mb_offset(&ctx.pic, mb_x, mb_y, ctx.mb_field);
+        let (uv_off, uv_stride) = chroma_mb_offset(&ctx.pic, mb_x, mb_y, ctx.mb_field);
+        let y_sum = mb_plane_sum(&ctx.pic.y, y_off, y_stride, 16);
+        let u_sum = mb_plane_sum(&ctx.pic.u, uv_off, uv_stride, 8);
+        let v_sum = mb_plane_sum(&ctx.pic.v, uv_off, uv_stride, 8);
+        trace!(
+            mb_x,
+            mb_y,
+            mb_type = mb.mb_type,
+            qp,
+            cbp = mb.cbp,
+            t8x8 = mb.transform_size_8x8_flag,
+            is_intra = mb.is_intra,
+            y_sum,
+            u_sum,
+            v_sum,
+            "MB_RECON"
+        );
+        trace!(
+            mb_x,
+            mb_y,
+            y_row0 = ?&ctx.pic.y[y_off..y_off + 16],
+            y_row1 = ?&ctx.pic.y[y_off + y_stride..y_off + y_stride + 16],
+            y_row2 = ?&ctx.pic.y[y_off + 2 * y_stride..y_off + 2 * y_stride + 16],
+            y_row3 = ?&ctx.pic.y[y_off + 3 * y_stride..y_off + 3 * y_stride + 16],
+            "INTRA_FINAL_ROWS"
+        );
+    }
 
     // Store MbDeblockInfo for the deblocking filter.
     // For CAVLC 8x8 DCT, compute CBP from NNZ sums (matching FFmpeg's cbp_table
@@ -1243,6 +1351,7 @@ fn decode_inter_mb(
         return;
     }
 
+    trace!(mb_x, mb_y, mb_type = mb.mb_type, "inter MB");
 
     match mb.mb_type {
         0 => {
@@ -1256,6 +1365,13 @@ fn decode_inter_mb(
                 4,
                 Some(&ctx.slice_table),
                 ctx.current_slice,
+            );
+            trace!(
+                mb_x, mb_y,
+                mv_a = ?n.mv_a, ref_a = n.ref_a, a_avail = n.a_avail,
+                mv_b = ?n.mv_b, ref_b = n.ref_b, b_avail = n.b_avail,
+                mv_c = ?n.mv_c, ref_c = n.ref_c, c_avail = n.c_avail,
+                ref_idx, "16x16 neighbors"
             );
             let mvp = mvpred::predict_mv(
                 n.mv_a,
@@ -1273,6 +1389,7 @@ fn decode_inter_mb(
                 mvp[0].wrapping_add(mb.mvd_l0[0][0]),
                 mvp[1].wrapping_add(mb.mvd_l0[0][1]),
             ];
+            trace!(mb_x, mb_y, mvp = ?mvp, mvd = ?mb.mvd_l0[0], mv = ?mv, "16x16 MV");
 
             let ref_pic = &ref_pics[ref_idx.min(ref_pics.len() - 1)];
             apply_mc_partition(ctx, ref_pic, mb_x, mb_y, 0, 0, 16, 16, mv);
@@ -1299,6 +1416,12 @@ fn decode_inter_mb(
                     Some(&ctx.slice_table),
                     ctx.current_slice,
                 );
+                trace!(mb_x, mb_y, part, ref_idx, blk_y,
+                    mv_a = ?n.mv_a, ref_a = n.ref_a, a_avail = n.a_avail,
+                    mv_b = ?n.mv_b, ref_b = n.ref_b, b_avail = n.b_avail,
+                    mv_c = ?n.mv_c, ref_c = n.ref_c, c_avail = n.c_avail,
+                    ref_pics_len = ref_pics.len(),
+                    "16x8 neighbors");
                 let mvp = mvpred::predict_mv_16x8(
                     n.mv_a,
                     n.mv_b,
@@ -1317,6 +1440,7 @@ fn decode_inter_mb(
                     mvp[1].wrapping_add(mb.mvd_l0[part as usize][1]),
                 ];
 
+                trace!(mb_x, mb_y, part, mvp = ?mvp, mvd = ?mb.mvd_l0[part as usize], mv = ?mv, ref_idx, "16x8 MV");
 
                 let ref_pic = &ref_pics[ref_idx.min(ref_pics.len() - 1)];
                 apply_mc_partition(ctx, ref_pic, mb_x, mb_y, 0, blk_y * 4, 16, 8, mv);
@@ -1391,6 +1515,7 @@ fn decode_inter_mb(
                 let part_y = (i8x8 / 2) as u32 * 2; // 0 or 2
 
                 let sub_type = mb.sub_mb_type[i8x8];
+                trace!(mb_x, mb_y, i8x8, sub_type, ref_idx, "P_8x8 sub");
 
                 match sub_type {
                     0 => {
@@ -1403,6 +1528,13 @@ fn decode_inter_mb(
                             2,
                             Some(&ctx.slice_table),
                             ctx.current_slice,
+                        );
+                        trace!(
+                            mb_x, mb_y, i8x8, part_x, part_y,
+                            mv_a = ?n.mv_a, ref_a = n.ref_a, a_avail = n.a_avail,
+                            mv_b = ?n.mv_b, ref_b = n.ref_b, b_avail = n.b_avail,
+                            mv_c = ?n.mv_c, ref_c = n.ref_c, c_avail = n.c_avail,
+                            ref_idx, "P_8x8 neighbors"
                         );
                         let mvp = mvpred::predict_mv(
                             n.mv_a,
@@ -1421,6 +1553,7 @@ fn decode_inter_mb(
                             mvp[0].wrapping_add(mb.mvd_l0[mvd_idx][0]),
                             mvp[1].wrapping_add(mb.mvd_l0[mvd_idx][1]),
                         ];
+                        trace!(mb_x, mb_y, i8x8, mvp = ?mvp, mvd = ?mb.mvd_l0[mvd_idx], mv = ?mv, "P_8x8 MV");
 
                         let ref_pic = &ref_pics[ref_idx.min(ref_pics.len() - 1)];
                         apply_mc_partition(
@@ -1490,6 +1623,11 @@ fn decode_inter_mb(
                                 mvp[0].wrapping_add(mb.mvd_l0[mvd_idx][0]),
                                 mvp[1].wrapping_add(mb.mvd_l0[mvd_idx][1]),
                             ];
+                            trace!(mb_x, mb_y, i8x8, sub, part_x, sub_y,
+                                mv_a = ?n.mv_a, ref_a = n.ref_a, a_avail = n.a_avail,
+                                mv_b = ?n.mv_b, ref_b = n.ref_b, b_avail = n.b_avail,
+                                mv_c = ?n.mv_c, ref_c = n.ref_c, c_avail = n.c_avail,
+                                mvp = ?mvp, mvd = ?mb.mvd_l0[mvd_idx], mv = ?mv, "P_8x4 MV");
 
                             let ref_pic = &ref_pics[ref_idx.min(ref_pics.len() - 1)];
                             apply_mc_partition(
@@ -1558,6 +1696,11 @@ fn decode_inter_mb(
                                 mvp[0].wrapping_add(mb.mvd_l0[mvd_idx][0]),
                                 mvp[1].wrapping_add(mb.mvd_l0[mvd_idx][1]),
                             ];
+                            trace!(mb_x, mb_y, i8x8, sub, sub_x, part_y,
+                                mv_a = ?n.mv_a, ref_a = n.ref_a, a_avail = n.a_avail,
+                                mv_b = ?n.mv_b, ref_b = n.ref_b, b_avail = n.b_avail,
+                                mv_c = ?n.mv_c, ref_c = n.ref_c, c_avail = n.c_avail,
+                                mvp = ?mvp, mvd = ?mb.mvd_l0[mvd_idx], mv = ?mv, "P_4x8 MV");
 
                             let ref_pic = &ref_pics[ref_idx.min(ref_pics.len() - 1)];
                             apply_mc_partition(
@@ -1679,6 +1822,12 @@ fn decode_inter_mb(
         }
     }
 
+    {
+        let (luma_off, _stride) = luma_mb_offset(&ctx.pic, mb_x, mb_y, ctx.mb_field);
+        let mut mc_row0 = [0u8; 16];
+        mc_row0.copy_from_slice(&ctx.pic.y[luma_off..luma_off + 16]);
+        trace!(mb_x, mb_y, row0 = ?mc_row0, "inter MC luma");
+    }
 
     // Add residual on top of the motion-compensated prediction
     let cbp_luma = mb.cbp & 0x0F;
@@ -1690,6 +1839,19 @@ fn decode_inter_mb(
                     let cqm = 3; // inter
                     let dequant_table = &ctx.dequant8.coeffs[cqm][qp as usize];
                     dequant::dequant_8x8(&mut mb.luma_8x8_coeffs[i8x8], dequant_table);
+                    trace!(
+                        mb_x,
+                        mb_y,
+                        block_idx = i8x8,
+                        qp,
+                        cqm,
+                        coeff_sum = mb.luma_8x8_coeffs[i8x8]
+                            .iter()
+                            .map(|&c| c.unsigned_abs() as u32)
+                            .sum::<u32>(),
+                        dc = mb.luma_8x8_coeffs[i8x8][0],
+                        "DEQUANT"
+                    );
                     // bx/by are pixel offsets within MB (0 or 8)
                     let blk_x_4 = bx / 4; // 0 or 2 in 4x4-block units
                     let blk_y_4 = by / 4;
@@ -1700,6 +1862,17 @@ fn decode_inter_mb(
                         field_stride,
                         &mut mb.luma_8x8_coeffs[i8x8],
                     );
+                    {
+                        let mut post_sum = 0u32;
+                        for dy in 0..8usize {
+                            for dx in 0..8usize {
+                                post_sum = post_sum.wrapping_add(
+                                    ctx.pic.y[offset + dy * field_stride + dx] as u32,
+                                );
+                            }
+                        }
+                        trace!(mb_x, mb_y, i8x8, post_sum, "POST_IDCT_8X8");
+                    }
                 }
             }
         } else {
@@ -1709,6 +1882,18 @@ fn decode_inter_mb(
                 if cbp_luma & (1 << group_8x8) != 0 {
                     let raster_idx = block_to_raster(block);
                     dequant::dequant_4x4(&mut mb.luma_coeffs[raster_idx], dq_table);
+                    trace!(
+                        mb_x,
+                        mb_y,
+                        block_idx = block,
+                        qp,
+                        coeff_sum = mb.luma_coeffs[raster_idx]
+                            .iter()
+                            .map(|&c| c.unsigned_abs() as u32)
+                            .sum::<u32>(),
+                        dc = mb.luma_coeffs[raster_idx][0],
+                        "DEQUANT"
+                    );
                     let (offset, stride) =
                         luma_block_offset(&ctx.pic, mb_x, mb_y, blk_x, blk_y, ctx.mb_field);
                     idct::idct4x4_add(
@@ -1721,6 +1906,12 @@ fn decode_inter_mb(
         }
     }
 
+    {
+        let (luma_off, _stride) = luma_mb_offset(&ctx.pic, mb_x, mb_y, ctx.mb_field);
+        let mut final_row0 = [0u8; 16];
+        final_row0.copy_from_slice(&ctx.pic.y[luma_off..luma_off + 16]);
+        trace!(mb_x, mb_y, row0 = ?final_row0, "inter final luma");
+    }
 
     // Decode chroma for inter MB (same as intra, but prediction is from MC)
     decode_chroma_inter(ctx, mb, mb_x, mb_y, chroma_qp);
@@ -1875,9 +2066,17 @@ pub fn decode_skip_mb(
             Some(&ctx.slice_table),
             ctx.current_slice,
         );
+        trace!(
+            mb_x, mb_y,
+            mv_a = ?n.mv_a, ref_a = n.ref_a, a_avail = n.a_avail,
+            mv_b = ?n.mv_b, ref_b = n.ref_b, b_avail = n.b_avail,
+            mv_c = ?n.mv_c, ref_c = n.ref_c, c_avail = n.c_avail,
+            "P_SKIP neighbors"
+        );
         let mv = mvpred::predict_mv_skip_full(
             n.mv_a, n.mv_b, n.mv_c, n.ref_a, n.ref_b, n.ref_c, n.a_avail, n.b_avail, n.c_avail,
         );
+        trace!(mb_x, mb_y, mv = ?mv, "P_SKIP MV");
 
         // Apply motion compensation from ref_pics[0]
         apply_mc_partition(ctx, &ref_pics[0], mb_x, mb_y, 0, 0, 16, 16, mv);
@@ -2466,6 +2665,31 @@ fn decode_b_8x8_mb(
                         n.mv_a, n.mv_b, n.mv_c, n.ref_a, n.ref_b, n.ref_c, ref_l0, n.a_avail,
                         n.b_avail, n.c_avail,
                     );
+                    trace!(
+                        mb_x,
+                        mb_y,
+                        part,
+                        j,
+                        list = 0,
+                        sub_blk_x,
+                        sub_blk_y,
+                        sw,
+                        a_mv_x = n.mv_a[0],
+                        a_mv_y = n.mv_a[1],
+                        a_ref = n.ref_a,
+                        a_avail = n.a_avail,
+                        b_mv_x = n.mv_b[0],
+                        b_mv_y = n.mv_b[1],
+                        b_ref = n.ref_b,
+                        b_avail = n.b_avail,
+                        c_mv_x = n.mv_c[0],
+                        c_mv_y = n.mv_c[1],
+                        c_ref = n.ref_c,
+                        c_avail = n.c_avail,
+                        mvp_x = mvp[0],
+                        mvp_y = mvp[1],
+                        "B_8x8 neighbors"
+                    );
                     [
                         mvp[0].wrapping_add(mb.mvd_l0[mvd_idx][0]),
                         mvp[1].wrapping_add(mb.mvd_l0[mvd_idx][1]),
@@ -2498,6 +2722,31 @@ fn decode_b_8x8_mb(
                         n.mv_a, n.mv_b, n.mv_c, n.ref_a, n.ref_b, n.ref_c, ref_l1, n.a_avail,
                         n.b_avail, n.c_avail,
                     );
+                    trace!(
+                        mb_x,
+                        mb_y,
+                        part,
+                        j,
+                        list = 1,
+                        sub_blk_x,
+                        sub_blk_y,
+                        sw,
+                        a_mv_x = n.mv_a[0],
+                        a_mv_y = n.mv_a[1],
+                        a_ref = n.ref_a,
+                        a_avail = n.a_avail,
+                        b_mv_x = n.mv_b[0],
+                        b_mv_y = n.mv_b[1],
+                        b_ref = n.ref_b,
+                        b_avail = n.b_avail,
+                        c_mv_x = n.mv_c[0],
+                        c_mv_y = n.mv_c[1],
+                        c_ref = n.ref_c,
+                        c_avail = n.c_avail,
+                        mvp_x = mvp[0],
+                        mvp_y = mvp[1],
+                        "B_8x8 neighbors"
+                    );
                     [
                         mvp[0].wrapping_add(mb.mvd_l1[mvd_idx][0]),
                         mvp[1].wrapping_add(mb.mvd_l1[mvd_idx][1]),
@@ -2514,6 +2763,26 @@ fn decode_b_8x8_mb(
                     }
                 }
 
+                trace!(
+                    mb_x,
+                    mb_y,
+                    part,
+                    j,
+                    sub_type,
+                    sub_blk_x,
+                    sub_blk_y,
+                    mv_l0_x = mv_l0[0],
+                    mv_l0_y = mv_l0[1],
+                    ref_l0,
+                    mv_l1_x = mv_l1[0],
+                    mv_l1_y = mv_l1[1],
+                    ref_l1,
+                    mvd_l0_x = mb.mvd_l0[mvd_idx][0],
+                    mvd_l0_y = mb.mvd_l0[mvd_idx][1],
+                    mvd_l1_x = mb.mvd_l1[mvd_idx][0],
+                    mvd_l1_y = mb.mvd_l1[mvd_idx][1],
+                    "B_8x8 sub-partition MV"
+                );
 
                 // Apply MC at sub-partition size
                 let px_x = sub_blk_x * 4;
@@ -2594,6 +2863,19 @@ fn add_b_residual(
                     let cqm = 3; // inter
                     let dequant_table = &ctx.dequant8.coeffs[cqm][qp as usize];
                     dequant::dequant_8x8(&mut mb.luma_8x8_coeffs[i8x8], dequant_table);
+                    trace!(
+                        mb_x,
+                        mb_y,
+                        block_idx = i8x8,
+                        qp,
+                        cqm,
+                        coeff_sum = mb.luma_8x8_coeffs[i8x8]
+                            .iter()
+                            .map(|&c| c.unsigned_abs() as u32)
+                            .sum::<u32>(),
+                        dc = mb.luma_8x8_coeffs[i8x8][0],
+                        "DEQUANT"
+                    );
                     // bx/by are pixel offsets within MB (0 or 8)
                     let blk_x_4 = bx / 4; // 0 or 2 in 4x4-block units
                     let blk_y_4 = by / 4;
@@ -2604,6 +2886,17 @@ fn add_b_residual(
                         field_stride,
                         &mut mb.luma_8x8_coeffs[i8x8],
                     );
+                    {
+                        let mut post_sum = 0u32;
+                        for dy in 0..8usize {
+                            for dx in 0..8usize {
+                                post_sum = post_sum.wrapping_add(
+                                    ctx.pic.y[offset + dy * field_stride + dx] as u32,
+                                );
+                            }
+                        }
+                        trace!(mb_x, mb_y, i8x8, post_sum, "POST_IDCT_8X8");
+                    }
                 }
             }
         } else {
@@ -2613,6 +2906,18 @@ fn add_b_residual(
                 if cbp_luma & (1 << group_8x8) != 0 {
                     let raster_idx = block_to_raster(block);
                     dequant::dequant_4x4(&mut mb.luma_coeffs[raster_idx], dq_table);
+                    trace!(
+                        mb_x,
+                        mb_y,
+                        block_idx = block,
+                        qp,
+                        coeff_sum = mb.luma_coeffs[raster_idx]
+                            .iter()
+                            .map(|&c| c.unsigned_abs() as u32)
+                            .sum::<u32>(),
+                        dc = mb.luma_coeffs[raster_idx][0],
+                        "DEQUANT"
+                    );
                     let (offset, stride) =
                         luma_block_offset(&ctx.pic, mb_x, mb_y, blk_x, blk_y, ctx.mb_field);
                     idct::idct4x4_add(
@@ -3047,6 +3352,14 @@ fn apply_weight_list(
         } else {
             (1i32 << hdr.luma_log2_weight_denom, 0i32)
         };
+        trace!(
+            ref_idx,
+            list,
+            luma_weight = w,
+            luma_offset = o,
+            denom = hdr.luma_log2_weight_denom,
+            "weighted pred luma"
+        );
         apply_weight_uni_at(
             &mut ctx.pic.y,
             luma_off,
@@ -3501,6 +3814,12 @@ fn decode_chroma_inter(
             let mut chroma_dc_out = [0i32; 4];
             idct::chroma_dc_dequant_idct(&mut chroma_dc_out, &mb.chroma_dc[plane_idx], qmul);
 
+            {
+                let plane_name = if plane_idx == 0 { "U" } else { "V" };
+                trace!(mb_x, mb_y, plane = plane_name,
+                    dc_in = ?mb.chroma_dc[plane_idx], dc_out = ?chroma_dc_out,
+                    qmul, c_qp, "inter chroma DC");
+            }
 
             for (blk_idx, &dc_val) in chroma_dc_out.iter().enumerate() {
                 let blk_x = (blk_idx & 1) as u32;
@@ -3531,6 +3850,12 @@ fn decode_chroma_inter(
                 } else {
                     // DC-only
                     let dc_add = (dc_val + 32) >> 6;
+                    {
+                        let plane_name = if plane_idx == 0 { "U" } else { "V" };
+                        let mc_row0: Vec<u8> = (0..4).map(|i| plane_data[c_offset + i]).collect();
+                        trace!(mb_x, mb_y, plane = plane_name, blk_x, blk_y,
+                            dc_val, dc_add, mc_pred_row0 = ?mc_row0, "inter chroma DC-add");
+                    }
                     for j in 0..4 {
                         for i in 0..4 {
                             let idx = c_offset + j * c_stride + i;
@@ -3660,6 +3985,16 @@ fn decode_intra8x8(
             block_has_top_left,
             block_has_top_right,
         );
+        // Prediction checksum (before residual addition)
+        {
+            let mut pred_sum = 0u32;
+            for dy in 0..8usize {
+                for dx in 0..8usize {
+                    pred_sum = pred_sum.wrapping_add(ctx.pic.y[offset + dy * stride + dx] as u32);
+                }
+            }
+            trace!(mb_x, mb_y, i8x8, mode, pred_sum, "INTRA8x8_PRED");
+        }
 
         // Dequant and IDCT residual if CBP indicates this 8x8 block is coded
         if cbp_luma & (1 << i8x8) != 0 {
@@ -3667,11 +4002,35 @@ fn decode_intra8x8(
             let cqm = 0; // intra
             let dequant_table = &ctx.dequant8.coeffs[cqm][qp as usize];
             dequant::dequant_8x8(&mut mb.luma_8x8_coeffs[i8x8], dequant_table);
+            trace!(
+                mb_x,
+                mb_y,
+                block_idx = i8x8,
+                qp,
+                cqm,
+                coeff_sum = mb.luma_8x8_coeffs[i8x8]
+                    .iter()
+                    .map(|&c| c.unsigned_abs() as u32)
+                    .sum::<u32>(),
+                dc = mb.luma_8x8_coeffs[i8x8][0],
+                "DEQUANT"
+            );
             idct::idct8x8_add(
                 &mut ctx.pic.y[offset..],
                 stride,
                 &mut mb.luma_8x8_coeffs[i8x8],
             );
+            // Post-IDCT pixel checksum for this 8x8 block
+            {
+                let mut post_sum = 0u32;
+                for dy in 0..8usize {
+                    for dx in 0..8usize {
+                        post_sum =
+                            post_sum.wrapping_add(ctx.pic.y[offset + dy * stride + dx] as u32);
+                    }
+                }
+                trace!(mb_x, mb_y, i8x8, post_sum, "POST_IDCT_8X8");
+            }
         }
     }
 
@@ -3699,6 +4058,42 @@ fn decode_intra4x4(
 ) {
     let cbp_luma = mb.cbp & 0x0F;
 
+    // Raw neighbor pixels from frame buffer for MBAFF debugging.
+    // Dumps the 16-pixel top row, left column, and top-left at MB-level
+    // before any per-block gather. Compare with FFmpeg via ffmpeg_recon_extract.py.
+    {
+        let (mb_off, mb_str) = luma_mb_offset(&ctx.pic, mb_x, mb_y, ctx.mb_field);
+        let raw_top: [u8; 16] = if mb_off >= mb_str {
+            let row = mb_off - mb_str;
+            let mut t = [0u8; 16];
+            t.copy_from_slice(&ctx.pic.y[row..row + 16]);
+            t
+        } else {
+            [0u8; 16]
+        };
+        let raw_left: [u8; 16] = if has_left {
+            let mut l = [128u8; 16];
+            for (i, lv) in l.iter_mut().enumerate() {
+                *lv = ctx.pic.y[mb_off + i * mb_str - 1];
+            }
+            l
+        } else {
+            [128u8; 16]
+        };
+        let raw_tl = if has_top && has_left && mb_off >= mb_str {
+            ctx.pic.y[mb_off - mb_str - 1]
+        } else {
+            128
+        };
+        trace!(
+            mb_x, mb_y,
+            offset = mb_off, stride = mb_str,
+            top_row = ?raw_top,
+            left_col = ?raw_left,
+            top_left = raw_tl,
+            "INTRA_RAW_NEIGHBORS"
+        );
+    }
 
     // Decode each of the 16 4x4 luma blocks in block scan order
     for (block, &(blk_x, blk_y)) in BLOCK_INDEX_TO_XY.iter().enumerate() {
@@ -3782,18 +4177,32 @@ fn decode_intra4x4(
             block_has_top_right,
         );
 
+        {
+            let mut pred = [0u8; 16];
+            for r in 0..4 {
+                let off = offset + r * stride;
+                pred[r * 4..r * 4 + 4].copy_from_slice(&ctx.pic.y[off..off + 4]);
+            }
+            trace!(mb_x, mb_y, blk_x, blk_y, pred = ?pred, "intra4x4 prediction");
+        }
 
         // Dequant and IDCT residual if CBP indicates this 8x8 group is coded
         let group_8x8 = (blk_y / 2) * 2 + (blk_x / 2);
         if cbp_luma & (1 << group_8x8) != 0 {
             let raster_idx = block_to_raster(block);
 
+            {
+                trace!(mb_x, mb_y, blk_x, blk_y, coeffs = ?mb.luma_coeffs[raster_idx], "intra4x4 pre-dequant");
+            }
 
             dequant::dequant_4x4(
                 &mut mb.luma_coeffs[raster_idx],
                 &ctx.dequant4.coeffs[0][qp as usize],
             ); // intra Y
 
+            {
+                trace!(mb_x, mb_y, blk_x, blk_y, coeffs = ?mb.luma_coeffs[raster_idx], "intra4x4 post-dequant");
+            }
 
             let (offset, stride) =
                 luma_block_offset(&ctx.pic, mb_x, mb_y, blk_x, blk_y, ctx.mb_field);
@@ -3803,6 +4212,14 @@ fn decode_intra4x4(
                 &mut mb.luma_coeffs[raster_idx],
             );
 
+            {
+                let mut final_px = [0u8; 16];
+                for r in 0..4 {
+                    let off = offset + r * stride;
+                    final_px[r * 4..r * 4 + 4].copy_from_slice(&ctx.pic.y[off..off + 4]);
+                }
+                trace!(mb_x, mb_y, blk_x, blk_y, pixels = ?final_px, "intra4x4 post-IDCT");
+            }
         }
     }
 
@@ -3828,6 +4245,39 @@ fn decode_intra16x16(
     // Apply 16x16 intra prediction
     let (offset, stride) = luma_mb_offset(&ctx.pic, mb_x, mb_y, ctx.mb_field);
 
+    // Raw neighbor pixels from frame buffer for MBAFF debugging
+    {
+        let raw_top: [u8; 16] = if offset >= stride {
+            let row = offset - stride;
+            let mut t = [0u8; 16];
+            t.copy_from_slice(&ctx.pic.y[row..row + 16]);
+            t
+        } else {
+            [0u8; 16]
+        };
+        let raw_left: [u8; 16] = if has_left {
+            let mut l = [128u8; 16];
+            for (i, lv) in l.iter_mut().enumerate() {
+                *lv = ctx.pic.y[offset + i * stride - 1];
+            }
+            l
+        } else {
+            [128u8; 16]
+        };
+        let raw_tl = if has_top && has_left && offset >= stride {
+            ctx.pic.y[offset - stride - 1]
+        } else {
+            128
+        };
+        trace!(
+            mb_x, mb_y,
+            offset, stride,
+            top_row = ?raw_top,
+            left_col = ?raw_left,
+            top_left = raw_tl,
+            "INTRA_RAW_NEIGHBORS"
+        );
+    }
 
     let top: [u8; 16] = gather_top(&ctx.pic.y, offset, stride);
     let left: [u8; 16] = gather_left(&ctx.pic.y, offset, stride, has_left);
@@ -3843,12 +4293,20 @@ fn decode_intra16x16(
         has_left,
     );
 
+    {
+        let mut pred_row0 = [0u8; 16];
+        pred_row0.copy_from_slice(&ctx.pic.y[offset..offset + 16]);
+        trace!(mb_x, mb_y, mode = mb.intra16x16_mode, row0 = ?pred_row0, "intra16x16 prediction");
+    }
 
     // Luma DC: inverse Hadamard + dequant (i32 output to avoid i16 overflow)
     let qmul = dequant::dc_dequant_scale(&ctx.dequant4, 0, qp);
     let mut luma_dc_out = [0i32; 16];
     idct::luma_dc_dequant_idct(&mut luma_dc_out, &mb.luma_dc, qmul);
 
+    {
+        trace!(mb_x, mb_y, dc_out = ?luma_dc_out, "intra16x16 luma DC Hadamard");
+    }
 
     let cbp_luma = mb.cbp & 0x0F;
 

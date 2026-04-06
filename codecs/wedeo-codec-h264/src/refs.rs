@@ -7,6 +7,7 @@
 // Reference: ITU-T H.264 Sections 8.2.4 (list construction) and
 // 8.2.5 (reference picture marking), FFmpeg libavcodec/h264_refs.c
 
+use tracing::debug;
 
 use crate::dpb::{Dpb, RefStatus};
 use crate::slice::{MmcoOp, RefPicListModification, SliceHeader};
@@ -505,6 +506,12 @@ fn apply_mmco(
                 if let Some(idx) = found {
                     dpb.mark_unused(idx);
                 }
+                debug!(
+                    op = "SHORT_UNUSED",
+                    pic_num,
+                    found = found.is_some(),
+                    "MMCO"
+                );
             }
 
             MmcoOp::LongTermUnused { long_term_pic_num } => {
@@ -512,6 +519,12 @@ fn apply_mmco(
                 if let Some(idx) = found {
                     dpb.mark_unused(idx);
                 }
+                debug!(
+                    op = "LT_UNUSED",
+                    long_term_pic_num,
+                    found = found.is_some(),
+                    "MMCO"
+                );
             }
 
             MmcoOp::ShortTermToLongTerm {
@@ -530,6 +543,13 @@ fn apply_mmco(
                     entry.status = RefStatus::LongTerm;
                     entry.long_term_frame_idx = *long_term_frame_idx;
                 }
+                debug!(
+                    op = "SHORT_TO_LONG",
+                    pic_num,
+                    long_term_frame_idx,
+                    found = found.is_some(),
+                    "MMCO"
+                );
             }
 
             MmcoOp::MaxLongTermFrameIdx {
@@ -546,12 +566,15 @@ fn apply_mmco(
                         }
                     })
                     .collect();
+                let removed = to_remove.len();
                 for i in to_remove {
                     dpb.mark_unused(i);
                 }
+                debug!(op = "MAX_LT_IDX", max_idx, removed, "MMCO");
             }
 
             MmcoOp::Reset => {
+                debug!(op = "RESET", "MMCO");
                 // Clear all entries except the current one
                 for (i, entry) in dpb.entries.iter_mut().enumerate() {
                     if Some(i) == current_dpb_idx {
@@ -591,6 +614,7 @@ fn apply_mmco(
                     entry.long_term_frame_idx = *long_term_frame_idx;
                 }
                 current_marked = true;
+                debug!(op = "CUR_TO_LONG", long_term_frame_idx, "MMCO");
             }
         }
     }

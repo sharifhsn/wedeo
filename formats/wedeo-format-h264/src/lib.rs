@@ -6,6 +6,7 @@
 //
 // Reference: FFmpeg libavformat/h264dec.c, ITU-T H.264 Annex B.
 
+use tracing::{info, trace};
 use wedeo_codec::decoder::CodecParameters;
 use wedeo_codec_h264::nal::{NalUnitType, split_annex_b};
 use wedeo_codec_h264::sps::{Sps, parse_sps};
@@ -169,6 +170,12 @@ impl Demuxer for H264Demuxer {
         let mut stream = Stream::new(0, params);
         stream.time_base = time_base;
 
+        info!(
+            width = stream.codec_params.width,
+            height = stream.codec_params.height,
+            time_base = %time_base,
+            "H.264 stream opened"
+        );
 
         // Seek back to start so read_packet gets the full stream
         if io.is_seekable() {
@@ -399,6 +406,12 @@ impl H264Demuxer {
         if is_keyframe {
             pkt.flags = PacketFlags::KEY;
         }
+        trace!(
+            frame = self.frame_count,
+            size = data.len(),
+            is_keyframe,
+            "H.264 packet"
+        );
         self.frame_count += 1;
         Ok(pkt)
     }

@@ -8,6 +8,7 @@
 //
 // Reference: FFmpeg libavcodec/cabac.c, cabac_functions.h, cabac.h, h264_cabac.c
 
+use tracing::trace;
 use wedeo_core::error::{Error, Result};
 
 use crate::cabac_tables::{
@@ -116,8 +117,12 @@ impl<'a> CabacReader<'a> {
     /// bits 1..6 = probability index). Updated in place after decode.
     ///
     /// Reference: FFmpeg `get_cabac_inline`.
-    #[inline(always)]
+    #[inline]
     pub fn get_cabac(&mut self, state: &mut u8) -> u8 {
+        let pre_state = *state;
+        let pre_low = self.low;
+        let pre_range = self.range;
+
         let s = *state as i32;
         let range_lps = LPS_RANGE[(2 * (self.range & 0xC0) + s) as usize] as i32;
 
@@ -138,6 +143,30 @@ impl<'a> CabacReader<'a> {
             self.refill2();
         }
 
+        {
+            use std::sync::atomic::{AtomicI32, Ordering};
+            static BIN_COUNT: AtomicI32 = AtomicI32::new(0);
+            static MAX_BINS: AtomicI32 = AtomicI32::new(-1);
+            let max = MAX_BINS.load(Ordering::Relaxed);
+            let max = if max < 0 {
+                let v = std::env::var("CABAC_MAX_BINS")
+                    .ok()
+                    .and_then(|s| s.parse::<i32>().ok())
+                    .unwrap_or(10000);
+                MAX_BINS.store(v, Ordering::Relaxed);
+                v
+            } else {
+                max
+            };
+            let n = BIN_COUNT.fetch_add(1, Ordering::Relaxed);
+            if n < max {
+                trace!(
+                    "CABAC_BIN {} state={} low={} range={} -> bit={} post_low={} post_range={}",
+                    n, pre_state, pre_low, pre_range, bit, self.low, self.range
+                );
+            }
+        }
+
         bit as u8
     }
 
@@ -147,8 +176,11 @@ impl<'a> CabacReader<'a> {
     /// syntax elements.
     ///
     /// Reference: FFmpeg `get_cabac_bypass`.
-    #[inline(always)]
+    #[inline]
     pub fn get_cabac_bypass(&mut self) -> u8 {
+        let pre_low = self.low;
+        let pre_range = self.range;
+
         self.low += self.low;
 
         if self.low & CABAC_MASK == 0 {
@@ -156,12 +188,38 @@ impl<'a> CabacReader<'a> {
         }
 
         let range = self.range << (CABAC_BITS + 1);
-        if self.low < range {
+        let bit = if self.low < range {
             0
         } else {
             self.low -= range;
             1
+        };
+
+        {
+            use std::sync::atomic::{AtomicI32, Ordering};
+            static BYPASS_COUNT: AtomicI32 = AtomicI32::new(0);
+            static MAX_BINS_BP: AtomicI32 = AtomicI32::new(-1);
+            let max = MAX_BINS_BP.load(Ordering::Relaxed);
+            let max = if max < 0 {
+                let v = std::env::var("CABAC_MAX_BINS")
+                    .ok()
+                    .and_then(|s| s.parse::<i32>().ok())
+                    .unwrap_or(10000);
+                MAX_BINS_BP.store(v, Ordering::Relaxed);
+                v
+            } else {
+                max
+            };
+            let n = BYPASS_COUNT.fetch_add(1, Ordering::Relaxed);
+            if n < max {
+                trace!(
+                    "CABAC_BYPASS {} low={} range={} -> bit={} post_low={}",
+                    n, pre_low, pre_range, bit, self.low
+                );
+            }
         }
+
+        bit
     }
 
     /// Decode a bypass symbol and apply it as a sign to `val`.
@@ -171,8 +229,11 @@ impl<'a> CabacReader<'a> {
     /// mask = low >> 31 (sign extension).
     ///
     /// Reference: FFmpeg `get_cabac_bypass_sign`.
-    #[inline(always)]
+    #[inline]
     pub fn get_cabac_bypass_sign(&mut self, val: i32) -> i32 {
+        let pre_low = self.low;
+        let pre_range = self.range;
+
         self.low += self.low;
 
         if self.low & CABAC_MASK == 0 {
@@ -183,7 +244,35 @@ impl<'a> CabacReader<'a> {
         self.low -= range;
         let mask = self.low >> 31;
         self.low += range & mask;
-        (val ^ mask) - mask
+        let result = (val ^ mask) - mask;
+
+        {
+            use std::sync::atomic::{AtomicI32, Ordering};
+            static BYPASS_SIGN_COUNT: AtomicI32 = AtomicI32::new(0);
+            static MAX_BINS_BPS: AtomicI32 = AtomicI32::new(-1);
+            let max = MAX_BINS_BPS.load(Ordering::Relaxed);
+            let max = if max < 0 {
+                let v = std::env::var("CABAC_MAX_BINS")
+                    .ok()
+                    .and_then(|s| s.parse::<i32>().ok())
+                    .unwrap_or(10000);
+                MAX_BINS_BPS.store(v, Ordering::Relaxed);
+                v
+            } else {
+                max
+            };
+            let n = BYPASS_SIGN_COUNT.fetch_add(1, Ordering::Relaxed);
+            if n < max {
+                // bit=1 means negative (LPS), bit=0 means positive (MPS)
+                let bit = if mask == 0 { 0 } else { 1 };
+                trace!(
+                    "CABAC_BYPASS_SIGN {} low={} range={} val={} -> bit={} result={} post_low={}",
+                    n, pre_low, pre_range, val, bit, result, self.low
+                );
+            }
+        }
+
+        result
     }
 
     /// Check for end-of-slice (terminate symbol).
@@ -192,10 +281,13 @@ impl<'a> CabacReader<'a> {
     /// a fixed range reduction of 2.
     ///
     /// Reference: FFmpeg `get_cabac_terminate`.
-    #[inline(always)]
+    #[inline]
     pub fn get_cabac_terminate(&mut self) -> bool {
+        let pre_low = self.low;
+        let pre_range = self.range;
+
         self.range -= 2;
-        if self.low < (self.range << (CABAC_BITS + 1)) {
+        let result = if self.low < (self.range << (CABAC_BITS + 1)) {
             // Not terminated: renormalize once
             let shift = ((self.range as u32).wrapping_sub(0x100) >> 31) as i32;
             self.range <<= shift;
@@ -206,7 +298,19 @@ impl<'a> CabacReader<'a> {
             false
         } else {
             true
+        };
+
+        {
+            use std::sync::atomic::{AtomicI32, Ordering};
+            static TERM_COUNT: AtomicI32 = AtomicI32::new(0);
+            let n = TERM_COUNT.fetch_add(1, Ordering::Relaxed);
+            trace!(
+                "CABAC_TERM {} low={} range={} -> result={} post_low={} post_range={}",
+                n, pre_low, pre_range, result as i32, self.low, self.range
+            );
         }
+
+        result
     }
 
     /// Skip `n` bytes and re-initialize the CABAC engine.
@@ -867,10 +971,20 @@ fn decode_cabac_intra_mb_type(
         {
             ctx += 1;
         }
+        trace!(
+            "CABAC_INTRA_MB_TYPE ctx_base={} ctx={} state_idx={}",
+            ctx_base,
+            ctx,
+            ctx_base + ctx
+        );
         if reader.get_cabac(&mut state[ctx_base + ctx]) == 0 {
             return 0; // I_4x4
         }
     } else {
+        trace!(
+            "CABAC_INTRA_MB_TYPE ctx_base={} ctx=0 state_idx={} (inter_slice)",
+            ctx_base, ctx_base
+        );
         if reader.get_cabac(&mut state[ctx_base]) == 0 {
             return 0; // I_4x4
         }
@@ -1919,6 +2033,11 @@ pub fn decode_mb_cabac(
     let nb_top = nb.top_idx;
     let left_block_option = nb.left_block_option;
 
+    trace!(
+        "CABAC_MB_START mb_x={} mb_y={} slice_type={:?}",
+        mb_x, mb_y, slice_type
+    );
+
     // 1. Parse mb_type
     let is_intra;
     let mut cbp;
@@ -1972,6 +2091,7 @@ pub fn decode_mb_cabac(
                 b_ctx += 1;
             }
 
+            trace!("CABAC_B_MB_TYPE b_ctx={} state_idx={}", b_ctx, 27 + b_ctx);
 
             if reader.get_cabac(&mut state[27 + b_ctx]) == 0 {
                 // B_Direct_16x16
@@ -2212,6 +2332,7 @@ pub fn decode_mb_cabac(
     }
 
     // 4. Chroma prediction mode (for intra MBs)
+    trace!("CABAC_SECTION chroma_pred_mode");
     if is_intra && decode_chroma {
         mb.chroma_pred_mode =
             decode_cabac_mb_chroma_pre_mode(reader, state, cabac_nb, nb_left, nb_top);
@@ -2573,6 +2694,7 @@ pub fn decode_mb_cabac(
     }
 
     // 6. CBP (for non-I16x16)
+    trace!("CABAC_SECTION cbp");
     if !mb.is_intra16x16 {
         let left_cbp = cabac_nb.left_cbp_mbaff(nb_left, nb_left_bot, is_intra, left_block_option);
         let top_cbp = cabac_nb.top_cbp(nb_top, is_intra);
@@ -2599,6 +2721,7 @@ pub fn decode_mb_cabac(
     }
 
     // 7. QP delta and residual coefficients
+    trace!("CABAC_SECTION qp_delta_and_residual cbp={}", cbp);
     let mut stored_cbp = cbp;
     let is_i16x16 = mb.is_intra16x16;
     if cbp > 0 || is_i16x16 {
@@ -2606,6 +2729,7 @@ pub fn decode_mb_cabac(
         mb.mb_qp_delta = decode_cabac_mb_dqp(reader, state, last_qscale_diff)?;
 
         // Decode luma residual
+        trace!("CABAC_SECTION luma_residual");
         decode_cabac_luma_residual(
             reader,
             state,
@@ -2622,6 +2746,7 @@ pub fn decode_mb_cabac(
         );
 
         // Decode chroma residual (4:2:0)
+        trace!("CABAC_SECTION chroma_residual");
         decode_cabac_chroma_residual(
             reader,
             state,
@@ -2637,6 +2762,36 @@ pub fn decode_mb_cabac(
             left_block_option,
         );
 
+        // Per-MB coefficient summary for pipeline-stage tracing
+        {
+            let luma_sum: u32 = if mb.transform_size_8x8_flag {
+                mb.luma_8x8_coeffs
+                    .iter()
+                    .flat_map(|c| c.iter())
+                    .map(|&c| c.unsigned_abs() as u32)
+                    .sum()
+            } else {
+                mb.luma_coeffs
+                    .iter()
+                    .flat_map(|c| c.iter())
+                    .map(|&c| c.unsigned_abs() as u32)
+                    .sum()
+            };
+            let chroma_dc_cb: i16 = mb.chroma_dc[0].iter().sum();
+            let chroma_dc_cr: i16 = mb.chroma_dc[1].iter().sum();
+            trace!(
+                mb_x,
+                mb_y,
+                t8x8 = mb.transform_size_8x8_flag,
+                luma_sum,
+                chroma_dc_cb,
+                chroma_dc_cr,
+                cbp,
+                i16x16 = is_i16x16,
+                "COEFF_CABAC"
+            );
+        }
+
         // Store the luma DC coded flag if I16x16 had non-zero DC
         if is_i16x16 && mb.luma_dc.iter().any(|&c| c != 0) {
             stored_cbp |= 0x100;
@@ -2645,6 +2800,17 @@ pub fn decode_mb_cabac(
 
     // Update stored cbp
     mb.cbp = stored_cbp;
+
+    trace!(
+        mb_x,
+        mb_y,
+        mb_type = mb.mb_type,
+        cbp = mb.cbp,
+        is_intra4x4 = mb.is_intra4x4,
+        is_intra16x16 = mb.is_intra16x16,
+        is_pcm = mb.is_pcm,
+        "CABAC decoded MB"
+    );
 
     Ok(mb)
 }
