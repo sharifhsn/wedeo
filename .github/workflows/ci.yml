@@ -60,7 +60,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Cache FATE H.264 samples
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         id: fate-cache
         with:
           path: fate-suite/h264-conformance
@@ -120,7 +120,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Cache JVT vectors
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: jvt-vectors
           key: jvt-vectors-${{ hashFiles('test_suites/h264/*.json') }}
