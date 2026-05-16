@@ -49,7 +49,7 @@ cc = "1"
 cpal = "0.17"
 minifb = "0.28"
 pollster = "0.4"
-ringbuf = "0.4"
+ringbuf = "0.5"
 wgpu = "29"
 winit = "0.30"
 wedeo-core = { path = "crates/wedeo-core", version = "0.2.0" }
