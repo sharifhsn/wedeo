@@ -46,10 +46,10 @@ tracing = { version = "0.1", features = ["attributes"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 cc = "1"
 
-cpal = "0.17"
+cpal = "0.18"
 minifb = "0.28"
 pollster = "0.4"
-ringbuf = "0.4"
+ringbuf = "0.5"
 wgpu = "29"
 winit = "0.30"
 wedeo-core = { path = "crates/wedeo-core", version = "0.2.0" }
