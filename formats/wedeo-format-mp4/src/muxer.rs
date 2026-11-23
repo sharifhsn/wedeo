@@ -1,28 +1,32 @@
-// MP4 muxer implementation.
-//
-// Two-pass approach: mdat is written first (incrementally), moov is written at
-// the end with all sample tables. Requires a seekable output.
+//! ISOBMFF / MP4 / M4A muxer implementation (Wedeo v2).
+//!
+//! Automatically selects output layout based on `sink.is_seekable()`:
+//! - **Seekable sinks**: classic faststart `moov`-first MP4 (`ftyp` + `moov` + `mdat`).
+//! - **Non-seekable sinks** (pipes/streams): CMAF-ready fragmented MP4 (`ftyp` + `moov` [`mvex`/`trex`] + `moof`/`mdat` fragments).
 
-use wedeo_core::codec_id::CodecId;
-use wedeo_core::error::{Error, Result};
-use wedeo_core::media_type::MediaType;
-use wedeo_core::packet::{Packet, PacketFlags};
-use wedeo_format::demuxer::Stream;
-use wedeo_format::io::BufferedIo;
-use wedeo_format::muxer::Muxer;
+use wedeo_core::{
+    ByteSink, CodecId, ColorDesc, ContainerHeader, EditSegment, Error, MediaType, Muxer,
+    MuxerDescriptor, MuxerFactory, Packet, PacketFlags, Rational, Result, StreamParams, TrackId,
+    rescale_q,
+};
 
 use crate::atoms;
 
 /// Per-track state accumulated during muxing.
 pub struct TrackState {
-    pub stream_index: usize,
+    pub track_id: TrackId,
     pub codec_id: CodecId,
     pub media_type: MediaType,
     pub timescale: u32,
+    pub language: Option<String>,
+    pub edit_list: Vec<EditSegment>,
 
     // Video
     pub width: u32,
     pub height: u32,
+    pub color: ColorDesc,
+    pub sar: Rational,
+    pub display_matrix: Option<[i32; 9]>,
 
     // Audio
     pub sample_rate: u32,
@@ -32,7 +36,7 @@ pub struct TrackState {
 
     pub extradata: Vec<u8>,
 
-    // Sample table data (accumulated during write_packet)
+    // Classic sample table data
     pub sample_count: u32,
     pub sample_sizes: Vec<u32>,
     pub sample_durations: Vec<u32>,
@@ -40,104 +44,238 @@ pub struct TrackState {
     pub sync_samples: Vec<u32>,
     pub cts_offsets: Vec<i32>,
     pub has_cts: bool,
-
     pub duration_ts: u64,
+
+    // Fragmented MP4 tracking
+    pub next_dts: i64,
 }
 
-/// Options for controlling MP4 muxer behavior.
-#[derive(Default)]
-pub struct Mp4MuxerOptions {
-    /// Place moov before mdat for progressive playback (equivalent to `-movflags +faststart`).
-    pub faststart: bool,
+/// One sample inside a `moof` fragment.
+#[derive(Debug, Clone, Copy)]
+pub struct FragmentSample {
+    pub duration: u32,
+    pub size: u32,
+    pub cts_offset: i32,
+    pub is_key: bool,
 }
 
-/// MP4 muxer state.
+/// Per-track fragment buffer for fMP4 `traf` / `trun` generation.
+pub struct FragmentTrackData {
+    pub track_id: u32,
+    pub base_decode_time: u64,
+    pub data_offset: i32,
+    pub samples: Vec<FragmentSample>,
+    pub payload: Vec<u8>,
+}
+
+/// Native ISOBMFF / MP4 / M4A muxer owning a `Box<dyn ByteSink>`.
 pub struct Mp4Muxer {
+    sink: Box<dyn ByteSink>,
     tracks: Vec<TrackState>,
-    /// File offset where the mdat box starts (at the size field).
-    mdat_pos: u64,
-    /// File offset of the 64-bit largesize field in the mdat header.
-    mdat_largesize_pos: u64,
-    /// Movie-level timescale (typically 1000).
     movie_timescale: u32,
-    /// Enable moov-before-mdat relocation.
-    faststart: bool,
-}
-
-impl Default for Mp4Muxer {
-    fn default() -> Self {
-        Self::new()
-    }
+    fragmented: bool,
+    ftyp_len: u64,
+    // Seekable faststart buffer
+    mdat_buf: Vec<u8>,
+    // Fragmented MP4 state
+    frag_seq: u32,
+    frag_tracks: Vec<FragmentTrackData>,
+    frag_total_bytes: usize,
 }
 
 impl Mp4Muxer {
-    pub fn new() -> Self {
+    /// Create a new `Mp4Muxer` owning `sink`.
+    pub fn new(sink: Box<dyn ByteSink>) -> Self {
         Self {
+            sink,
             tracks: Vec::new(),
-            mdat_pos: 0,
-            mdat_largesize_pos: 0,
             movie_timescale: 1000,
-            faststart: false,
+            fragmented: false,
+            ftyp_len: 0,
+            mdat_buf: Vec::new(),
+            frag_seq: 0,
+            frag_tracks: Vec::new(),
+            frag_total_bytes: 0,
         }
     }
 
-    pub fn with_options(options: Mp4MuxerOptions) -> Self {
-        Self {
-            tracks: Vec::new(),
-            mdat_pos: 0,
-            mdat_largesize_pos: 0,
-            movie_timescale: 1000,
-            faststart: options.faststart,
-        }
+    fn find_track(&self, track_id: TrackId) -> Option<usize> {
+        self.tracks.iter().position(|t| t.track_id == track_id)
     }
 
-    fn find_track(&self, stream_index: usize) -> Option<usize> {
-        self.tracks
+    fn flush_fragment(&mut self) -> Result<()> {
+        let mut active: Vec<FragmentTrackData> = Vec::new();
+        for ft in &mut self.frag_tracks {
+            if !ft.samples.is_empty() {
+                active.push(FragmentTrackData {
+                    track_id: ft.track_id,
+                    base_decode_time: ft.base_decode_time,
+                    data_offset: 0,
+                    samples: std::mem::take(&mut ft.samples),
+                    payload: std::mem::take(&mut ft.payload),
+                });
+            }
+        }
+        self.frag_total_bytes = 0;
+
+        if active.is_empty() {
+            return Ok(());
+        }
+
+        self.frag_seq += 1;
+        let trial_moof = atoms::write_moof(self.frag_seq, &active);
+        let moof_size = trial_moof.len() as i32;
+
+        let mut payload_offset = 0i32;
+        for frag in &mut active {
+            frag.data_offset = moof_size + 8 + payload_offset;
+            payload_offset += frag.payload.len() as i32;
+        }
+
+        let moof = atoms::write_moof(self.frag_seq, &active);
+        let mdat_size = (8 + payload_offset as usize) as u32;
+
+        self.sink
+            .write_all(&moof)
+            .map_err(|e| Error::io("mp4/muxer", &e))?;
+        self.sink
+            .write_all(&mdat_size.to_be_bytes())
+            .map_err(|e| Error::io("mp4/muxer", &e))?;
+        self.sink
+            .write_all(b"mdat")
+            .map_err(|e| Error::io("mp4/muxer", &e))?;
+        for frag in &active {
+            self.sink
+                .write_all(&frag.payload)
+                .map_err(|e| Error::io("mp4/muxer", &e))?;
+        }
+        self.sink.flush().map_err(|e| Error::io("mp4/muxer", &e))?;
+
+        Ok(())
+    }
+
+    fn build_faststart_moov(&mut self, mdat_header_size: u64) -> Vec<u8> {
+        let original_offsets: Vec<Vec<u64>> = self
+            .tracks
             .iter()
-            .position(|t| t.stream_index == stream_index)
+            .map(|t| t.chunk_offsets.clone())
+            .collect();
+
+        let trial_moov = atoms::write_moov(&self.tracks, self.movie_timescale, false);
+        let mut moov_size = trial_moov.len() as u64;
+
+        for iter in 0..2 {
+            let base = self.ftyp_len + moov_size + mdat_header_size;
+            for (track, orig) in self.tracks.iter_mut().zip(original_offsets.iter()) {
+                track.chunk_offsets = orig.iter().map(|&o| base + o).collect();
+            }
+
+            let moov = atoms::write_moov(&self.tracks, self.movie_timescale, false);
+            let new_size = moov.len() as u64;
+            if new_size == moov_size || iter == 1 {
+                return moov;
+            }
+            moov_size = new_size;
+        }
+        unreachable!()
     }
 }
 
 impl Muxer for Mp4Muxer {
-    fn write_header(&mut self, io: &mut BufferedIo, streams: &[Stream]) -> Result<()> {
-        if streams.is_empty() {
-            return Err(Error::StreamNotFound);
+    fn write_header(&mut self, header: &ContainerHeader) -> Result<()> {
+        if header.tracks.is_empty() {
+            return Err(Error::invalid_argument(
+                "mp4/muxer",
+                "container header has no tracks",
+            ));
         }
 
-        // Two-pass muxing requires seek to patch mdat size
-        if !io.is_seekable() {
-            return Err(Error::Other("MP4 muxer requires seekable output".into()));
-        }
+        self.fragmented = !self.sink.is_seekable();
 
-        // Validate codecs and initialize track state
-        let has_video = streams
-            .iter()
-            .any(|s| s.codec_params.media_type == MediaType::Video);
-        let has_audio = streams
-            .iter()
-            .any(|s| s.codec_params.media_type == MediaType::Audio);
+        let mut has_video = false;
+        let mut has_audio = false;
 
-        for stream in streams {
-            let params = &stream.codec_params;
-
-            if !is_supported_codec(params.codec_id) {
-                return Err(Error::PatchwelcomeNotImplemented);
+        for (i, desc) in header.tracks.iter().enumerate() {
+            if !is_supported_codec(desc.codec_id) {
+                return Err(Error::unsupported(
+                    "mp4/muxer",
+                    format!("unsupported codec: {}", desc.codec_id.name()),
+                ));
             }
 
-            let timescale = compute_timescale(params);
+            let timescale = compute_timescale(desc);
+            let (
+                media_type,
+                width,
+                height,
+                color,
+                sar,
+                display_matrix,
+                sample_rate,
+                channels,
+                bits_per_sample,
+                bit_rate,
+                extradata,
+            ) = match &desc.params {
+                StreamParams::Video(vp) => {
+                    has_video = true;
+                    (
+                        MediaType::Video,
+                        vp.width,
+                        vp.height,
+                        vp.color,
+                        vp.sar,
+                        vp.display_matrix,
+                        0,
+                        0,
+                        0,
+                        vp.bit_rate,
+                        vp.extradata.clone(),
+                    )
+                }
+                StreamParams::Audio(ap) => {
+                    has_audio = true;
+                    (
+                        MediaType::Audio,
+                        0,
+                        0,
+                        ColorDesc::UNSPECIFIED,
+                        Rational::new(1, 1),
+                        None,
+                        ap.sample_rate,
+                        ap.channel_layout.nb_channels as u16,
+                        (ap.bits_per_coded_sample as u16).max(16),
+                        ap.bit_rate,
+                        ap.extradata.clone(),
+                    )
+                }
+                _ => {
+                    return Err(Error::unsupported(
+                        "mp4/muxer",
+                        "only video and audio tracks are supported",
+                    ));
+                }
+            };
+
+            validate_extradata(desc.codec_id, &extradata)?;
 
             self.tracks.push(TrackState {
-                stream_index: stream.index,
-                codec_id: params.codec_id,
-                media_type: params.media_type,
+                track_id: desc.id,
+                codec_id: desc.codec_id,
+                media_type,
                 timescale,
-                width: params.width,
-                height: params.height,
-                sample_rate: params.sample_rate,
-                channels: params.channel_layout.nb_channels as u16,
-                bits_per_sample: params.bits_per_coded_sample as u16,
-                bit_rate: params.bit_rate,
-                extradata: params.extradata.clone(),
+                language: desc.language.clone(),
+                edit_list: desc.edit_list.clone(),
+                width,
+                height,
+                color,
+                sar,
+                display_matrix,
+                sample_rate,
+                channels,
+                bits_per_sample,
+                bit_rate,
+                extradata,
                 sample_count: 0,
                 sample_sizes: Vec::new(),
                 sample_durations: Vec::new(),
@@ -146,196 +284,198 @@ impl Muxer for Mp4Muxer {
                 cts_offsets: Vec::new(),
                 has_cts: false,
                 duration_ts: 0,
+                next_dts: 0,
+            });
+
+            self.frag_tracks.push(FragmentTrackData {
+                track_id: i as u32 + 1,
+                base_decode_time: 0,
+                data_offset: 0,
+                samples: Vec::new(),
+                payload: Vec::new(),
             });
         }
 
-        // Validate extradata requirements
-        for track in &self.tracks {
-            match track.codec_id {
-                CodecId::H264 => {
-                    if track.extradata.is_empty() {
-                        return Err(Error::InvalidArgument);
-                    }
-                    if track.extradata[0] != 0x01 {
-                        return Err(Error::InvalidData);
-                    }
-                }
-                CodecId::Av1 if track.extradata.is_empty() => {
-                    return Err(Error::InvalidArgument);
-                }
-                CodecId::Aac if track.extradata.is_empty() => {
-                    return Err(Error::InvalidArgument);
-                }
-                _ => {}
-            }
+        let ftyp = atoms::write_ftyp(has_video, has_audio, self.fragmented);
+        self.ftyp_len = ftyp.len() as u64;
+        self.sink
+            .write_all(&ftyp)
+            .map_err(|e| Error::io("mp4/muxer", &e))?;
+
+        if self.fragmented {
+            let moov = atoms::write_moov(&self.tracks, self.movie_timescale, true);
+            self.sink
+                .write_all(&moov)
+                .map_err(|e| Error::io("mp4/muxer", &e))?;
         }
 
-        // Write ftyp
-        let ftyp = atoms::write_ftyp(has_video, has_audio);
-        io.write_bytes(&ftyp)?;
-
-        // Write extended mdat header (16 bytes: size=1 + "mdat" + largesize placeholder)
-        self.mdat_pos = io.tell()?;
-        io.write_u32be(1)?; // size = 1 means "use largesize"
-        io.write_bytes(b"mdat")?;
-        self.mdat_largesize_pos = io.tell()?;
-        io.write_bytes(&0u64.to_be_bytes())?; // largesize placeholder
-
-        io.flush()?;
+        self.sink.flush().map_err(|e| Error::io("mp4/muxer", &e))?;
         Ok(())
     }
 
-    fn write_packet(&mut self, io: &mut BufferedIo, packet: &Packet) -> Result<()> {
+    fn write_packet(&mut self, pkt: &Packet) -> Result<()> {
         let track_idx = self
-            .find_track(packet.stream_index)
-            .ok_or(Error::StreamNotFound)?;
+            .find_track(pkt.track_id)
+            .ok_or_else(|| Error::not_found("mp4/muxer", "packet track_id not in header"))?;
 
-        let offset = io.tell()?;
-        let data = packet.data.data();
-        io.write_bytes(data)?;
+        let timescale = self.tracks[track_idx].timescale.max(1);
+        let track_tb = Rational::new(1, timescale as i32);
 
-        let track = &mut self.tracks[track_idx];
-        track.sample_count += 1;
-        track.sample_sizes.push(data.len() as u32);
-        track.chunk_offsets.push(offset);
+        let rescale_ts = |ts: i64| -> i64 {
+            if pkt.time_base.is_valid() && pkt.time_base != track_tb {
+                rescale_q(ts, pkt.time_base, track_tb)
+            } else {
+                ts
+            }
+        };
 
-        // Duration: use packet.duration if available, otherwise default to 1
-        let duration = if packet.duration > 0 {
-            packet.duration as u32
+        let dts = match pkt.dts.get() {
+            Some(d) => rescale_ts(d),
+            None => match pkt.pts.get() {
+                Some(p) => rescale_ts(p),
+                None => self.tracks[track_idx].next_dts,
+            },
+        };
+        let pts = pkt.pts.get().map(rescale_ts).unwrap_or(dts);
+        let duration = if pkt.duration > 0 {
+            rescale_ts(pkt.duration).max(1) as u32
         } else {
             1
         };
-        track.sample_durations.push(duration);
-        track.duration_ts += duration as u64;
+        let cts_offset = (pts - dts) as i32;
+        let is_key = pkt.flags.contains(PacketFlags::KEY);
+        let data = pkt.data.as_slice().ok_or_else(|| {
+            Error::invalid_argument("mp4/muxer", "packet data must be CPU-accessible")
+        })?;
 
-        // Sync samples (keyframes) — 1-indexed
-        if packet.flags.contains(PacketFlags::KEY) {
-            track.sync_samples.push(track.sample_count);
-        }
+        if self.fragmented {
+            let is_video_key = self.tracks[track_idx].media_type == MediaType::Video && is_key;
+            if (is_video_key && self.frag_total_bytes > 0) || self.frag_total_bytes >= 1_048_576 {
+                self.flush_fragment()?;
+            }
 
-        // CTS offset (pts - dts)
-        let cts_offset = if packet.pts != i64::MIN && packet.dts != i64::MIN {
-            (packet.pts - packet.dts) as i32
+            let ft = &mut self.frag_tracks[track_idx];
+            if ft.samples.is_empty() {
+                ft.base_decode_time = dts.max(0) as u64;
+            }
+            ft.samples.push(FragmentSample {
+                duration,
+                size: data.len() as u32,
+                cts_offset,
+                is_key,
+            });
+            ft.payload.extend_from_slice(data);
+            self.frag_total_bytes += data.len();
+            self.tracks[track_idx].next_dts = dts + i64::from(duration);
         } else {
-            0
-        };
-        track.cts_offsets.push(cts_offset);
-        if cts_offset != 0 {
-            track.has_cts = true;
+            let offset_in_mdat = self.mdat_buf.len() as u64;
+            self.mdat_buf.extend_from_slice(data);
+
+            let track = &mut self.tracks[track_idx];
+            track.sample_count += 1;
+            track.sample_sizes.push(data.len() as u32);
+            track.chunk_offsets.push(offset_in_mdat);
+            track.sample_durations.push(duration);
+            track.duration_ts += u64::from(duration);
+            track.next_dts = dts + i64::from(duration);
+            if is_key {
+                track.sync_samples.push(track.sample_count);
+            }
+            track.cts_offsets.push(cts_offset);
+            if cts_offset != 0 {
+                track.has_cts = true;
+            }
         }
 
         Ok(())
     }
 
-    fn write_trailer(&mut self, io: &mut BufferedIo) -> Result<()> {
-        io.flush()?;
-
-        let mdat_end = io.tell()?;
-        let mdat_size = mdat_end - self.mdat_pos;
-
-        // Patch 64-bit largesize in the extended mdat header
-        io.seek(self.mdat_largesize_pos)?;
-        io.write_bytes(&mdat_size.to_be_bytes())?;
-        io.flush()?;
-
-        if self.faststart {
-            // Build moov with adjusted chunk offsets (shifted forward by moov size)
-            let moov = self.build_faststart_moov()?;
-            let moov_size = moov.len() as u64;
-
-            // Shift mdat data forward by moov_size using backwards chunk copy
-            shift_data_forward(io, self.mdat_pos, mdat_size, moov_size)?;
-
-            // Write moov into the gap before mdat
-            io.seek(self.mdat_pos)?;
-            io.write_bytes(&moov)?;
-            io.flush()?;
-        } else {
-            // Standard layout: moov at end
-            io.seek(mdat_end)?;
-            let moov = atoms::write_moov(&self.tracks, self.movie_timescale);
-            io.write_bytes(&moov)?;
-            io.flush()?;
+    fn finalize(mut self: Box<Self>) -> Result<()> {
+        if self.fragmented {
+            self.flush_fragment()?;
+            self.sink.flush().map_err(|e| Error::io("mp4/muxer", &e))?;
+            return Ok(());
         }
 
+        let payload_len = self.mdat_buf.len() as u64;
+        let use_largesize = payload_len + 8 > u64::from(u32::MAX);
+        let mdat_header_size = if use_largesize { 16u64 } else { 8u64 };
+
+        let moov = self.build_faststart_moov(mdat_header_size);
+        self.sink
+            .write_all(&moov)
+            .map_err(|e| Error::io("mp4/muxer", &e))?;
+
+        if use_largesize {
+            let total_size = 16 + payload_len;
+            self.sink
+                .write_all(&1u32.to_be_bytes())
+                .map_err(|e| Error::io("mp4/muxer", &e))?;
+            self.sink
+                .write_all(b"mdat")
+                .map_err(|e| Error::io("mp4/muxer", &e))?;
+            self.sink
+                .write_all(&total_size.to_be_bytes())
+                .map_err(|e| Error::io("mp4/muxer", &e))?;
+        } else {
+            let total_size = (8 + payload_len) as u32;
+            self.sink
+                .write_all(&total_size.to_be_bytes())
+                .map_err(|e| Error::io("mp4/muxer", &e))?;
+            self.sink
+                .write_all(b"mdat")
+                .map_err(|e| Error::io("mp4/muxer", &e))?;
+        }
+
+        self.sink
+            .write_all(&self.mdat_buf)
+            .map_err(|e| Error::io("mp4/muxer", &e))?;
+        self.sink.flush().map_err(|e| Error::io("mp4/muxer", &e))?;
         Ok(())
     }
 }
 
-impl Mp4Muxer {
-    /// Build moov with chunk offsets adjusted for faststart relocation.
-    ///
-    /// Handles stco→co64 size convergence: adding offset bytes may push offsets
-    /// past u32::MAX, upgrading stco to co64 and changing moov size. Converges
-    /// in at most 2 iterations since co64 is the maximum size.
-    fn build_faststart_moov(&mut self) -> Result<Vec<u8>> {
-        // Save original chunk offsets
-        let original_offsets: Vec<Vec<u64>> = self
-            .tracks
-            .iter()
-            .map(|t| t.chunk_offsets.clone())
-            .collect();
-
-        // Iteration 1: trial build to get moov size
-        let trial_moov = atoms::write_moov(&self.tracks, self.movie_timescale);
-        let mut moov_size = trial_moov.len() as u64;
-
-        for max_iter in 0..2 {
-            // Adjust all chunk offsets by +moov_size
-            for (track, orig) in self.tracks.iter_mut().zip(original_offsets.iter()) {
-                track.chunk_offsets = orig.iter().map(|&o| o + moov_size).collect();
+fn validate_extradata(codec_id: CodecId, extradata: &[u8]) -> Result<()> {
+    match codec_id {
+        CodecId::H264 => {
+            if extradata.is_empty() {
+                return Err(Error::invalid_argument(
+                    "mp4/muxer",
+                    "H.264 requires avcC extradata",
+                ));
             }
-
-            let moov = atoms::write_moov(&self.tracks, self.movie_timescale);
-            let new_size = moov.len() as u64;
-
-            if new_size == moov_size || max_iter == 1 {
-                return Ok(moov);
+            if extradata[0] != 0x01 {
+                return Err(Error::invalid_data(
+                    "mp4/muxer",
+                    "H.264 extradata must be avcC (starting with version byte 0x01)",
+                ));
             }
-
-            // Size changed (stco upgraded to co64), retry with new size
-            moov_size = new_size;
         }
-
-        unreachable!()
+        CodecId::Hevc | CodecId::Av1 | CodecId::Vp9 | CodecId::Aac if extradata.is_empty() => {
+            return Err(Error::invalid_argument(
+                "mp4/muxer",
+                format!("{} requires extradata", codec_id.name()),
+            ));
+        }
+        _ => {}
     }
-}
-
-/// Copy `len` bytes from position `start` to `start + shift`, working backwards
-/// in chunks to avoid overwriting unread data.
-fn shift_data_forward(io: &mut BufferedIo, start: u64, len: u64, shift: u64) -> Result<()> {
-    if len == 0 || shift == 0 {
-        return Ok(());
-    }
-
-    const CHUNK_SIZE: u64 = 8 * 1024 * 1024; // 8 MiB
-    let mut buf = vec![0u8; CHUNK_SIZE as usize];
-    let mut remaining = len;
-
-    while remaining > 0 {
-        let chunk = remaining.min(CHUNK_SIZE);
-        let read_pos = start + remaining - chunk;
-
-        io.seek(read_pos)?;
-        io.read_exact(&mut buf[..chunk as usize])?;
-
-        io.seek(read_pos + shift)?;
-        io.write_bytes(&buf[..chunk as usize])?;
-        io.flush()?;
-
-        remaining -= chunk;
-    }
-
     Ok(())
 }
 
-/// Check if a codec is supported by the MP4 muxer.
 fn is_supported_codec(codec_id: CodecId) -> bool {
     matches!(
         codec_id,
         CodecId::H264
+            | CodecId::Hevc
             | CodecId::Av1
+            | CodecId::Vp9
             | CodecId::Aac
+            | CodecId::Alac
+            | CodecId::Opus
+            | CodecId::Flac
+            | CodecId::Ac3
+            | CodecId::PcmS8
+            | CodecId::PcmU8
             | CodecId::PcmS16be
             | CodecId::PcmS16le
             | CodecId::PcmS24be
@@ -349,644 +489,32 @@ fn is_supported_codec(codec_id: CodecId) -> bool {
     )
 }
 
-/// Compute media timescale for a track from its codec parameters.
-fn compute_timescale(params: &wedeo_codec::decoder::CodecParameters) -> u32 {
-    match params.media_type {
-        MediaType::Audio => {
-            if params.sample_rate > 0 {
-                params.sample_rate
-            } else {
-                44100 // fallback
-            }
-        }
-        MediaType::Video => {
-            // Use the stream time_base denominator if sensible
-            if params.time_base.den > 0 {
-                params.time_base.den as u32
-            } else {
-                90000 // fallback (common for MPEG-TS / H.264)
-            }
-        }
-        _ => 1000,
+fn compute_timescale(desc: &wedeo_core::TrackDescriptor) -> u32 {
+    if desc.time_base.is_valid() && desc.time_base.num == 1 && desc.time_base.den > 0 {
+        return desc.time_base.den as u32;
+    }
+    match &desc.params {
+        StreamParams::Audio(ap) if ap.sample_rate > 0 => ap.sample_rate,
+        _ => 90_000,
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use wedeo_codec::decoder::CodecParameters;
-    use wedeo_core::buffer::Buffer;
-    use wedeo_core::rational::Rational;
-    use wedeo_format::io::{BufferedIo, FileIo};
+pub struct Mp4MuxerFactory;
 
-    /// Roundtrip test: create a minimal H.264 MP4, verify it has the expected
-    /// box structure (ftyp, mdat, moov).
-    #[test]
-    fn test_mp4_muxer_basic_structure() {
-        let tmp_path = "/tmp/wedeo_test_mp4_muxer.mp4";
-
-        // Set up a video stream
-        let mut params = CodecParameters::new(CodecId::H264, MediaType::Video);
-        params.width = 320;
-        params.height = 240;
-        params.time_base = Rational::new(1, 25); // 25 fps
-        // Minimal avcC extradata (version 1, profile 66 baseline, level 30)
-        params.extradata = vec![
-            0x01, 0x42, 0xC0, 0x1E, 0xFF,
-            0xE1, // configurationVersion, profile, compat, level, NALU len - 1, numSPS
-            0x00, 0x04, // SPS length
-            0x67, 0x42, 0xC0, 0x1E, // fake SPS
-            0x01, // numPPS
-            0x00, 0x02, // PPS length
-            0x68, 0xCE, // fake PPS
-        ];
-
-        let stream = Stream::new(0, params);
-
-        // Create muxer and write
-        let mut muxer = Mp4Muxer::new();
-        let file_io = FileIo::create(tmp_path).expect("create file");
-        let mut io = BufferedIo::new(Box::new(file_io));
-
-        muxer
-            .write_header(&mut io, &[stream])
-            .expect("write_header");
-
-        // Write 3 packets (keyframe, non-key, non-key)
-        for i in 0..3 {
-            let data = vec![0u8; 100 + i * 10]; // varying sizes
-            let mut pkt = Packet::new();
-            pkt.data = Buffer::from_slice(&data);
-            pkt.stream_index = 0;
-            pkt.pts = i as i64;
-            pkt.dts = i as i64;
-            pkt.duration = 1;
-            if i == 0 {
-                pkt.flags = PacketFlags::KEY;
-            }
-            muxer.write_packet(&mut io, &pkt).expect("write_packet");
-        }
-
-        muxer.write_trailer(&mut io).expect("write_trailer");
-        drop(io);
-
-        // Read back and verify box structure
-        let data = std::fs::read(tmp_path).expect("read file");
-        std::fs::remove_file(tmp_path).ok();
-
-        // Parse top-level boxes
-        let boxes = parse_top_level_boxes(&data);
-        let box_types: Vec<&str> = boxes.iter().map(|(t, _, _)| t.as_str()).collect();
-        assert_eq!(box_types, vec!["ftyp", "mdat", "moov"]);
-
-        // Verify ftyp contains isom brand
-        let (_, ftyp_start, ftyp_size) = &boxes[0];
-        let ftyp_data = &data[*ftyp_start..*ftyp_start + *ftyp_size];
-        assert_eq!(&ftyp_data[8..12], b"isom"); // major brand
-
-        // Verify mdat size accounts for packet data (100 + 110 + 120 = 330 + 16 extended header)
-        let (_, _, mdat_size) = &boxes[1];
-        assert_eq!(*mdat_size, 330 + 16);
-
-        // Verify moov has mvhd and trak inside
-        let (_, moov_start, moov_size) = &boxes[2];
-        let moov_data = &data[*moov_start + 8..*moov_start + *moov_size];
-        let inner_boxes = parse_top_level_boxes(moov_data);
-        let inner_types: Vec<&str> = inner_boxes.iter().map(|(t, _, _)| t.as_str()).collect();
-        assert_eq!(inner_types, vec!["mvhd", "trak"]);
-    }
-
-    /// Verify ffprobe can read the MP4 we produce.
-    #[test]
-    fn test_mp4_ffprobe_validates() {
-        let tmp_path = "/tmp/wedeo_test_mp4_ffprobe.mp4";
-
-        let mut params = CodecParameters::new(CodecId::H264, MediaType::Video);
-        params.width = 320;
-        params.height = 240;
-        params.time_base = Rational::new(1, 25);
-        // Minimal avcC
-        params.extradata = vec![
-            0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x04, 0x67, 0x42, 0xC0, 0x1E, 0x01, 0x00,
-            0x02, 0x68, 0xCE,
-        ];
-
-        let stream = Stream::new(0, params);
-        let mut muxer = Mp4Muxer::new();
-        let file_io = FileIo::create(tmp_path).expect("create file");
-        let mut io = BufferedIo::new(Box::new(file_io));
-
-        muxer.write_header(&mut io, &[stream]).unwrap();
-
-        for i in 0..5 {
-            let data = vec![0u8; 200];
-            let mut pkt = Packet::new();
-            pkt.data = Buffer::from_slice(&data);
-            pkt.stream_index = 0;
-            pkt.pts = i;
-            pkt.dts = i;
-            pkt.duration = 1;
-            if i == 0 {
-                pkt.flags = PacketFlags::KEY;
-            }
-            muxer.write_packet(&mut io, &pkt).unwrap();
-        }
-
-        muxer.write_trailer(&mut io).unwrap();
-        drop(io);
-
-        // Run ffprobe on the output
-        let output = std::process::Command::new("ffprobe")
-            .args([
-                "-v",
-                "error",
-                "-show_format",
-                "-show_streams",
-                "-of",
-                "json",
-                tmp_path,
-            ])
-            .output();
-
-        std::fs::remove_file(tmp_path).ok();
-
-        match output {
-            Ok(result) => {
-                let stdout = String::from_utf8_lossy(&result.stdout);
-                let stderr = String::from_utf8_lossy(&result.stderr);
-                assert!(result.status.success(), "ffprobe failed: {}", stderr);
-                // Verify it detected the video stream
-                assert!(stdout.contains("\"codec_type\": \"video\""));
-                assert!(stdout.contains("\"width\": 320"));
-                assert!(stdout.contains("\"height\": 240"));
-            }
-            Err(_) => {
-                // ffprobe not available — skip silently
-            }
-        }
-    }
-
-    /// Non-seekable I/O for testing the seekable guard.
-    struct NonSeekableIo(Vec<u8>);
-
-    impl wedeo_format::io::IoContext for NonSeekableIo {
-        fn read(&mut self, _buf: &mut [u8]) -> wedeo_core::error::Result<usize> {
-            Ok(0)
-        }
-        fn write(&mut self, buf: &[u8]) -> wedeo_core::error::Result<usize> {
-            self.0.extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn seek(&mut self, _pos: std::io::SeekFrom) -> wedeo_core::error::Result<u64> {
-            Err(Error::Other("not seekable".into()))
-        }
-        fn tell(&mut self) -> wedeo_core::error::Result<u64> {
-            Ok(self.0.len() as u64)
-        }
-        fn size(&mut self) -> wedeo_core::error::Result<u64> {
-            Ok(self.0.len() as u64)
-        }
-        fn is_seekable(&self) -> bool {
-            false
-        }
-    }
-
-    /// Minimal avcC extradata for tests.
-    fn test_avcc() -> Vec<u8> {
-        vec![
-            0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x04, 0x67, 0x42, 0xC0, 0x1E, 0x01, 0x00,
-            0x02, 0x68, 0xCE,
-        ]
-    }
-
-    #[test]
-    fn test_reject_non_seekable() {
-        let mut params = CodecParameters::new(CodecId::H264, MediaType::Video);
-        params.width = 320;
-        params.height = 240;
-        params.time_base = Rational::new(1, 25);
-        params.extradata = test_avcc();
-        let stream = Stream::new(0, params);
-
-        let mut muxer = Mp4Muxer::new();
-        let mut io = BufferedIo::new(Box::new(NonSeekableIo(Vec::new())));
-        let err = muxer.write_header(&mut io, &[stream]).unwrap_err();
-        assert!(matches!(err, Error::Other(_)));
-    }
-
-    #[test]
-    fn test_reject_unsupported_codec() {
-        let mut params = CodecParameters::new(CodecId::Vp9, MediaType::Video);
-        params.width = 320;
-        params.height = 240;
-        params.time_base = Rational::new(1, 25);
-        let stream = Stream::new(0, params);
-
-        let tmp_path = "/tmp/wedeo_test_reject_codec.mp4";
-        let mut muxer = Mp4Muxer::new();
-        let file_io = FileIo::create(tmp_path).expect("create file");
-        let mut io = BufferedIo::new(Box::new(file_io));
-        let err = muxer.write_header(&mut io, &[stream]).unwrap_err();
-        std::fs::remove_file(tmp_path).ok();
-        assert_eq!(err, Error::PatchwelcomeNotImplemented);
-    }
-
-    #[test]
-    fn test_reject_missing_extradata() {
-        let mut params = CodecParameters::new(CodecId::H264, MediaType::Video);
-        params.width = 320;
-        params.height = 240;
-        params.time_base = Rational::new(1, 25);
-        // No extradata
-        let stream = Stream::new(0, params);
-
-        let tmp_path = "/tmp/wedeo_test_reject_noextra.mp4";
-        let mut muxer = Mp4Muxer::new();
-        let file_io = FileIo::create(tmp_path).expect("create file");
-        let mut io = BufferedIo::new(Box::new(file_io));
-        let err = muxer.write_header(&mut io, &[stream]).unwrap_err();
-        std::fs::remove_file(tmp_path).ok();
-        assert_eq!(err, Error::InvalidArgument);
-    }
-
-    #[test]
-    fn test_reject_invalid_avcc() {
-        let mut params = CodecParameters::new(CodecId::H264, MediaType::Video);
-        params.width = 320;
-        params.height = 240;
-        params.time_base = Rational::new(1, 25);
-        // Annex B start code instead of avcC (version byte != 0x01)
-        params.extradata = vec![0x00, 0x00, 0x00, 0x01, 0x67, 0x42];
-        let stream = Stream::new(0, params);
-
-        let tmp_path = "/tmp/wedeo_test_reject_annexb.mp4";
-        let mut muxer = Mp4Muxer::new();
-        let file_io = FileIo::create(tmp_path).expect("create file");
-        let mut io = BufferedIo::new(Box::new(file_io));
-        let err = muxer.write_header(&mut io, &[stream]).unwrap_err();
-        std::fs::remove_file(tmp_path).ok();
-        assert_eq!(err, Error::InvalidData);
-    }
-
-    #[test]
-    fn test_96khz_audio() {
-        let tmp_path = "/tmp/wedeo_test_96khz.m4a";
-
-        let mut params = CodecParameters::new(CodecId::Aac, MediaType::Audio);
-        params.sample_rate = 96000;
-        params.channel_layout.nb_channels = 2;
-        params.bits_per_coded_sample = 16;
-        // Minimal AAC AudioSpecificConfig (2 bytes)
-        params.extradata = vec![0x11, 0x90]; // AAC-LC 96kHz stereo
-        let stream = Stream::new(0, params);
-
-        let mut muxer = Mp4Muxer::new();
-        let file_io = FileIo::create(tmp_path).expect("create file");
-        let mut io = BufferedIo::new(Box::new(file_io));
-        muxer.write_header(&mut io, &[stream]).unwrap();
-
-        // Write a packet
-        let mut pkt = Packet::new();
-        pkt.data = Buffer::from_slice(&[0u8; 100]);
-        pkt.stream_index = 0;
-        pkt.pts = 0;
-        pkt.dts = 0;
-        pkt.duration = 1024;
-        pkt.flags = PacketFlags::KEY;
-        muxer.write_packet(&mut io, &pkt).unwrap();
-
-        muxer.write_trailer(&mut io).unwrap();
-        drop(io);
-
-        // If ffprobe is available, verify it can read the file
-        let output = std::process::Command::new("ffprobe")
-            .args(["-v", "error", "-show_streams", "-of", "json", tmp_path])
-            .output();
-        std::fs::remove_file(tmp_path).ok();
-
-        if let Ok(result) = output {
-            assert!(
-                result.status.success(),
-                "ffprobe failed: {}",
-                String::from_utf8_lossy(&result.stderr)
-            );
-        }
-    }
-
-    #[test]
-    fn test_audio_only_m4a() {
-        let tmp_path = "/tmp/wedeo_test_m4a_brand.m4a";
-
-        let mut params = CodecParameters::new(CodecId::Aac, MediaType::Audio);
-        params.sample_rate = 44100;
-        params.channel_layout.nb_channels = 2;
-        params.bits_per_coded_sample = 16;
-        params.extradata = vec![0x12, 0x10]; // AAC-LC 44100 stereo
-        let stream = Stream::new(0, params);
-
-        let mut muxer = Mp4Muxer::new();
-        let file_io = FileIo::create(tmp_path).expect("create file");
-        let mut io = BufferedIo::new(Box::new(file_io));
-        muxer.write_header(&mut io, &[stream]).unwrap();
-
-        let mut pkt = Packet::new();
-        pkt.data = Buffer::from_slice(&[0u8; 100]);
-        pkt.stream_index = 0;
-        pkt.pts = 0;
-        pkt.dts = 0;
-        pkt.duration = 1024;
-        pkt.flags = PacketFlags::KEY;
-        muxer.write_packet(&mut io, &pkt).unwrap();
-        muxer.write_trailer(&mut io).unwrap();
-        drop(io);
-
-        // Verify M4A branding in the raw file
-        let data = std::fs::read(tmp_path).expect("read file");
-        std::fs::remove_file(tmp_path).ok();
-
-        let boxes = parse_top_level_boxes(&data);
-        let (_, ftyp_start, ftyp_size) = &boxes[0];
-        let ftyp_data = &data[*ftyp_start..*ftyp_start + *ftyp_size];
-        assert_eq!(&ftyp_data[8..12], b"M4A "); // major brand
-    }
-
-    #[test]
-    fn test_large_duration() {
-        // Simulate a track with duration > u32::MAX to trigger version-1 boxes
-        let track = TrackState {
-            stream_index: 0,
-            codec_id: CodecId::Aac,
-            media_type: MediaType::Audio,
-            timescale: 1000, // match movie_timescale so rescale is 1:1
-            width: 0,
-            height: 0,
-            sample_rate: 44100,
-            channels: 2,
-            bits_per_sample: 16,
-            bit_rate: 128000,
-            extradata: vec![0x12, 0x10],
-            sample_count: 1,
-            sample_sizes: vec![100],
-            sample_durations: vec![1024],
-            chunk_offsets: vec![100],
-            sync_samples: vec![1],
-            cts_offsets: vec![0],
-            has_cts: false,
-            duration_ts: u32::MAX as u64 + 1000, // exceeds u32
+impl MuxerFactory for Mp4MuxerFactory {
+    fn descriptor(&self) -> &MuxerDescriptor {
+        static DESC: MuxerDescriptor = MuxerDescriptor {
+            name: "mp4",
+            long_name: "MP4 / MOV / M4A (ISOBMFF)",
+            extensions: &["mp4", "m4a", "m4v", "mov"],
+            mime_types: &["video/mp4", "audio/mp4"],
+            default_video: CodecId::H264,
+            default_audio: CodecId::Aac,
         };
-
-        let moov = atoms::write_moov(&[track], 1000);
-
-        // Parse moov → mvhd, check it uses version 1
-        let inner = parse_top_level_boxes(&moov[8..]); // skip moov header
-        // mvhd is first inner box
-        let (ref mvhd_type, mvhd_start, mvhd_size) = inner[0];
-        assert_eq!(mvhd_type, "mvhd");
-        // version is the first byte after the box header (8 bytes)
-        let mvhd_data = &moov[8 + mvhd_start..8 + mvhd_start + mvhd_size];
-        let version = mvhd_data[8]; // offset 8 = after size(4) + type(4)
-        assert_eq!(version, 1, "mvhd should use version 1 for large durations");
-
-        // Also check trak → tkhd uses version 1
-        let (ref trak_type, trak_start, trak_size) = inner[1];
-        assert_eq!(trak_type, "trak");
-        let trak_data = &moov[8 + trak_start + 8..8 + trak_start + trak_size];
-        let trak_inner = parse_top_level_boxes(trak_data);
-        let (ref tkhd_type, tkhd_start, _) = trak_inner[0];
-        assert_eq!(tkhd_type, "tkhd");
-        let tkhd_version = trak_data[tkhd_start + 8];
-        assert_eq!(
-            tkhd_version, 1,
-            "tkhd should use version 1 for large durations"
-        );
+        &DESC
     }
 
-    #[test]
-    fn test_faststart_box_order() {
-        let tmp_path = "/tmp/wedeo_test_faststart_order.mp4";
-
-        let mut params = CodecParameters::new(CodecId::H264, MediaType::Video);
-        params.width = 320;
-        params.height = 240;
-        params.time_base = Rational::new(1, 25);
-        params.extradata = test_avcc();
-        let stream = Stream::new(0, params);
-
-        let mut muxer = Mp4Muxer::with_options(Mp4MuxerOptions { faststart: true });
-        let file_io = FileIo::create(tmp_path).expect("create file");
-        let mut io = BufferedIo::new(Box::new(file_io));
-
-        muxer.write_header(&mut io, &[stream]).unwrap();
-
-        for i in 0..3 {
-            let data = vec![0xABu8; 100 + i * 10];
-            let mut pkt = Packet::new();
-            pkt.data = Buffer::from_slice(&data);
-            pkt.stream_index = 0;
-            pkt.pts = i as i64;
-            pkt.dts = i as i64;
-            pkt.duration = 1;
-            if i == 0 {
-                pkt.flags = PacketFlags::KEY;
-            }
-            muxer.write_packet(&mut io, &pkt).unwrap();
-        }
-
-        muxer.write_trailer(&mut io).unwrap();
-        drop(io);
-
-        let data = std::fs::read(tmp_path).expect("read file");
-        std::fs::remove_file(tmp_path).ok();
-
-        // Verify box order: ftyp, moov, mdat
-        let boxes = parse_top_level_boxes(&data);
-        let box_types: Vec<&str> = boxes.iter().map(|(t, _, _)| t.as_str()).collect();
-        assert_eq!(box_types, vec!["ftyp", "moov", "mdat"]);
-
-        // Verify mdat size: 100 + 110 + 120 = 330 payload + 16 extended header
-        let (_, _, mdat_size) = &boxes[2];
-        assert_eq!(*mdat_size, 330 + 16);
-    }
-
-    #[test]
-    fn test_faststart_ffprobe() {
-        let tmp_path = "/tmp/wedeo_test_faststart_ffprobe.mp4";
-
-        let mut params = CodecParameters::new(CodecId::H264, MediaType::Video);
-        params.width = 320;
-        params.height = 240;
-        params.time_base = Rational::new(1, 25);
-        params.extradata = test_avcc();
-        let stream = Stream::new(0, params);
-
-        let mut muxer = Mp4Muxer::with_options(Mp4MuxerOptions { faststart: true });
-        let file_io = FileIo::create(tmp_path).expect("create file");
-        let mut io = BufferedIo::new(Box::new(file_io));
-
-        muxer.write_header(&mut io, &[stream]).unwrap();
-
-        for i in 0..5 {
-            let data = vec![0u8; 200];
-            let mut pkt = Packet::new();
-            pkt.data = Buffer::from_slice(&data);
-            pkt.stream_index = 0;
-            pkt.pts = i;
-            pkt.dts = i;
-            pkt.duration = 1;
-            if i == 0 {
-                pkt.flags = PacketFlags::KEY;
-            }
-            muxer.write_packet(&mut io, &pkt).unwrap();
-        }
-
-        muxer.write_trailer(&mut io).unwrap();
-        drop(io);
-
-        let output = std::process::Command::new("ffprobe")
-            .args([
-                "-v",
-                "error",
-                "-show_format",
-                "-show_streams",
-                "-of",
-                "json",
-                tmp_path,
-            ])
-            .output();
-
-        std::fs::remove_file(tmp_path).ok();
-
-        if let Ok(result) = output {
-            let stdout = String::from_utf8_lossy(&result.stdout);
-            let stderr = String::from_utf8_lossy(&result.stderr);
-            assert!(result.status.success(), "ffprobe failed: {}", stderr);
-            assert!(stdout.contains("\"codec_type\": \"video\""));
-            assert!(stdout.contains("\"width\": 320"));
-        }
-    }
-
-    #[test]
-    fn test_faststart_data_integrity() {
-        let tmp_path = "/tmp/wedeo_test_faststart_integrity.mp4";
-
-        let mut params = CodecParameters::new(CodecId::H264, MediaType::Video);
-        params.width = 320;
-        params.height = 240;
-        params.time_base = Rational::new(1, 25);
-        params.extradata = test_avcc();
-        let stream = Stream::new(0, params);
-
-        let mut muxer = Mp4Muxer::with_options(Mp4MuxerOptions { faststart: true });
-        let file_io = FileIo::create(tmp_path).expect("create file");
-        let mut io = BufferedIo::new(Box::new(file_io));
-
-        muxer.write_header(&mut io, &[stream]).unwrap();
-
-        // Write packets with known content patterns
-        let expected_payloads: Vec<Vec<u8>> = (0..5)
-            .map(|i| vec![(i as u8).wrapping_mul(0x37); 100 + i * 50])
-            .collect();
-        for (i, payload) in expected_payloads.iter().enumerate() {
-            let mut pkt = Packet::new();
-            pkt.data = Buffer::from_slice(payload);
-            pkt.stream_index = 0;
-            pkt.pts = i as i64;
-            pkt.dts = i as i64;
-            pkt.duration = 1;
-            if i == 0 {
-                pkt.flags = PacketFlags::KEY;
-            }
-            muxer.write_packet(&mut io, &pkt).unwrap();
-        }
-
-        muxer.write_trailer(&mut io).unwrap();
-        drop(io);
-
-        let data = std::fs::read(tmp_path).expect("read file");
-        std::fs::remove_file(tmp_path).ok();
-
-        // Find mdat box and extract payload
-        let boxes = parse_top_level_boxes(&data);
-        let (ref mdat_type, mdat_start, mdat_size) = boxes[2];
-        assert_eq!(mdat_type, "mdat");
-
-        // mdat payload starts after extended header (16 bytes)
-        let mdat_payload = &data[mdat_start + 16..mdat_start + mdat_size];
-
-        // Verify all packet payloads are intact and contiguous
-        let mut offset = 0;
-        for payload in &expected_payloads {
-            assert_eq!(
-                &mdat_payload[offset..offset + payload.len()],
-                payload.as_slice(),
-                "packet data corrupted after faststart relocation"
-            );
-            offset += payload.len();
-        }
-        assert_eq!(offset, mdat_payload.len());
-    }
-
-    #[test]
-    fn test_default_no_faststart() {
-        let tmp_path = "/tmp/wedeo_test_default_no_faststart.mp4";
-
-        let mut params = CodecParameters::new(CodecId::H264, MediaType::Video);
-        params.width = 320;
-        params.height = 240;
-        params.time_base = Rational::new(1, 25);
-        params.extradata = test_avcc();
-        let stream = Stream::new(0, params);
-
-        // Default constructor — no faststart
-        let mut muxer = Mp4Muxer::new();
-        let file_io = FileIo::create(tmp_path).expect("create file");
-        let mut io = BufferedIo::new(Box::new(file_io));
-
-        muxer.write_header(&mut io, &[stream]).unwrap();
-
-        let mut pkt = Packet::new();
-        pkt.data = Buffer::from_slice(&[0u8; 100]);
-        pkt.stream_index = 0;
-        pkt.pts = 0;
-        pkt.dts = 0;
-        pkt.duration = 1;
-        pkt.flags = PacketFlags::KEY;
-        muxer.write_packet(&mut io, &pkt).unwrap();
-
-        muxer.write_trailer(&mut io).unwrap();
-        drop(io);
-
-        let data = std::fs::read(tmp_path).expect("read file");
-        std::fs::remove_file(tmp_path).ok();
-
-        // Verify standard order: ftyp, mdat, moov
-        let boxes = parse_top_level_boxes(&data);
-        let box_types: Vec<&str> = boxes.iter().map(|(t, _, _)| t.as_str()).collect();
-        assert_eq!(box_types, vec!["ftyp", "mdat", "moov"]);
-    }
-
-    /// Parse top-level MP4 boxes from raw data (handles extended size).
-    fn parse_top_level_boxes(data: &[u8]) -> Vec<(String, usize, usize)> {
-        let mut boxes = Vec::new();
-        let mut offset = 0;
-        while offset + 8 <= data.len() {
-            let size32 = u32::from_be_bytes(data[offset..offset + 4].try_into().unwrap());
-            let box_type = String::from_utf8_lossy(&data[offset + 4..offset + 8]).to_string();
-            let size = if size32 == 1 {
-                // Extended size: 8-byte largesize follows the type field
-                if offset + 16 > data.len() {
-                    break;
-                }
-                u64::from_be_bytes(data[offset + 8..offset + 16].try_into().unwrap()) as usize
-            } else {
-                size32 as usize
-            };
-            if size < 8 || offset + size > data.len() {
-                break;
-            }
-            boxes.push((box_type, offset, size));
-            offset += size;
-        }
-        boxes
+    fn create(&self, sink: Box<dyn ByteSink>) -> Result<Box<dyn Muxer>> {
+        Ok(Box::new(Mp4Muxer::new(sink)))
     }
 }

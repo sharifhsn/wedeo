@@ -1,54 +1,36 @@
-// MP4 demuxer implementation.
-//
-// Reads standard (non-fragmented) MP4/M4A/M4V files with H.264 video and/or
-// AAC audio. Builds a flat per-sample index at header time for O(1) packet
-// reads and efficient seeking.
-//
-// Reference: ISO 14496-12 (ISOBMFF), ISO 14496-14 (MP4 file format).
+//! ISOBMFF / MP4 / MOV / M4A demuxer implementation (Wedeo v2).
+//!
+//! Supports classic (`moov` + `mdat`) and fragmented (`moov` [`mvex`] + `moof`/`mdat`)
+//! MP4 files, VFR `stts` + `ctts` v1 signed composition offsets, `elst` edit lists,
+//! `colr` (`nclx` + ICC), `pasp` SAR, `tkhd` display matrix, video (`avc1`/`avc3`/
+//! `hvc1`/`hev1`/`av01`/`vp09`), and audio (`mp4a`/`alac`/`Opus`/`fLaC`/`ac-3`/PCM).
 
-use wedeo_codec::decoder::CodecParameters;
-use wedeo_core::buffer::Buffer;
-use wedeo_core::channel_layout::ChannelLayout;
-use wedeo_core::codec_id::CodecId;
-use wedeo_core::error::{Error, Result};
-use wedeo_core::media_type::MediaType;
-use wedeo_core::metadata::Metadata;
-use wedeo_core::packet::{Packet, PacketFlags};
-use wedeo_core::pixel_format::PixelFormat;
-use wedeo_core::rational::Rational;
-use wedeo_format::demuxer::{
-    Demuxer, DemuxerHeader, InputFormatDescriptor, InputFormatFlags, ProbeData, SeekFlags, Stream,
+use std::io;
+
+use wedeo_core::{
+    AudioStreamParams, BufByteSource, Buffer, ByteSource, ChannelLayout, CodecId, ColorDesc,
+    ContainerHeader, Demuxer, DemuxerDescriptor, DemuxerFactory, Error, ErrorPolicy, HealthEvent,
+    HealthIssue, Packet, PacketFlags, PixelLayout, Rational, RecvStatus, Result, SampleFormat,
+    SeekTarget, SideData, StreamHealth, StreamParams, Timestamp, TrackDescriptor, TrackDisposition,
+    TrackId, VideoStreamParams, reduce, rescale_q,
 };
-use wedeo_format::io::BufferedIo;
-use wedeo_format::registry::DemuxerFactory;
 
-use crate::boxes;
+use crate::boxes::{self, ElstEntry, StsdEntry, Trex};
 
 // ---------------------------------------------------------------------------
 // Sample index
 // ---------------------------------------------------------------------------
 
-/// Pre-computed per-sample entry for O(1) packet reads.
+#[derive(Debug, Clone, Copy)]
 struct SampleEntry {
-    /// Byte offset in the file.
     offset: u64,
-    /// Byte length of the sample.
     size: u32,
-    /// Decode timestamp in media timescale.
     dts: i64,
-    /// Composition time offset (PTS = DTS + cts_offset).
     cts_offset: i32,
-    /// Sample duration in media timescale.
     duration: u32,
-    /// Whether this sample is a sync (keyframe) sample.
     is_keyframe: bool,
 }
 
-/// Build the flat sample index from the parsed sample table boxes.
-///
-/// Combines stts (time-to-sample), stsc (sample-to-chunk), stsz (sample sizes),
-/// stco/co64 (chunk offsets), stss (sync samples), and ctts (composition offsets)
-/// into a single Vec<SampleEntry>.
 fn build_sample_index(
     stts: &[(u32, u32)],
     stsc: &[(u32, u32, u32)],
@@ -58,16 +40,15 @@ fn build_sample_index(
     sync_samples: &[u32],
     ctts: &[(u32, i32)],
 ) -> Vec<SampleEntry> {
-    // Count total samples from stts
-    let total_samples: u64 = stts.iter().map(|&(count, _)| count as u64).sum();
+    let total_samples: u64 = stts.iter().map(|&(count, _)| u64::from(count)).sum();
     let total_samples = total_samples as usize;
     if total_samples == 0 {
         return Vec::new();
     }
 
-    let mut samples = Vec::with_capacity(total_samples);
+    let mut samples = Vec::with_capacity(total_samples.min(1_048_576));
 
-    // Step 1: Expand stts → cumulative DTS and duration per sample
+    // Step 1: Expand stts -> cumulative DTS and duration per sample
     let mut dts: i64 = 0;
     for &(count, delta) in stts {
         for _ in 0..count {
@@ -79,42 +60,40 @@ fn build_sample_index(
                 duration: delta,
                 is_keyframe: false,
             });
-            dts += delta as i64;
+            dts = dts.saturating_add(i64::from(delta));
         }
     }
 
-    // Step 2: Expand ctts → composition time offsets
+    // Step 2: Expand ctts -> signed composition time offsets (v0 & v1)
     if !ctts.is_empty() {
-        let mut sample_idx = 0;
+        let mut sample_idx = 0usize;
         for &(count, offset) in ctts {
             for _ in 0..count {
                 if sample_idx < samples.len() {
                     samples[sample_idx].cts_offset = offset;
                     sample_idx += 1;
+                } else {
+                    break;
                 }
             }
         }
     }
 
-    // Step 3: Compute file offsets via stsc + stco + stsz
-    //
-    // stsc entries are (first_chunk_1indexed, samples_per_chunk, desc_index).
-    // They define ranges: entry[i] applies from first_chunk[i] to first_chunk[i+1]-1
-    // (or to the last chunk for the final entry).
+    // Step 3: Compute file offsets via stsc + stco/co64 + stsz
     let mut sample_idx: usize = 0;
+    let mut stsc_cursor: usize = 0;
 
     for (chunk_idx, &chunk_offset) in chunk_offsets.iter().enumerate() {
         let chunk_1indexed = chunk_idx as u32 + 1;
-
-        // Find which stsc entry applies to this chunk.
-        // The last entry whose first_chunk <= chunk_1indexed wins.
-        let mut samples_in_chunk = 0u32;
-        for entry in stsc.iter().rev() {
-            if entry.0 <= chunk_1indexed {
-                samples_in_chunk = entry.1;
-                break;
-            }
+        while stsc_cursor + 1 < stsc.len() && stsc[stsc_cursor + 1].0 <= chunk_1indexed {
+            stsc_cursor += 1;
         }
+        let samples_in_chunk = if stsc_cursor < stsc.len() && stsc[stsc_cursor].0 <= chunk_1indexed
+        {
+            stsc[stsc_cursor].1
+        } else {
+            0
+        };
 
         let mut offset_in_chunk: u64 = 0;
         for _ in 0..samples_in_chunk {
@@ -128,15 +107,14 @@ fn build_sample_index(
             } else {
                 0
             };
-            samples[sample_idx].offset = chunk_offset + offset_in_chunk;
+            samples[sample_idx].offset = chunk_offset.saturating_add(offset_in_chunk);
             samples[sample_idx].size = size;
-            offset_in_chunk += size as u64;
+            offset_in_chunk = offset_in_chunk.saturating_add(u64::from(size));
             sample_idx += 1;
         }
     }
 
-    // Step 4: Mark keyframes from stss (1-indexed).
-    // If stss is absent, all samples are keyframes.
+    // Step 4: Mark keyframes from stss (1-indexed). If absent, all samples are keyframes.
     if sync_samples.is_empty() {
         for s in &mut samples {
             s.is_keyframe = true;
@@ -154,16 +132,21 @@ fn build_sample_index(
 }
 
 // ---------------------------------------------------------------------------
-// Track parsing state (temporary, used during read_header)
+// Temporary track parsing state during `open()`
 // ---------------------------------------------------------------------------
 
 struct TrackParseState {
+    track_id: u32,
     handler_type: [u8; 4],
     timescale: u32,
     duration: u64,
+    tkhd_duration: u64,
     width: u32,
     height: u32,
-    stsd_entry: Option<boxes::StsdEntry>,
+    display_matrix: Option<[i32; 9]>,
+    language: Option<String>,
+    elst: Vec<ElstEntry>,
+    stsd_entry: Option<StsdEntry>,
     stts: Vec<(u32, u32)>,
     stsc: Vec<(u32, u32, u32)>,
     fixed_sample_size: u32,
@@ -176,11 +159,16 @@ struct TrackParseState {
 impl TrackParseState {
     fn new() -> Self {
         Self {
+            track_id: 0,
             handler_type: [0; 4],
             timescale: 0,
             duration: 0,
+            tkhd_duration: 0,
             width: 0,
             height: 0,
+            display_matrix: None,
+            language: None,
+            elst: Vec::new(),
             stsd_entry: None,
             stts: Vec::new(),
             stsc: Vec::new(),
@@ -206,87 +194,101 @@ impl TrackParseState {
 // ---------------------------------------------------------------------------
 
 struct Mp4TrackState {
-    stream_index: usize,
+    track_id: TrackId,
+    mp4_track_id: u32,
+    is_video: bool,
     samples: Vec<SampleEntry>,
     current_sample: usize,
     timescale: u32,
+    display_matrix: Option<[i32; 9]>,
+    sent_display_matrix: bool,
+    extra_side_data: Vec<SideData>,
+    sent_extra_side_data: bool,
+    last_dts: Option<i64>,
 }
 
+/// Native ISOBMFF / MP4 / MOV / M4A demuxer owning a `Box<dyn ByteSource>`.
 pub struct Mp4Demuxer {
+    io: BufByteSource,
+    header: ContainerHeader,
     tracks: Vec<Mp4TrackState>,
-}
-
-impl Default for Mp4Demuxer {
-    fn default() -> Self {
-        Self::new()
-    }
+    health: StreamHealth,
+    policy: ErrorPolicy,
+    is_fragmented: bool,
+    trex_defaults: Vec<Trex>,
+    eof: bool,
 }
 
 impl Mp4Demuxer {
-    pub fn new() -> Self {
-        Self { tracks: Vec::new() }
-    }
-}
-
-impl Demuxer for Mp4Demuxer {
-    fn read_header(&mut self, io: &mut BufferedIo) -> Result<DemuxerHeader> {
-        let file_size = io.size().unwrap_or(u64::MAX);
+    /// Open an MP4/MOV/M4A stream from a `Box<dyn ByteSource>`.
+    pub fn open(source: Box<dyn ByteSource>, policy: ErrorPolicy) -> Result<Self> {
+        let mut io = BufByteSource::new(source);
         let mut movie_timescale = 1000u32;
         let mut movie_duration = 0u64;
         let mut track_states: Vec<TrackParseState> = Vec::new();
-
-        // Scan top-level boxes until we find moov
-        let mut pos: u64 = 0;
+        let mut trex_defaults: Vec<Trex> = Vec::new();
+        let mut is_fragmented = false;
         let mut found_moov = false;
 
-        while pos < file_size {
-            io.seek(pos)?;
-            let header = match boxes::read_box_header(io) {
-                Ok(h) => h,
-                Err(Error::Eof) => break,
-                Err(e) => return Err(e),
-            };
+        let file_limit = io.size_hint().unwrap_or(u64::MAX);
 
-            let box_end = if header.size == 0 {
-                file_size
+        while io.tell() < file_limit {
+            let box_start = io.tell();
+            let Some(hdr) = boxes::try_read_box_header(&mut io)? else {
+                break;
+            };
+            let box_end = if hdr.size == 0 {
+                file_limit
             } else {
-                pos + header.size
+                box_start.saturating_add(hdr.size).min(file_limit)
             };
 
-            if &header.box_type == b"moov" {
+            if &hdr.box_type == b"moov" {
                 found_moov = true;
                 parse_moov(
-                    io,
+                    &mut io,
                     box_end,
                     &mut movie_timescale,
                     &mut movie_duration,
                     &mut track_states,
+                    &mut trex_defaults,
+                    &mut is_fragmented,
                 )?;
+                let cur = io.tell();
+                if cur < box_end && box_end != u64::MAX {
+                    io.skip(box_end - cur)
+                        .map_err(|e| Error::io("mp4/demuxer", &e))?;
+                }
                 break;
             }
 
-            // Skip non-moov boxes (ftyp, mdat, free, etc.)
-            pos = box_end;
+            if box_end == u64::MAX {
+                break;
+            }
+            let cur = io.tell();
+            if cur < box_end {
+                io.skip(box_end - cur)
+                    .map_err(|e| Error::io("mp4/demuxer", &e))?;
+            }
         }
 
         if !found_moov {
-            return Err(Error::InvalidData);
+            return Err(Error::invalid_data("mp4/demuxer", "missing moov box"));
         }
 
-        // Build streams and sample indices from parsed tracks
-        let mut streams = Vec::new();
+        let mut header = ContainerHeader::new("mp4");
+        let mut tracks = Vec::new();
 
-        for tps in &track_states {
+        for (idx, tps) in track_states.iter().enumerate() {
             if !tps.is_video() && !tps.is_audio() {
                 continue;
             }
-
-            let stream_index = streams.len();
-            let stsd = match &tps.stsd_entry {
-                Some(e) => e,
-                None => continue,
+            let Some(stsd) = &tps.stsd_entry else {
+                continue;
             };
 
+            let timescale = tps.timescale.max(1);
+            let time_base = Rational::new(1, timescale as i32);
             let samples = build_sample_index(
                 &tps.stts,
                 &tps.stsc,
@@ -296,195 +298,661 @@ impl Demuxer for Mp4Demuxer {
                 &tps.sync_samples,
                 &tps.ctts,
             );
-
-            let nb_frames = samples.len() as i64;
-
-            if tps.is_video() {
-                let codec_id = match &stsd.fourcc {
-                    b"avc1" | b"avc3" => CodecId::H264,
-                    b"av01" => CodecId::Av1,
-                    _ => continue,
-                };
-                let mut params = CodecParameters::new(codec_id, MediaType::Video);
-                params.width = tps.width.max(stsd.width as u32);
-                params.height = tps.height.max(stsd.height as u32);
-                params.pixel_format = PixelFormat::Yuv420p;
-                params.extradata = stsd.extradata.clone();
-                params.time_base = Rational::new(1, tps.timescale as i32);
-
-                let mut stream = Stream::new(stream_index, params);
-                stream.time_base = Rational::new(1, tps.timescale as i32);
-                stream.duration = tps.duration as i64;
-                stream.nb_frames = nb_frames;
-                streams.push(stream);
+            let nb_frames = if samples.is_empty() {
+                None
             } else {
-                // Audio
-                let codec_id = match &stsd.fourcc {
-                    b"mp4a" => CodecId::Aac,
-                    _ => continue,
-                };
-                let mut params = CodecParameters::new(codec_id, MediaType::Audio);
-                params.sample_rate = stsd.sample_rate;
-                params.channel_layout = if stsd.channel_count == 1 {
-                    ChannelLayout::mono()
-                } else if stsd.channel_count == 2 {
-                    ChannelLayout::stereo()
-                } else {
-                    ChannelLayout::unspec(stsd.channel_count as i32)
-                };
-                params.extradata = stsd.extradata.clone();
-                params.time_base = Rational::new(1, tps.timescale as i32);
+                Some(samples.len() as u64)
+            };
 
-                let mut stream = Stream::new(stream_index, params);
-                stream.time_base = Rational::new(1, tps.timescale as i32);
-                stream.duration = tps.duration as i64;
-                stream.nb_frames = nb_frames;
-                streams.push(stream);
+            let track_id = TrackId(tracks.len() as u32);
+            let mp4_track_id = if tps.track_id != 0 {
+                tps.track_id
+            } else {
+                (idx + 1) as u32
+            };
+
+            let (codec_id, params) = if tps.is_video() {
+                let Some(codec_id) = map_video_codec(&stsd.fourcc) else {
+                    continue;
+                };
+                let mut vp = VideoStreamParams::new(
+                    tps.width.max(u32::from(stsd.width)),
+                    tps.height.max(u32::from(stsd.height)),
+                    PixelLayout::YUV420P,
+                );
+                vp.color = stsd.color.unwrap_or(ColorDesc::UNSPECIFIED);
+                vp.sar = stsd.sar.unwrap_or_else(|| Rational::new(1, 1));
+                vp.display_matrix = tps.display_matrix;
+                vp.bit_rate = stsd.avg_bitrate;
+                vp.extradata = stsd.extradata.clone();
+                if let Some(n) = nb_frames
+                    && tps.duration > 0
+                {
+                    let (num, den, _) = reduce(
+                        (n as i64).saturating_mul(i64::from(timescale)),
+                        tps.duration as i64,
+                        i32::MAX as i64,
+                    );
+                    if den > 0 {
+                        vp.avg_frame_rate = Rational::new(num, den);
+                    }
+                }
+                (codec_id, StreamParams::Video(vp))
+            } else {
+                let Some((codec_id, sample_format)) = map_audio_codec(stsd) else {
+                    continue;
+                };
+                let ch = stsd.channel_count.max(1);
+                let layout = match ch {
+                    1 => ChannelLayout::mono(),
+                    2 => ChannelLayout::stereo(),
+                    n => ChannelLayout::unspec(n as u32),
+                };
+                let mut ap = AudioStreamParams::new(stsd.sample_rate, sample_format, layout);
+                ap.bits_per_coded_sample = u32::from(stsd.sample_size);
+                ap.bit_rate = stsd.avg_bitrate;
+                ap.initial_padding = stsd.initial_padding;
+                ap.extradata = stsd.extradata.clone();
+                (codec_id, StreamParams::Audio(ap))
+            };
+
+            let mut desc = TrackDescriptor::new(track_id, codec_id, time_base, params);
+            desc.codec_tag = u32::from_be_bytes(stsd.fourcc);
+            desc.duration = if tps.duration > 0 {
+                tps.duration as i64
+            } else if movie_timescale > 0 && tps.tkhd_duration > 0 {
+                rescale_q(
+                    tps.tkhd_duration as i64,
+                    Rational::new(1, movie_timescale as i32),
+                    time_base,
+                )
+            } else {
+                0
+            };
+            desc.nb_frames = nb_frames;
+            desc.language = tps.language.clone();
+            if tracks.is_empty() {
+                desc.disposition = TrackDisposition::DEFAULT;
             }
+            desc.edit_list = tps
+                .elst
+                .iter()
+                .map(|e| e.to_edit_segment(timescale, movie_timescale, tps.duration))
+                .collect();
 
-            self.tracks.push(Mp4TrackState {
-                stream_index,
+            header.tracks.push(desc);
+            tracks.push(Mp4TrackState {
+                track_id,
+                mp4_track_id,
+                is_video: tps.is_video(),
                 samples,
                 current_sample: 0,
-                timescale: tps.timescale,
+                timescale,
+                display_matrix: tps.display_matrix,
+                sent_display_matrix: false,
+                extra_side_data: stsd.side_data.clone(),
+                sent_extra_side_data: false,
+                last_dts: None,
             });
         }
 
-        if streams.is_empty() {
-            return Err(Error::StreamNotFound);
+        if tracks.is_empty() {
+            return Err(Error::not_found(
+                "mp4/demuxer",
+                "no supported video or audio tracks found",
+            ));
         }
 
-        // Compute file-level duration in AV_TIME_BASE (1_000_000)
-        let duration = if movie_timescale > 0 && movie_duration > 0 {
-            (movie_duration as i64 * 1_000_000) / movie_timescale as i64
-        } else {
-            0
-        };
+        if movie_timescale > 0 && movie_duration > 0 {
+            header.duration = Some(rescale_q(
+                movie_duration as i64,
+                Rational::new(1, movie_timescale as i32),
+                header.time_base,
+            ));
+        }
+        header.start_time = Timestamp::new(0);
 
-        Ok(DemuxerHeader {
-            streams,
-            metadata: Metadata::new(),
-            duration,
-            start_time: 0,
+        Ok(Self {
+            io,
+            header,
+            tracks,
+            health: StreamHealth::new(),
+            policy,
+            is_fragmented,
+            trex_defaults,
+            eof: false,
         })
     }
 
-    fn read_packet(&mut self, io: &mut BufferedIo) -> Result<Packet> {
-        // Find the track with the lowest DTS among remaining samples
-        let mut best_track: Option<usize> = None;
-        let mut best_dts: i64 = i64::MAX;
-
-        for (i, track) in self.tracks.iter().enumerate() {
-            if track.current_sample >= track.samples.len() {
-                continue;
-            }
-            let sample = &track.samples[track.current_sample];
-            // Normalize DTS to a common timebase for comparison.
-            // Multiply by 1_000_000 / timescale to get microseconds.
-            let dts_us = if track.timescale > 0 {
-                sample.dts * 1_000_000 / track.timescale as i64
-            } else {
-                sample.dts
-            };
-            if dts_us < best_dts {
-                best_dts = dts_us;
-                best_track = Some(i);
-            }
+    fn record_or_fail(
+        &mut self,
+        track: TrackId,
+        pts: Timestamp,
+        byte_offset: Option<u64>,
+        kind: HealthIssue,
+        detail: &'static str,
+    ) -> Result<()> {
+        if self.policy == ErrorPolicy::Strict {
+            return Err(Error::corrupt("mp4/demuxer", detail));
         }
-
-        let track_idx = best_track.ok_or(Error::Eof)?;
-        let track = &mut self.tracks[track_idx];
-        let sample = &track.samples[track.current_sample];
-
-        // Seek to sample position and read data
-        io.seek(sample.offset)?;
-        let data = io.read_bytes(sample.size as usize)?;
-
-        let mut pkt = Packet::new();
-        pkt.data = Buffer::from_slice(&data);
-        pkt.dts = sample.dts;
-        pkt.pts = sample.dts + sample.cts_offset as i64;
-        pkt.duration = sample.duration as i64;
-        pkt.stream_index = track.stream_index;
-        pkt.pos = sample.offset as i64;
-        if sample.is_keyframe {
-            pkt.flags = PacketFlags::KEY;
-        }
-
-        track.current_sample += 1;
-        Ok(pkt)
+        self.health.record(HealthEvent {
+            track,
+            pts,
+            byte_offset,
+            kind,
+            detail,
+        });
+        Ok(())
     }
 
-    fn seek(
-        &mut self,
-        _io: &mut BufferedIo,
-        stream_index: usize,
-        timestamp: i64,
-        _flags: SeekFlags,
-    ) -> Result<()> {
-        // Find the target track
-        let track = self
-            .tracks
-            .iter_mut()
-            .find(|t| t.stream_index == stream_index)
-            .ok_or(Error::StreamNotFound)?;
+    /// Scan forward for the next `moof` box and append its samples into `self.tracks`.
+    /// Returns `Ok(true)` if at least one sample was loaded, `Ok(false)` on clean EOF.
+    fn load_next_fragment(&mut self) -> Result<bool> {
+        let file_limit = self.io.size_hint().unwrap_or(u64::MAX);
+        while self.io.tell() < file_limit {
+            let moof_offset = self.io.tell();
+            let Some(hdr) = boxes::try_read_box_header(&mut self.io)? else {
+                return Ok(false);
+            };
+            let box_end = if hdr.size == 0 {
+                file_limit
+            } else {
+                moof_offset.saturating_add(hdr.size).min(file_limit)
+            };
 
-        // Binary search for the nearest keyframe at or before the target timestamp
-        let target_sample = match track.samples.binary_search_by_key(&timestamp, |s| s.dts) {
-            Ok(i) => i,
-            Err(i) => i.saturating_sub(1),
-        };
-
-        // Walk backwards to find a keyframe
-        let mut keyframe_idx = target_sample;
-        while keyframe_idx > 0 && !track.samples[keyframe_idx].is_keyframe {
-            keyframe_idx -= 1;
-        }
-
-        track.current_sample = keyframe_idx;
-
-        // Reset other tracks to approximately the same time position
-        let target_dts = track.samples[keyframe_idx].dts;
-        let target_timescale = track.timescale;
-
-        for other in self.tracks.iter_mut() {
-            if other.stream_index == stream_index {
+            if &hdr.box_type == b"moof" {
+                let loaded = self.parse_moof(moof_offset, box_end)?;
+                let cur = self.io.tell();
+                if cur < box_end && box_end != u64::MAX {
+                    self.io
+                        .skip(box_end - cur)
+                        .map_err(|e| Error::io("mp4/moof", &e))?;
+                }
+                if loaded > 0 {
+                    return Ok(true);
+                }
                 continue;
             }
-            // Convert target_dts to other track's timescale
-            let other_dts = if target_timescale > 0 && other.timescale > 0 {
-                target_dts * other.timescale as i64 / target_timescale as i64
+
+            if box_end == u64::MAX {
+                return Ok(false);
+            }
+            let cur = self.io.tell();
+            if cur < box_end {
+                self.io
+                    .skip(box_end - cur)
+                    .map_err(|e| Error::io("mp4/demuxer", &e))?;
+            }
+        }
+        Ok(false)
+    }
+
+    fn parse_moof(&mut self, moof_offset: u64, moof_end: u64) -> Result<usize> {
+        let mut total_loaded = 0usize;
+        while self.io.tell() + 8 <= moof_end {
+            let sub_start = self.io.tell();
+            let hdr = boxes::read_box_header(&mut self.io)?;
+            let sub_end = if hdr.size == 0 {
+                moof_end
             } else {
-                target_dts
+                sub_start.saturating_add(hdr.size).min(moof_end)
             };
 
-            // Find the sample at or before other_dts
-            let idx = match other.samples.binary_search_by_key(&other_dts, |s| s.dts) {
-                Ok(i) => i,
-                Err(i) => i.saturating_sub(1),
+            if &hdr.box_type == b"traf" {
+                total_loaded += self.parse_traf(moof_offset, sub_end)?;
+            }
+
+            let cur = self.io.tell();
+            if cur < sub_end {
+                self.io
+                    .skip(sub_end - cur)
+                    .map_err(|e| Error::io("mp4/moof", &e))?;
+            }
+        }
+        Ok(total_loaded)
+    }
+
+    fn parse_traf(&mut self, moof_offset: u64, traf_end: u64) -> Result<usize> {
+        let mut tfhd: Option<boxes::Tfhd> = None;
+        let mut tfdt_val: Option<u64> = None;
+        let mut truns: Vec<boxes::Trun> = Vec::new();
+
+        while self.io.tell() + 8 <= traf_end {
+            let sub_start = self.io.tell();
+            let hdr = boxes::read_box_header(&mut self.io)?;
+            let sub_end = if hdr.size == 0 {
+                traf_end
+            } else {
+                sub_start.saturating_add(hdr.size).min(traf_end)
             };
-            other.current_sample = idx;
+
+            match &hdr.box_type {
+                b"tfhd" => tfhd = Some(boxes::parse_tfhd(&mut self.io)?),
+                b"tfdt" => tfdt_val = Some(boxes::parse_tfdt(&mut self.io)?),
+                b"trun" => truns.push(boxes::parse_trun(&mut self.io)?),
+                _ => {}
+            }
+
+            let cur = self.io.tell();
+            if cur < sub_end {
+                self.io
+                    .skip(sub_end - cur)
+                    .map_err(|e| Error::io("mp4/traf", &e))?;
+            }
         }
 
+        let Some(tfhd) = tfhd else {
+            return Ok(0);
+        };
+        let Some(track_idx) = self
+            .tracks
+            .iter()
+            .position(|t| t.mp4_track_id == tfhd.track_id)
+        else {
+            return Ok(0);
+        };
+
+        let trex = self
+            .trex_defaults
+            .iter()
+            .find(|t| t.track_id == tfhd.track_id)
+            .copied();
+
+        let default_dur = tfhd
+            .default_sample_duration
+            .or_else(|| trex.map(|t| t.default_sample_duration))
+            .unwrap_or(0);
+        let default_size = tfhd
+            .default_sample_size
+            .or_else(|| trex.map(|t| t.default_sample_size))
+            .unwrap_or(0);
+        let default_flags = tfhd
+            .default_sample_flags
+            .or_else(|| trex.map(|t| t.default_sample_flags))
+            .unwrap_or(0);
+
+        let base_offset = tfhd.base_data_offset.unwrap_or(moof_offset);
+
+        let track = &mut self.tracks[track_idx];
+        let mut dts = tfdt_val.map(|v| v as i64).unwrap_or_else(|| {
+            track
+                .samples
+                .last()
+                .map_or(0, |s| s.dts.saturating_add(i64::from(s.duration)))
+        });
+
+        let mut loaded = 0usize;
+        for trun in truns {
+            let mut offset = match trun.data_offset {
+                Some(doff) => base_offset.saturating_add_signed(i64::from(doff)),
+                None => base_offset,
+            };
+            for (i, sample) in trun.samples.iter().enumerate() {
+                let dur = sample.duration.unwrap_or(default_dur);
+                let size = sample.size.unwrap_or(default_size);
+                let flags = if i == 0 {
+                    trun.first_sample_flags
+                        .or(sample.flags)
+                        .unwrap_or(default_flags)
+                } else {
+                    sample.flags.unwrap_or(default_flags)
+                };
+                // ISOBMFF sample_depends_on == 2 or sample_is_non_sync_sample (bit 16) == 0
+                let is_non_sync = (flags & 0x0001_0000) != 0;
+                let is_keyframe = !is_non_sync || !track.is_video;
+
+                track.samples.push(SampleEntry {
+                    offset,
+                    size,
+                    dts,
+                    cts_offset: sample.cts_offset,
+                    duration: dur,
+                    is_keyframe,
+                });
+                offset = offset.saturating_add(u64::from(size));
+                dts = dts.saturating_add(i64::from(dur));
+                loaded += 1;
+            }
+        }
+        Ok(loaded)
+    }
+}
+
+impl Demuxer for Mp4Demuxer {
+    fn header(&self) -> &ContainerHeader {
+        &self.header
+    }
+
+    fn health(&self) -> &StreamHealth {
+        &self.health
+    }
+
+    fn read_packet(&mut self) -> Result<RecvStatus<Packet>> {
+        if self.eof {
+            return Ok(RecvStatus::Eof);
+        }
+
+        let seekable = self.io.is_seekable();
+        loop {
+            let mut best_track: Option<usize> = None;
+            let mut best_key: i64 = i64::MAX;
+
+            for (i, track) in self.tracks.iter().enumerate() {
+                if track.current_sample >= track.samples.len() {
+                    continue;
+                }
+                let sample = &track.samples[track.current_sample];
+                let key = if seekable {
+                    rescale_q(
+                        sample.dts,
+                        Rational::new(1, track.timescale.max(1) as i32),
+                        wedeo_core::TIME_BASE_Q,
+                    )
+                } else {
+                    sample.offset as i64
+                };
+                if key < best_key {
+                    best_key = key;
+                    best_track = Some(i);
+                }
+            }
+
+            let Some(track_idx) = best_track else {
+                if self.is_fragmented && self.load_next_fragment()? {
+                    continue;
+                }
+                self.eof = true;
+                return Ok(RecvStatus::Eof);
+            };
+
+            let sample = self.tracks[track_idx].samples[self.tracks[track_idx].current_sample];
+            let track_id = self.tracks[track_idx].track_id;
+            let timescale = self.tracks[track_idx].timescale.max(1);
+            let last_dts = self.tracks[track_idx].last_dts;
+            let pts_val = sample.dts.saturating_add(i64::from(sample.cts_offset));
+
+            if let Some(prev) = last_dts
+                && sample.dts < prev
+            {
+                self.record_or_fail(
+                    track_id,
+                    Timestamp::new(pts_val),
+                    Some(sample.offset),
+                    HealthIssue::NonMonotonicDts,
+                    "non-monotonic DTS in MP4 sample table",
+                )?;
+            }
+
+            // Avoid redundant seek() calls when reading sequential samples.
+            if self.io.tell() != sample.offset {
+                if !self.io.is_seekable() && sample.offset > self.io.tell() {
+                    self.io
+                        .skip(sample.offset - self.io.tell())
+                        .map_err(|e| Error::io("mp4/demuxer", &e))?;
+                } else {
+                    self.io
+                        .seek_abs(sample.offset)
+                        .map_err(|e| Error::io("mp4/demuxer", &e))?;
+                }
+            }
+
+            let mut data = vec![0u8; sample.size as usize];
+            let mut corrupt = false;
+            if let Err(e) = self.io.read_exact_bytes(&mut data) {
+                if e.kind() == io::ErrorKind::UnexpectedEof {
+                    self.record_or_fail(
+                        track_id,
+                        Timestamp::new(pts_val),
+                        Some(sample.offset),
+                        HealthIssue::TruncatedPacket,
+                        "truncated MP4 sample at EOF",
+                    )?;
+                    corrupt = true;
+                    data.clear();
+                } else {
+                    return Err(Error::io("mp4/demuxer", &e));
+                }
+            }
+
+            let track = &mut self.tracks[track_idx];
+            track.current_sample += 1;
+            track.last_dts = Some(sample.dts);
+
+            let mut pkt = Packet::new(
+                Buffer::from_slice(&data),
+                track.track_id,
+                Rational::new(1, timescale as i32),
+            );
+            pkt.dts = Timestamp::new(sample.dts);
+            pkt.pts = Timestamp::new(pts_val);
+            pkt.duration = i64::from(sample.duration);
+            pkt.pos = Some(sample.offset);
+            if sample.is_keyframe {
+                pkt.flags |= PacketFlags::KEY;
+            }
+            if corrupt {
+                pkt.flags |= PacketFlags::CORRUPT;
+            }
+
+            if !track.sent_display_matrix {
+                track.sent_display_matrix = true;
+                if let Some(m) = track.display_matrix {
+                    pkt.side_data.push(SideData::DisplayMatrix(m));
+                }
+            }
+            if !track.sent_extra_side_data {
+                track.sent_extra_side_data = true;
+                if !track.extra_side_data.is_empty() {
+                    pkt.side_data.extend(track.extra_side_data.iter().cloned());
+                }
+            }
+
+            return Ok(RecvStatus::Ready(pkt));
+        }
+    }
+
+    fn seek(&mut self, target: SeekTarget) -> Result<()> {
+        if !self.io.is_seekable() {
+            return Err(Error::not_seekable(
+                "mp4/demuxer",
+                "cannot seek a non-seekable byte source",
+            ));
+        }
+
+        let target_track_idx = match target.track {
+            Some(tid) => self
+                .tracks
+                .iter()
+                .position(|t| t.track_id == tid)
+                .ok_or_else(|| Error::not_found("mp4/demuxer", "seek target track not found"))?,
+            None => 0,
+        };
+
+        let target_ts = target.timestamp.get().unwrap_or(0);
+        let track = &mut self.tracks[target_track_idx];
+        let track_tb = Rational::new(1, track.timescale.max(1) as i32);
+        let ts_in_track = if target.time_base.is_valid() {
+            rescale_q(target_ts, target.time_base, track_tb)
+        } else {
+            target_ts
+        };
+
+        let keyframe_idx = if track.samples.is_empty() {
+            0
+        } else {
+            let pos = match track.samples.binary_search_by_key(&ts_in_track, |s| s.dts) {
+                Ok(i) => i,
+                Err(i) => {
+                    if target.backward {
+                        i.saturating_sub(1)
+                    } else {
+                        i.min(track.samples.len() - 1)
+                    }
+                }
+            };
+            let mut kf = pos;
+            if target.backward {
+                while kf > 0 && !track.samples[kf].is_keyframe {
+                    kf -= 1;
+                }
+            } else {
+                while kf + 1 < track.samples.len() && !track.samples[kf].is_keyframe {
+                    kf += 1;
+                }
+                if !track.samples[kf].is_keyframe {
+                    kf = pos;
+                    while kf > 0 && !track.samples[kf].is_keyframe {
+                        kf -= 1;
+                    }
+                }
+            }
+            kf
+        };
+
+        track.current_sample = keyframe_idx;
+        track.last_dts = None;
+
+        let anchor_dts = track
+            .samples
+            .get(keyframe_idx)
+            .map_or(ts_in_track, |s| s.dts);
+
+        for (i, other) in self.tracks.iter_mut().enumerate() {
+            if i == target_track_idx {
+                continue;
+            }
+            let other_tb = Rational::new(1, other.timescale.max(1) as i32);
+            let other_dts = rescale_q(anchor_dts, track_tb, other_tb);
+            let idx = match other.samples.binary_search_by_key(&other_dts, |s| s.dts) {
+                Ok(k) => k,
+                Err(k) => k.saturating_sub(1),
+            };
+            other.current_sample = idx;
+            other.last_dts = None;
+        }
+
+        self.eof = false;
         Ok(())
     }
 }
 
 // ---------------------------------------------------------------------------
-// moov box recursive parser
+// Codec mapping helpers
+// ---------------------------------------------------------------------------
+
+fn map_video_codec(fourcc: &[u8; 4]) -> Option<CodecId> {
+    match fourcc {
+        b"avc1" | b"avc3" => Some(CodecId::H264),
+        b"hvc1" | b"hev1" => Some(CodecId::Hevc),
+        b"av01" => Some(CodecId::Av1),
+        b"vp09" => Some(CodecId::Vp9),
+        b"vp08" => Some(CodecId::Vp8),
+        b"mp4v" => Some(CodecId::Mpeg4),
+        b"apch" | b"apcn" | b"apcs" | b"apco" | b"ap4h" => Some(CodecId::Prores),
+        _ => None,
+    }
+}
+
+fn map_audio_codec(stsd: &StsdEntry) -> Option<(CodecId, SampleFormat)> {
+    match &stsd.fourcc {
+        b"mp4a" => match stsd.esds_object_type {
+            Some(0x69 | 0x6B) => Some((CodecId::Mp3, SampleFormat::F32Planar)),
+            Some(0xA5) => Some((CodecId::Ac3, SampleFormat::F32Planar)),
+            _ => Some((CodecId::Aac, SampleFormat::F32Planar)),
+        },
+        b"alac" => Some((CodecId::Alac, SampleFormat::S32Planar)),
+        b"Opus" => Some((CodecId::Opus, SampleFormat::F32)),
+        b"fLaC" => Some((CodecId::Flac, SampleFormat::S32)),
+        b"ac-3" => Some((CodecId::Ac3, SampleFormat::F32Planar)),
+        b"sowt" => match stsd.sample_size {
+            8 => Some((CodecId::PcmS8, SampleFormat::U8)),
+            24 => Some((CodecId::PcmS24le, SampleFormat::S32)),
+            32 => Some((CodecId::PcmS32le, SampleFormat::S32)),
+            _ => Some((CodecId::PcmS16le, SampleFormat::S16)),
+        },
+        b"twos" => match stsd.sample_size {
+            8 => Some((CodecId::PcmS8, SampleFormat::U8)),
+            24 => Some((CodecId::PcmS24be, SampleFormat::S32)),
+            32 => Some((CodecId::PcmS32be, SampleFormat::S32)),
+            _ => Some((CodecId::PcmS16be, SampleFormat::S16)),
+        },
+        b"in24" => {
+            if stsd.pcm_little_endian == Some(true) {
+                Some((CodecId::PcmS24le, SampleFormat::S32))
+            } else {
+                Some((CodecId::PcmS24be, SampleFormat::S32))
+            }
+        }
+        b"in32" => {
+            if stsd.pcm_little_endian == Some(true) {
+                Some((CodecId::PcmS32le, SampleFormat::S32))
+            } else {
+                Some((CodecId::PcmS32be, SampleFormat::S32))
+            }
+        }
+        b"fl32" => {
+            if stsd.pcm_little_endian == Some(true) {
+                Some((CodecId::PcmF32le, SampleFormat::F32))
+            } else {
+                Some((CodecId::PcmF32be, SampleFormat::F32))
+            }
+        }
+        b"fl64" => {
+            if stsd.pcm_little_endian == Some(true) {
+                Some((CodecId::PcmF64le, SampleFormat::F64))
+            } else {
+                Some((CodecId::PcmF64be, SampleFormat::F64))
+            }
+        }
+        b"lpcm" | b"ipcm" => {
+            let le = stsd.pcm_little_endian.unwrap_or(true);
+            match (stsd.sample_size, le) {
+                (8, _) => Some((CodecId::PcmS8, SampleFormat::U8)),
+                (24, true) => Some((CodecId::PcmS24le, SampleFormat::S32)),
+                (24, false) => Some((CodecId::PcmS24be, SampleFormat::S32)),
+                (32, true) => Some((CodecId::PcmS32le, SampleFormat::S32)),
+                (32, false) => Some((CodecId::PcmS32be, SampleFormat::S32)),
+                (_, true) => Some((CodecId::PcmS16le, SampleFormat::S16)),
+                (_, false) => Some((CodecId::PcmS16be, SampleFormat::S16)),
+            }
+        }
+        b"fpcm" => {
+            let le = stsd.pcm_little_endian.unwrap_or(true);
+            match (stsd.sample_size, le) {
+                (64, true) => Some((CodecId::PcmF64le, SampleFormat::F64)),
+                (64, false) => Some((CodecId::PcmF64be, SampleFormat::F64)),
+                (_, true) => Some((CodecId::PcmF32le, SampleFormat::F32)),
+                (_, false) => Some((CodecId::PcmF32be, SampleFormat::F32)),
+            }
+        }
+        b"raw " | b"NONE" => Some((CodecId::PcmU8, SampleFormat::U8)),
+        b"ulaw" => Some((CodecId::PcmMulaw, SampleFormat::S16)),
+        b"alaw" => Some((CodecId::PcmAlaw, SampleFormat::S16)),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `moov` box recursive parser
 // ---------------------------------------------------------------------------
 
 fn parse_moov(
-    io: &mut BufferedIo,
+    io: &mut BufByteSource,
     end_pos: u64,
     movie_timescale: &mut u32,
     movie_duration: &mut u64,
     tracks: &mut Vec<TrackParseState>,
+    trex_defaults: &mut Vec<Trex>,
+    is_fragmented: &mut bool,
 ) -> Result<()> {
-    while io.tell()? + 8 <= end_pos {
+    while io.tell() + 8 <= end_pos {
+        let box_start = io.tell();
         let header = boxes::read_box_header(io)?;
-        let box_end = io.tell()?.saturating_sub(header.header_size as u64) + header.size;
-        let box_end = box_end.min(end_pos);
+        let box_end = if header.size == 0 {
+            end_pos
+        } else {
+            box_start.saturating_add(header.size).min(end_pos)
+        };
 
         match &header.box_type {
             b"mvhd" => {
@@ -497,29 +965,66 @@ fn parse_moov(
                 parse_trak(io, box_end, &mut tps)?;
                 tracks.push(tps);
             }
+            b"mvex" => {
+                *is_fragmented = true;
+                parse_mvex(io, box_end, trex_defaults)?;
+            }
             _ => {}
         }
 
-        // Ensure we're at the box end
-        let current = io.tell()?;
+        let current = io.tell();
         if current < box_end {
-            io.skip(box_end - current)?;
+            io.skip(box_end - current)
+                .map_err(|e| Error::io("mp4/moov", &e))?;
         }
     }
     Ok(())
 }
 
-fn parse_trak(io: &mut BufferedIo, end_pos: u64, tps: &mut TrackParseState) -> Result<()> {
-    while io.tell()? + 8 <= end_pos {
+fn parse_mvex(io: &mut BufByteSource, end_pos: u64, trex_defaults: &mut Vec<Trex>) -> Result<()> {
+    while io.tell() + 8 <= end_pos {
+        let box_start = io.tell();
         let header = boxes::read_box_header(io)?;
-        let box_end = io.tell()?.saturating_sub(header.header_size as u64) + header.size;
-        let box_end = box_end.min(end_pos);
+        let box_end = if header.size == 0 {
+            end_pos
+        } else {
+            box_start.saturating_add(header.size).min(end_pos)
+        };
+
+        if &header.box_type == b"trex" {
+            trex_defaults.push(boxes::parse_trex(io)?);
+        }
+
+        let current = io.tell();
+        if current < box_end {
+            io.skip(box_end - current)
+                .map_err(|e| Error::io("mp4/mvex", &e))?;
+        }
+    }
+    Ok(())
+}
+
+fn parse_trak(io: &mut BufByteSource, end_pos: u64, tps: &mut TrackParseState) -> Result<()> {
+    while io.tell() + 8 <= end_pos {
+        let box_start = io.tell();
+        let header = boxes::read_box_header(io)?;
+        let box_end = if header.size == 0 {
+            end_pos
+        } else {
+            box_start.saturating_add(header.size).min(end_pos)
+        };
 
         match &header.box_type {
             b"tkhd" => {
                 let tkhd = boxes::parse_tkhd(io)?;
+                tps.track_id = tkhd.track_id;
+                tps.tkhd_duration = tkhd.duration;
                 tps.width = tkhd.width;
                 tps.height = tkhd.height;
+                tps.display_matrix = tkhd.display_matrix;
+            }
+            b"edts" => {
+                parse_edts(io, box_end, tps)?;
             }
             b"mdia" => {
                 parse_mdia(io, box_end, tps)?;
@@ -527,26 +1032,55 @@ fn parse_trak(io: &mut BufferedIo, end_pos: u64, tps: &mut TrackParseState) -> R
             _ => {}
         }
 
-        let current = io.tell()?;
+        let current = io.tell();
         if current < box_end {
-            io.skip(box_end - current)?;
+            io.skip(box_end - current)
+                .map_err(|e| Error::io("mp4/trak", &e))?;
         }
     }
     Ok(())
 }
 
-fn parse_mdia(io: &mut BufferedIo, end_pos: u64, tps: &mut TrackParseState) -> Result<()> {
-    while io.tell()? + 8 <= end_pos {
+fn parse_edts(io: &mut BufByteSource, end_pos: u64, tps: &mut TrackParseState) -> Result<()> {
+    while io.tell() + 8 <= end_pos {
+        let box_start = io.tell();
         let header = boxes::read_box_header(io)?;
-        let box_end = io.tell()?.saturating_sub(header.header_size as u64) + header.size;
-        let box_end = box_end.min(end_pos);
-        let payload_size = header.payload_size().unwrap_or(0);
+        let box_end = if header.size == 0 {
+            end_pos
+        } else {
+            box_start.saturating_add(header.size).min(end_pos)
+        };
+
+        if &header.box_type == b"elst" {
+            tps.elst = boxes::parse_elst(io)?;
+        }
+
+        let current = io.tell();
+        if current < box_end {
+            io.skip(box_end - current)
+                .map_err(|e| Error::io("mp4/edts", &e))?;
+        }
+    }
+    Ok(())
+}
+
+fn parse_mdia(io: &mut BufByteSource, end_pos: u64, tps: &mut TrackParseState) -> Result<()> {
+    while io.tell() + 8 <= end_pos {
+        let box_start = io.tell();
+        let header = boxes::read_box_header(io)?;
+        let box_end = if header.size == 0 {
+            end_pos
+        } else {
+            box_start.saturating_add(header.size).min(end_pos)
+        };
+        let payload_size = box_end.saturating_sub(io.tell());
 
         match &header.box_type {
             b"mdhd" => {
                 let mdhd = boxes::parse_mdhd(io)?;
                 tps.timescale = mdhd.timescale;
                 tps.duration = mdhd.duration;
+                tps.language = mdhd.language;
             }
             b"hdlr" => {
                 let hdlr = boxes::parse_hdlr(io, payload_size)?;
@@ -558,446 +1092,123 @@ fn parse_mdia(io: &mut BufferedIo, end_pos: u64, tps: &mut TrackParseState) -> R
             _ => {}
         }
 
-        let current = io.tell()?;
+        let current = io.tell();
         if current < box_end {
-            io.skip(box_end - current)?;
+            io.skip(box_end - current)
+                .map_err(|e| Error::io("mp4/mdia", &e))?;
         }
     }
     Ok(())
 }
 
-fn parse_minf(io: &mut BufferedIo, end_pos: u64, tps: &mut TrackParseState) -> Result<()> {
-    while io.tell()? + 8 <= end_pos {
+fn parse_minf(io: &mut BufByteSource, end_pos: u64, tps: &mut TrackParseState) -> Result<()> {
+    while io.tell() + 8 <= end_pos {
+        let box_start = io.tell();
         let header = boxes::read_box_header(io)?;
-        let box_end = io.tell()?.saturating_sub(header.header_size as u64) + header.size;
-        let box_end = box_end.min(end_pos);
+        let box_end = if header.size == 0 {
+            end_pos
+        } else {
+            box_start.saturating_add(header.size).min(end_pos)
+        };
 
         if &header.box_type == b"stbl" {
             parse_stbl(io, box_end, tps)?;
         }
 
-        let current = io.tell()?;
+        let current = io.tell();
         if current < box_end {
-            io.skip(box_end - current)?;
+            io.skip(box_end - current)
+                .map_err(|e| Error::io("mp4/minf", &e))?;
         }
     }
     Ok(())
 }
 
-fn parse_stbl(io: &mut BufferedIo, end_pos: u64, tps: &mut TrackParseState) -> Result<()> {
-    while io.tell()? + 8 <= end_pos {
+fn parse_stbl(io: &mut BufByteSource, end_pos: u64, tps: &mut TrackParseState) -> Result<()> {
+    while io.tell() + 8 <= end_pos {
+        let box_start = io.tell();
         let header = boxes::read_box_header(io)?;
-        let box_end = io.tell()?.saturating_sub(header.header_size as u64) + header.size;
-        let box_end = box_end.min(end_pos);
-        let payload_size = header.payload_size().unwrap_or(0);
+        let box_end = if header.size == 0 {
+            end_pos
+        } else {
+            box_start.saturating_add(header.size).min(end_pos)
+        };
+        let payload_size = box_end.saturating_sub(io.tell());
 
         match &header.box_type {
-            b"stsd" => {
-                tps.stsd_entry = Some(boxes::parse_stsd(io, payload_size)?);
-            }
-            b"stts" => {
-                tps.stts = boxes::parse_stts(io)?;
-            }
-            b"stsc" => {
-                tps.stsc = boxes::parse_stsc(io)?;
-            }
+            b"stsd" => tps.stsd_entry = Some(boxes::parse_stsd(io, payload_size)?),
+            b"stts" => tps.stts = boxes::parse_stts(io)?,
+            b"stsc" => tps.stsc = boxes::parse_stsc(io)?,
             b"stsz" => {
-                let (fixed, per_sample) = boxes::parse_stsz(io)?;
+                let (fixed, _count, per_sample) = boxes::parse_stsz(io)?;
                 tps.fixed_sample_size = fixed;
                 tps.sample_sizes = per_sample;
             }
-            b"stco" => {
-                tps.chunk_offsets = boxes::parse_stco(io)?;
-            }
-            b"co64" => {
-                tps.chunk_offsets = boxes::parse_co64(io)?;
-            }
-            b"stss" => {
-                tps.sync_samples = boxes::parse_stss(io)?;
-            }
-            b"ctts" => {
-                tps.ctts = boxes::parse_ctts(io)?;
-            }
-            _ => {
-                let current = io.tell()?;
-                if current < box_end {
-                    io.skip(box_end - current)?;
-                }
-            }
+            b"stco" => tps.chunk_offsets = boxes::parse_stco(io)?,
+            b"co64" => tps.chunk_offsets = boxes::parse_co64(io)?,
+            b"stss" => tps.sync_samples = boxes::parse_stss(io)?,
+            b"ctts" => tps.ctts = boxes::parse_ctts(io)?,
+            _ => {}
         }
 
-        // Ensure we're at the box end
-        let current = io.tell()?;
+        let current = io.tell();
         if current < box_end {
-            io.skip(box_end - current)?;
+            io.skip(box_end - current)
+                .map_err(|e| Error::io("mp4/stbl", &e))?;
         }
     }
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// Probe function
+// Probe & Factory
 // ---------------------------------------------------------------------------
 
-/// Probe score for MP4 files. Returns 0-100.
-fn probe_mp4(data: &ProbeData<'_>) -> i32 {
-    let buf = data.buf;
-    if buf.len() < 8 {
+/// Probe score for ISOBMFF/MP4/MOV/M4A (`90..=100` on `ftyp`, `0` on non-MP4).
+pub fn probe_mp4(head: &[u8], _ext: Option<&str>) -> u8 {
+    if head.len() < 8 {
         return 0;
     }
-
-    // Check for ftyp box at offset 0
-    if buf.len() >= 8 && &buf[4..8] == b"ftyp" {
-        return 90;
+    let size = u32::from_be_bytes([head[0], head[1], head[2], head[3]]);
+    if size < 8 && size != 0 && size != 1 {
+        return 0;
     }
-
-    // Check for moov/mdat/free/wide at offset 4..8 (some files start with these)
-    if buf.len() >= 8
-        && (&buf[4..8] == b"moov"
-            || &buf[4..8] == b"mdat"
-            || &buf[4..8] == b"free"
-            || &buf[4..8] == b"wide")
-    {
-        return 70;
+    match &head[4..8] {
+        b"ftyp" => {
+            if head.len() >= 12 {
+                match &head[8..12] {
+                    b"isom" | b"iso2" | b"iso5" | b"iso6" | b"mp41" | b"mp42" | b"M4A "
+                    | b"M4V " | b"qt  " | b"avc1" | b"hvc1" | b"dash" | b"cmfc" | b"3gp4"
+                    | b"3gp5" => 100,
+                    _ => 92,
+                }
+            } else {
+                90
+            }
+        }
+        b"moov" | b"mdat" | b"free" | b"wide" | b"styp" | b"moof" => 70,
+        _ => 0,
     }
-
-    // Extension-based fallback
-    let filename = data.filename.to_lowercase();
-    if filename.ends_with(".mp4")
-        || filename.ends_with(".m4a")
-        || filename.ends_with(".m4v")
-        || filename.ends_with(".mov")
-    {
-        return 50;
-    }
-
-    0
 }
 
-// ---------------------------------------------------------------------------
-// Factory registration
-// ---------------------------------------------------------------------------
-
-struct Mp4DemuxerFactory;
+pub struct Mp4DemuxerFactory;
 
 impl DemuxerFactory for Mp4DemuxerFactory {
-    fn descriptor(&self) -> &InputFormatDescriptor {
-        static DESC: InputFormatDescriptor = InputFormatDescriptor {
+    fn descriptor(&self) -> &DemuxerDescriptor {
+        static DESC: DemuxerDescriptor = DemuxerDescriptor {
             name: "mp4",
-            long_name: "MP4 (MPEG-4 Part 14)",
-            extensions: "mp4,m4a,m4v,mov",
-            mime_types: "video/mp4,audio/mp4",
-            flags: InputFormatFlags::empty(),
-            priority: 100,
+            long_name: "MP4 / MOV / M4A (ISOBMFF)",
+            extensions: &["mp4", "m4a", "m4v", "mov", "3gp"],
+            mime_types: &["video/mp4", "audio/mp4", "video/quicktime"],
         };
         &DESC
     }
 
-    fn probe(&self, data: &ProbeData<'_>) -> i32 {
-        probe_mp4(data)
+    fn probe(&self, head: &[u8], ext: Option<&str>) -> u8 {
+        probe_mp4(head, ext)
     }
 
-    fn create(&self) -> Result<Box<dyn Demuxer>> {
-        Ok(Box::new(Mp4Demuxer::new()))
-    }
-}
-
-inventory::submit!(&Mp4DemuxerFactory as &dyn DemuxerFactory);
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::muxer::Mp4Muxer;
-    use wedeo_codec::decoder::CodecParameters;
-    use wedeo_core::buffer::Buffer;
-    use wedeo_core::rational::Rational;
-    use wedeo_format::io::{BufferedIo, FileIo};
-    use wedeo_format::muxer::Muxer;
-
-    /// Minimal avcC extradata for tests.
-    fn test_avcc() -> Vec<u8> {
-        vec![
-            0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x04, 0x67, 0x42, 0xC0, 0x1E, 0x01, 0x00,
-            0x02, 0x68, 0xCE,
-        ]
-    }
-
-    /// Helper: mux an MP4 file with the given video packets and return the path.
-    fn mux_test_mp4(
-        path: &str,
-        width: u32,
-        height: u32,
-        packets: &[(Vec<u8>, i64, i64, i64, bool)], // (data, pts, dts, duration, is_key)
-    ) {
-        let mut params = CodecParameters::new(CodecId::H264, MediaType::Video);
-        params.width = width;
-        params.height = height;
-        params.time_base = Rational::new(1, 25);
-        params.extradata = test_avcc();
-        let stream = Stream::new(0, params);
-
-        let mut muxer = Mp4Muxer::new();
-        let file_io = FileIo::create(path).expect("create file");
-        let mut io = BufferedIo::new(Box::new(file_io));
-        muxer.write_header(&mut io, &[stream]).unwrap();
-
-        for (data, pts, dts, duration, is_key) in packets {
-            let mut pkt = Packet::new();
-            pkt.data = Buffer::from_slice(data);
-            pkt.stream_index = 0;
-            pkt.pts = *pts;
-            pkt.dts = *dts;
-            pkt.duration = *duration;
-            if *is_key {
-                pkt.flags = PacketFlags::KEY;
-            }
-            muxer.write_packet(&mut io, &pkt).unwrap();
-        }
-
-        muxer.write_trailer(&mut io).unwrap();
-    }
-
-    #[test]
-    fn test_demux_roundtrip() {
-        let path = "/tmp/wedeo_test_mp4_demux_roundtrip.mp4";
-
-        // Write 5 packets with varying sizes
-        let packets: Vec<(Vec<u8>, i64, i64, i64, bool)> = (0..5)
-            .map(|i| (vec![0xAA; 100 + i * 20], i as i64, i as i64, 1i64, i == 0))
-            .collect();
-        mux_test_mp4(path, 320, 240, &packets);
-
-        // Now demux it
-        let mut demuxer = Mp4Demuxer::new();
-        let file_io = FileIo::open(path).expect("open file");
-        let mut io = BufferedIo::new(Box::new(file_io));
-        let header = demuxer.read_header(&mut io).unwrap();
-
-        // Verify stream info
-        assert_eq!(header.streams.len(), 1);
-        assert_eq!(header.streams[0].codec_params.codec_id, CodecId::H264);
-        assert_eq!(header.streams[0].codec_params.width, 320);
-        assert_eq!(header.streams[0].codec_params.height, 240);
-        assert!(!header.streams[0].codec_params.extradata.is_empty());
-
-        // Read all packets back
-        let mut read_packets = Vec::new();
-        loop {
-            match demuxer.read_packet(&mut io) {
-                Ok(pkt) => read_packets.push(pkt),
-                Err(Error::Eof) => break,
-                Err(e) => panic!("unexpected error: {e:?}"),
-            }
-        }
-
-        // Verify packet count and sizes
-        assert_eq!(read_packets.len(), 5);
-        for (i, pkt) in read_packets.iter().enumerate() {
-            assert_eq!(pkt.data.size(), 100 + i * 20, "packet {i} size mismatch");
-            assert_eq!(pkt.stream_index, 0);
-            assert_eq!(pkt.dts, i as i64);
-            assert_eq!(pkt.duration, 1);
-        }
-
-        // First packet should be keyframe
-        assert!(read_packets[0].flags.contains(PacketFlags::KEY));
-        // Others should not
-        for pkt in &read_packets[1..] {
-            assert!(!pkt.flags.contains(PacketFlags::KEY));
-        }
-
-        std::fs::remove_file(path).ok();
-    }
-
-    #[test]
-    fn test_demux_probe() {
-        // ftyp header → score 90
-        let mut ftyp_buf = vec![0u8; 32];
-        ftyp_buf[4..8].copy_from_slice(b"ftyp");
-        let probe = ProbeData {
-            filename: "test.mp4",
-            buf: &ftyp_buf,
-        };
-        assert_eq!(probe_mp4(&probe), 90);
-
-        // moov header → score 70
-        let mut moov_buf = vec![0u8; 32];
-        moov_buf[4..8].copy_from_slice(b"moov");
-        let probe = ProbeData {
-            filename: "test.bin",
-            buf: &moov_buf,
-        };
-        assert_eq!(probe_mp4(&probe), 70);
-
-        // Extension only → score 50
-        let probe = ProbeData {
-            filename: "test.mp4",
-            buf: &[0u8; 32],
-        };
-        assert_eq!(probe_mp4(&probe), 50);
-
-        // No match → score 0
-        let probe = ProbeData {
-            filename: "test.wav",
-            buf: b"RIFF....WAVE",
-        };
-        assert_eq!(probe_mp4(&probe), 0);
-    }
-
-    #[test]
-    fn test_demux_seek() {
-        let path = "/tmp/wedeo_test_mp4_demux_seek.mp4";
-
-        // Write packets with keyframes at 0 and 3
-        let packets: Vec<(Vec<u8>, i64, i64, i64, bool)> = (0..6)
-            .map(|i| {
-                let is_key = i == 0 || i == 3;
-                (vec![i as u8; 50], i as i64, i as i64, 1i64, is_key)
-            })
-            .collect();
-        mux_test_mp4(path, 320, 240, &packets);
-
-        let mut demuxer = Mp4Demuxer::new();
-        let file_io = FileIo::open(path).expect("open file");
-        let mut io = BufferedIo::new(Box::new(file_io));
-        demuxer.read_header(&mut io).unwrap();
-
-        // Seek to DTS=4 — should snap back to keyframe at DTS=3
-        demuxer.seek(&mut io, 0, 4, SeekFlags::BACKWARD).unwrap();
-        let pkt = demuxer.read_packet(&mut io).unwrap();
-        assert_eq!(pkt.dts, 3);
-        assert!(pkt.flags.contains(PacketFlags::KEY));
-
-        // Seek to DTS=0 — should be at the beginning
-        demuxer.seek(&mut io, 0, 0, SeekFlags::BACKWARD).unwrap();
-        let pkt = demuxer.read_packet(&mut io).unwrap();
-        assert_eq!(pkt.dts, 0);
-        assert!(pkt.flags.contains(PacketFlags::KEY));
-
-        std::fs::remove_file(path).ok();
-    }
-
-    #[test]
-    fn test_demux_cts_offsets() {
-        let path = "/tmp/wedeo_test_mp4_demux_cts.mp4";
-
-        // Mux with CTS offsets (PTS != DTS for B-frame reordering)
-        let mut params = CodecParameters::new(CodecId::H264, MediaType::Video);
-        params.width = 320;
-        params.height = 240;
-        params.time_base = Rational::new(1, 25);
-        params.extradata = test_avcc();
-        let stream = Stream::new(0, params);
-
-        let mut muxer = Mp4Muxer::new();
-        let file_io = FileIo::create(path).expect("create file");
-        let mut io = BufferedIo::new(Box::new(file_io));
-        muxer.write_header(&mut io, &[stream]).unwrap();
-
-        // DTS order: 0, 1, 2, 3
-        // PTS order: 1, 0, 3, 2 (simulating B-frame reorder)
-        let frame_data: Vec<(i64, i64, bool)> = vec![
-            (1, 0, true),  // I-frame: pts=1, dts=0
-            (0, 1, false), // B-frame: pts=0, dts=1
-            (3, 2, false), // P-frame: pts=3, dts=2
-            (2, 3, false), // B-frame: pts=2, dts=3
-        ];
-
-        for (pts, dts, is_key) in &frame_data {
-            let mut pkt = Packet::new();
-            pkt.data = Buffer::from_slice(&[0u8; 64]);
-            pkt.stream_index = 0;
-            pkt.pts = *pts;
-            pkt.dts = *dts;
-            pkt.duration = 1;
-            if *is_key {
-                pkt.flags = PacketFlags::KEY;
-            }
-            muxer.write_packet(&mut io, &pkt).unwrap();
-        }
-
-        muxer.write_trailer(&mut io).unwrap();
-        drop(io);
-
-        // Demux and verify PTS/DTS
-        let mut demuxer = Mp4Demuxer::new();
-        let file_io = FileIo::open(path).expect("open file");
-        let mut io = BufferedIo::new(Box::new(file_io));
-        demuxer.read_header(&mut io).unwrap();
-
-        let mut read_pkts = Vec::new();
-        loop {
-            match demuxer.read_packet(&mut io) {
-                Ok(pkt) => read_pkts.push(pkt),
-                Err(Error::Eof) => break,
-                Err(e) => panic!("unexpected error: {e:?}"),
-            }
-        }
-
-        assert_eq!(read_pkts.len(), 4);
-        // Verify DTS is monotonically increasing
-        for (i, pkt) in read_pkts.iter().enumerate() {
-            assert_eq!(pkt.dts, i as i64, "dts mismatch at {i}");
-        }
-        // Verify PTS matches what we wrote
-        assert_eq!(read_pkts[0].pts, 1); // I: pts=1, dts=0
-        assert_eq!(read_pkts[1].pts, 0); // B: pts=0, dts=1
-        assert_eq!(read_pkts[2].pts, 3); // P: pts=3, dts=2
-        assert_eq!(read_pkts[3].pts, 2); // B: pts=2, dts=3
-
-        std::fs::remove_file(path).ok();
-    }
-
-    #[test]
-    fn test_demux_faststart() {
-        let path = "/tmp/wedeo_test_mp4_demux_faststart.mp4";
-
-        // Use faststart (moov before mdat)
-        let mut params = CodecParameters::new(CodecId::H264, MediaType::Video);
-        params.width = 160;
-        params.height = 120;
-        params.time_base = Rational::new(1, 30);
-        params.extradata = test_avcc();
-        let stream = Stream::new(0, params);
-
-        let mut muxer =
-            crate::muxer::Mp4Muxer::with_options(crate::muxer::Mp4MuxerOptions { faststart: true });
-        let file_io = FileIo::create(path).expect("create file");
-        let mut io = BufferedIo::new(Box::new(file_io));
-        muxer.write_header(&mut io, &[stream]).unwrap();
-
-        for i in 0..3 {
-            let mut pkt = Packet::new();
-            pkt.data = Buffer::from_slice(&[0u8; 80]);
-            pkt.stream_index = 0;
-            pkt.pts = i;
-            pkt.dts = i;
-            pkt.duration = 1;
-            if i == 0 {
-                pkt.flags = PacketFlags::KEY;
-            }
-            muxer.write_packet(&mut io, &pkt).unwrap();
-        }
-
-        muxer.write_trailer(&mut io).unwrap();
-        drop(io);
-
-        // Demux — faststart puts moov before mdat, demuxer should handle both layouts
-        let mut demuxer = Mp4Demuxer::new();
-        let file_io = FileIo::open(path).expect("open file");
-        let mut io = BufferedIo::new(Box::new(file_io));
-        let header = demuxer.read_header(&mut io).unwrap();
-
-        assert_eq!(header.streams.len(), 1);
-        assert_eq!(header.streams[0].codec_params.width, 160);
-        assert_eq!(header.streams[0].codec_params.height, 120);
-
-        let mut count = 0;
-        while demuxer.read_packet(&mut io).is_ok() {
-            count += 1;
-        }
-        assert_eq!(count, 3);
-
-        std::fs::remove_file(path).ok();
+    fn open(&self, source: Box<dyn ByteSource>, policy: ErrorPolicy) -> Result<Box<dyn Demuxer>> {
+        Ok(Box::new(Mp4Demuxer::open(source, policy)?))
     }
 }

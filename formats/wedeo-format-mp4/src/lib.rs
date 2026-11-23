@@ -1,32 +1,18 @@
+//! Native ISOBMFF / MP4 / MOV / M4A demuxer, faststart/auto-fMP4 muxer, and box AST (`wedeo inspect`).
+
+#![forbid(unsafe_code)]
+
 mod atoms;
-mod boxes;
+pub mod boxes;
 pub mod demuxer;
 pub mod muxer;
 
-use wedeo_core::codec_id::CodecId;
-use wedeo_core::error::Result;
-use wedeo_format::muxer::{Muxer, OutputFormatDescriptor, OutputFormatFlags};
-use wedeo_format::registry::MuxerFactory;
+use std::sync::Arc;
 
-struct Mp4MuxerFactory;
+use wedeo_core::Registry;
 
-impl MuxerFactory for Mp4MuxerFactory {
-    fn descriptor(&self) -> &OutputFormatDescriptor {
-        static DESC: OutputFormatDescriptor = OutputFormatDescriptor {
-            name: "mp4",
-            long_name: "MP4 (MPEG-4 Part 14)",
-            extensions: "mp4,m4a,m4v",
-            mime_types: "video/mp4",
-            flags: OutputFormatFlags::GLOBALHEADER,
-            audio_codec: CodecId::Aac,
-            video_codec: CodecId::H264,
-        };
-        &DESC
-    }
-
-    fn create(&self) -> Result<Box<dyn Muxer>> {
-        Ok(Box::new(muxer::Mp4Muxer::new()))
-    }
+/// Register the native MP4/MOV/M4A demuxer and muxer into `reg`.
+pub fn register_mp4(reg: &mut Registry) {
+    reg.register_demuxer(Arc::new(demuxer::Mp4DemuxerFactory));
+    reg.register_muxer(Arc::new(muxer::Mp4MuxerFactory));
 }
-
-inventory::submit!(&Mp4MuxerFactory as &dyn MuxerFactory);
