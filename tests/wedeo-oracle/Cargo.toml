@@ -1,0 +1,25 @@
+[package]
+name = "wedeo-oracle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Dev-only FFmpeg n9.1 verification oracle, checkasm, framecrc, and DAG lint harness"
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "wedeo-audiogen"
+path = "src/audiogen.rs"
+
+[[bin]]
+name = "wedeo-framecrc"
+path = "src/framecrc.rs"
+
+[dependencies]
+wedeo = { workspace = true, features = ["rav1d"] }
+adler2 = "2.0.1"
+md-5 = "0.10.6"

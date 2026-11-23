@@ -2,19 +2,14 @@
 name = "wedeo-format-mp4"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-keywords.workspace = true
-categories.workspace = true
-rust-version.workspace = true
-description = "MP4/MOV format demuxer and muxer for wedeo"
-
-
-[dependencies]
-wedeo-core = { workspace = true }
-wedeo-codec = { workspace = true }
-wedeo-format = { workspace = true }
-inventory = { workspace = true }
+description = "Native ISOBMFF/MP4/MOV demuxer and faststart/auto-fMP4 muxer for wedeo"
 
 [lints]
 workspace = true
+
+[dependencies]
+wedeo-core.workspace = true
+wedeo-syntax.workspace = true

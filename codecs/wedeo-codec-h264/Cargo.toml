@@ -2,32 +2,21 @@
 name = "wedeo-codec-h264"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-keywords.workspace = true
-categories.workspace = true
-rust-version.workspace = true
-description = "H.264/AVC video codec for wedeo"
-
-[features]
-default = ["asm"]
-asm = []
-
-[dependencies]
-wedeo-core = { workspace = true }
-wedeo-codec = { workspace = true }
-inventory = { workspace = true }
-tracing = { workspace = true }
-
-[build-dependencies]
-cc = { workspace = true }
-
-[dev-dependencies]
-divan = { workspace = true }
-
-[[bench]]
-name = "h264_bench"
-harness = false
+description = "Pure-Rust FFmpeg n9.1 H.264/AVC video decoder for wedeo"
 
 [lints]
 workspace = true
+
+[features]
+default = []
+dev-trace = []
+
+[dependencies]
+wedeo-core.workspace = true
+wedeo-syntax = { workspace = true, default-features = false, features = ["h264"] }
+
+[dev-dependencies]
+divan.workspace = true

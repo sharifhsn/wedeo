@@ -2,18 +2,18 @@
 name = "wedeo-codec-vp9"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-keywords.workspace = true
-categories.workspace = true
-rust-version.workspace = true
-description = "VP9 video codec for wedeo"
-
-[dependencies]
-wedeo-core = { workspace = true }
-wedeo-codec = { workspace = true }
-inventory = { workspace = true }
-tracing = { workspace = true }
+description = "Pure-Rust FFmpeg n9.1 VP9 video decoder for wedeo"
 
 [lints]
 workspace = true
+
+[features]
+default = []
+dev-trace = []
+
+[dependencies]
+wedeo-core.workspace = true
+wedeo-syntax = { workspace = true, default-features = false, features = ["vp9"] }

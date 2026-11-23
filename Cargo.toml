@@ -6,6 +6,19 @@ members = [
     "crates/wedeo-audio-ops",
     "crates/wedeo-graph",
     "crates/wedeo-gpu-wgpu",
+    "crates/wedeo",
+    "codecs/wedeo-codec-pcm",
+    "codecs/wedeo-codec-h264",
+    "codecs/wedeo-codec-vp9",
+    "formats/wedeo-format-wav",
+    "formats/wedeo-format-mp4",
+    "formats/wedeo-format-mkv",
+    "formats/wedeo-format-ivf",
+    "adapters/wedeo-rav1d",
+    "adapters/wedeo-rav1e",
+    "adapters/wedeo-symphonia",
+    "bins/wedeo-cli",
+    "tests/wedeo-oracle",
 ]
 resolver = "3"
 
@@ -23,7 +36,7 @@ all = { level = "deny", priority = -1 }
 
 [workspace.dependencies]
 bitflags = "2"
-bytemuck = "1"
+divan = "0.1.21"
 pollster = "0.4"
 wgpu = "29"
 
@@ -33,3 +46,17 @@ wedeo-video-ops = { path = "crates/wedeo-video-ops", version = "0.3.0" }
 wedeo-audio-ops = { path = "crates/wedeo-audio-ops", version = "0.3.0" }
 wedeo-graph = { path = "crates/wedeo-graph", version = "0.3.0" }
 wedeo-gpu-wgpu = { path = "crates/wedeo-gpu-wgpu", version = "0.3.0" }
+wedeo = { path = "crates/wedeo", version = "0.3.0" }
+
+wedeo-codec-pcm = { path = "codecs/wedeo-codec-pcm", version = "0.3.0" }
+wedeo-codec-h264 = { path = "codecs/wedeo-codec-h264", version = "0.3.0" }
+wedeo-codec-vp9 = { path = "codecs/wedeo-codec-vp9", version = "0.3.0" }
+
+wedeo-format-wav = { path = "formats/wedeo-format-wav", version = "0.3.0" }
+wedeo-format-mp4 = { path = "formats/wedeo-format-mp4", version = "0.3.0" }
+wedeo-format-mkv = { path = "formats/wedeo-format-mkv", version = "0.3.0" }
+wedeo-format-ivf = { path = "formats/wedeo-format-ivf", version = "0.3.0" }
+
+wedeo-rav1d = { path = "adapters/wedeo-rav1d", version = "0.3.0" }
+wedeo-rav1e = { path = "adapters/wedeo-rav1e", version = "0.3.0" }
+wedeo-symphonia = { path = "adapters/wedeo-symphonia", version = "0.3.0" }

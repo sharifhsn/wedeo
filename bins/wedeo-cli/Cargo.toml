@@ -2,34 +2,22 @@
 name = "wedeo-cli"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-keywords.workspace = true
-categories.workspace = true
-rust-version.workspace = true
-description = "CLI tools for wedeo (ffprobe/ffmpeg equivalent)"
+description = "Unified wedeo CLI (inspect/transcode/cut/mux/explain, wedeo ffmpeg, and wedeo mcp)"
 publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "wedeo"
+path = "src/main.rs"
 
 [[bin]]
 name = "wedeo-cli"
 path = "src/main.rs"
 
 [dependencies]
-wedeo-core = { workspace = true }
-wedeo-codec = { workspace = true }
-wedeo-format = { workspace = true }
-wedeo-codec-pcm = { workspace = true }
-wedeo-codec-h264 = { workspace = true }
-wedeo-format-wav = { workspace = true }
-wedeo-format-h264 = { workspace = true }
-wedeo-format-mp4 = { workspace = true }
-wedeo-symphonia = { workspace = true }
-wedeo-rav1d = { workspace = true }
-wedeo-rav1e = { workspace = true }
-wedeo-codec-vp9 = { workspace = true }
-wedeo-format-ivf = { workspace = true }
-wedeo-format-webm = { workspace = true }
-tracing-subscriber = { workspace = true }
-
-[lints]
-workspace = true
+wedeo = { workspace = true, features = ["rav1d"] }

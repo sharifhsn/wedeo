@@ -2,18 +2,13 @@
 name = "wedeo-format-wav"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-keywords.workspace = true
-categories.workspace = true
-rust-version.workspace = true
-description = "WAV format muxer for wedeo"
-
-
-[dependencies]
-wedeo-core = { workspace = true }
-wedeo-format = { workspace = true }
-inventory = { workspace = true }
+description = "Native bit-exact FFmpeg RIFF/RIFX/RF64/BW64 WAV demuxer and muxer for wedeo"
 
 [lints]
 workspace = true
+
+[dependencies]
+wedeo-core.workspace = true

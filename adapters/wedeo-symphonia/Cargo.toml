@@ -2,38 +2,18 @@
 name = "wedeo-symphonia"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-keywords.workspace = true
-categories.workspace = true
-rust-version.workspace = true
-description = "Symphonia audio backend adapter for wedeo"
-
-
-[dependencies]
-wedeo-core = { workspace = true }
-wedeo-codec = { workspace = true }
-wedeo-format = { workspace = true }
-inventory = { workspace = true }
-symphonia = { version = "0.5.5", default-features = false, features = [
-    "aac",
-    "alac",
-    "flac",
-    "mp1",
-    "mp2",
-    "mp3",
-    "pcm",
-    "vorbis",
-    "isomp4",
-    "mkv",
-    "ogg",
-    "wav",
-    "aiff",
-    "caf",
-    "adpcm",
-    "opt-simd",
-] }
-opus-decoder = "0.1.1"
+description = "Segregated Symphonia fallback audio adapter for wedeo"
 
 [lints]
 workspace = true
+
+[dependencies]
+wedeo-core.workspace = true
+symphonia = { version = "0.5.5", default-features = false, features = [
+    "aac", "alac", "flac", "mp1", "mp2", "mp3", "pcm", "vorbis",
+    "isomp4", "mkv", "ogg", "wav", "aiff", "caf", "adpcm", "opt-simd",
+] }
+opus-decoder = "0.1.1"

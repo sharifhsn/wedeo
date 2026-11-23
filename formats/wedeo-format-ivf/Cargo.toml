@@ -2,19 +2,13 @@
 name = "wedeo-format-ivf"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-keywords.workspace = true
-categories.workspace = true
-rust-version.workspace = true
-description = "IVF container demuxer for wedeo"
-
-[dependencies]
-wedeo-core = { workspace = true }
-wedeo-format = { workspace = true }
-wedeo-codec = { workspace = true }
-inventory = { workspace = true }
-tracing = { workspace = true }
+description = "Native IVF container demuxer and muxer for wedeo"
 
 [lints]
 workspace = true
+
+[dependencies]
+wedeo-core.workspace = true

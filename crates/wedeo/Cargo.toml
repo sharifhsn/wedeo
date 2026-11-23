@@ -2,45 +2,47 @@
 name = "wedeo"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-keywords.workspace = true
-categories.workspace = true
-rust-version.workspace = true
-description = "AI-generated Rust rewrite of FFmpeg — pure-Rust multimedia framework"
+description = "Pure-Rust Universal A/V Adapter — ergonomic facade and audio/video readers"
 readme = "README.md"
-
-[features]
-default = ["h264", "pcm", "wav", "h264-format", "mp4", "symphonia"]
-h264 = ["dep:wedeo-codec-h264"]
-pcm = ["dep:wedeo-codec-pcm"]
-wav = ["dep:wedeo-format-wav"]
-h264-format = ["dep:wedeo-format-h264"]
-mp4 = ["dep:wedeo-format-mp4"]
-symphonia = ["dep:wedeo-symphonia"]
-rav1e = ["dep:wedeo-rav1e"]
-
-[dependencies]
-# Framework crates (always present)
-wedeo-core = { workspace = true }
-wedeo-codec = { workspace = true }
-wedeo-format = { workspace = true }
-wedeo-filter = { workspace = true }
-wedeo-resample = { workspace = true }
-wedeo-scale = { workspace = true }
-
-# Implementation crates — linked for inventory registration at link time.
-# Each is optional so users can slim the binary by disabling unused formats.
-wedeo-codec-h264 = { workspace = true, optional = true }
-wedeo-codec-pcm = { workspace = true, optional = true }
-wedeo-format-wav = { workspace = true, optional = true }
-wedeo-format-h264 = { workspace = true, optional = true }
-wedeo-format-mp4 = { workspace = true, optional = true }
-wedeo-symphonia = { workspace = true, optional = true }
-wedeo-rav1e = { workspace = true, optional = true }
-# Note: wedeo-rav1d (AV1 via rav1d) is not included here because it depends
-# on a git-only crate and cannot be published to crates.io. To use AV1
-# decoding, depend on wedeo-rav1d directly from the git repository.
 
 [lints]
 workspace = true
+
+[features]
+default = ["audio-ops", "video-ops", "syntax", "graph", "pcm", "wav", "h264", "vp9", "mp4", "mkv", "ivf", "symphonia", "rav1e"]
+audio-ops = ["dep:wedeo-audio-ops"]
+video-ops = ["dep:wedeo-video-ops"]
+syntax = ["dep:wedeo-syntax"]
+graph = ["dep:wedeo-graph", "audio-ops", "video-ops", "syntax"]
+gpu-wgpu = ["dep:wedeo-gpu-wgpu", "video-ops"]
+pcm = ["dep:wedeo-codec-pcm"]
+wav = ["dep:wedeo-format-wav"]
+h264 = ["dep:wedeo-codec-h264", "syntax"]
+vp9 = ["dep:wedeo-codec-vp9", "syntax"]
+mp4 = ["dep:wedeo-format-mp4", "syntax"]
+mkv = ["dep:wedeo-format-mkv", "syntax"]
+ivf = ["dep:wedeo-format-ivf"]
+symphonia = ["dep:wedeo-symphonia"]
+rav1e = ["dep:wedeo-rav1e"]
+rav1d = ["dep:wedeo-rav1d"]
+
+[dependencies]
+wedeo-core.workspace = true
+wedeo-audio-ops = { workspace = true, optional = true }
+wedeo-video-ops = { workspace = true, optional = true }
+wedeo-syntax = { workspace = true, optional = true }
+wedeo-graph = { workspace = true, optional = true }
+wedeo-gpu-wgpu = { workspace = true, optional = true }
+wedeo-codec-pcm = { workspace = true, optional = true }
+wedeo-format-wav = { workspace = true, optional = true }
+wedeo-codec-h264 = { workspace = true, optional = true }
+wedeo-codec-vp9 = { workspace = true, optional = true }
+wedeo-format-mp4 = { workspace = true, optional = true }
+wedeo-format-mkv = { workspace = true, optional = true }
+wedeo-format-ivf = { workspace = true, optional = true }
+wedeo-symphonia = { workspace = true, optional = true }
+wedeo-rav1e = { workspace = true, optional = true }
+wedeo-rav1d = { workspace = true, optional = true }
