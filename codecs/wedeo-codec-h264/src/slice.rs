@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 // H.264 slice header parsing.
 //
 // Reference: ITU-T H.264 Section 7.3.3, FFmpeg libavcodec/h264_slice.c

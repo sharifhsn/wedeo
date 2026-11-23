@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 // H.264/AVC decoder.
 //
 // Implements NAL unit parsing (SPS, PPS, slice header) and macroblock-level

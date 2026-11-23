@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 // H.264/AVC reference picture list construction and marking.
 //
 // For Baseline profile (no B-frames), only list 0 is used.

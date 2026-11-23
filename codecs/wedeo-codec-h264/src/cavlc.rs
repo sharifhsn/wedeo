@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 // CAVLC (Context-Adaptive Variable-Length Coding) decode functions.
 //
 // Implements macroblock-level CAVLC parsing for H.264 Baseline/Main profile.

@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 // H.264/AVC lookup tables.
 //
 // Scan orders, default scaling matrices, QP mapping, CBP tables, and level limits.

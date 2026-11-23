@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 // H.264/AVC motion vector prediction.
 //
 // In H.264, motion vectors are differentially coded. The predicted MV is

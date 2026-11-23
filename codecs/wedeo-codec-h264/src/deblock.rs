@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 // H.264/AVC in-loop deblocking filter.
 //
 // Reduces blocking artifacts at macroblock and 4x4 block boundaries.

@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 // Decoded Picture Buffer (DPB) for H.264/AVC.
 //
 // The DPB stores decoded reference pictures for inter prediction and manages

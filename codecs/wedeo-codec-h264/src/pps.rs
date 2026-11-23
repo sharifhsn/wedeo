@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 // H.264 PPS (Picture Parameter Set) parsing.
 //
 // Reference: ITU-T H.264 Section 7.3.2.2, FFmpeg libavcodec/h264_ps.c

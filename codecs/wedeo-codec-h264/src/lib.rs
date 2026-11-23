@@ -1,6 +1,6 @@
 //! Pure-Rust FFmpeg `n9.1` H.264/AVC video decoder for Wedeo.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![allow(rustdoc::broken_intra_doc_links)]
 
 #[cfg(feature = "dev-trace")]
@@ -42,6 +42,7 @@ pub mod pps;
 pub mod refs;
 pub mod sei;
 pub mod shared_picture;
+pub mod simd;
 pub mod slice;
 pub mod sps;
 pub mod tables;

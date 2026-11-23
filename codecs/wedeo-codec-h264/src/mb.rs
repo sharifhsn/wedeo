@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 // H.264 macroblock decode orchestrator.
 //
 // Decodes a single macroblock by calling CAVLC, dequant, intra prediction,

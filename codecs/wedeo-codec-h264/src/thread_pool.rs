@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 // Persistent thread pool for frame-level decode parallelism.
 //
 // Replaces per-frame `std::thread::spawn` with a fixed pool of N worker

@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 // H.264 intra prediction modes.
 //
 // Implements all 9 Intra_4x4, 4 Intra_16x16, and 4 chroma prediction modes

@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 // NAL unit parsing for H.264/AVC.
 //
 // Handles both Annex B (start-code delimited) and NALFF/avcC (length-prefixed)

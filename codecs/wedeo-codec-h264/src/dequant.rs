@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 // H.264 dequantization (inverse quantization).
 //
 // Implements dequantization for 4x4 and 8x8 transform blocks, including

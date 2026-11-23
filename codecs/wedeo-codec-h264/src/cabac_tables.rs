@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 // CABAC arithmetic engine tables.
 //
 // Packed lookup tables for the CABAC binary arithmetic decoder.

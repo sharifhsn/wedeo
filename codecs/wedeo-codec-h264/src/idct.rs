@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 // H.264 IDCT (Inverse Discrete Cosine Transform) and related transforms.
 //
 // Implements the 4x4 integer IDCT, DC-only shortcut, and inverse Hadamard
@@ -20,70 +21,14 @@
 ///
 /// Reference: FFmpeg `ff_h264_idct_add` in h264idct_template.c
 pub fn idct4x4_add(dst: &mut [u8], stride: usize, coeffs: &mut [i16; 16]) {
-    // Add rounding bias to DC coefficient (same as FFmpeg's block[0] += 1 << 5)
-    coeffs[0] = coeffs[0].wrapping_add(32);
-
-    // FFmpeg stores coefficients in COLUMN-MAJOR (transposed) order and applies
-    // the same loop structure. With our ROW-MAJOR coefficients, we must swap the
-    // pass order to match FFmpeg's effective computation:
-    //   FFmpeg: row-transform first, column-transform second (on transposed data)
-    //   Wedeo:  row-transform first, column-transform second (on row-major data)
-    //
-    // The >>1 truncation in the butterfly makes pass order significant.
-    //
-    // Reference: FFmpeg `ff_h264_idct_add` in h264idct_template.c, noting that
-    // FFmpeg's block layout is transposed via h264_slice.c:757 TRANSPOSE().
-
-    // First pass: row transform (iterates over rows, mixes columns within each row)
-    for i in 0..4 {
-        let row = 4 * i;
-        let z0 = coeffs[row] as i32 + coeffs[row + 2] as i32;
-        let z1 = coeffs[row] as i32 - coeffs[row + 2] as i32;
-        let z2 = (coeffs[row + 1] as i32 >> 1) - coeffs[row + 3] as i32;
-        let z3 = coeffs[row + 1] as i32 + (coeffs[row + 3] as i32 >> 1);
-
-        coeffs[row] = (z0 + z3) as i16;
-        coeffs[row + 1] = (z1 + z2) as i16;
-        coeffs[row + 2] = (z1 - z2) as i16;
-        coeffs[row + 3] = (z0 - z3) as i16;
-    }
-
-    // Second pass: column transform and add to destination
-    assert!(3 * stride + 3 < dst.len());
-    for i in 0..4 {
-        let z0 = coeffs[i] as i32 + coeffs[i + 8] as i32;
-        let z1 = coeffs[i] as i32 - coeffs[i + 8] as i32;
-        let z2 = (coeffs[i + 4] as i32 >> 1) - coeffs[i + 12] as i32;
-        let z3 = coeffs[i + 4] as i32 + (coeffs[i + 12] as i32 >> 1);
-
-        dst[i] = (dst[i] as i32 + ((z0 + z3) >> 6)).clamp(0, 255) as u8;
-        dst[stride + i] = (dst[stride + i] as i32 + ((z1 + z2) >> 6)).clamp(0, 255) as u8;
-        dst[2 * stride + i] = (dst[2 * stride + i] as i32 + ((z1 - z2) >> 6)).clamp(0, 255) as u8;
-        dst[3 * stride + i] = (dst[3 * stride + i] as i32 + ((z0 - z3) >> 6)).clamp(0, 255) as u8;
-    }
-
-    // Zero the coefficient block (FFmpeg: memset(block, 0, 16 * sizeof(dctcoef)))
-    *coeffs = [0i16; 16];
+    crate::simd::idct_add_4x4(dst, stride, coeffs);
 }
 
 /// DC-only 4x4 IDCT shortcut: add `(dc + 32) >> 6` to all 16 pixels.
 ///
-/// When only the DC coefficient is non-zero, the full IDCT simplifies to
-/// adding a constant value to every pixel. This is a common case and avoids
-/// the full butterfly computation.
-///
 /// Reference: FFmpeg `ff_h264_idct_dc_add` in h264idct_template.c
 pub fn idct4x4_dc_add(dst: &mut [u8], stride: usize, dc: &mut i16) {
-    let val = (*dc as i32 + 32) >> 6;
-    *dc = 0;
-
-    assert!(3 * stride + 3 < dst.len());
-    for j in 0..4 {
-        let row = j * stride;
-        for px in &mut dst[row..row + 4] {
-            *px = (*px as i32 + val).clamp(0, 255) as u8;
-        }
-    }
+    crate::simd::idct_dc_add_4x4(dst, stride, dc);
 }
 
 /// 8x8 integer IDCT: transform coefficients and add to destination.
@@ -100,123 +45,14 @@ pub fn idct4x4_dc_add(dst: &mut [u8], stride: usize, dc: &mut i16) {
 ///
 /// Reference: FFmpeg `ff_h264_idct8_add` in h264idct_template.c
 pub fn idct8x8_add(dst: &mut [u8], stride: usize, coeffs: &mut [i16; 64]) {
-    // Add rounding bias
-    coeffs[0] = coeffs[0].wrapping_add(32);
-
-    // FFmpeg stores coefficients in COLUMN-MAJOR (transposed) order and applies
-    // the same loop structure. With our ROW-MAJOR coefficients, we must swap the
-    // pass order to match FFmpeg's effective computation:
-    //   FFmpeg: row-transform first, column-transform second (on transposed data)
-    //   Wedeo:  row-transform first, column-transform second (on row-major data)
-    //
-    // The >>1/>>2 truncation in the butterfly makes pass order significant.
-    //
-    // Reference: FFmpeg `ff_h264_idct8_add` in h264idct_template.c, noting that
-    // FFmpeg's block layout is transposed.
-
-    // First pass: row transform (iterates over rows, mixes columns within each row)
-    for i in 0..8 {
-        let row = i * 8;
-        let a0 = coeffs[row] as i32 + coeffs[row + 4] as i32;
-        let a2 = coeffs[row] as i32 - coeffs[row + 4] as i32;
-        let a4 = (coeffs[row + 2] as i32 >> 1) - coeffs[row + 6] as i32;
-        let a6 = (coeffs[row + 6] as i32 >> 1) + coeffs[row + 2] as i32;
-
-        let b0 = a0 + a6;
-        let b2 = a2 + a4;
-        let b4 = a2 - a4;
-        let b6 = a0 - a6;
-
-        let a1 = -(coeffs[row + 3] as i32) + coeffs[row + 5] as i32
-            - coeffs[row + 7] as i32
-            - (coeffs[row + 7] as i32 >> 1);
-        let a3 = coeffs[row + 1] as i32 + coeffs[row + 7] as i32
-            - coeffs[row + 3] as i32
-            - (coeffs[row + 3] as i32 >> 1);
-        let a5 = -(coeffs[row + 1] as i32)
-            + coeffs[row + 7] as i32
-            + coeffs[row + 5] as i32
-            + (coeffs[row + 5] as i32 >> 1);
-        let a7 = coeffs[row + 3] as i32
-            + coeffs[row + 5] as i32
-            + coeffs[row + 1] as i32
-            + (coeffs[row + 1] as i32 >> 1);
-
-        let b1 = (a7 >> 2) + a1;
-        let b3 = a3 + (a5 >> 2);
-        let b5 = (a3 >> 2) - a5;
-        let b7 = a7 - (a1 >> 2);
-
-        coeffs[row] = (b0 + b7) as i16;
-        coeffs[row + 7] = (b0 - b7) as i16;
-        coeffs[row + 1] = (b2 + b5) as i16;
-        coeffs[row + 6] = (b2 - b5) as i16;
-        coeffs[row + 2] = (b4 + b3) as i16;
-        coeffs[row + 5] = (b4 - b3) as i16;
-        coeffs[row + 3] = (b6 + b1) as i16;
-        coeffs[row + 4] = (b6 - b1) as i16;
-    }
-
-    // Second pass: column transform and add to destination
-    assert!(7 * stride + 7 < dst.len());
-    for i in 0..8 {
-        let a0 = coeffs[i] as i32 + coeffs[i + 32] as i32;
-        let a2 = coeffs[i] as i32 - coeffs[i + 32] as i32;
-        let a4 = (coeffs[i + 16] as i32 >> 1) - coeffs[i + 48] as i32;
-        let a6 = (coeffs[i + 48] as i32 >> 1) + coeffs[i + 16] as i32;
-
-        let b0 = a0 + a6;
-        let b2 = a2 + a4;
-        let b4 = a2 - a4;
-        let b6 = a0 - a6;
-
-        let a1 = -(coeffs[i + 24] as i32) + coeffs[i + 40] as i32
-            - coeffs[i + 56] as i32
-            - (coeffs[i + 56] as i32 >> 1);
-        let a3 = coeffs[i + 8] as i32 + coeffs[i + 56] as i32
-            - coeffs[i + 24] as i32
-            - (coeffs[i + 24] as i32 >> 1);
-        let a5 = -(coeffs[i + 8] as i32)
-            + coeffs[i + 56] as i32
-            + coeffs[i + 40] as i32
-            + (coeffs[i + 40] as i32 >> 1);
-        let a7 = coeffs[i + 24] as i32
-            + coeffs[i + 40] as i32
-            + coeffs[i + 8] as i32
-            + (coeffs[i + 8] as i32 >> 1);
-
-        let b1 = (a7 >> 2) + a1;
-        let b3 = a3 + (a5 >> 2);
-        let b5 = (a3 >> 2) - a5;
-        let b7 = a7 - (a1 >> 2);
-
-        dst[i] = (dst[i] as i32 + ((b0 + b7) >> 6)).clamp(0, 255) as u8;
-        dst[stride + i] = (dst[stride + i] as i32 + ((b2 + b5) >> 6)).clamp(0, 255) as u8;
-        dst[2 * stride + i] = (dst[2 * stride + i] as i32 + ((b4 + b3) >> 6)).clamp(0, 255) as u8;
-        dst[3 * stride + i] = (dst[3 * stride + i] as i32 + ((b6 + b1) >> 6)).clamp(0, 255) as u8;
-        dst[4 * stride + i] = (dst[4 * stride + i] as i32 + ((b6 - b1) >> 6)).clamp(0, 255) as u8;
-        dst[5 * stride + i] = (dst[5 * stride + i] as i32 + ((b4 - b3) >> 6)).clamp(0, 255) as u8;
-        dst[6 * stride + i] = (dst[6 * stride + i] as i32 + ((b2 - b5) >> 6)).clamp(0, 255) as u8;
-        dst[7 * stride + i] = (dst[7 * stride + i] as i32 + ((b0 - b7) >> 6)).clamp(0, 255) as u8;
-    }
-
-    *coeffs = [0i16; 64];
+    crate::simd::idct_add_8x8(dst, stride, coeffs);
 }
 
 /// DC-only 8x8 IDCT shortcut: add `(dc + 32) >> 6` to all 64 pixels.
 ///
 /// Reference: FFmpeg `ff_h264_idct8_dc_add` in h264idct_template.c
 pub fn idct8x8_dc_add(dst: &mut [u8], stride: usize, dc: &mut i16) {
-    let val = (*dc as i32 + 32) >> 6;
-    *dc = 0;
-
-    assert!(7 * stride + 7 < dst.len());
-    for j in 0..8 {
-        let row = j * stride;
-        for px in &mut dst[row..row + 8] {
-            *px = (*px as i32 + val).clamp(0, 255) as u8;
-        }
-    }
+    crate::simd::idct_dc_add_8x8(dst, stride, dc);
 }
 
 /// 4x4 inverse Hadamard transform with dequantization for Intra16x16 luma DC.

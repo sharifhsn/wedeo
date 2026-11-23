@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 // H.264 SEI (Supplemental Enhancement Information) parsing.
 //
 // Most SEI messages are parsed and ignored for Baseline conformance.

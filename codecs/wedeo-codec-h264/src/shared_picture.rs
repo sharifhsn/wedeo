@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 // Safe pooled picture buffers and immutable reference pictures for H.264 decode.
 //
 // `PicHandle` is uniquely owned (`&mut`) by `FrameDecodeContext` during macroblock

@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 // CABAC (Context-Adaptive Binary Arithmetic Coding) decoder.
 //
 // Binary arithmetic decoder for H.264 Main/High profile entropy coding.

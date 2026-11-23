@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 // H.264/AVC motion compensation — quarter-pixel luma, eighth-pixel chroma.
 //
 // Luma uses a 6-tap FIR filter {1, -5, 20, 20, -5, 1} for half-pel positions,
@@ -403,35 +404,6 @@ fn hv_lowpass(
 // i32 extraction buffer. For interior blocks (~90% of all MC operations),
 // this eliminates the biggest bottleneck: the u8→i32 copy in extract_ref_block.
 
-/// Fixed-width horizontal lowpass for auto-vectorization.
-/// W is the block width (compile-time constant).
-#[inline(always)]
-fn h_lowpass_direct_w<const W: usize>(
-    dst: &mut [u8],
-    dst_stride: usize,
-    src: &[u8],
-    src_stride: usize,
-    src_offset: usize,
-    block_h: usize,
-) {
-    for j in 0..block_h {
-        let row = src_offset + j * src_stride;
-        let src_row = &src[row..row + W + 5];
-        let dst_row = &mut dst[j * dst_stride..j * dst_stride + W];
-        for i in 0..W {
-            let val = filter6(
-                src_row[i] as i32,
-                src_row[i + 1] as i32,
-                src_row[i + 2] as i32,
-                src_row[i + 3] as i32,
-                src_row[i + 4] as i32,
-                src_row[i + 5] as i32,
-            );
-            dst_row[i] = clip_u8((val + 16) >> 5);
-        }
-    }
-}
-
 /// Horizontal lowpass reading directly from u8 reference data.
 /// For interior blocks only — caller must ensure all reads are in-bounds.
 #[inline]
@@ -445,73 +417,14 @@ fn h_lowpass_direct(
     block_w: usize,
     block_h: usize,
 ) {
-    match block_w {
-        4 => h_lowpass_direct_w::<4>(dst, dst_stride, src, src_stride, src_offset, block_h),
-        8 => h_lowpass_direct_w::<8>(dst, dst_stride, src, src_stride, src_offset, block_h),
-        16 => h_lowpass_direct_w::<16>(dst, dst_stride, src, src_stride, src_offset, block_h),
-        _ => h_lowpass_direct_w_generic(
-            dst, dst_stride, src, src_stride, src_offset, block_w, block_h,
-        ),
-    }
-}
-
-/// Generic fallback for non-standard block widths.
-#[inline]
-#[allow(clippy::too_many_arguments)]
-fn h_lowpass_direct_w_generic(
-    dst: &mut [u8],
-    dst_stride: usize,
-    src: &[u8],
-    src_stride: usize,
-    src_offset: usize,
-    block_w: usize,
-    block_h: usize,
-) {
-    for j in 0..block_h {
-        let row = src_offset + j * src_stride;
-        let src_row = &src[row..row + block_w + 5];
-        let dst_row = &mut dst[j * dst_stride..j * dst_stride + block_w];
-        for i in 0..block_w {
-            let val = filter6(
-                src_row[i] as i32,
-                src_row[i + 1] as i32,
-                src_row[i + 2] as i32,
-                src_row[i + 3] as i32,
-                src_row[i + 4] as i32,
-                src_row[i + 5] as i32,
-            );
-            dst_row[i] = clip_u8((val + 16) >> 5);
-        }
-    }
-}
-
-/// Fixed-width vertical lowpass for auto-vectorization.
-/// W is the block width (compile-time constant).
-#[inline(always)]
-fn v_lowpass_direct_w<const W: usize>(
-    dst: &mut [u8],
-    dst_stride: usize,
-    src: &[u8],
-    src_stride: usize,
-    src_offset: usize,
-    block_h: usize,
-) {
-    for j in 0..block_h {
-        let row_base = src_offset + j * src_stride;
-        let dst_row = &mut dst[j * dst_stride..j * dst_stride + W];
-        for (i, dst_px) in dst_row.iter_mut().enumerate().take(W) {
-            let base = row_base + i;
-            let val = filter6(
-                src[base] as i32,
-                src[base + src_stride] as i32,
-                src[base + 2 * src_stride] as i32,
-                src[base + 3 * src_stride] as i32,
-                src[base + 4 * src_stride] as i32,
-                src[base + 5 * src_stride] as i32,
-            );
-            *dst_px = clip_u8((val + 16) >> 5);
-        }
-    }
+    crate::simd::luma_6tap_h(
+        dst,
+        dst_stride,
+        &src[src_offset..],
+        src_stride,
+        block_w,
+        block_h,
+    );
 }
 
 /// Vertical lowpass reading directly from u8 reference data.
@@ -527,97 +440,17 @@ fn v_lowpass_direct(
     block_w: usize,
     block_h: usize,
 ) {
-    match block_w {
-        4 => v_lowpass_direct_w::<4>(dst, dst_stride, src, src_stride, src_offset, block_h),
-        8 => v_lowpass_direct_w::<8>(dst, dst_stride, src, src_stride, src_offset, block_h),
-        16 => v_lowpass_direct_w::<16>(dst, dst_stride, src, src_stride, src_offset, block_h),
-        _ => v_lowpass_direct_w_generic(
-            dst, dst_stride, src, src_stride, src_offset, block_w, block_h,
-        ),
-    }
-}
-
-/// Generic fallback for non-standard block widths.
-#[inline]
-#[allow(clippy::too_many_arguments)]
-fn v_lowpass_direct_w_generic(
-    dst: &mut [u8],
-    dst_stride: usize,
-    src: &[u8],
-    src_stride: usize,
-    src_offset: usize,
-    block_w: usize,
-    block_h: usize,
-) {
-    for j in 0..block_h {
-        let row_base = src_offset + j * src_stride;
-        let dst_row = &mut dst[j * dst_stride..j * dst_stride + block_w];
-        for (i, dst_px) in dst_row.iter_mut().enumerate().take(block_w) {
-            let base = row_base + i;
-            let val = filter6(
-                src[base] as i32,
-                src[base + src_stride] as i32,
-                src[base + 2 * src_stride] as i32,
-                src[base + 3 * src_stride] as i32,
-                src[base + 4 * src_stride] as i32,
-                src[base + 5 * src_stride] as i32,
-            );
-            *dst_px = clip_u8((val + 16) >> 5);
-        }
-    }
-}
-
-/// Fixed-width 2D half-pel lowpass for auto-vectorization.
-/// W is the block width (compile-time constant).
-#[inline(always)]
-fn hv_lowpass_direct_w<const W: usize>(
-    dst: &mut [u8],
-    dst_stride: usize,
-    src: &[u8],
-    src_stride: usize,
-    src_offset: usize,
-    block_h: usize,
-    tmp: &mut [i32],
-) {
-    let tmp_h = block_h + 5;
-
-    // First pass: horizontal filter from u8 reference into i32 tmp.
-    for j in 0..tmp_h {
-        let row = src_offset + j * src_stride;
-        let src_row = &src[row..row + W + 5];
-        let tmp_row = &mut tmp[j * W..j * W + W];
-        for i in 0..W {
-            tmp_row[i] = filter6(
-                src_row[i] as i32,
-                src_row[i + 1] as i32,
-                src_row[i + 2] as i32,
-                src_row[i + 3] as i32,
-                src_row[i + 4] as i32,
-                src_row[i + 5] as i32,
-            );
-        }
-    }
-
-    // Second pass: vertical filter on the tmp buffer — row-major for cache locality.
-    for j in 0..block_h {
-        let dst_row = &mut dst[j * dst_stride..j * dst_stride + W];
-        for i in 0..W {
-            let val = filter6(
-                tmp[j * W + i],
-                tmp[(j + 1) * W + i],
-                tmp[(j + 2) * W + i],
-                tmp[(j + 3) * W + i],
-                tmp[(j + 4) * W + i],
-                tmp[(j + 5) * W + i],
-            );
-            dst_row[i] = clip_u8((val + 512) >> 10);
-        }
-    }
+    crate::simd::luma_6tap_v(
+        dst,
+        dst_stride,
+        &src[src_offset..],
+        src_stride,
+        block_w,
+        block_h,
+    );
 }
 
 /// 2D half-pel lowpass reading directly from u8 reference data.
-/// First pass: horizontal filter from &[u8] → &mut [i32] tmp.
-/// Second pass: vertical filter from &[i32] tmp → &mut [u8] dst.
 /// For interior blocks only — caller must ensure all reads are in-bounds.
 #[inline]
 #[allow(clippy::too_many_arguments)]
@@ -631,86 +464,20 @@ fn hv_lowpass_direct(
     block_h: usize,
     tmp: &mut [i32],
 ) {
-    match block_w {
-        4 => hv_lowpass_direct_w::<4>(dst, dst_stride, src, src_stride, src_offset, block_h, tmp),
-        8 => hv_lowpass_direct_w::<8>(dst, dst_stride, src, src_stride, src_offset, block_h, tmp),
-        16 => hv_lowpass_direct_w::<16>(dst, dst_stride, src, src_stride, src_offset, block_h, tmp),
-        _ => hv_lowpass_direct_w_generic(
-            dst, dst_stride, src, src_stride, src_offset, block_w, block_h, tmp,
-        ),
-    }
-}
-
-/// Generic fallback for non-standard block widths.
-#[inline]
-#[allow(clippy::too_many_arguments)]
-fn hv_lowpass_direct_w_generic(
-    dst: &mut [u8],
-    dst_stride: usize,
-    src: &[u8],
-    src_stride: usize,
-    src_offset: usize,
-    block_w: usize,
-    block_h: usize,
-    tmp: &mut [i32],
-) {
-    let tmp_h = block_h + 5;
-    let tmp_stride = block_w;
-
-    for j in 0..tmp_h {
-        let row = src_offset + j * src_stride;
-        let src_row = &src[row..row + block_w + 5];
-        let tmp_row = &mut tmp[j * tmp_stride..j * tmp_stride + block_w];
-        for i in 0..block_w {
-            tmp_row[i] = filter6(
-                src_row[i] as i32,
-                src_row[i + 1] as i32,
-                src_row[i + 2] as i32,
-                src_row[i + 3] as i32,
-                src_row[i + 4] as i32,
-                src_row[i + 5] as i32,
-            );
-        }
-    }
-
-    for j in 0..block_h {
-        let dst_row = &mut dst[j * dst_stride..j * dst_stride + block_w];
-        for i in 0..block_w {
-            let a = tmp[j * tmp_stride + i];
-            let b = tmp[(j + 1) * tmp_stride + i];
-            let c = tmp[(j + 2) * tmp_stride + i];
-            let d = tmp[(j + 3) * tmp_stride + i];
-            let e = tmp[(j + 4) * tmp_stride + i];
-            let f = tmp[(j + 5) * tmp_stride + i];
-            let val = filter6(a, b, c, d, e, f);
-            dst_row[i] = clip_u8((val + 512) >> 10);
-        }
-    }
+    crate::simd::luma_6tap_hv(
+        dst,
+        dst_stride,
+        &src[src_offset..],
+        src_stride,
+        block_w,
+        block_h,
+        tmp,
+    );
 }
 
 // ---------------------------------------------------------------------------
 // Pixel averaging (for quarter-pel from half-pel + integer/half-pel)
 // ---------------------------------------------------------------------------
-
-/// Fixed-width pixel averaging for auto-vectorization.
-#[inline(always)]
-fn avg_pixels_w<const W: usize>(
-    dst: &mut [u8],
-    dst_stride: usize,
-    a: &[u8],
-    a_stride: usize,
-    b: &[u8],
-    b_stride: usize,
-    block_h: usize,
-) {
-    for j in 0..block_h {
-        for i in 0..W {
-            let va = a[j * a_stride + i] as u16;
-            let vb = b[j * b_stride + i] as u16;
-            dst[j * dst_stride + i] = ((va + vb + 1) >> 1) as u8;
-        }
-    }
-}
 
 /// Average two pixel buffers: `dst[i] = (a[i] + b[i] + 1) >> 1`.
 #[inline]
@@ -725,20 +492,7 @@ fn avg_pixels(
     block_w: usize,
     block_h: usize,
 ) {
-    match block_w {
-        4 => avg_pixels_w::<4>(dst, dst_stride, a, a_stride, b, b_stride, block_h),
-        8 => avg_pixels_w::<8>(dst, dst_stride, a, a_stride, b, b_stride, block_h),
-        16 => avg_pixels_w::<16>(dst, dst_stride, a, a_stride, b, b_stride, block_h),
-        _ => {
-            for j in 0..block_h {
-                for i in 0..block_w {
-                    let va = a[j * a_stride + i] as u16;
-                    let vb = b[j * b_stride + i] as u16;
-                    dst[j * dst_stride + i] = ((va + vb + 1) >> 1) as u8;
-                }
-            }
-        }
-    }
+    crate::simd::avg_pixels(dst, dst_stride, a, a_stride, b, b_stride, block_w, block_h);
 }
 
 /// Copy a block of pixels.
@@ -1344,8 +1098,12 @@ pub fn mc_luma(
                 // Dispatch to fixed-width copy so the compiler can inline memcpy
                 // with a compile-time constant size (e.g. ldp/stp for 16 bytes on ARM64).
                 match block_w {
-                    16 => copy_block_direct::<16>(
-                        dst, dst_stride, ref_y, ref_stride, src_offset, block_h,
+                    16 => crate::simd::put_pixels_16x16(
+                        dst,
+                        dst_stride,
+                        &ref_y[src_offset..],
+                        ref_stride,
+                        block_h,
                     ),
                     8 => copy_block_direct::<8>(
                         dst, dst_stride, ref_y, ref_stride, src_offset, block_h,
@@ -1606,24 +1364,6 @@ pub fn mc_luma(
 // B-frame weighted prediction helper
 // ---------------------------------------------------------------------------
 
-/// Fixed-width in-place averaging for auto-vectorization.
-#[inline(always)]
-fn mc_avg_w<const W: usize>(
-    dst: &mut [u8],
-    dst_stride: usize,
-    pred2: &[u8],
-    pred2_stride: usize,
-    block_h: usize,
-) {
-    for j in 0..block_h {
-        for i in 0..W {
-            let a = dst[j * dst_stride + i] as u16;
-            let b = pred2[j * pred2_stride + i] as u16;
-            dst[j * dst_stride + i] = ((a + b + 1) >> 1) as u8;
-        }
-    }
-}
-
 /// Average `dst` with a second prediction (for B-frame bi-prediction).
 ///
 /// After this call, `dst[i] = (dst[i] + pred2[i] + 1) >> 1`.
@@ -1635,20 +1375,7 @@ pub fn mc_avg(
     block_w: usize,
     block_h: usize,
 ) {
-    match block_w {
-        4 => mc_avg_w::<4>(dst, dst_stride, pred2, pred2_stride, block_h),
-        8 => mc_avg_w::<8>(dst, dst_stride, pred2, pred2_stride, block_h),
-        16 => mc_avg_w::<16>(dst, dst_stride, pred2, pred2_stride, block_h),
-        _ => {
-            for j in 0..block_h {
-                for i in 0..block_w {
-                    let a = dst[j * dst_stride + i] as u16;
-                    let b = pred2[j * pred2_stride + i] as u16;
-                    dst[j * dst_stride + i] = ((a + b + 1) >> 1) as u8;
-                }
-            }
-        }
-    }
+    crate::simd::avg_pixels_inplace(dst, dst_stride, pred2, pred2_stride, block_w, block_h);
 }
 
 // ---------------------------------------------------------------------------
@@ -1873,38 +1600,57 @@ fn chroma_mc_scalar(
 
         // Dispatch to fixed-width specializations for auto-vectorization.
         if d != 0 {
-            match block_w {
-                2 => chroma_mc_bilinear_w::<2>(
-                    dst, dst_stride, ref_uv, ref_stride, src_offset, block_h, a, b, c, d, avg,
-                ),
-                4 => chroma_mc_bilinear_w::<4>(
-                    dst, dst_stride, ref_uv, ref_stride, src_offset, block_h, a, b, c, d, avg,
-                ),
-                8 => chroma_mc_bilinear_w::<8>(
-                    dst, dst_stride, ref_uv, ref_stride, src_offset, block_h, a, b, c, d, avg,
-                ),
-                _ => chroma_mc_bilinear_generic(
-                    dst, dst_stride, ref_uv, ref_stride, src_offset, block_w, block_h, a, b, c, d,
+            if matches!(block_w, 4 | 8 | 16) {
+                crate::simd::chroma_mc_bilinear(
+                    dst,
+                    dst_stride,
+                    &ref_uv[src_offset..],
+                    ref_stride,
+                    block_w,
+                    block_h,
+                    a,
+                    b,
+                    c,
+                    d,
                     avg,
-                ),
+                );
+            } else {
+                match block_w {
+                    2 => chroma_mc_bilinear_w::<2>(
+                        dst, dst_stride, ref_uv, ref_stride, src_offset, block_h, a, b, c, d, avg,
+                    ),
+                    _ => chroma_mc_bilinear_generic(
+                        dst, dst_stride, ref_uv, ref_stride, src_offset, block_w, block_h, a, b, c,
+                        d, avg,
+                    ),
+                }
             }
         } else if b + c != 0 {
             let e = b + c;
             let step = if c != 0 { ref_stride } else { 1 };
-            match block_w {
-                2 => chroma_mc_2tap_w::<2>(
-                    dst, dst_stride, ref_uv, ref_stride, src_offset, block_h, a, e, step, avg,
-                ),
-                4 => chroma_mc_2tap_w::<4>(
-                    dst, dst_stride, ref_uv, ref_stride, src_offset, block_h, a, e, step, avg,
-                ),
-                8 => chroma_mc_2tap_w::<8>(
-                    dst, dst_stride, ref_uv, ref_stride, src_offset, block_h, a, e, step, avg,
-                ),
-                _ => chroma_mc_2tap_generic(
-                    dst, dst_stride, ref_uv, ref_stride, src_offset, block_w, block_h, a, e, step,
+            if matches!(block_w, 4 | 8 | 16) {
+                crate::simd::chroma_mc_2tap(
+                    dst,
+                    dst_stride,
+                    &ref_uv[src_offset..],
+                    ref_stride,
+                    block_w,
+                    block_h,
+                    a,
+                    e,
+                    step,
                     avg,
-                ),
+                );
+            } else {
+                match block_w {
+                    2 => chroma_mc_2tap_w::<2>(
+                        dst, dst_stride, ref_uv, ref_stride, src_offset, block_h, a, e, step, avg,
+                    ),
+                    _ => chroma_mc_2tap_generic(
+                        dst, dst_stride, ref_uv, ref_stride, src_offset, block_w, block_h, a, e,
+                        step, avg,
+                    ),
+                }
             }
         } else if !avg {
             // Pure full-pel copy: a==64, (64*s0+32)>>6 == s0. Use fixed-width memcpy.
@@ -2239,26 +1985,6 @@ pub fn mc_block(
 // Bi-directional averaging (in-place)
 // ---------------------------------------------------------------------------
 
-/// Fixed-width in-place pixel averaging for auto-vectorization.
-#[inline(always)]
-fn avg_pixels_inplace_w<const W: usize>(
-    dst: &mut [u8],
-    dst_stride: usize,
-    src: &[u8],
-    src_stride: usize,
-    h: usize,
-) {
-    for row in 0..h {
-        let d_off = row * dst_stride;
-        let s_off = row * src_stride;
-        for col in 0..W {
-            let a = dst[d_off + col] as u16;
-            let b = src[s_off + col] as u16;
-            dst[d_off + col] = ((a + b + 1) >> 1) as u8;
-        }
-    }
-}
-
 /// Average dst with src in-place: dst[i] = (dst[i] + src[i] + 1) >> 1.
 ///
 /// Used for unweighted bi-directional prediction (weighted_bipred_idc == 0).
@@ -2271,23 +1997,7 @@ pub fn avg_pixels_inplace(
     w: usize,
     h: usize,
 ) {
-    match w {
-        2 => avg_pixels_inplace_w::<2>(dst, dst_stride, src, src_stride, h),
-        4 => avg_pixels_inplace_w::<4>(dst, dst_stride, src, src_stride, h),
-        8 => avg_pixels_inplace_w::<8>(dst, dst_stride, src, src_stride, h),
-        16 => avg_pixels_inplace_w::<16>(dst, dst_stride, src, src_stride, h),
-        _ => {
-            for row in 0..h {
-                let d_off = row * dst_stride;
-                let s_off = row * src_stride;
-                for col in 0..w {
-                    let a = dst[d_off + col] as u16;
-                    let b = src[s_off + col] as u16;
-                    dst[d_off + col] = ((a + b + 1) >> 1) as u8;
-                }
-            }
-        }
-    }
+    crate::simd::avg_pixels_inplace(dst, dst_stride, src, src_stride, w, h);
 }
 
 // ---------------------------------------------------------------------------

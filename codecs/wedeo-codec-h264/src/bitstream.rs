@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! Big-endian bitstream reader and exp-Golomb parsers for H.264.
 //!
 //! Matches FFmpeg's `libavcodec/get_bits.h` and `libavcodec/golomb.h` in 100% safe Rust.

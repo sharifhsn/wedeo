@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 // CAVLC (Context-Adaptive Variable-Length Coding) lookup tables and VLC readers.
 //
 // Implements the VLC decoding functions for coeff_token, total_zeros, and

@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! H.264 Sequence Parameter Set (SPS) parsing.
 //!
 //! Implements parsing of the SPS NAL unit as specified in ITU-T H.264
