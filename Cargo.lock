@@ -2440,7 +2440,6 @@ name = "wedeo-format-mp4"
 version = "0.3.0"
 dependencies = [
  "wedeo-core",
- "wedeo-syntax",
 ]
 
 [[package]]
