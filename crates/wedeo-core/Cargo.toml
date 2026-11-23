@@ -7,13 +7,10 @@ repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 rust-version.workspace = true
-description = "Core types for wedeo (libavutil equivalent)"
-
+description = "Core types, zero-copy buffers, bitstream primitives, and domain traits for wedeo"
 
 [dependencies]
-aligned-vec = "0.6.4"
 bitflags = { workspace = true }
-tracing = { workspace = true }
 
 [lints]
 workspace = true

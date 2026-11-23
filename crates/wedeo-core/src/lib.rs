@@ -1,35 +1,68 @@
-pub mod buffer;
-pub mod channel_layout;
-pub mod chroma_location;
-pub mod codec_id;
-pub mod color_primaries;
-pub mod color_trc;
-pub mod error;
-pub mod frame;
-pub mod frame_side_data;
-pub mod log;
-pub mod media_type;
-pub mod metadata;
-pub mod packet;
-pub mod pixel_format;
-pub mod rational;
-pub mod sample_format;
-pub mod timestamp;
+//! Core media types, zero-copy aligned buffers, Miri-sound row-progress planes,
+//! bitstream primitives, I/O contracts, codec/container traits, and explicit registry.
 
-// Re-export key types at the crate root for convenience.
-pub use buffer::Buffer;
-pub use channel_layout::ChannelLayout;
-pub use chroma_location::ChromaLocation;
-pub use codec_id::CodecId;
-pub use color_primaries::ColorPrimaries;
-pub use color_trc::ColorTransferCharacteristic;
-pub use error::{Error, Result};
-pub use frame::Frame;
-pub use frame_side_data::{FrameSideData, FrameSideDataType};
-pub use media_type::MediaType;
-pub use metadata::Metadata;
-pub use packet::Packet;
-pub use pixel_format::PixelFormat;
-pub use rational::Rational;
-pub use sample_format::SampleFormat;
-pub use timestamp::{NOPTS_VALUE, TIME_BASE, TIME_BASE_Q};
+#[forbid(unsafe_code)]
+pub mod audio;
+#[forbid(unsafe_code)]
+pub mod bitstream;
+pub mod buffer;
+#[forbid(unsafe_code)]
+pub mod clock;
+#[forbid(unsafe_code)]
+pub mod error;
+#[forbid(unsafe_code)]
+pub mod io;
+#[forbid(unsafe_code)]
+pub mod media;
+#[forbid(unsafe_code)]
+pub mod registry;
+pub mod sync_plane;
+#[forbid(unsafe_code)]
+pub mod time;
+#[forbid(unsafe_code)]
+pub mod traits;
+#[forbid(unsafe_code)]
+pub mod video;
+
+// Convenience root re-exports.
+pub use audio::{
+    AudioBlock, AudioStreamParams, Channel, ChannelLayout, ChannelOrder, SampleFormat, SampleTrim,
+};
+pub use bitstream::{BitReader, BitReaderLe, BitWriter, adler32_ffmpeg, crc32};
+pub use buffer::{
+    BorderPadding, BorderedPlane, Buffer, BufferPool, ExternalCpuBuffer, GpuDeviceId, GpuSurface,
+    MemoryDomain, NativeGpuHandle, SIMD_ALIGN, SIMD_TAIL_PADDING,
+};
+pub use clock::{AudioClock, SeekEpoch};
+pub use error::{
+    Error, ErrorKind, ErrorPolicy, HealthEvent, HealthIssue, MAX_HEALTH_EVENTS, RecvStatus, Result,
+    SendStatus, StreamHealth,
+};
+pub use io::{
+    BufByteSource, ByteSink, ByteSource, FileSink, FileSource, InterruptibleSource, MemorySink,
+    MemorySource,
+};
+pub use media::{
+    Attachment, Chapter, CodecId, ContainerHeader, DataStreamParams, EditSegment,
+    MasteringDisplayMeta, MediaType, MediaUnit, Metadata, Packet, PacketFlags, PositionedPlane,
+    ReplayGain, SeekTarget, SideData, StreamParams, SubtitleEvent, SubtitleFormat, SubtitlePayload,
+    SubtitleStreamParams, TimedData, TrackDescriptor, TrackDisposition, TrackId,
+};
+pub use registry::Registry;
+pub use sync_plane::{
+    PlaneRowReader, PlaneRowWriter, PublishedPlaneView, UnpublishedRowsMut, row_progress_plane,
+};
+pub use time::{
+    ROUND_PASS_MINMAX, Rational, Rounding, TIME_BASE, TIME_BASE_Q, Timestamp, WrappingExt, cmp_q,
+    gcd, reduce, rescale, rescale_q, rescale_q_rnd, rescale_rnd,
+};
+pub use traits::{
+    CodecContext, Decoder, DecoderDescriptor, DecoderFactory, Demuxer, DemuxerDescriptor,
+    DemuxerFactory, EncodeHint, Encoder, EncoderDescriptor, EncoderFactory, Muxer, MuxerDescriptor,
+    MuxerFactory, OptionKind, OptionSchema, PassMode,
+};
+pub use video::{
+    AlphaMode, ChromaLocation, ColorDesc, ColorModel, ColorPrimaries, ColorRange, CompOrder,
+    CropRect, Endian, FrameFlags, MatrixCoefficients, PictureType, PixelLayout, PlanePacking,
+    SampleDepth, Subsampling, TransferCharacteristic, VideoFrame, VideoStorage, VideoStreamParams,
+};
