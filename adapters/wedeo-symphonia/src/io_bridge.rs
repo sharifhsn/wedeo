@@ -1,25 +1,25 @@
 use std::io::{Read, Seek, SeekFrom};
+use std::sync::Mutex;
 
 use symphonia::core::io::MediaSource;
-use wedeo_format::io::IoContext;
+use wedeo_core::ByteSource;
 
-/// Wraps a wedeo `Box<dyn IoContext>` as a symphonia `MediaSource`.
+/// Private I/O bridge wrapping a wedeo `Box<dyn ByteSource>` as a symphonia `MediaSource`.
 ///
-/// This is the I/O bridge that allows symphonia's FormatReader to read
-/// from wedeo's I/O layer.
-pub struct WedeoMediaSource {
-    inner: Box<dyn IoContext>,
-    /// Cached file size (symphonia's `byte_len()` takes `&self`).
+/// `Mutex` satisfies `MediaSource: Send + Sync` under `#![forbid(unsafe_code)]`, while
+/// `Read` and `Seek` use `Mutex::get_mut` for zero-lock-overhead exclusive access.
+pub(crate) struct WedeoMediaSource {
+    inner: Mutex<Box<dyn ByteSource>>,
     cached_size: Option<u64>,
     seekable: bool,
 }
 
 impl WedeoMediaSource {
-    pub fn new(mut inner: Box<dyn IoContext>) -> Self {
-        let cached_size = inner.size().ok();
+    pub(crate) fn new(inner: Box<dyn ByteSource>) -> Self {
+        let cached_size = inner.size_hint();
         let seekable = inner.is_seekable();
         Self {
-            inner,
+            inner: Mutex::new(inner),
             cached_size,
             seekable,
         }
@@ -28,17 +28,27 @@ impl WedeoMediaSource {
 
 impl Read for WedeoMediaSource {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.inner
-            .read(buf)
-            .map_err(|e| std::io::Error::other(e.to_string()))
+        let inner = self
+            .inner
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.read(buf)
     }
 }
 
 impl Seek for WedeoMediaSource {
     fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
-        self.inner
-            .seek(pos)
-            .map_err(|e| std::io::Error::other(e.to_string()))
+        if !self.seekable {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotSeekable,
+                "byte source is not seekable",
+            ));
+        }
+        let inner = self
+            .inner
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.seek(pos)
     }
 }
 

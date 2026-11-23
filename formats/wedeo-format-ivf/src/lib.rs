@@ -351,16 +351,18 @@ impl IvfDemuxer {
         }
         let data_start_offset = io.tell();
 
-        let (time_base, avg_frame_rate) =
-            if fps_num > 0 && fps_den > 0 && fps_num <= i32::MAX as u32 && fps_den <= i32::MAX as u32
-            {
-                (
-                    Rational::new(fps_den as i32, fps_num as i32),
-                    Rational::new(fps_num as i32, fps_den as i32),
-                )
-            } else {
-                (Rational::new(1, 30), Rational::new(30, 1))
-            };
+        let (time_base, avg_frame_rate) = if fps_num > 0
+            && fps_den > 0
+            && fps_num <= i32::MAX as u32
+            && fps_den <= i32::MAX as u32
+        {
+            (
+                Rational::new(fps_den as i32, fps_num as i32),
+                Rational::new(fps_num as i32, fps_den as i32),
+            )
+        } else {
+            (Rational::new(1, 30), Rational::new(30, 1))
+        };
 
         let mut video_params = VideoStreamParams::new(width, height, PixelLayout::YUV420P);
         video_params.avg_frame_rate = avg_frame_rate;
@@ -566,7 +568,7 @@ impl Demuxer for IvfDemuxer {
                 .seek(SeekFrom::Start(start_scan))
                 .map_err(|e| Error::io("ivf/demuxer", &e))?;
 
-            while let Ok( pkt_status) = self.read_packet() {
+            while let Ok(pkt_status) = self.read_packet() {
                 match pkt_status {
                     RecvStatus::Ready(pkt) => {
                         if pkt.pts.raw() >= target_pts && !pkt.flags.contains(PacketFlags::KEY) {
@@ -739,16 +741,15 @@ impl Muxer for IvfMuxer {
             Timestamp::new(i64::from(self.frame_count))
         };
 
-        let pts = if pkt.time_base.is_valid()
-            && pkt.time_base.num > 0
-            && pkt.time_base != self.time_base
-        {
-            raw_ts
-                .rescale(pkt.time_base, self.time_base, Rounding::NearInf)
-                .raw()
-        } else {
-            raw_ts.raw()
-        };
+        let pts =
+            if pkt.time_base.is_valid() && pkt.time_base.num > 0 && pkt.time_base != self.time_base
+            {
+                raw_ts
+                    .rescale(pkt.time_base, self.time_base, Rounding::NearInf)
+                    .raw()
+            } else {
+                raw_ts.raw()
+            };
 
         let mut fhdr = [0u8; IVF_FRAME_HEADER_LEN];
         fhdr[0..4].copy_from_slice(&(data.len() as u32).to_le_bytes());
@@ -889,7 +890,8 @@ mod tests {
         vec![
             0x12, 0x00, // Temporal Delimiter OBU
             0x0A, 0x04, 0x00, 0x00, 0x00, 0x00, // Sequence Header OBU
-            0x32, 0x04, 0x10, 0xAA, 0xBB, 0xCC, // Frame OBU: show_existing=0, frame_type=0 (KEY)
+            0x32, 0x04, 0x10, 0xAA, 0xBB,
+            0xCC, // Frame OBU: show_existing=0, frame_type=0 (KEY)
         ]
     }
 
@@ -1124,9 +1126,11 @@ mod tests {
         bytes.extend_from_slice(&[0x82, 0x49, 0x83]); // only 3 bytes instead of 100
 
         // Strict policy fails on truncated frame
-        let mut strict_demux =
-            IvfDemuxer::open(Box::new(MemorySource::new(bytes.clone())), ErrorPolicy::Strict)
-                .unwrap();
+        let mut strict_demux = IvfDemuxer::open(
+            Box::new(MemorySource::new(bytes.clone())),
+            ErrorPolicy::Strict,
+        )
+        .unwrap();
         for _ in 0..3 {
             assert!(matches!(
                 strict_demux.read_packet().unwrap(),

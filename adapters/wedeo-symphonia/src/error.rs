@@ -1,23 +1,34 @@
-use wedeo_core::error::Error;
+use wedeo_core::Error;
 
-/// Convert a symphonia error to a wedeo error.
-pub fn from_symphonia(e: symphonia::core::errors::Error) -> Error {
+/// Convert a symphonia error to a `wedeo_core::Error`.
+pub fn from_symphonia(component: &'static str, e: symphonia::core::errors::Error) -> Error {
     match e {
-        symphonia::core::errors::Error::IoError(io_err) => Error::from(io_err),
+        symphonia::core::errors::Error::IoError(io_err) => Error::io(component, &io_err),
         symphonia::core::errors::Error::DecodeError(msg) => {
-            Error::Other(format!("symphonia decode error: {msg}"))
+            Error::invalid_data(component, format!("symphonia decode error: {msg}"))
         }
-        symphonia::core::errors::Error::SeekError(kind) => {
-            Error::Other(format!("symphonia seek error: {kind:?}"))
-        }
+        symphonia::core::errors::Error::SeekError(kind) => match kind {
+            symphonia::core::errors::SeekErrorKind::Unseekable => {
+                Error::not_seekable(component, "symphonia stream is not seekable")
+            }
+            symphonia::core::errors::SeekErrorKind::OutOfRange => {
+                Error::invalid_argument(component, "symphonia seek target out of range")
+            }
+            symphonia::core::errors::SeekErrorKind::ForwardOnly => {
+                Error::not_seekable(component, "symphonia stream supports forward seek only")
+            }
+            symphonia::core::errors::SeekErrorKind::InvalidTrack => {
+                Error::not_found(component, "symphonia seek track not found")
+            }
+        },
         symphonia::core::errors::Error::Unsupported(msg) => {
-            Error::Other(format!("symphonia unsupported: {msg}"))
+            Error::unsupported(component, format!("symphonia unsupported: {msg}"))
         }
         symphonia::core::errors::Error::LimitError(msg) => {
-            Error::Other(format!("symphonia limit error: {msg}"))
+            Error::invalid_data(component, format!("symphonia limit error: {msg}"))
         }
         symphonia::core::errors::Error::ResetRequired => {
-            Error::Other("symphonia: reset required".into())
+            Error::invalid_data(component, "symphonia: reset required")
         }
     }
 }

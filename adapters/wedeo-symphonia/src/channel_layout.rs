@@ -1,10 +1,10 @@
 use symphonia::core::audio::Channels;
-use wedeo_core::channel_layout::{Channel, ChannelLayout, ChannelOrder};
+use wedeo_core::{Channel, ChannelLayout, ChannelOrder};
 
-/// Convert a wedeo ChannelLayout back to symphonia Channels.
+/// Convert a wedeo `ChannelLayout` back to symphonia `Channels`.
 ///
 /// This is the reverse of `channels_to_layout`. Used when creating a
-/// symphonia decoder from wedeo codec parameters.
+/// symphonia decoder from wedeo track parameters.
 pub fn layout_to_channels(layout: &ChannelLayout) -> Channels {
     use symphonia::core::audio::Channels as C;
 
@@ -40,7 +40,8 @@ pub fn layout_to_channels(layout: &ChannelLayout) -> Channels {
         }
     }
 
-    // Fallback: if no channels matched but we know the count, use front channels
+    // Fallback: if no channels matched (e.g. mono mapped to FrontCenter is matched above,
+    // or Unspec layout with count) use symphonia's expected front channel placeholders.
     if channels.is_empty() {
         match layout.nb_channels {
             1 => channels = C::FRONT_LEFT,
@@ -52,19 +53,16 @@ pub fn layout_to_channels(layout: &ChannelLayout) -> Channels {
     channels
 }
 
-/// Convert symphonia Channels to a wedeo ChannelLayout.
+/// Convert symphonia `Channels` to a wedeo `ChannelLayout`.
 ///
-/// Symphonia uses FRONT_LEFT as a placeholder for formats that don't carry
-/// explicit channel mapping (e.g. basic WAV without WAVEFORMATEXTENSIBLE).
+/// Symphonia uses `FRONT_LEFT` as a placeholder for formats that don't carry
+/// explicit channel mapping (e.g. basic WAV without `WAVEFORMATEXTENSIBLE`).
 /// We detect the common mono/stereo cases and return the standard FFmpeg
-/// layouts so that framecrc output matches.
+/// layouts so that output matches.
 pub fn channels_to_layout(channels: Channels, count: usize) -> ChannelLayout {
     use symphonia::core::audio::Channels as C;
 
-    // Handle common cases where symphonia uses placeholder channels:
-    // mono WAV reports FRONT_LEFT with count=1, stereo reports FL+FR with count=2.
-    // Map these to the standard FFmpeg layouts (mono=FC, stereo=FL+FR).
-    if count == 1 && channels == C::FRONT_LEFT {
+    if count == 1 && (channels == C::FRONT_LEFT || channels == C::FRONT_CENTRE) {
         return ChannelLayout::mono();
     }
     if count == 2 && channels == (C::FRONT_LEFT | C::FRONT_RIGHT) {
@@ -73,8 +71,6 @@ pub fn channels_to_layout(channels: Channels, count: usize) -> ChannelLayout {
 
     let mut layout_channels = Vec::new();
 
-    // Map symphonia channel flags to wedeo Channel enum.
-    // The order matches FFmpeg's native channel order (ascending bit positions).
     let mapping: &[(Channels, Channel)] = &[
         (C::FRONT_LEFT, Channel::FrontLeft),
         (C::FRONT_RIGHT, Channel::FrontRight),
@@ -104,12 +100,35 @@ pub fn channels_to_layout(channels: Channels, count: usize) -> ChannelLayout {
     }
 
     if layout_channels.is_empty() {
-        ChannelLayout::unspec(count as i32)
+        ChannelLayout::unspec(count as u32)
     } else {
         ChannelLayout {
             order: ChannelOrder::Native,
-            nb_channels: layout_channels.len() as i32,
+            nb_channels: layout_channels.len() as u32,
             channels: layout_channels,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use symphonia::core::audio::Channels as C;
+
+    #[test]
+    fn channel_layout_roundtrips() {
+        assert_eq!(channels_to_layout(C::FRONT_LEFT, 1), ChannelLayout::mono());
+        assert_eq!(
+            channels_to_layout(C::FRONT_LEFT | C::FRONT_RIGHT, 2),
+            ChannelLayout::stereo()
+        );
+
+        let l51 = ChannelLayout::surround_5_1();
+        let sym51 = layout_to_channels(&l51);
+        assert_eq!(channels_to_layout(sym51, 6), l51);
+
+        let l71 = ChannelLayout::surround_7_1();
+        let sym71 = layout_to_channels(&l71);
+        assert_eq!(channels_to_layout(sym71, 8), l71);
     }
 }

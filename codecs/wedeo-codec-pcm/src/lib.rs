@@ -636,7 +636,11 @@ pub struct PcmDecoder {
 }
 
 impl PcmDecoder {
-    pub fn open(expected_codec: CodecId, track: &TrackDescriptor, ctx: CodecContext) -> Result<Self> {
+    pub fn open(
+        expected_codec: CodecId,
+        track: &TrackDescriptor,
+        ctx: CodecContext,
+    ) -> Result<Self> {
         if track.codec_id != expected_codec {
             return Err(Error::invalid_argument(
                 "pcm_dec",
@@ -839,7 +843,11 @@ pub struct PcmEncoder {
 }
 
 impl PcmEncoder {
-    pub fn open(expected_codec: CodecId, track: &TrackDescriptor, ctx: CodecContext) -> Result<Self> {
+    pub fn open(
+        expected_codec: CodecId,
+        track: &TrackDescriptor,
+        ctx: CodecContext,
+    ) -> Result<Self> {
         if track.codec_id != expected_codec {
             return Err(Error::invalid_argument(
                 "pcm_enc",
@@ -987,7 +995,11 @@ impl PcmEncoder {
             } else {
                 self.sample_rate
             };
-            rescale_q(block.nb_samples as i64, Rational::new(1, sr as i32), time_base)
+            rescale_q(
+                block.nb_samples as i64,
+                Rational::new(1, sr as i32),
+                time_base,
+            )
         };
 
         let mut pkt = Packet::new(out_buf, self.track_id, time_base);
@@ -1314,8 +1326,7 @@ mod tests {
         let fmt = codec_id_to_sample_format(codec_id).unwrap();
         let mut params = AudioStreamParams::new(sample_rate, fmt, layout);
         params.bits_per_coded_sample = bits_per_coded_sample(codec_id).unwrap();
-        params.block_align =
-            params.channel_layout.nb_channels * (params.bits_per_coded_sample / 8);
+        params.block_align = params.channel_layout.nb_channels * (params.bits_per_coded_sample / 8);
         params.bit_rate = params.sample_rate as i64 * params.block_align as i64 * 8;
         TrackDescriptor::new(
             TrackId(0),
@@ -1443,7 +1454,10 @@ mod tests {
             });
 
             // Decode
-            assert_eq!(dec.send_packet(Some(&in_pkt)).unwrap(), SendStatus::Accepted);
+            assert_eq!(
+                dec.send_packet(Some(&in_pkt)).unwrap(),
+                SendStatus::Accepted
+            );
             let RecvStatus::Ready(unit) = dec.receive().unwrap() else {
                 panic!("expected decoded unit for {}", codec_id.name());
             };
@@ -1464,9 +1478,17 @@ mod tests {
             let RecvStatus::Ready(out_pkt) = enc.receive_packet().unwrap() else {
                 panic!("expected encoded packet for {}", codec_id.name());
             };
-            assert!(matches!(enc.receive_packet().unwrap(), RecvStatus::NeedMore));
+            assert!(matches!(
+                enc.receive_packet().unwrap(),
+                RecvStatus::NeedMore
+            ));
 
-            assert_eq!(out_pkt.data.data(), raw.as_slice(), "mismatch for {}", codec_id.name());
+            assert_eq!(
+                out_pkt.data.data(),
+                raw.as_slice(),
+                "mismatch for {}",
+                codec_id.name()
+            );
             assert_eq!(out_pkt.pts, Timestamp::new(12_345));
             assert_eq!(out_pkt.dts, Timestamp::new(12_345));
             assert_eq!(out_pkt.duration, 120);
@@ -1525,7 +1547,8 @@ mod tests {
         );
 
         // Resilient mode truncates trailing partial sample and records HealthIssue::TruncatedPacket.
-        let mut dec_res = PcmDecoder::open(CodecId::PcmS16le, &track, CodecContext::default()).unwrap();
+        let mut dec_res =
+            PcmDecoder::open(CodecId::PcmS16le, &track, CodecContext::default()).unwrap();
         dec_res.send_packet(Some(&pkt)).unwrap();
         let RecvStatus::Ready(MediaUnit::Audio(block)) = dec_res.receive().unwrap() else {
             panic!("expected decoded block");
@@ -1535,8 +1558,10 @@ mod tests {
         assert_eq!(dec_res.health().corrupt_packets, 1);
 
         // Strict mode fails immediately with ErrorKind::CorruptStream.
-        let mut strict_ctx = CodecContext::default();
-        strict_ctx.error_policy = ErrorPolicy::Strict;
+        let strict_ctx = CodecContext {
+            error_policy: ErrorPolicy::Strict,
+            ..Default::default()
+        };
         let mut dec_strict = PcmDecoder::open(CodecId::PcmS16le, &track, strict_ctx).unwrap();
         let err = dec_strict.send_packet(Some(&pkt)).unwrap_err();
         assert_eq!(err.kind, ErrorKind::CorruptStream);

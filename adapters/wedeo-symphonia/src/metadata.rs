@@ -1,7 +1,7 @@
 use symphonia::core::meta::{MetadataRevision, StandardTagKey};
-use wedeo_core::metadata::Metadata;
+use wedeo_core::Metadata;
 
-/// Convert symphonia metadata to wedeo Metadata.
+/// Convert symphonia metadata to wedeo `Metadata`.
 pub fn convert_metadata(revision: &MetadataRevision) -> Metadata {
     let mut metadata = Metadata::new();
 
@@ -9,21 +9,20 @@ pub fn convert_metadata(revision: &MetadataRevision) -> Metadata {
         let key = if let Some(std_key) = tag.std_key {
             standard_tag_to_ffmpeg_key(std_key)
         } else {
-            // Use the raw tag key
             None
         };
 
         if let Some(key) = key {
             metadata.set(key, tag.value.to_string());
         } else if !tag.key.is_empty() {
-            metadata.set(&tag.key, tag.value.to_string());
+            metadata.set(tag.key.clone(), tag.value.to_string());
         }
     }
 
     metadata
 }
 
-/// Map symphonia StandardTagKey to FFmpeg metadata key names.
+/// Map symphonia `StandardTagKey` to FFmpeg metadata key names.
 fn standard_tag_to_ffmpeg_key(key: StandardTagKey) -> Option<&'static str> {
     match key {
         StandardTagKey::Album => Some("album"),
