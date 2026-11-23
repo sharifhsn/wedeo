@@ -1,5 +1,6 @@
 # Build
 /target
+/bins/wedeo-wasm/target
 /dist
 /web/wedeo.wasm
 

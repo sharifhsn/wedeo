@@ -18,9 +18,9 @@ members = [
     "adapters/wedeo-rav1e",
     "adapters/wedeo-symphonia",
     "bins/wedeo-cli",
-    "bins/wedeo-wasm",
     "tests/wedeo-oracle",
 ]
+exclude = ["bins/wedeo-wasm"]
 resolver = "3"
 
 [profile.wasm-release]

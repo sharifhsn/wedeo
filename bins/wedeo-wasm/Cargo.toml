@@ -1,18 +1,17 @@
+[workspace]
+
 [package]
 name = "wedeo-wasm"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
-repository.workspace = true
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.89"
+license = "LGPL-2.1-or-later"
+repository = "https://github.com/sharifhsn/wedeo"
 description = "Pure-Rust WebAssembly entrypoint for Wedeo (inspect, H.264/VP9/audio decode, SwsOpList, remux)"
 publish = false
 
 [lib]
 crate-type = ["cdylib", "rlib"]
-
-[lints]
-workspace = true
 
 [dependencies]
 wedeo = { path = "../../crates/wedeo", default-features = false, features = [
@@ -29,3 +28,10 @@ wedeo = { path = "../../crates/wedeo", default-features = false, features = [
     "ivf",
     "symphonia",
 ] }
+
+[profile.wasm-release]
+inherits = "release"
+opt-level = "s"
+lto = "thin"
+strip = true
+panic = "abort"

@@ -15,18 +15,21 @@ const COMPONENT: &str = "symphonia/opus";
 static OPUS_DECODER_DESCRIPTOR: DecoderDescriptor = DecoderDescriptor {
     codec_id: CodecId::Opus,
     name: "opus_symphonia",
-    long_name: "Opus audio decoder [opus-decoder]",
+    long_name: "Opus audio decoder [opus1 pure-Rust]",
     media_type: MediaType::Audio,
 };
 
 static OPUS_DECODER_OPTIONS: &[OptionSchema] = &[];
 
-/// Opus decoder wrapper using the pure-Rust `opus-decoder` crate.
+/// Maximum Opus packet duration is 120 ms (5760 samples/ch at 48 kHz).
+const MAX_OPUS_FRAME_SAMPLES: usize = 5760;
+
+/// Opus decoder wrapper using the pure-Rust `opus1` crate (libopus 1.x port).
 ///
-/// Opus always decodes at 48 kHz internally. The `opus-decoder` crate supports
-/// output at 8/12/16/24/48 kHz. We decode to `SampleFormat::F32` at the stream's sample rate.
+/// Opus always decodes at 8/12/16/24/48 kHz internally. We decode to
+/// `SampleFormat::F32` at the nearest valid Opus output rate (48 kHz by default).
 pub struct OpusDecoderWrapper {
-    inner: opus_decoder::OpusDecoder,
+    inner: opus1::OpusDecoder,
     pending_packets: VecDeque<Packet>,
     drained: bool,
     sample_rate: u32,
@@ -35,7 +38,7 @@ pub struct OpusDecoderWrapper {
     track_time_base: Rational,
     ctx: CodecContext,
     health: StreamHealth,
-    /// Reusable decode buffer (`f32`, interleaved, max frame size).
+    /// Reusable decode buffer (`f32`, interleaved, max 120 ms frame).
     decode_buf: Vec<f32>,
 }
 
@@ -63,21 +66,28 @@ impl OpusDecoderWrapper {
         if channels > 2 {
             return Err(Error::unsupported(
                 COMPONENT,
-                format!("opus-decoder: only mono/stereo supported, got {channels} channels"),
+                format!("opus1: only mono/stereo supported, got {channels} channels"),
             ));
         }
         let channels = channels.max(1);
-
-        let sample_rate = if audio.sample_rate > 0 {
-            audio.sample_rate
+        let opus_channels = if channels == 1 {
+            opus1::Channels::Mono
         } else {
-            48_000
+            opus1::Channels::Stereo
         };
 
-        let inner = opus_decoder::OpusDecoder::new(sample_rate, channels)
-            .map_err(|e| Error::invalid_argument(COMPONENT, format!("opus-decoder init: {e}")))?;
+        let (opus_rate, sample_rate) = match audio.sample_rate {
+            8_000 => (opus1::SampleRate::Hz8000, 8_000),
+            12_000 => (opus1::SampleRate::Hz12000, 12_000),
+            16_000 => (opus1::SampleRate::Hz16000, 16_000),
+            24_000 => (opus1::SampleRate::Hz24000, 24_000),
+            _ => (opus1::SampleRate::Hz48000, 48_000),
+        };
 
-        let max_frame = inner.max_frame_size_per_channel() * channels;
+        let inner = opus1::OpusDecoder::new(opus_rate, opus_channels)
+            .map_err(|e| Error::invalid_argument(COMPONENT, format!("opus1 init: {e}")))?;
+
+        let max_frame = MAX_OPUS_FRAME_SAMPLES * channels;
 
         let channel_layout = if audio.channel_layout.nb_channels > 0 {
             audio.channel_layout.clone()
@@ -125,7 +135,10 @@ impl Decoder for OpusDecoderWrapper {
             let data = pkt.data.data();
 
             let samples_per_channel =
-                match self.inner.decode_float(data, &mut self.decode_buf, false) {
+                match self
+                    .inner
+                    .decode(data, MAX_OPUS_FRAME_SAMPLES, &mut self.decode_buf)
+                {
                     Ok(n) => n,
                     Err(e) => {
                         if self.ctx.error_policy == ErrorPolicy::Strict {
@@ -185,7 +198,7 @@ impl Decoder for OpusDecoderWrapper {
     }
 
     fn flush(&mut self) {
-        self.inner.reset();
+        self.inner.reset_state();
         self.pending_packets.clear();
         self.drained = false;
     }

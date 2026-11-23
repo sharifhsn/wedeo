@@ -1425,6 +1425,7 @@ pub struct TranscodeReq {
     pub overwrite: bool,
     pub prefer_gpu: bool,
     pub tags: Vec<(String, String)>,
+    pub chapters: Vec<wedeo::core::Chapter>,
     pub codec_options: Vec<(String, String)>,
 }
 
@@ -1452,6 +1453,7 @@ impl TranscodeReq {
             overwrite: false,
             prefer_gpu: false,
             tags: Vec::new(),
+            chapters: Vec::new(),
             codec_options: Vec::new(),
         }
     }
@@ -1670,6 +1672,9 @@ fn build_transcode_graph(
     }
     for (k, v) in &req.tags {
         out_header.metadata.set(k, v);
+    }
+    if !req.chapters.is_empty() {
+        out_header.chapters = req.chapters.clone();
     }
 
     let mut mux_inputs: Vec<PortContract> = Vec::new();
@@ -2536,6 +2541,7 @@ pub struct MuxReq {
     pub output: String,
     pub format: Option<String>,
     pub tags: Vec<(String, String)>,
+    pub chapters: Vec<wedeo::core::Chapter>,
     pub preserve_all: bool,
     pub strict: bool,
     pub overwrite: bool,
@@ -2550,6 +2556,7 @@ impl MuxReq {
             output: output.into(),
             format: None,
             tags: Vec::new(),
+            chapters: Vec::new(),
             preserve_all: true,
             strict: false,
             overwrite: false,
@@ -2724,6 +2731,9 @@ pub fn run_mux(reg: &Registry, req: &MuxReq) -> Result<RunReport> {
 
     for (k, v) in &req.tags {
         out_header.metadata.set(k, v);
+    }
+    if !req.chapters.is_empty() {
+        out_header.chapters = req.chapters.clone();
     }
 
     let sink = Box::new(FileSink::create(&req.output)?);

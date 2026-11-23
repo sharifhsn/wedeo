@@ -604,7 +604,6 @@ fn arch_forbid_unsafe_code_enforced_across_safe_crates() {
         "crates/wedeo-audio-ops",
         "crates/wedeo-graph",
         "crates/wedeo-gpu-wgpu",
-        "codecs/wedeo-codec-vp9",
         "codecs/wedeo-codec-pcm",
         "formats/wedeo-format-wav",
         "formats/wedeo-format-mp4",
@@ -630,23 +629,9 @@ fn arch_forbid_unsafe_code_enforced_across_safe_crates() {
         );
     }
 
-    // `wedeo-codec-h264` may use `#![deny(unsafe_code)]` (or `#![forbid(unsafe_code)]`)
-    // to isolate audited `core::arch` SIMD intrinsics inside `src/simd.rs`, while
-    // forbidding `unsafe` in all other modules.
-    let h264_src_dir = root.join("codecs/wedeo-codec-h264/src");
-    let h264_lib_rs = h264_src_dir.join("lib.rs");
-    let h264_lib = std::fs::read_to_string(&h264_lib_rs)
-        .unwrap_or_else(|e| panic!("failed to read {}: {e}", h264_lib_rs.display()));
-    let has_h264_guard = h264_lib
-        .lines()
-        .map(str::trim)
-        .any(|line| line == "#![forbid(unsafe_code)]" || line == "#![deny(unsafe_code)]");
-    assert!(
-        has_h264_guard,
-        "{} must declare `#![forbid(unsafe_code)]` or `#![deny(unsafe_code)]`",
-        h264_lib_rs.display()
-    );
-
+    // `wedeo-codec-h264` and `wedeo-codec-vp9` may use `#![deny(unsafe_code)]`
+    // (or `#![forbid(unsafe_code)]`) to isolate audited `core::arch` SIMD
+    // intrinsics strictly inside `src/simd.rs`, forbidding `unsafe` everywhere else.
     fn contains_unsafe_code_token(src: &str) -> bool {
         for raw_line in src.lines() {
             let line = raw_line.split("//").next().unwrap_or("");
@@ -669,29 +654,44 @@ fn arch_forbid_unsafe_code_enforced_across_safe_crates() {
         false
     }
 
-    assert!(
-        !contains_unsafe_code_token(&h264_lib) && !h264_lib.contains("allow(unsafe_code)"),
-        "{} must not contain `unsafe` code or `allow(unsafe_code)`",
-        h264_lib_rs.display()
-    );
-
-    for entry in std::fs::read_dir(&h264_src_dir)
-        .unwrap_or_else(|e| panic!("failed to read {}: {e}", h264_src_dir.display()))
-    {
-        let path = entry.expect("dir entry").path();
-        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-            continue;
-        }
-        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if matches!(file_name, "lib.rs" | "simd.rs") {
-            continue;
-        }
-        let src = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+    for simd_crate_src in ["codecs/wedeo-codec-h264/src", "codecs/wedeo-codec-vp9/src"] {
+        let src_dir = root.join(simd_crate_src);
+        let lib_rs = src_dir.join("lib.rs");
+        let lib_src = std::fs::read_to_string(&lib_rs)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", lib_rs.display()));
+        let has_guard = lib_src
+            .lines()
+            .map(str::trim)
+            .any(|line| line == "#![forbid(unsafe_code)]" || line == "#![deny(unsafe_code)]");
         assert!(
-            !contains_unsafe_code_token(&src) && !src.contains("allow(unsafe_code)"),
-            "{} contains `unsafe` outside audited `src/simd.rs`",
-            path.display()
+            has_guard,
+            "{} must declare `#![forbid(unsafe_code)]` or `#![deny(unsafe_code)]`",
+            lib_rs.display()
         );
+        assert!(
+            !contains_unsafe_code_token(&lib_src) && !lib_src.contains("allow(unsafe_code)"),
+            "{} must not contain `unsafe` code or `allow(unsafe_code)`",
+            lib_rs.display()
+        );
+
+        for entry in std::fs::read_dir(&src_dir)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", src_dir.display()))
+        {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if matches!(file_name, "lib.rs" | "simd.rs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+            assert!(
+                !contains_unsafe_code_token(&src) && !src.contains("allow(unsafe_code)"),
+                "{} contains `unsafe` outside audited `src/simd.rs`",
+                path.display()
+            );
+        }
     }
 }

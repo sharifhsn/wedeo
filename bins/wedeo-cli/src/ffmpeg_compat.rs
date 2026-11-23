@@ -11,7 +11,8 @@
 
 use std::collections::BTreeMap;
 
-use wedeo::{Error, Registry, Result};
+use wedeo::core::Chapter;
+use wedeo::{Error, Metadata, Rational, Registry, Result, Timestamp};
 
 use crate::json::JsonValue;
 use crate::ops::{
@@ -132,6 +133,7 @@ pub fn parse_ffmpeg_args(args: &[String]) -> Result<FfmpegAction> {
     let mut channels: Option<u32> = None;
     let mut maps: Vec<MapRule> = Vec::new();
     let mut tags: Vec<(String, String)> = Vec::new();
+    let mut chapters: Vec<Chapter> = Vec::new();
     let mut codec_options: Vec<(String, String)> = Vec::new();
 
     let mut i = 0usize;
@@ -155,12 +157,18 @@ pub fn parse_ffmpeg_args(args: &[String]) -> Result<FfmpegAction> {
             | "-bitexact" | "-accurate_seek" | "-noaccurate_seek" | "-copyinkf" | "-re" => {}
             "-i" => {
                 let raw = next_arg(args, &mut i, "-i")?;
-                inputs.push(FfmpegInputSpec {
-                    path: strip_file_proto(&raw),
-                    ss: pending_in_ss.take(),
-                    t: pending_in_t.take(),
-                    to: pending_in_to.take(),
-                });
+                let path = strip_file_proto(&raw);
+                if let Some(meta) = try_parse_ffmetadata1(&path) {
+                    tags.extend(meta.tags);
+                    chapters.extend(meta.chapters);
+                } else {
+                    inputs.push(FfmpegInputSpec {
+                        path,
+                        ss: pending_in_ss.take(),
+                        t: pending_in_t.take(),
+                        to: pending_in_to.take(),
+                    });
+                }
             }
             "-c:v" | "-vcodec" | "-codec:v" => {
                 video_codec = Some(next_arg(args, &mut i, arg)?);
@@ -347,6 +355,7 @@ pub fn parse_ffmpeg_args(args: &[String]) -> Result<FfmpegAction> {
         let mut mux = MuxReq::new(out_path);
         mux.format = format;
         mux.tags = tags;
+        mux.chapters = chapters;
         mux.strict = strict;
         mux.overwrite = overwrite;
 
@@ -446,6 +455,7 @@ pub fn parse_ffmpeg_args(args: &[String]) -> Result<FfmpegAction> {
     tr.strict = strict;
     tr.overwrite = overwrite;
     tr.tags = tags;
+    tr.chapters = chapters;
     tr.codec_options = codec_options;
 
     Ok(FfmpegAction::Transcode(tr))
@@ -839,4 +849,116 @@ fn parse_bitrate(s: &str) -> Result<i64> {
         s.parse::<i64>()
             .map_err(|_| Error::invalid_argument("ffmpeg", format!("invalid bitrate '{s}'")))
     }
+}
+
+struct FfMetadata {
+    tags: Vec<(String, String)>,
+    chapters: Vec<Chapter>,
+}
+
+/// Parse an FFmpeg `;FFMETADATA1` sidecar file (used by `yt-dlp --embed-chapters`
+/// and `--embed-metadata`). Returns `None` if `path` is not an FFMETADATA1 file.
+fn try_parse_ffmetadata1(path: &str) -> Option<FfMetadata> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let first_line = text.lines().next()?.trim();
+    if !first_line.starts_with(";FFMETADATA") {
+        return None;
+    }
+
+    let mut global_tags = Vec::new();
+    let mut chapters = Vec::new();
+    let mut in_chapter = false;
+    let mut tb = Rational::new(1, 1000);
+    let mut start: Option<i64> = None;
+    let mut end: Option<i64> = None;
+    let mut chap_meta = Metadata::new();
+
+    let flush_chapter = |chapters: &mut Vec<Chapter>,
+                         tb: Rational,
+                         start: &mut Option<i64>,
+                         end: &mut Option<i64>,
+                         chap_meta: &mut Metadata| {
+        if let (Some(s), Some(e)) = (start.take(), end.take()) {
+            let id = chapters.len() as i64 + 1;
+            chapters.push(Chapter {
+                id,
+                start: Timestamp::new(s),
+                end: Timestamp::new(e),
+                time_base: tb,
+                metadata: std::mem::take(chap_meta),
+            });
+        } else {
+            *chap_meta = Metadata::new();
+        }
+    };
+
+    for raw in text.lines().skip(1) {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with(';') || line.starts_with('#') {
+            continue;
+        }
+        if line.eq_ignore_ascii_case("[CHAPTER]") {
+            if in_chapter {
+                flush_chapter(&mut chapters, tb, &mut start, &mut end, &mut chap_meta);
+            }
+            in_chapter = true;
+            tb = Rational::new(1, 1000);
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            if in_chapter {
+                flush_chapter(&mut chapters, tb, &mut start, &mut end, &mut chap_meta);
+            }
+            in_chapter = false;
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let key = k.trim();
+        let val = unescape_ffmetadata(v);
+        if in_chapter {
+            match key {
+                "TIMEBASE" => {
+                    if let Some((n, d)) = val.split_once('/')
+                        && let (Ok(num), Ok(den)) = (n.parse::<i32>(), d.parse::<i32>())
+                        && den > 0
+                    {
+                        tb = Rational::new(num, den);
+                    }
+                }
+                "START" => start = val.parse::<i64>().ok(),
+                "END" => end = val.parse::<i64>().ok(),
+                _ => chap_meta.set(key, &val),
+            }
+        } else {
+            global_tags.push((key.to_string(), val));
+        }
+    }
+    if in_chapter {
+        flush_chapter(&mut chapters, tb, &mut start, &mut end, &mut chap_meta);
+    }
+
+    Some(FfMetadata {
+        tags: global_tags,
+        chapters,
+    })
+}
+
+fn unescape_ffmetadata(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(next) = chars.next() {
+                match next {
+                    'n' => out.push('\n'),
+                    other => out.push(other),
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
