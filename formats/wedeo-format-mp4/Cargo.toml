@@ -12,4 +12,3 @@ workspace = true
 
 [dependencies]
 wedeo-core.workspace = true
-wedeo-syntax.workspace = true

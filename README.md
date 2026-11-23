@@ -1,225 +1,52 @@
 # wedeo
 
-Rust rewrite of FFmpeg, verified against FFmpeg's output
-bit-for-bit.
+**100% Pure-Rust Universal A/V Adapter** — a deterministic, VFR-native, data-oriented media compiler and runtime combining exact algorithmic ports of **FFmpeg `n9.1` ("Gauss")** with optional `wgpu` WGSL GPU compute acceleration.
 
-**This codebase is AI-generated.** Written by Claude (Anthropic) via
-[Claude Code](https://claude.ai/claude-code), directed by a
-human. The AI reads FFmpeg's C source and reimplements it in Rust. Every
-conformance claim below is verified by automated CI on every commit, comparing
-to FFmpeg's output.
+- **Zero FFI / Zero Vendored ASM:** No `.S` files, no `cc` `build.rs`, no `bindgen`, no `c2rust`, no `inventory` link-time globals.
+- **Strong Audio / Video Separation:** Audio-only builds (`wedeo` with `--no-default-features --features "audio-ops,pcm,wav,symphonia"`) pull zero video decoders, zero `SwsOpList`, and zero `wgpu`.
+- **VFR-Native Everywhere:** Exact rational `(pts, dts, duration, time_base)` on every `Packet`, `AudioBlock`, and `VideoFrame`.
+- **Data-Oriented Design (DOD):** `256×16` L1/L2 strip-fused `SwsOpList`, `1024`-sample planar `AudioOpList` slabs, warm `BufferPool`, `BorderedPlane` edge extension, and flat-indexed `CompiledGraph`.
+- **Unified CLI & MCP:** One `wedeo` binary (`inspect`, `transcode`, `cut`, `mux`, `explain`, `wedeo ffmpeg`, `wedeo mcp`).
 
-The intention of this project is to push the boundaries of what is possible with
-AI rewriting codebases in Rust. It provides no additional features compared to
-FFmpeg, and despite incorporating FFmpeg's assembly code, is significantly slower.
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the locked v2 architectural specification.
 
-## Status
+## Workspace Layout (19 Crates)
 
-| Component | Conformance | Notes |
-|-----------|-------------|-------|
-| H.264 decode | 79/79 BITEXACT | CAVLC + CABAC, Baseline through High profile |
-| H.264 FRext | 23/55 bitexact | Progressive 4:2:0 8-bit done; MBAFF/PAFF/10-bit remaining |
-| H.264 NEON (aarch64) | 1.75x speedup | MC, IDCT, deblock — FFmpeg's vendored assembly via `cc` |
-| WAV demuxer + PCM | bitexact | RIFF/RIFX/RF64/BW64, 17 PCM formats, 13/13 FATE files |
-| WAV muxer | bitexact | Roundtrip verified |
-| FLAC, WavPack | bitexact | Via symphonia adapter |
-| Vorbis, AAC, MP3 | ~120-140 dB SNR | Lossy codecs, float precision only |
-| AV1 | bitexact | Via rav1d adapter |
-| VP9 decode | keyframe-only | Native Rust, intra prediction + loop filter |
-| IVF demuxer | working | VP8, VP9, AV1 containers |
-| MP4 demuxer | working | H.264, AV1, AAC tracks |
-| Video player | 24fps 0-drop | GPU (wgpu), ffplay-style A/V sync, pause, volume |
+| Layer | Crates | Role |
+|---|---|---|
+| **L0** | `crates/wedeo-core` | Lean foundation (`bitflags` only): VFR `Timestamp`/`Rational`, `BorderedPlane`, `RowProgressPlane`, `BufferPool`, `GpuSurface`, `StreamHealth`, traits, concrete `Registry` |
+| **L1** | `crates/wedeo-syntax` | `#![no_std]`, `#![forbid(unsafe_code)]` CBS/BSF/extradata + `RawStreamDemuxer` |
+| **L1** | `crates/wedeo-video-ops` | Pure-Rust FFmpeg `n9.1` `SwsOpList` optimizer + `256×16` strip-fused `CpuSwsBackend` |
+| **L1** | `crates/wedeo-audio-ops` | `AudioOpList` + `CompiledAudioOps` (`libswresample` polyphase/rematrix/dither, `1024`-sample slabs) |
+| **L1** | `crates/wedeo-graph` | Flat-indexed VFR-native `CompiledGraph`, `Timeline`, auto-adapter, custom filter traits |
+| **L1b** | `crates/wedeo-gpu-wgpu` | Optional `wgpu` backend compiling `SwsOpList` + `WgslFilter` into cached WGSL compute shaders |
+| **L2a** | `codecs/wedeo-codec-{pcm,h264,vp9}` | Native pure-Rust PCM (17 formats), H.264/AVC, and VP9 decoders |
+| **L2a** | `formats/wedeo-format-{wav,mp4,mkv,ivf}` | Native WAV, ISOBMFF/MP4 (faststart + auto-fMP4), Matroska/WebM EBML, and IVF demuxers + muxers |
+| **L2b** | `adapters/wedeo-{rav1d,rav1e,symphonia}` | Segregated AV1 decode/encode and fallback audio decode adapters |
+| **L3** | `crates/wedeo`, `bins/wedeo-cli` | Ergonomic library facade (`AudioReader`, `VideoReader`) and unified `wedeo` CLI/MCP binary |
+| **Dev** | `tests/wedeo-oracle` | Non-published FFmpeg `n9.1` oracle (`framecrc`, `audiogen`, `checkasm`, `CountingAlloc`, DAG lints) |
 
-### H.264 decoder
-
-The H.264 decoder is ~30K lines of Rust across 25 modules. It implements:
-
-- CAVLC and CABAC entropy coding
-- All intra prediction modes (4x4, 8x8, 16x16, chroma)
-- Quarter-pel motion compensation (6-tap FIR luma, bilinear chroma)
-- 4x4 and 8x8 IDCT with Hadamard DC transforms
-- In-loop deblocking filter
-- MMCO and sliding-window reference management
-- Weighted prediction (uni/bi)
-- B-frames with direct prediction (spatial + temporal)
-- High profile: 8x8 transforms, custom scaling matrices
-- MBAFF interlaced (partial — field/frame MB switching, CABAC context adaptation)
-- Frame-level threading with wavefront deblocking
-- aarch64 NEON assembly for MC, IDCT, and deblocking (feature-gated)
-
-Architecture details: [H264.md](H264.md).
-Known FFmpeg behavioral differences: [DIVERGENCES.md](DIVERGENCES.md).
-
-### Not yet implemented
-
-FFmpeg has hundreds of codecs and formats. wedeo currently covers a small
-subset. Major gaps for parity:
-
-- **Video codecs** — HEVC/H.265, MPEG-2, MPEG-4 Part 2, VP8, Theora. VP9 is keyframe-only (inter frames deferred). H.264 is missing interlaced (MBAFF/PAFF), 10-bit, and 4:2:2/4:4:4.
-- **Video encoding** — no encoders exist yet (H.264, H.265, AV1 via rav1e)
-- **Muxers** — only WAV. No MP4/MOV, MKV/WebM, or MPEG-TS muxer.
-- **Demuxers** — no MKV/WebM, MPEG-TS, FLV, or AVI demuxer (MP4, WAV, and IVF only, plus symphonia-backed formats)
-- **Filters** — trait skeleton exists but no functional filter graph (no scale, crop, overlay, fps, etc.)
-- **Player** — no seek, no subtitle rendering, no hardware-accelerated decode
-- **Infrastructure** — no interruptible I/O (network streams), no chapter/program support, no `avformat_find_stream_info` equivalent
-
-## Quick start
-
-### Install the CLI
+## Quick Start
 
 ```bash
-# From source (includes AV1 support via rav1d)
-cargo install --git https://github.com/sharifhsn/wedeo wedeo-cli
+# Build workspace
+cargo build --offline
+
+# Run unit & oracle tests
+cargo test --offline -p wedeo-oracle --test oracle_arch_lint --test oracle_dod_alloc
+
+# Unified CLI
+cargo run --offline -p wedeo-cli -- inspect input.mp4
+cargo run --offline -p wedeo-cli -- transcode input.mp4 output.mkv
 ```
 
-### Play a video
-
-```bash
-# Also from source — AV1, H.264, and audio all work
-cargo install --git https://github.com/sharifhsn/wedeo wedeo-play
-wedeo-play video.mp4
-```
-
-### Use as a library
+### Audio-Only Library Build (Zero Video / Zero GPU)
 
 ```toml
-# Cargo.toml — core crates are on crates.io
 [dependencies]
-wedeo = "0.1.2"
-wedeo-codec-h264 = "0.1.2"    # H.264 decoder
-wedeo-format-mp4 = "0.1.2"    # MP4 demuxer
-wedeo-symphonia = "0.1.2"     # audio codecs (AAC, MP3, FLAC, etc.)
-
-# AV1 requires a git dependency (rav1d is not yet on crates.io)
-wedeo-rav1d = { git = "https://github.com/sharifhsn/wedeo" }
+wedeo = { version = "0.3.0", default-features = false, features = ["audio-ops", "pcm", "wav", "symphonia"] }
 ```
-
-### Build and test locally
-
-```bash
-cargo build
-cargo nextest run            # or cargo test
-cargo clippy
-```
-
-Decode a file and compare against FFmpeg:
-
-```bash
-cargo run --release --bin wedeo-framecrc -- input.264
-ffmpeg -bitexact -i input.264 -f framecrc -
-```
-
-### FATE testing
-
-FFmpeg's native test suite.
-
-```bash
-./scripts/fetch-fate-suite.sh                    # downloads full suite (~1.2 GB)
-FATE_SUITE=./fate-suite cargo nextest run -p wedeo-fate
-```
-
-### JVT conformance (ITU test vectors)
-
-204 test vectors from the ITU JVT conformance suite, with MD5 ground truth
-from the [Fluster](https://github.com/fluendo/fluster) project. No FFmpeg
-required — comparison is against ITU-provided checksums.
-
-```bash
-python3 scripts/fetch_jvt.py                     # download vectors (~50 MB)
-python3 scripts/suite_runner.py --suite jvt-avc-v1,jvt-fr-ext --format yuv420p
-```
-
-The unified suite runner also wraps the FATE suites:
-
-```bash
-python3 scripts/suite_runner.py --suite all --format yuv420p
-python3 scripts/suite_runner.py --suite fate-cavlc --save-snapshot
-python3 scripts/suite_runner.py --suite fate-cavlc --check-snapshot   # regression check
-```
-
-## Architecture
-
-```
-wedeo/
-  crates/
-    wedeo-core/          libavutil   — Rational, Buffer, Frame, Packet, errors
-    wedeo-codec/         libavcodec  — Decoder/Encoder traits, codec registry
-    wedeo-format/        libavformat — Demuxer/Muxer traits, I/O, InputContext
-    wedeo-filter/        libavfilter (stub)
-    wedeo-resample/      libswresample (rubato)
-    wedeo-scale/         libswscale (dcv-color-primitives)
-  codecs/
-    wedeo-codec-h264/    H.264 decoder — 30K lines, NEON assembly, 55 benchmarks
-    wedeo-codec-pcm/     PCM codec — 17 formats
-  formats/
-    wedeo-format-h264/   H.264 Annex B demuxer
-    wedeo-format-wav/    WAV demuxer + muxer
-    wedeo-format-mp4/    MP4/MOV demuxer
-  adapters/
-    wedeo-symphonia/     Wraps symphonia (FLAC, Vorbis, MP3, AAC, WavPack)
-    wedeo-rav1d/         Wraps rav1d (AV1)
-  bins/
-    wedeo-cli/           CLI tool
-    wedeo-play/          Video player — wgpu+winit, ffplay-style A/V sync
-  tests/
-    fate/                FATE cross-validation harness
-  scripts/
-    suite_runner.py      Unified conformance runner (FATE + JVT)
-    fetch_jvt.py         JVT vector downloader
-    conformance_full.py  FATE conformance report
-    regression_check.py  Quick regression check
-  test_suites/
-    h264/                JVT manifest JSONs (tracked)
-```
-
-Each FFmpeg library maps to one Rust crate. Codecs and formats register
-themselves via `inventory` at link time — no central enum.
-
-## CI
-
-Five parallel jobs run on every PR (all required to merge):
-
-- **Lint** — clippy + rustfmt
-- **Test** — 462 unit and integration tests via nextest
-- **FATE Regression** — no previously-passing FATE test may regress (framecrc vs FFmpeg)
-- **JVT Regression** — no previously-passing JVT test may regress (MD5 vs ITU checksums)
-- **Deny** — license allow-list and advisory audit via cargo-deny
-
-Conformance baselines are committed in `test_suites/baselines/`. To update
-after expanding coverage:
-
-```bash
-python3 scripts/suite_runner.py --suite fate-cavlc,fate-cabac \
-  --save-snapshot --snapshot-dir test_suites/baselines
-```
-
-Pre-commit hook available: `pip install pre-commit && pre-commit install`
-
-## FFmpeg reference
-
-The `FFmpeg/` submodule is pinned to `n8.1`. Optional — only needed to read
-the C source or build a debug FFmpeg for development:
-
-```bash
-git submodule update --init
-cd FFmpeg && ./configure --disable-optimizations --enable-debug=3 \
-  --disable-stripping --disable-asm && make -j$(nproc) ffmpeg
-```
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md).
-
-### For AI agents
-
-This repo is designed for AI-assisted development. [CLAUDE.md](CLAUDE.md)
-contains the full project context: architecture, conventions, debugging
-procedures, and technical requirements. It is the canonical reference for any
-AI agent working on this codebase — read it before writing code.
-
-The [llms.txt](llms.txt) file provides a machine-readable project summary
-following the [llms.txt convention](https://llmstxt.org/).
 
 ## License
 
-LGPL-2.1-or-later. See [LICENSE](LICENSE) and [COPYING.LGPLv2.1](COPYING.LGPLv2.1).
+`LGPL-2.1-or-later`. See [LICENSE](LICENSE) and [COPYING.LGPLv2.1](COPYING.LGPLv2.1).

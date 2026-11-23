@@ -1,74 +1,39 @@
-# Wedeo - FFmpeg Rust Rewrite
+# Wedeo — FFmpeg `n9.1` ("Gauss") Pure-Rust Rewrite
 
 ## Project Overview
 
-Rust rewrite of FFmpeg, translated directly from FFmpeg's C source. **No bindgen,
-no c2rust, no FFI.** Pure Rust. Licensed under **LGPL-2.1-or-later** (same as FFmpeg).
-Verification target: **bit-for-bit output parity** with FFmpeg's FATE test suite.
-See `H264.md` for decoder architecture, module map, and conformance status.
+Pure-Rust Universal A/V Adapter verified against **FFmpeg `n9.1` ("Gauss")**.
+**100% Pure Rust:** No `.S` files, no `cc` `build.rs`, no `bindgen`, no `c2rust`, no FFI, no `inventory`.
+Licensed under **LGPL-2.1-or-later**.
+Canonical architecture spec: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-## Philosophy
+## Architecture (19 Crates)
 
-- **"Make it work, make it right, make it fast."** Correctness first.
-- Reproduce C bugs if needed for behavioral parity.
-- Copy FFmpeg comments verbatim. Don't invent docs where FFmpeg has none.
+- **L0 (`wedeo-core`):** Depends ONLY on `bitflags`. VFR `Timestamp`/`Rational`, `BorderedPlane`, `RowProgressPlane`, `BufferPool`, `GpuSurface`, `StreamHealth`, concrete `Registry`.
+- **L1:** `wedeo-syntax` (`#![no_std]`, `#![forbid(unsafe_code)]`), `wedeo-video-ops` (`SwsOpList` + `256×16` `CpuSwsBackend`), `wedeo-audio-ops` (`AudioOpList` + `1024`-sample `CompiledAudioOps`), `wedeo-graph` (`CompiledGraph`, `Timeline`, filters), `wedeo-gpu-wgpu` (optional `wgpu` WGSL compute backend).
+- **L2a:** `wedeo-codec-{pcm,h264,vp9}`, `wedeo-format-{wav,mp4,mkv,ivf}`.
+- **L2b:** `wedeo-{rav1d,rav1e,symphonia}` (segregated adapters).
+- **L3:** `wedeo` (facade with `AudioReader`/`VideoReader`), `wedeo-cli` (`inspect`/`transcode`/`cut`/`mux`/`explain`, `wedeo ffmpeg`, `wedeo mcp`).
+- **Dev-Only (`tests/wedeo-oracle`, `publish = false`):** FFmpeg `n9.1` oracle, `framecrc`, `audiogen`, `checkasm`, `CountingAlloc` DOD gates, and DAG lints.
+
+## Hard Architectural Rules
+
+- **Strict Downward DAG & A/V Separation:** Audio crates (`wedeo-audio-ops`, `wedeo-codec-pcm`, `wedeo-format-wav`, `wedeo-symphonia`) must NEVER depend on video or GPU crates. `wedeo-video-ops` must NEVER depend on `wgpu` or `wedeo-gpu-wgpu`.
+- **Safety:** `#![forbid(unsafe_code)]` on all safe crates (`wedeo-codec-h264` uses `#![deny(unsafe_code)]` with audited `core::arch` SIMD isolated to `src/simd.rs`).
+- **VFR-Native:** Always carry exact rational `(pts, dts, duration, time_base)`; never assume CFR.
+- **DOD Steady-State Zero-Alloc:** Reuse `BufferPool`, pre-allocated scratch slabs, and in-place `BorderedPlane::extend_edges`.
+- **Zero Dev Slop in Production:** Keep all FFmpeg oracle binaries, `framecrc`, `CountingAlloc`, and stage dumps (`#[cfg(feature = "dev-trace")]`) out of production APIs.
 
 ## Build & Verify
 
-- `cargo clippy` + `cargo fmt` before considering code complete
-- `cargo nextest run` for tests (process isolation, leak detection)
-- FATE: `FATE_SUITE=./fate-suite cargo nextest run --profile fate -p wedeo-fate`
-- Video cross-validate: `cargo run --bin wedeo-framecrc -- <file>` vs `ffmpeg -bitexact -i <file> -f framecrc -`
-- Conformance: `python3 scripts/conformance_full.py` (full report), `scripts/regression_check.py` (quick check)
+```bash
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all -- --check
+cargo test --offline -p wedeo-oracle --test oracle_arch_lint --test oracle_dod_alloc
+```
 
-## Debugging H.264 Differences
+## Debugging & Verification Workflow
 
-**Conformance workflow (do this in order):**
-1. `scripts/conformance_full.py` — full report. `--save-snapshot` to baseline.
-2. `scripts/regression_check.py` — quick check against snapshot. Run after every change.
-3. `scripts/framecrc_compare.py --pixel-detail <file>` — triage specific files with per-plane pixel diffs.
-
-**Key rules:**
-- **Read the FFmpeg C code FIRST.** Key files: `h264_cavlc.c`, `h264_cabac.c`, `h264idct_template.c`, `h264_mb.c`, `h264_mb_template.c`, `h264_ps.c`, `h264_mvpred.h`.
-- **HARD RULE:** After 2 failed hypotheses, **STOP theorizing**. Extract values from BOTH decoders. Find WHERE values diverge before explaining WHY. **5-minute backstop** without ground-truth extraction → use lldb.
-- **When formulas look identical, the bug is in the INPUTS.** One lldb extraction > any algebraic analysis.
-- **Never infer intermediate values from outputs.** Measure via lldb: `breakpoint set -f file.c -l N` → `expression`.
-- **Never manually count entries in C arrays.** Write a parser or use lldb to extract table contents.
-- **Build debug FFmpeg:** `cd FFmpeg && ./configure --disable-optimizations --enable-debug=3 --disable-stripping --disable-asm && make -j$(sysctl -n hw.ncpu) ffmpeg`. `--disable-asm` is critical on ARM64.
-- **Tracing is always available.** `RUST_LOG=wedeo_codec_h264::mb=trace`. Never use `eprintln!` — always `tracing` macros.
-- **When existing logs don't reveal the divergence, get better logs.** (1) add `trace!()`, (2) FFmpeg `-loglevel debug`, (3) lldb.
-- **CABAC cat=5 (8x8 luma) has NO coded_block_flag.** The CBP check is the only gate.
-- **CABAC context offsets are 2D for MBAFF** — `significant_coeff_flag_offset[MB_FIELD][cat]` uses field vs frame tables.
-- **MBAFF field-mode above-neighbor stride** — `top_xy = mb_xy - (mb_stride << MB_FIELD)`.
-- **MBAFF left_block_options** — FFmpeg's `fill_decode_neighbors` (h264_mvpred.h:491-538) selects 1 of 4 remapping variants for NNZ/CBP/intra4x4 mode context when there's a field/frame mismatch with the left neighbor. For CABAC state comparison, breakpoint at h264_cabac.c:1966 (after field flag decode).
-- **CABAC neighbor cache:** FFmpeg's `fill_decode_caches` (h264_mvpred.h:576) is the canonical reference for how neighbor values populate the CABAC context. For inter/skip MBs, `intra4x4_pred_mode` = 2 (DC) without `constrained_intra_pred`, -1 with it. Wedeo has two parallel storage systems (`NeighborContext` + `CabacNeighborCtx`) — both must store consistent values.
-- **Pipeline-stage tracing tags:** SLICE→PPS_SCALING→DEQUANT_TABLES→COEFF→DEQUANT→MB_RECON→MB_DEBLOCK.
-
-## Code Quality
-
-- Fix all clippy warnings. No `#[allow(clippy::*)]` without a comment.
-- Prefer safe Rust. `unsafe` requires `// SAFETY:` comment.
-- `Result<T, E>` + `?` for errors, not panics.
-- `wrapping_add`/`wrapping_neg`/`wrapping_mul` for C overflow parity.
-
-## Architecture
-
-- Bottom-up: wedeo-core → wedeo-codec/wedeo-format → implementations → CLI
-- Each FFmpeg library → one Rust crate. Codecs/formats registered via `inventory`.
-- Traits: `Decoder`, `Demuxer`, `Muxer`, `Filter`. Builder pattern for contexts.
-- `Vec<(String, String)>` for metadata (NOT `HashMap` — deterministic ordering for FATE parity).
-
-## Critical Technical Requirements
-
-- SIMD padding: `vec.resize(len + 64, 0)` (matches `AV_INPUT_BUFFER_PADDING_SIZE`)
-- Endianness: `u32::from_be_bytes()` / `u32::from_le_bytes()`
-- Custom `Rational` with FFmpeg-compatible rounding (not `num-rational`)
-- Adler-32 in framecrc: FFmpeg's non-standard init (`s1=0, s2=0`)
-- Packet sizes: `bitrate / 8 / 10 / block_align`, rounded down to power of 2
-
-## Reference
-
-- FFmpeg source: `./FFmpeg/` — read C code before writing Rust equivalents
-- FATE samples: `./fate-suite/`
-- See `H264.md` for decoder status, `CONTRIBUTING.md` for adding codecs/formats
-- See `TODO.md` for tasks, `DIVERGENCES.md` for known behavioral differences
+- Read FFmpeg `n9.1` C source in `./FFmpeg/` before modifying codec/ops math; use explicit `wrapping_*` arithmetic for C `-fwrapv` parity.
+- Never infer intermediate values from outputs — use `tracing` (or `dev-trace` feature) and differential `framecrc` / `audiogen` / `checkasm` comparisons against FFmpeg `n9.1`.
+- Preserve deterministic ordering (`Vec<(String, String)>` for metadata, never `HashMap`).
