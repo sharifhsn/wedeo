@@ -729,7 +729,8 @@ fn filter_plane_cols(
                                 16,
                             );
                         } else {
-                            loop_filter_edge(plane, ptr, stride, 1, e, ii, h as i32, 8);
+                            // FFmpeg: loop_filter_8[2][0] — 16-tap filter on a single 8-pixel edge.
+                            loop_filter_edge(plane, ptr, stride, 1, e, ii, h as i32, 16);
                         }
                     } else if hm2 & x as u8 != 0 {
                         let wd1 = if hmask1[1] & x as u8 != 0 { 8 } else { 4 };
@@ -871,7 +872,8 @@ fn filter_plane_rows(
                                 16,
                             );
                         } else {
-                            loop_filter_edge(plane, ptr, 1, stride as isize, e, ii, h as i32, 8);
+                            // FFmpeg: loop_filter_8[2][1] — 16-tap filter on a single 8-pixel edge.
+                            loop_filter_edge(plane, ptr, 1, stride as isize, e, ii, h as i32, 16);
                         }
                     } else if vm & x_next as u8 != 0 {
                         let wd1 = if vmask[1] & x as u8 != 0 { 8 } else { 4 };

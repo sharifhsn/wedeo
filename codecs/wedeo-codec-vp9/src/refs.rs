@@ -22,7 +22,7 @@ use crate::recon::FrameBuffer;
 /// Motion vector pair stored per 4×4 block, used for temporal MV prediction.
 ///
 /// Mirrors `VP9mvrefPair` in vp9shared.h.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub struct MvRefPair {
     /// Motion vectors for up to two reference frames: `mv[ref_idx] = [x, y]`
     /// in 1/8-pel units.
@@ -30,6 +30,15 @@ pub struct MvRefPair {
     /// Reference frame indices. -1 = intra / unused.
     /// 0 = LAST, 1 = GOLDEN, 2 = ALTREF.
     pub ref_frame: [i8; 2],
+}
+
+impl Default for MvRefPair {
+    fn default() -> Self {
+        Self {
+            mv: [[0, 0], [0, 0]],
+            ref_frame: [-1, -1],
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

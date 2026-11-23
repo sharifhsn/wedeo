@@ -291,3 +291,152 @@ fn vp9_corrupt_packet_records_stream_health_and_flush_resets() {
     dec.flush();
     assert!(matches!(dec.receive().unwrap(), RecvStatus::NeedMore));
 }
+
+fn generate_libvpx_ivf(
+    name: &str,
+    width: u32,
+    height: u32,
+    frames: u32,
+    extra_args: &[&str],
+) -> PathBuf {
+    let out_path =
+        std::env::temp_dir().join(format!("wedeo_vp9_{name}_{}.ivf", std::process::id()));
+    let filter = format!("testsrc2=size={width}x{height}:rate=25");
+    let frames_str = frames.to_string();
+    let mut cmd = Command::new("/usr/bin/ffmpeg");
+    cmd.args([
+        "-y",
+        "-v",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        &filter,
+        "-frames:v",
+        &frames_str,
+        "-pix_fmt",
+        "yuv420p",
+        "-c:v",
+        "libvpx-vp9",
+        "-b:v",
+        "200k",
+    ]);
+    cmd.args(extra_args);
+    cmd.arg(&out_path);
+    let out = cmd.output().expect("failed to execute /usr/bin/ffmpeg");
+    assert!(
+        out.status.success(),
+        "/usr/bin/ffmpeg failed for {name}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out_path
+}
+
+fn assert_ivf_bit_exact(
+    name: &str,
+    ivf_path: &std::path::Path,
+    exp_w: u32,
+    exp_h: u32,
+    exp_frames: usize,
+) {
+    let frames = decode_ivf_with_wedeo(ivf_path);
+    assert_eq!(
+        frames.len(),
+        exp_frames,
+        "decoded frame count mismatch for {name}"
+    );
+
+    let oracle_raw = oracle_raw_video(ivf_path);
+    let y_bytes = (exp_w * exp_h) as usize;
+    let uv_bytes = (exp_w.div_ceil(2) * exp_h.div_ceil(2)) as usize;
+    let frame_bytes = y_bytes + 2 * uv_bytes;
+    assert_eq!(
+        oracle_raw.len(),
+        exp_frames * frame_bytes,
+        "oracle raw length mismatch for {name}"
+    );
+
+    let mut actual_raw = Vec::with_capacity(oracle_raw.len());
+    for (idx, vf) in frames.iter().enumerate() {
+        assert_eq!(vf.width, exp_w, "width mismatch at frame {idx} for {name}");
+        assert_eq!(
+            vf.height, exp_h,
+            "height mismatch at frame {idx} for {name}"
+        );
+        assert_eq!(
+            vf.layout,
+            PixelLayout::YUV420P,
+            "layout mismatch at frame {idx} for {name}"
+        );
+        let actual_frame = flatten_planes(vf);
+        let oracle_frame = &oracle_raw[idx * frame_bytes..(idx + 1) * frame_bytes];
+        if actual_frame != oracle_frame {
+            let mut diffs = Vec::new();
+            let mut total_diffs = 0usize;
+            for (i, (a, b)) in actual_frame.iter().zip(oracle_frame.iter()).enumerate() {
+                if a != b {
+                    total_diffs += 1;
+                    if diffs.len() < 12 {
+                        let (plane, py, px) = if i < y_bytes {
+                            ("Y", i / exp_w as usize, i % exp_w as usize)
+                        } else if i < y_bytes + uv_bytes {
+                            let j = i - y_bytes;
+                            let cw = exp_w.div_ceil(2) as usize;
+                            ("U", j / cw, j % cw)
+                        } else {
+                            let j = i - y_bytes - uv_bytes;
+                            let cw = exp_w.div_ceil(2) as usize;
+                            ("V", j / cw, j % cw)
+                        };
+                        diffs.push(format!("{plane}({px},{py}): act={a} exp={b}"));
+                    }
+                }
+            }
+            panic!(
+                "pixel parity mismatch vs FFmpeg n9.1 oracle for {name} at frame {idx}: {total_diffs} differing bytes; first diffs: {diffs:?}"
+            );
+        }
+        actual_raw.extend_from_slice(&actual_frame);
+    }
+    assert_eq!(actual_raw, oracle_raw);
+}
+
+#[test]
+fn vp9_inter_clip1_p_frames_bit_exact_against_ffmpeg_oracle() {
+    let ivf = generate_libvpx_ivf("clip1_inter", 160, 112, 15, &["-auto-alt-ref", "0"]);
+    assert_ivf_bit_exact("clip1_inter", &ivf, 160, 112, 15);
+    let _ = std::fs::remove_file(&ivf);
+}
+
+#[test]
+fn vp9_inter_clip2_altref_compound_bit_exact_against_ffmpeg_oracle() {
+    let ivf = generate_libvpx_ivf(
+        "clip2_altref",
+        160,
+        112,
+        15,
+        &["-auto-alt-ref", "1", "-lag-in-frames", "10"],
+    );
+    assert_ivf_bit_exact("clip2_altref", &ivf, 160, 112, 15);
+    let _ = std::fs::remove_file(&ivf);
+}
+
+#[test]
+fn vp9_inter_clip3_odd_dim_130x98_bit_exact_against_ffmpeg_oracle() {
+    let ivf = generate_libvpx_ivf("clip3_odd", 130, 98, 10, &["-auto-alt-ref", "0"]);
+    assert_ivf_bit_exact("clip3_odd", &ivf, 130, 98, 10);
+    let _ = std::fs::remove_file(&ivf);
+}
+
+#[test]
+fn vp9_inter_clip4_multi_tile_320x240_bit_exact_against_ffmpeg_oracle() {
+    let ivf = generate_libvpx_ivf(
+        "clip4_tiles",
+        320,
+        240,
+        10,
+        &["-tile-columns", "1", "-auto-alt-ref", "0"],
+    );
+    assert_ivf_bit_exact("clip4_tiles", &ivf, 320, 240, 10);
+    let _ = std::fs::remove_file(&ivf);
+}

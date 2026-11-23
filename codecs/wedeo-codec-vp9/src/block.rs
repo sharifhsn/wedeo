@@ -439,7 +439,8 @@ fn decode_block(
         {
             skip = true;
             let row7 = (row >> 1) & 7;
-            for c in col..col + w4 {
+            let skip_w4 = BWH_TAB[0][bs as usize][0] as usize;
+            for c in col..col + skip_w4 {
                 if c < td.above.skip.len() {
                     td.above.skip[c] = 1;
                 }
@@ -983,9 +984,9 @@ fn decode_inter_mode(
 
     // --- MV search context ---
     // MV clamping bounds: cols_4x4/rows_4x4 and col/row are in 4×4 units,
-    // so bw4/bh4 must also be in 4×4 units (BWH_TAB[0], not BWH_TAB[1]).
-    let bw4 = BWH_TAB[0][bs as usize][0] as i32;
-    let bh4 = BWH_TAB[0][bs as usize][1] as i32;
+    // and FFmpeg uses 8x8-aligned block extents (BWH_TAB[1] * 2).
+    let bw4 = BWH_TAB[1][bs as usize][0] as i32 * 2;
+    let bh4 = BWH_TAB[1][bs as usize][1] as i32 * 2;
     let mv_ctx = MvSearchCtx {
         min_mv: [
             (-(128 + col as i32 * 32)).clamp(i16::MIN as i32, i16::MAX as i32) as i16,
@@ -1459,9 +1460,9 @@ fn update_mv_ctx(
                 td.above.mv[ac + 1] = mv3;
             }
         } else {
-            // >=8×8: broadcast mv[3] across w4*2 above and h4*2 left
+            // >=8×8: broadcast mv[3] across above (8x8 width * 4) and left (8x8 height * 2).
             let mv3 = mv[3];
-            for n in 0..w4 * 2 {
+            for n in 0..w4 * 4 {
                 let idx = col * 2 + n;
                 if idx < td.above.mv.len() {
                     td.above.mv[idx] = mv3;
@@ -1476,11 +1477,12 @@ fn update_mv_ctx(
         }
     }
 
-    // MV grid update: write MvRefPair to cur_mv_grid for each 4×4 in the block.
-    // Use BWH_TAB[0] (luma dimensions in 4×4 units) since our grid has 4×4
-    // granularity, unlike the above/left context arrays which use BWH_TAB[1].
-    let grid_w4 = BWH_TAB[0][bs as usize][0] as usize;
-    let grid_h4 = BWH_TAB[0][bs as usize][1] as usize;
+    // MV grid update: write MvRefPair across the full 8x8-aligned block extent
+    // (BWH_TAB[1] * 2 in 4x4 units), matching FFmpeg vp9block.c lines 778-801.
+    // Clipped to the visible 8x8 grid, like FFmpeg's `w4 = FFMIN(cols - col, bw4)`,
+    // so wide blocks at the right edge do not wrap into the next grid row.
+    let grid_w4 = (w4 * 2).min(td.cols_4x4.saturating_sub(col));
+    let grid_h4 = (h4 * 2).min(td.rows_4x4.saturating_sub(row));
     for y in 0..grid_h4 {
         let grid_row = row + y;
         for x in 0..grid_w4 {
@@ -2161,8 +2163,8 @@ fn update_ctx(
     filter_id: u8,
     vref: u8,
 ) {
-    // Above context arrays are cols_4x4 entries (4×4 units) → use BWH_TAB[0] for width.
-    let w4 = BWH_TAB[0][bs as usize][0] as usize;
+    // Above context updates (cols_4x4 = 2 per 8x8 MI): use BWH_TAB[1][bs][0] * 2.
+    let w4 = BWH_TAB[1][bs as usize][0] as usize * 2;
     // Left context arrays are 8 entries (8×8 units) → use BWH_TAB[1] for height.
     let h4 = BWH_TAB[1][bs as usize][1] as usize;
     // row is in 4×4 units; left context needs 8×8-unit row within the SB.
