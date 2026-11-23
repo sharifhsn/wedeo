@@ -19,7 +19,6 @@ members = [
     "adapters/wedeo-rav1d",
     "adapters/wedeo-rav1e",
     "bins/wedeo-cli",
-    "bins/wedeo-play",
     "tests/fate",
 ]
 resolver = "3"
@@ -46,12 +45,8 @@ tracing = { version = "0.1", features = ["attributes"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 cc = "1"
 
-cpal = "0.17"
-minifb = "0.28"
 pollster = "0.4"
-ringbuf = "0.4"
 wgpu = "29"
-winit = "0.30"
 wedeo-core = { path = "crates/wedeo-core", version = "0.2.0" }
 wedeo-codec = { path = "crates/wedeo-codec", version = "0.2.0" }
 wedeo-format = { path = "crates/wedeo-format", version = "0.2.0" }

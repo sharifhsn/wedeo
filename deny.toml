@@ -6,7 +6,6 @@ all-features = true
 
 [advisories]
 ignore = [
-    { id = "RUSTSEC-2024-0384", reason = "instant is transitive via minifb — no upgrade available" },
     { id = "RUSTSEC-2024-0436", reason = "paste is transitive via rav1d — no upgrade available" },
 ]
 
