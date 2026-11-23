@@ -1,842 +1,917 @@
-// wedeo-cli — FFmpeg-style command-line interface.
-//
-// Supports:
-//   wedeo-cli -i input.mp4                       (probe, like ffprobe)
-//   wedeo-cli -i input.mp4 output.wav            (transcode)
-//   wedeo-cli -i input.mp4 -c:v av1 output.mp4   (transcode with codec selection)
-//   wedeo-cli -codecs / -formats                  (list registered codecs/formats)
-//
-// Reference: FFmpeg ffmpeg.c option parsing, ffprobe.c
+#![forbid(unsafe_code)]
+//! Unified `wedeo` CLI (`inspect` / `explain` / `transcode` / `cut` / `mux` /
+//! `ffmpeg` / `mcp` / `codecs` / `formats`).
+//!
+//! Licensed under `LGPL-2.1-or-later`.
+
+mod ffmpeg_compat;
+mod json;
+mod mcp;
+mod ops;
 
 use std::env;
-use std::io;
-use std::path::Path;
 use std::process;
 
-// Ensure inventory registrations are linked in.
-use wedeo_codec_h264 as _;
-use wedeo_codec_pcm as _;
-use wedeo_codec_vp9 as _;
-use wedeo_format_h264 as _;
-use wedeo_format_ivf as _;
-use wedeo_format_mp4 as _;
-use wedeo_format_wav as _;
-use wedeo_rav1d as _;
-use wedeo_rav1e as _;
-use wedeo_symphonia as _;
+use wedeo::{Error, Registry, Result, default_registry};
 
-use wedeo_codec::decoder::DecoderBuilder;
-use wedeo_codec::encoder::{CodecFlags, EncoderBuilder};
-use wedeo_codec::registry as codec_registry;
-use wedeo_core::codec_id::CodecId;
-use wedeo_core::error::Error;
-use wedeo_core::media_type::MediaType;
-use wedeo_format::context::{InputContext, OutputContext};
-use wedeo_format::demuxer::Stream;
-use wedeo_format::registry as format_registry;
+use crate::ffmpeg_compat::{FfmpegResult, execute_ffmpeg};
+use crate::ops::{
+    CutMode, CutReq, ExplainReq, InspectLevel, InspectReq, MuxReq, TranscodeReq,
+    format_codecs_table, format_formats_table, parse_pixel_layout, parse_size, parse_timestamp_sec,
+    run_cut, run_explain, run_inspect, run_mux, run_transcode,
+};
 
-// ---------------------------------------------------------------------------
-// Parsed CLI options
-// ---------------------------------------------------------------------------
-
-struct CliOptions {
-    inputs: Vec<String>,
-    output: Option<String>,
-    video_codec: Option<String>,
-    audio_codec: Option<String>,
-    format: Option<String>,
-    bitrate_video: Option<i64>,
-    bitrate_audio: Option<i64>,
-    overwrite: bool,
-    frames_video: Option<u64>,
-    codec_options: Vec<(String, String)>,
-    loglevel: String,
-    // Special modes
-    list_codecs: bool,
-    list_formats: bool,
-    list_decoders: bool,
-    list_encoders: bool,
-    copy_video: bool,
-    copy_audio: bool,
-    video_disabled: bool,
-    audio_disabled: bool,
-}
-
-impl CliOptions {
-    fn new() -> Self {
-        Self {
-            inputs: Vec::new(),
-            output: None,
-            video_codec: None,
-            audio_codec: None,
-            format: None,
-            bitrate_video: None,
-            bitrate_audio: None,
-            overwrite: false,
-            frames_video: None,
-            codec_options: Vec::new(),
-            loglevel: "warn".to_string(),
-            list_codecs: false,
-            list_formats: false,
-            list_decoders: false,
-            list_encoders: false,
-            copy_video: false,
-            copy_audio: false,
-            video_disabled: false,
-            audio_disabled: false,
-        }
-    }
-}
-
-fn parse_args() -> CliOptions {
+fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
-    let mut opts = CliOptions::new();
+    if let Err(err) = dispatch(&args) {
+        eprintln!("Error: {err}");
+        process::exit(1);
+    }
+}
 
+fn dispatch(args: &[String]) -> Result<()> {
     if args.is_empty() {
-        print_usage();
-        process::exit(0);
+        print!("{}", main_usage());
+        return Ok(());
     }
 
-    let mut i = 0;
+    let reg = default_registry();
+    let cmd = args[0].as_str();
+    let rest = &args[1..];
+
+    match cmd {
+        "-h" | "--help" | "help" => {
+            print!("{}", main_usage());
+            Ok(())
+        }
+        "-V" | "--version" | "version" => {
+            println!("wedeo {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        "inspect" => cmd_inspect(&reg, rest),
+        "explain" => cmd_explain(&reg, rest),
+        "transcode" => cmd_transcode(&reg, rest),
+        "cut" => cmd_cut(&reg, rest),
+        "mux" => cmd_mux(&reg, rest),
+        "ffmpeg" => cmd_ffmpeg(&reg, rest),
+        "mcp" => {
+            mcp::serve_stdio(&reg).map_err(|e| Error::io("mcp", &e))?;
+            Ok(())
+        }
+        "codecs" => {
+            print!("{}", format_codecs_table(&reg));
+            Ok(())
+        }
+        "formats" => {
+            print!("{}", format_formats_table(&reg));
+            Ok(())
+        }
+        other => Err(Error::invalid_argument(
+            "wedeo",
+            format!("unknown subcommand '{other}' (run `wedeo --help` for usage)"),
+        )),
+    }
+}
+
+fn main_usage() -> &'static str {
+    "\
+wedeo — Pure-Rust Universal A/V Adapter
+
+Usage:
+  wedeo <command> [options]
+
+Commands:
+  inspect    Inspect container AST, tracks, colorimetry, packets/GOP/NALs, and StreamHealth
+  explain    Compile pipeline via wedeo-graph without running (nodes, bridges, GPU notes)
+  transcode  Transcode or remux media preserving tracks, metadata, chapters, and rotation
+  cut        Cut time ranges (--mode keyframe|smart|reencode via wedeo_graph::timeline)
+  mux        Losslessly mux video/audio/subtitle/chapter/tag streams from multiple inputs
+  ffmpeg     Order-sensitive FFmpeg CLI compatibility mode (`wedeo ffmpeg ...`)
+  mcp        Start stdio JSON-RPC 2.0 MCP server exposing the 5 typed operations
+  codecs     List registered decoders and encoders
+  formats    List registered demuxers and muxers
+"
+}
+
+fn next_val(args: &[String], idx: &mut usize, flag: &str) -> Result<String> {
+    *idx += 1;
+    args.get(*idx)
+        .cloned()
+        .ok_or_else(|| Error::invalid_argument("wedeo", format!("option {flag} requires a value")))
+}
+
+// ---------------------------------------------------------------------------
+// Subcommand Parsers & Runners
+// ---------------------------------------------------------------------------
+
+fn cmd_inspect(reg: &Registry, args: &[String]) -> Result<()> {
+    let mut input: Option<String> = None;
+    let mut level = InspectLevel::Container;
+    let mut verify = false;
+    let mut max_packets: Option<usize> = None;
+    let mut json_out = false;
+
+    let mut i = 0usize;
     while i < args.len() {
         match args[i].as_str() {
-            "-i" => {
-                i += 1;
-                if i >= args.len() {
-                    die("Option -i requires an argument");
-                }
-                opts.inputs.push(args[i].clone());
+            "-h" | "--help" => {
+                println!(
+                    "Usage: wedeo inspect [--level container|packets|gop|nal] [--verify] [--max-packets N] [--json] <input>"
+                );
+                return Ok(());
             }
-
-            "-c:v" | "-vcodec" => {
-                i += 1;
-                if i >= args.len() {
-                    die("Option -c:v requires an argument");
-                }
-                if args[i] == "copy" {
-                    opts.copy_video = true;
-                } else {
-                    opts.video_codec = Some(args[i].clone());
-                }
+            "-i" | "--input" => input = Some(next_val(args, &mut i, "--input")?),
+            "--level" => {
+                let v = next_val(args, &mut i, "--level")?;
+                level = InspectLevel::parse(&v)?;
             }
-
-            "-c:a" | "-acodec" => {
-                i += 1;
-                if i >= args.len() {
-                    die("Option -c:a requires an argument");
-                }
-                if args[i] == "copy" {
-                    opts.copy_audio = true;
-                } else {
-                    opts.audio_codec = Some(args[i].clone());
-                }
+            "--verify" => verify = true,
+            "--max-packets" => {
+                let v = next_val(args, &mut i, "--max-packets")?;
+                max_packets = Some(v.parse().map_err(|_| {
+                    Error::invalid_argument("inspect", format!("invalid --max-packets '{v}'"))
+                })?);
             }
-
-            "-c" => {
-                i += 1;
-                if i >= args.len() {
-                    die("Option -c requires an argument");
-                }
-                if args[i] == "copy" {
-                    opts.copy_video = true;
-                    opts.copy_audio = true;
-                } else {
-                    opts.video_codec = Some(args[i].clone());
-                    opts.audio_codec = Some(args[i].clone());
-                }
+            "--json" => json_out = true,
+            flag if flag.starts_with('-') => {
+                return Err(Error::invalid_argument(
+                    "inspect",
+                    format!("unknown option '{flag}'"),
+                ));
             }
-
-            "-f" => {
-                i += 1;
-                if i >= args.len() {
-                    die("Option -f requires an argument");
+            pos => {
+                if input.is_some() {
+                    return Err(Error::invalid_argument(
+                        "inspect",
+                        format!("unexpected positional argument '{pos}'"),
+                    ));
                 }
-                opts.format = Some(args[i].clone());
-            }
-
-            "-b:v" => {
-                i += 1;
-                if i >= args.len() {
-                    die("Option -b:v requires an argument");
-                }
-                opts.bitrate_video = Some(parse_bitrate(&args[i]));
-            }
-
-            "-b:a" => {
-                i += 1;
-                if i >= args.len() {
-                    die("Option -b:a requires an argument");
-                }
-                opts.bitrate_audio = Some(parse_bitrate(&args[i]));
-            }
-
-            "-frames:v" | "-vframes" => {
-                i += 1;
-                if i >= args.len() {
-                    die("Option -frames:v requires an argument");
-                }
-                opts.frames_video = args[i].parse().ok();
-            }
-
-            "-y" => opts.overwrite = true,
-            "-vn" => opts.video_disabled = true,
-            "-an" => opts.audio_disabled = true,
-
-            "-v" | "-loglevel" => {
-                i += 1;
-                if i >= args.len() {
-                    die("Option -loglevel requires an argument");
-                }
-                opts.loglevel = args[i].clone();
-            }
-
-            "-codecs" => opts.list_codecs = true,
-            "-formats" => opts.list_formats = true,
-            "-decoders" => opts.list_decoders = true,
-            "-encoders" => opts.list_encoders = true,
-
-            "-h" | "-help" | "--help" => {
-                print_usage();
-                process::exit(0);
-            }
-
-            // Codec-private options: -key value (anything starting with -)
-            s if s.starts_with('-') && s.len() > 1 => {
-                let key = s.trim_start_matches('-').to_string();
-                i += 1;
-                if i >= args.len() {
-                    die(&format!("Option {s} requires an argument"));
-                }
-                opts.codec_options.push((key, args[i].clone()));
-            }
-
-            // Positional: output file (first non-flag after inputs)
-            _ => {
-                if opts.output.is_some() {
-                    die(&format!("Unexpected argument: {}", args[i]));
-                }
-                opts.output = Some(args[i].clone());
+                input = Some(pos.to_string());
             }
         }
         i += 1;
     }
 
-    opts
-}
-
-fn print_usage() {
-    eprintln!("wedeo-cli — FFmpeg-compatible multimedia tool");
-    eprintln!();
-    eprintln!("Usage:");
-    eprintln!("  wedeo-cli [options] [output_file]");
-    eprintln!();
-    eprintln!("Options:");
-    eprintln!("  -i <input>       Input file (required for most operations)");
-    eprintln!("  -c:v <codec>     Video codec (e.g. av1, copy)");
-    eprintln!("  -c:a <codec>     Audio codec (e.g. pcm_s16le, copy)");
-    eprintln!("  -c <codec>       Set both video and audio codec (or 'copy')");
-    eprintln!("  -f <format>      Force output format (e.g. mp4, wav)");
-    eprintln!("  -b:v <bitrate>   Video bitrate (e.g. 2M, 500k, 1000000)");
-    eprintln!("  -b:a <bitrate>   Audio bitrate");
-    eprintln!("  -frames:v <n>    Stop after encoding n video frames");
-    eprintln!("  -vn              Disable video");
-    eprintln!("  -an              Disable audio");
-    eprintln!("  -y               Overwrite output without asking");
-    eprintln!("  -v <level>       Log level (error, warn, info, debug, trace)");
-    eprintln!("  -codecs          List all registered codecs");
-    eprintln!("  -formats         List all registered formats");
-    eprintln!("  -decoders        List registered decoders");
-    eprintln!("  -encoders        List registered encoders");
-    eprintln!();
-    eprintln!("Examples:");
-    eprintln!("  wedeo-cli -i input.mp4                          # probe file info");
-    eprintln!("  wedeo-cli -i input.mp4 -c:v av1 output.mp4     # transcode to AV1");
-    eprintln!("  wedeo-cli -i input.mp4 -c copy output.mp4      # remux (copy streams)");
-    eprintln!("  wedeo-cli -i input.mp4 -an -c:v av1 output.mp4 # video only, encode AV1");
-    eprintln!("  wedeo-cli -codecs                               # list codecs");
-}
-
-// ---------------------------------------------------------------------------
-// Entry point
-// ---------------------------------------------------------------------------
-
-fn main() {
-    let opts = parse_args();
-
-    init_tracing(&opts.loglevel);
-
-    // List modes
-    if opts.list_codecs {
-        cmd_codecs();
-        return;
-    }
-    if opts.list_formats {
-        cmd_formats();
-        return;
-    }
-    if opts.list_decoders {
-        cmd_decoders();
-        return;
-    }
-    if opts.list_encoders {
-        cmd_encoders();
-        return;
-    }
-
-    if opts.inputs.is_empty() {
-        die("At least one input file is required. Use -i <file>.");
-    }
-
-    // No output file = probe mode (like ffprobe / ffmpeg -i with no output)
-    if opts.output.is_none() {
-        for input in &opts.inputs {
-            if let Err(e) = cmd_probe(input) {
-                eprintln!("Error probing {input}: {e}");
-                process::exit(1);
-            }
-        }
-        return;
-    }
-
-    // Transcode/remux mode
-    if let Err(e) = cmd_transcode(&opts) {
-        eprintln!("Error: {e}");
-        process::exit(1);
-    }
-}
-
-fn init_tracing(level: &str) {
-    let filter = match level {
-        "quiet" | "-8" => "off",
-        "error" => "error",
-        "warning" | "warn" => "warn",
-        "info" => "info",
-        "verbose" | "debug" => "debug",
-        "trace" => "trace",
-        other => other,
+    let path =
+        input.ok_or_else(|| Error::invalid_argument("inspect", "missing input file path"))?;
+    let req = InspectReq {
+        input: path,
+        level,
+        verify,
+        max_packets,
     };
-
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(filter)),
-        )
-        .with_target(true)
-        .with_writer(io::stderr)
-        .init();
-}
-
-// ---------------------------------------------------------------------------
-// Probe (ffprobe equivalent)
-// ---------------------------------------------------------------------------
-
-fn cmd_probe(path: &str) -> wedeo_core::Result<()> {
-    let ctx = InputContext::open(path)?;
-
-    eprintln!("Input: {path}");
-    if ctx.duration > 0 {
-        let secs = ctx.duration as f64 / 1_000_000.0;
-        let h = (secs / 3600.0) as u32;
-        let m = ((secs % 3600.0) / 60.0) as u32;
-        let s = secs % 60.0;
-        eprintln!("  Duration: {h:02}:{m:02}:{s:06.3}");
-    }
-
-    for (key, value) in ctx.metadata.iter() {
-        eprintln!("  {key}: {value}");
-    }
-
-    for stream in &ctx.streams {
-        let cp = &stream.codec_params;
-        match cp.media_type {
-            MediaType::Video => {
-                eprintln!(
-                    "  Stream #{}: Video: {} {}x{} {}",
-                    stream.index,
-                    cp.codec_id.name(),
-                    cp.width,
-                    cp.height,
-                    cp.pixel_format.name(),
-                );
-            }
-            MediaType::Audio => {
-                eprintln!(
-                    "  Stream #{}: Audio: {} {} Hz {} ch {}",
-                    stream.index,
-                    cp.codec_id.name(),
-                    cp.sample_rate,
-                    cp.channel_layout.nb_channels,
-                    cp.sample_format,
-                );
-            }
-            other => {
-                eprintln!(
-                    "  Stream #{}: {}: {}",
-                    stream.index,
-                    other,
-                    cp.codec_id.name(),
-                );
-            }
-        }
-    }
-
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Transcode / remux
-// ---------------------------------------------------------------------------
-
-fn cmd_transcode(opts: &CliOptions) -> wedeo_core::Result<()> {
-    let output_path = opts.output.as_deref().unwrap();
-
-    // Check overwrite
-    if !opts.overwrite && Path::new(output_path).exists() {
-        die(&format!(
-            "File '{output_path}' already exists. Use -y to overwrite."
-        ));
-    }
-
-    // Open input
-    let mut input = InputContext::open(&opts.inputs[0])?;
-
-    // Determine output format
-    let format_name = if let Some(ref f) = opts.format {
-        f.clone()
+    let report = run_inspect(reg, &req)?;
+    if json_out {
+        println!("{}", report.to_json());
     } else {
-        guess_format_from_path(output_path).ok_or_else(|| {
-            Error::Other(format!(
-                "Cannot determine format for '{output_path}'. Use -f."
-            ))
-        })?
-    };
-
-    // Classify input streams and decide what to do with each
-    let mut video_stream_idx: Option<usize> = None;
-    let mut audio_stream_idx: Option<usize> = None;
-
-    for stream in &input.streams {
-        match stream.codec_params.media_type {
-            MediaType::Video if !opts.video_disabled && video_stream_idx.is_none() => {
-                video_stream_idx = Some(stream.index);
-            }
-            MediaType::Audio if !opts.audio_disabled && audio_stream_idx.is_none() => {
-                audio_stream_idx = Some(stream.index);
-            }
-            _ => {}
-        }
-    }
-
-    if video_stream_idx.is_none() && audio_stream_idx.is_none() {
-        return Err(Error::Other("No streams selected for output".into()));
-    }
-
-    // Build decoders and encoders for selected streams
-    let mut video_decoder = None;
-    let mut video_encoder = None;
-    let mut audio_decoder = None;
-    let mut audio_encoder = None;
-
-    // Output stream list for the muxer
-    let mut output_streams: Vec<Stream> = Vec::new();
-
-    // --- Video ---
-    if let Some(idx) = video_stream_idx {
-        let in_stream = &input.streams[idx];
-        let in_params = &in_stream.codec_params;
-
-        if opts.copy_video {
-            // Stream copy: pass packets through
-            let mut out_stream = Stream::new(output_streams.len(), in_params.clone());
-            out_stream.time_base = in_stream.time_base;
-            output_streams.push(out_stream);
-        } else {
-            // Decode + encode
-            let dec = DecoderBuilder::new(in_params.clone()).open()?;
-            video_decoder = Some(dec);
-
-            let out_codec_id = if let Some(ref name) = opts.video_codec {
-                CodecId::from_name(name)
-                    .ok_or_else(|| Error::Other(format!("Unknown video codec: '{name}'")))?
-            } else {
-                // Use muxer's default video codec
-                let muxer_factory = format_registry::find_muxer_by_name(&format_name)
-                    .ok_or(Error::MuxerNotFound)?;
-                let default_codec = muxer_factory.descriptor().video_codec;
-                if default_codec == CodecId::None {
-                    return Err(Error::Other(format!(
-                        "Format '{format_name}' has no default video codec. Use -c:v."
-                    )));
-                }
-                default_codec
-            };
-
-            let mut enc_builder = EncoderBuilder::new(out_codec_id, MediaType::Video);
-            enc_builder.width = in_params.width;
-            enc_builder.height = in_params.height;
-            enc_builder.pixel_format = in_params.pixel_format;
-            enc_builder.time_base = in_stream.time_base;
-
-            if let Some(br) = opts.bitrate_video {
-                enc_builder.bit_rate = br;
-            }
-
-            // Check if muxer needs GLOBAL_HEADER
-            if let Some(muxer_factory) = format_registry::find_muxer_by_name(&format_name) {
-                let mflags = muxer_factory.descriptor().flags;
-                if mflags.contains(wedeo_format::muxer::OutputFormatFlags::GLOBALHEADER) {
-                    enc_builder.flags |= CodecFlags::GLOBAL_HEADER;
-                }
-            }
-
-            // Apply codec-private options
-            for (key, value) in &opts.codec_options {
-                enc_builder.options.set(key, value);
-            }
-
-            let enc = enc_builder.open()?;
-            video_encoder = Some(enc);
-
-            let mut out_params =
-                wedeo_codec::decoder::CodecParameters::new(out_codec_id, MediaType::Video);
-            out_params.width = in_params.width;
-            out_params.height = in_params.height;
-            out_params.pixel_format = in_params.pixel_format;
-            let mut out_stream = Stream::new(output_streams.len(), out_params);
-            out_stream.time_base = in_stream.time_base;
-            output_streams.push(out_stream);
-        }
-    }
-
-    // --- Audio ---
-    if let Some(idx) = audio_stream_idx {
-        let in_stream = &input.streams[idx];
-        let in_params = &in_stream.codec_params;
-
-        if opts.copy_audio {
-            let mut out_stream = Stream::new(output_streams.len(), in_params.clone());
-            out_stream.time_base = in_stream.time_base;
-            output_streams.push(out_stream);
-        } else {
-            let dec = DecoderBuilder::new(in_params.clone()).open()?;
-            audio_decoder = Some(dec);
-
-            let out_codec_id = if let Some(ref name) = opts.audio_codec {
-                CodecId::from_name(name)
-                    .ok_or_else(|| Error::Other(format!("Unknown audio codec: '{name}'")))?
-            } else {
-                let muxer_factory = format_registry::find_muxer_by_name(&format_name)
-                    .ok_or(Error::MuxerNotFound)?;
-                let default_codec = muxer_factory.descriptor().audio_codec;
-                if default_codec == CodecId::None {
-                    return Err(Error::Other(format!(
-                        "Format '{format_name}' has no default audio codec. Use -c:a."
-                    )));
-                }
-                default_codec
-            };
-
-            let mut enc_builder = EncoderBuilder::new(out_codec_id, MediaType::Audio);
-            enc_builder.sample_rate = in_params.sample_rate;
-            enc_builder.sample_format = in_params.sample_format;
-            enc_builder.channel_layout = in_params.channel_layout.clone();
-            enc_builder.time_base = in_stream.time_base;
-
-            if let Some(br) = opts.bitrate_audio {
-                enc_builder.bit_rate = br;
-            }
-
-            let enc = enc_builder.open()?;
-            audio_encoder = Some(enc);
-
-            let mut out_params =
-                wedeo_codec::decoder::CodecParameters::new(out_codec_id, MediaType::Audio);
-            out_params.sample_rate = in_params.sample_rate;
-            out_params.sample_format = in_params.sample_format;
-            out_params.channel_layout = in_params.channel_layout.clone();
-            let mut out_stream = Stream::new(output_streams.len(), out_params);
-            out_stream.time_base = in_stream.time_base;
-            output_streams.push(out_stream);
-        }
-    }
-
-    // Open output
-    let mut output = OutputContext::create(output_path, &format_name, &output_streams)?;
-
-    // --- Main processing loop ---
-    let mut video_frames_out = 0u64;
-    let frame_limit = opts.frames_video.unwrap_or(u64::MAX);
-
-    // Demux → decode → encode → mux
-    loop {
-        let packet = match input.read_packet() {
-            Ok(pkt) => pkt,
-            Err(Error::Eof) => break,
-            Err(e) => return Err(e),
-        };
-
-        let stream_idx = packet.stream_index;
-
-        // Video stream
-        if Some(stream_idx) == video_stream_idx {
-            if video_frames_out >= frame_limit {
-                continue;
-            }
-
-            if opts.copy_video {
-                output.write_packet(&packet)?;
-                video_frames_out += 1;
-            } else if let (Some(dec), Some(enc)) = (&mut video_decoder, &mut video_encoder) {
-                dec.send_packet(Some(&packet))?;
-                loop {
-                    match dec.receive_frame() {
-                        Ok(frame) => {
-                            if video_frames_out >= frame_limit {
-                                break;
-                            }
-                            enc.send_frame(Some(&frame))?;
-                            drain_encoder_to_output(&mut **enc, &mut output)?;
-                            video_frames_out += 1;
-                        }
-                        Err(Error::Again) => break,
-                        Err(e) => return Err(e),
-                    }
-                }
-            }
-            continue;
-        }
-
-        // Audio stream
-        if Some(stream_idx) == audio_stream_idx {
-            if opts.copy_audio {
-                output.write_packet(&packet)?;
-            } else if let (Some(dec), Some(enc)) = (&mut audio_decoder, &mut audio_encoder) {
-                dec.send_packet(Some(&packet))?;
-                loop {
-                    match dec.receive_frame() {
-                        Ok(frame) => {
-                            enc.send_frame(Some(&frame))?;
-                            drain_encoder_to_output(&mut **enc, &mut output)?;
-                        }
-                        Err(Error::Again) => break,
-                        Err(e) => return Err(e),
-                    }
-                }
-            }
-        }
-    }
-
-    // Drain decoders and encoders
-    if let (Some(dec), Some(enc)) = (&mut video_decoder, &mut video_encoder) {
-        dec.send_packet(None)?;
-        loop {
-            match dec.receive_frame() {
-                Ok(frame) => {
-                    if video_frames_out < frame_limit {
-                        enc.send_frame(Some(&frame))?;
-                        drain_encoder_to_output(&mut **enc, &mut output)?;
-                        video_frames_out += 1;
-                    }
-                }
-                Err(Error::Eof | Error::Again) => break,
-                Err(e) => return Err(e),
-            }
-        }
-        enc.send_frame(None)?;
-        drain_encoder_to_output(&mut **enc, &mut output)?;
-    }
-
-    if let (Some(dec), Some(enc)) = (&mut audio_decoder, &mut audio_encoder) {
-        dec.send_packet(None)?;
-        loop {
-            match dec.receive_frame() {
-                Ok(frame) => {
-                    enc.send_frame(Some(&frame))?;
-                    drain_encoder_to_output(&mut **enc, &mut output)?;
-                }
-                Err(Error::Eof | Error::Again) => break,
-                Err(e) => return Err(e),
-            }
-        }
-        enc.send_frame(None)?;
-        drain_encoder_to_output(&mut **enc, &mut output)?;
-    }
-
-    output.finish()?;
-
-    eprintln!("Output: {output_path}");
-    if video_stream_idx.is_some() {
-        eprintln!("  Video: {video_frames_out} frames");
-    }
-
-    Ok(())
-}
-
-fn drain_encoder_to_output(
-    enc: &mut dyn wedeo_codec::encoder::Encoder,
-    output: &mut OutputContext,
-) -> wedeo_core::Result<()> {
-    loop {
-        match enc.receive_packet() {
-            Ok(pkt) => output.write_packet(&pkt)?,
-            Err(Error::Again | Error::Eof) => break,
-            Err(e) => return Err(e),
-        }
+        print!("{}", report.format_human());
     }
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// List commands
-// ---------------------------------------------------------------------------
+fn parse_transcode_args(args: &[String], cmd_name: &'static str) -> Result<(TranscodeReq, bool)> {
+    let mut input: Option<String> = None;
+    let mut output: Option<String> = None;
+    let mut format: Option<String> = None;
+    let mut video_codec: Option<String> = None;
+    let mut audio_codec: Option<String> = None;
+    let mut video_bitrate: Option<i64> = None;
+    let mut audio_bitrate: Option<i64> = None;
+    let mut frames_video: Option<u64> = None;
+    let mut no_video = false;
+    let mut no_audio = false;
+    let mut size = None;
+    let mut pixel_layout = None;
+    let mut sample_rate = None;
+    let mut channels = None;
+    let mut start_sec = None;
+    let mut duration_sec = None;
+    let mut strict = false;
+    let mut preserve_all = true;
+    let mut overwrite = false;
+    let mut prefer_gpu = false;
+    let mut json_out = false;
 
-fn cmd_codecs() {
-    println!("Codecs:");
-    println!(" D..... = Decoding supported");
-    println!(" .E.... = Encoding supported");
-    println!(" ..V... = Video codec");
-    println!(" ..A... = Audio codec");
-    println!(" ..S... = Subtitle codec");
-    println!(" ------");
-
-    // Collect all known codec IDs from decoders and encoders
-    let mut seen = std::collections::BTreeMap::<&str, (bool, bool, &str)>::new();
-
-    for factory in codec_registry::decoders() {
-        let desc = factory.descriptor();
-        let entry = seen.entry(desc.name).or_insert((false, false, ""));
-        entry.0 = true;
-        if entry.2.is_empty() {
-            entry.2 = desc.long_name;
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-i" | "--input" => input = Some(next_val(args, &mut i, "--input")?),
+            "-o" | "--output" => output = Some(next_val(args, &mut i, "--output")?),
+            "-f" | "--format" => format = Some(next_val(args, &mut i, "--format")?),
+            "--video" | "-c:v" => video_codec = Some(next_val(args, &mut i, "--video")?),
+            "--audio" | "-c:a" => audio_codec = Some(next_val(args, &mut i, "--audio")?),
+            "--bitrate-video" | "-b:v" => {
+                let v = next_val(args, &mut i, "--bitrate-video")?;
+                video_bitrate = Some(parse_bitrate_value(&v)?);
+            }
+            "--bitrate-audio" | "-b:a" => {
+                let v = next_val(args, &mut i, "--bitrate-audio")?;
+                audio_bitrate = Some(parse_bitrate_value(&v)?);
+            }
+            "--frames" => {
+                let v = next_val(args, &mut i, "--frames")?;
+                frames_video = Some(v.parse().map_err(|_| {
+                    Error::invalid_argument(cmd_name, format!("invalid --frames '{v}'"))
+                })?);
+            }
+            "--no-video" | "-vn" => no_video = true,
+            "--no-audio" | "-an" => no_audio = true,
+            "--size" => {
+                let v = next_val(args, &mut i, "--size")?;
+                size = Some(parse_size(&v)?);
+            }
+            "--pix-fmt" => {
+                let v = next_val(args, &mut i, "--pix-fmt")?;
+                pixel_layout = Some(parse_pixel_layout(&v).ok_or_else(|| {
+                    Error::invalid_argument(cmd_name, format!("unknown pixel layout '{v}'"))
+                })?);
+            }
+            "--sample-rate" => {
+                let v = next_val(args, &mut i, "--sample-rate")?;
+                sample_rate = Some(v.parse().map_err(|_| {
+                    Error::invalid_argument(cmd_name, format!("invalid --sample-rate '{v}'"))
+                })?);
+            }
+            "--channels" => {
+                let v = next_val(args, &mut i, "--channels")?;
+                channels = Some(v.parse().map_err(|_| {
+                    Error::invalid_argument(cmd_name, format!("invalid --channels '{v}'"))
+                })?);
+            }
+            "--from" | "-ss" => {
+                let v = next_val(args, &mut i, "--from")?;
+                start_sec = Some(parse_timestamp_sec(&v)?);
+            }
+            "--duration" | "-t" => {
+                let v = next_val(args, &mut i, "--duration")?;
+                duration_sec = Some(parse_timestamp_sec(&v)?);
+            }
+            "--strict" => strict = true,
+            "--preserve-all" => preserve_all = true,
+            "--no-preserve-all" => preserve_all = false,
+            "-y" | "--overwrite" => overwrite = true,
+            "--gpu" => prefer_gpu = true,
+            "--json" => json_out = true,
+            flag if flag.starts_with('-') => {
+                return Err(Error::invalid_argument(
+                    cmd_name,
+                    format!("unknown option '{flag}'"),
+                ));
+            }
+            pos => {
+                if input.is_none() {
+                    input = Some(pos.to_string());
+                } else if output.is_none() {
+                    output = Some(pos.to_string());
+                } else {
+                    return Err(Error::invalid_argument(
+                        cmd_name,
+                        format!("unexpected positional argument '{pos}'"),
+                    ));
+                }
+            }
         }
-    }
-    for factory in codec_registry::encoders() {
-        let desc = factory.descriptor();
-        let entry = seen.entry(desc.name).or_insert((false, false, ""));
-        entry.1 = true;
-        if entry.2.is_empty() {
-            entry.2 = desc.long_name;
-        }
+        i += 1;
     }
 
-    for (name, (has_dec, has_enc, long_name)) in &seen {
-        let d = if *has_dec { 'D' } else { '.' };
-        let e = if *has_enc { 'E' } else { '.' };
-        let t = match CodecId::from_name(name).map(media_type_for_codec) {
-            Some(MediaType::Video) => 'V',
-            Some(MediaType::Audio) => 'A',
-            Some(MediaType::Subtitle) => 'S',
-            _ => '.',
-        };
-        println!(" {d}{e}{t}... {name:<20} {long_name}");
-    }
+    let in_path =
+        input.ok_or_else(|| Error::invalid_argument(cmd_name, "missing input (-i <file>)"))?;
+    let out_path =
+        output.ok_or_else(|| Error::invalid_argument(cmd_name, "missing output (-o <file>)"))?;
+
+    let mut req = TranscodeReq::new(in_path, out_path);
+    req.format = format;
+    req.video_codec = video_codec;
+    req.audio_codec = audio_codec;
+    req.video_bitrate = video_bitrate;
+    req.audio_bitrate = audio_bitrate;
+    req.frames_video = frames_video;
+    req.no_video = no_video;
+    req.no_audio = no_audio;
+    req.size = size;
+    req.pixel_layout = pixel_layout;
+    req.sample_rate = sample_rate;
+    req.channels = channels;
+    req.start_sec = start_sec;
+    req.duration_sec = duration_sec;
+    req.strict = strict;
+    req.preserve_all = preserve_all;
+    req.overwrite = overwrite;
+    req.prefer_gpu = prefer_gpu;
+    Ok((req, json_out))
 }
 
-fn cmd_decoders() {
-    println!("Decoders:");
-    for factory in codec_registry::decoders() {
-        let desc = factory.descriptor();
+fn cmd_explain(reg: &Registry, args: &[String]) -> Result<()> {
+    if args.iter().any(|a| a == "-h" || a == "--help") {
         println!(
-            "  {:<20} {} ({})",
-            desc.name, desc.long_name, desc.media_type
+            "Usage: wedeo explain -i <input> -o <output> [--video codec] [--audio codec] [--size WxH] [--strict] [--gpu] [--json]"
         );
+        return Ok(());
     }
+    let (tr, json_out) = parse_transcode_args(args, "explain")?;
+    let plan = run_explain(reg, &ExplainReq::new(tr))?;
+    if json_out {
+        println!("{}", plan.to_json());
+    } else {
+        print!("{}", plan.explain());
+    }
+    Ok(())
 }
 
-fn cmd_encoders() {
-    println!("Encoders:");
-    for factory in codec_registry::encoders() {
-        let desc = factory.descriptor();
+fn cmd_transcode(reg: &Registry, args: &[String]) -> Result<()> {
+    if args.iter().any(|a| a == "-h" || a == "--help") {
         println!(
-            "  {:<20} {} ({})",
-            desc.name, desc.long_name, desc.media_type
+            "Usage: wedeo transcode -i <input> -o <output> [--video codec] [--audio codec] [--frames N] [--size WxH] [--sample-rate Hz] [--channels N] [--strict] [--no-video] [--no-audio] [-y] [--json]"
         );
+        return Ok(());
     }
+    let (req, json_out) = parse_transcode_args(args, "transcode")?;
+    let report = run_transcode(reg, &req)?;
+    if json_out {
+        println!("{}", report.to_json());
+    } else {
+        print!("{}", report.format_human());
+    }
+    Ok(())
 }
 
-fn cmd_formats() {
-    println!("Formats:");
-    println!(" D. = Demuxing supported");
-    println!(" .M = Muxing supported");
-    println!(" --");
+fn cmd_cut(reg: &Registry, args: &[String]) -> Result<()> {
+    let mut input: Option<String> = None;
+    let mut output: Option<String> = None;
+    let mut from_sec: Option<f64> = None;
+    let mut to_sec: Option<f64> = None;
+    let mut mode = CutMode::Smart;
+    let mut format: Option<String> = None;
+    let mut video_codec: Option<String> = None;
+    let mut audio_codec: Option<String> = None;
+    let mut strict = false;
+    let mut preserve_all = true;
+    let mut overwrite = false;
+    let mut json_out = false;
 
-    let mut seen = std::collections::BTreeMap::<&str, (bool, bool, &str)>::new();
-
-    for factory in format_registry::demuxers() {
-        let desc = factory.descriptor();
-        let entry = seen.entry(desc.name).or_insert((false, false, ""));
-        entry.0 = true;
-        if entry.2.is_empty() {
-            entry.2 = desc.long_name;
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-h" | "--help" => {
+                println!(
+                    "Usage: wedeo cut -i <input> --from <time> --to <time> [--mode keyframe|smart|reencode] -o <output> [-y] [--json]"
+                );
+                return Ok(());
+            }
+            "-i" | "--input" => input = Some(next_val(args, &mut i, "--input")?),
+            "-o" | "--output" => output = Some(next_val(args, &mut i, "--output")?),
+            "--from" => {
+                let v = next_val(args, &mut i, "--from")?;
+                from_sec = Some(parse_timestamp_sec(&v)?);
+            }
+            "--to" => {
+                let v = next_val(args, &mut i, "--to")?;
+                to_sec = Some(parse_timestamp_sec(&v)?);
+            }
+            "--mode" => {
+                let v = next_val(args, &mut i, "--mode")?;
+                mode = CutMode::parse(&v)?;
+            }
+            "-f" | "--format" => format = Some(next_val(args, &mut i, "--format")?),
+            "--video" => video_codec = Some(next_val(args, &mut i, "--video")?),
+            "--audio" => audio_codec = Some(next_val(args, &mut i, "--audio")?),
+            "--strict" => strict = true,
+            "--preserve-all" => preserve_all = true,
+            "--no-preserve-all" => preserve_all = false,
+            "-y" | "--overwrite" => overwrite = true,
+            "--json" => json_out = true,
+            flag if flag.starts_with('-') => {
+                return Err(Error::invalid_argument(
+                    "cut",
+                    format!("unknown option '{flag}'"),
+                ));
+            }
+            pos => {
+                if input.is_none() {
+                    input = Some(pos.to_string());
+                } else if output.is_none() {
+                    output = Some(pos.to_string());
+                } else {
+                    return Err(Error::invalid_argument(
+                        "cut",
+                        format!("unexpected positional argument '{pos}'"),
+                    ));
+                }
+            }
         }
+        i += 1;
     }
-    for factory in format_registry::muxers() {
-        let desc = factory.descriptor();
-        let entry = seen.entry(desc.name).or_insert((false, false, ""));
-        entry.1 = true;
-        if entry.2.is_empty() {
-            entry.2 = desc.long_name;
+
+    let in_path = input.ok_or_else(|| Error::invalid_argument("cut", "missing -i <input>"))?;
+    let out_path = output.ok_or_else(|| Error::invalid_argument("cut", "missing -o <output>"))?;
+    let from = from_sec.ok_or_else(|| Error::invalid_argument("cut", "missing --from <time>"))?;
+    let to = to_sec.ok_or_else(|| Error::invalid_argument("cut", "missing --to <time>"))?;
+
+    let mut req = CutReq::new(in_path, out_path, from, to);
+    req.mode = mode;
+    req.format = format;
+    req.video_codec = video_codec;
+    req.audio_codec = audio_codec;
+    req.strict = strict;
+    req.preserve_all = preserve_all;
+    req.overwrite = overwrite;
+
+    let report = run_cut(reg, &req)?;
+    if json_out {
+        println!("{}", report.to_json());
+    } else {
+        print!("{}", report.format_human());
+    }
+    Ok(())
+}
+
+fn cmd_mux(reg: &Registry, args: &[String]) -> Result<()> {
+    let mut video_inputs = Vec::new();
+    let mut audio_inputs = Vec::new();
+    let mut extra_inputs = Vec::new();
+    let mut output: Option<String> = None;
+    let mut format: Option<String> = None;
+    let mut tags = Vec::new();
+    let mut strict = false;
+    let mut preserve_all = true;
+    let mut overwrite = false;
+    let mut json_out = false;
+
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-h" | "--help" => {
+                println!(
+                    "Usage: wedeo mux [--video <v>]... [--audio <a>]... [-i <file>]... --output <out> [--tag KEY=VAL] [-y] [--json]"
+                );
+                return Ok(());
+            }
+            "--video" => video_inputs.push(next_val(args, &mut i, "--video")?),
+            "--audio" => audio_inputs.push(next_val(args, &mut i, "--audio")?),
+            "-i" | "--input" => extra_inputs.push(next_val(args, &mut i, "--input")?),
+            "-o" | "--output" => output = Some(next_val(args, &mut i, "--output")?),
+            "-f" | "--format" => format = Some(next_val(args, &mut i, "--format")?),
+            "--tag" => {
+                let kv = next_val(args, &mut i, "--tag")?;
+                let Some((k, v)) = kv.split_once('=') else {
+                    return Err(Error::invalid_argument(
+                        "mux",
+                        format!("invalid --tag '{kv}', expected KEY=VALUE"),
+                    ));
+                };
+                tags.push((k.to_string(), v.to_string()));
+            }
+            "--strict" => strict = true,
+            "--preserve-all" => preserve_all = true,
+            "--no-preserve-all" => preserve_all = false,
+            "-y" | "--overwrite" => overwrite = true,
+            "--json" => json_out = true,
+            flag if flag.starts_with('-') => {
+                return Err(Error::invalid_argument(
+                    "mux",
+                    format!("unknown option '{flag}'"),
+                ));
+            }
+            pos => {
+                if output.is_none() {
+                    output = Some(pos.to_string());
+                } else {
+                    return Err(Error::invalid_argument(
+                        "mux",
+                        format!("unexpected positional argument '{pos}'"),
+                    ));
+                }
+            }
         }
+        i += 1;
     }
 
-    for (name, (has_demux, has_mux, long_name)) in &seen {
-        let d = if *has_demux { 'D' } else { '.' };
-        let m = if *has_mux { 'M' } else { '.' };
-        println!(" {d}{m} {name:<20} {long_name}");
+    let out_path =
+        output.ok_or_else(|| Error::invalid_argument("mux", "missing --output <file>"))?;
+    let mut req = MuxReq::new(out_path);
+    req.video_inputs = video_inputs;
+    req.audio_inputs = audio_inputs;
+    req.extra_inputs = extra_inputs;
+    req.format = format;
+    req.tags = tags;
+    req.strict = strict;
+    req.preserve_all = preserve_all;
+    req.overwrite = overwrite;
+
+    let report = run_mux(reg, &req)?;
+    if json_out {
+        println!("{}", report.to_json());
+    } else {
+        print!("{}", report.format_human());
     }
+    Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn guess_format_from_path(path: &str) -> Option<String> {
-    let ext = Path::new(path).extension()?.to_str()?;
-    let factory = format_registry::guess_muxer_by_extension(ext)?;
-    Some(factory.descriptor().name.to_string())
+fn cmd_ffmpeg(reg: &Registry, args: &[String]) -> Result<()> {
+    match execute_ffmpeg(reg, args)? {
+        FfmpegResult::Text(txt) => print!("{txt}"),
+        FfmpegResult::Report(rep) => print!("{}", rep.format_human()),
+    }
+    Ok(())
 }
 
-fn parse_bitrate(s: &str) -> i64 {
+fn parse_bitrate_value(s: &str) -> Result<i64> {
     let s = s.trim();
     if let Some(prefix) = s.strip_suffix('k').or_else(|| s.strip_suffix('K')) {
-        prefix.parse::<i64>().unwrap_or(0) * 1000
-    } else if let Some(prefix) = s.strip_suffix('M') {
-        prefix.parse::<i64>().unwrap_or(0) * 1_000_000
+        let v: i64 = prefix
+            .parse()
+            .map_err(|_| Error::invalid_argument("wedeo", format!("invalid bitrate '{s}'")))?;
+        Ok(v.saturating_mul(1000))
+    } else if let Some(prefix) = s.strip_suffix('M').or_else(|| s.strip_suffix('m')) {
+        let v: i64 = prefix
+            .parse()
+            .map_err(|_| Error::invalid_argument("wedeo", format!("invalid bitrate '{s}'")))?;
+        Ok(v.saturating_mul(1_000_000))
     } else {
-        s.parse::<i64>().unwrap_or(0)
+        s.parse()
+            .map_err(|_| Error::invalid_argument("wedeo", format!("invalid bitrate '{s}'")))
     }
 }
 
-fn media_type_for_codec(id: CodecId) -> MediaType {
-    match id {
-        CodecId::None => MediaType::Data,
-        CodecId::Mpeg1video
-        | CodecId::Mpeg2video
-        | CodecId::H261
-        | CodecId::H263
-        | CodecId::Rv10
-        | CodecId::Rv20
-        | CodecId::Mjpeg
-        | CodecId::Mpeg4
-        | CodecId::Rawvideo
-        | CodecId::H264
-        | CodecId::Vp8
-        | CodecId::Vp9
-        | CodecId::Hevc
-        | CodecId::Av1 => MediaType::Video,
-        CodecId::SubDvdSubtitle
-        | CodecId::SubDvbSubtitle
-        | CodecId::SubText
-        | CodecId::SubXsub
-        | CodecId::SubSsa
-        | CodecId::SubMovText
-        | CodecId::SubSrt
-        | CodecId::SubWebvtt => MediaType::Subtitle,
-        _ => MediaType::Audio,
-    }
-}
+// ---------------------------------------------------------------------------
+// Comprehensive Unit & CLI Integration Tests
+// ---------------------------------------------------------------------------
 
-fn die(msg: &str) -> ! {
-    eprintln!("Error: {msg}");
-    process::exit(1);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use crate::json::JsonValue;
+    use wedeo::{
+        AudioStreamParams, Buffer, ChannelLayout, CodecId, ContainerHeader, FileSink, Packet,
+        PacketFlags, Rational, SampleFormat, StreamParams, Timestamp, TrackDescriptor, TrackId,
+    };
+
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_path(name: &str) -> PathBuf {
+        let id = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut p = env::temp_dir();
+        p.push(format!("wedeo_cli_test_{}_{}_{}", process::id(), id, name));
+        p
+    }
+
+    fn workspace_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf()
+    }
+
+    fn vp9_red_ivf() -> PathBuf {
+        workspace_root().join("tests/wedeo-oracle/data/vp9_red_64x64.ivf")
+    }
+
+    fn vp9_testsrc_ivf() -> PathBuf {
+        workspace_root().join("tests/wedeo-oracle/data/vp9_testsrc_128x128.ivf")
+    }
+
+    fn create_synthetic_wav(path: &Path, sample_rate: u32, samples_per_ch: usize) {
+        let reg = default_registry();
+        let muxer_factory = reg.find_muxer_by_name("wav").unwrap();
+        let sink = FileSink::create(path).unwrap();
+        let mut muxer = muxer_factory.create(Box::new(sink)).unwrap();
+
+        let tb = Rational::new(1, sample_rate as i32);
+        let ap = AudioStreamParams::new(sample_rate, SampleFormat::S16, ChannelLayout::stereo());
+        let mut hdr = ContainerHeader::new("wav");
+        hdr.time_base = tb;
+        hdr.tracks.push(TrackDescriptor::new(
+            TrackId(0),
+            CodecId::PcmS16le,
+            tb,
+            StreamParams::Audio(ap),
+        ));
+        muxer.write_header(&hdr).unwrap();
+
+        let mut bytes = vec![0u8; samples_per_ch * 2 * 2];
+        for i in 0..samples_per_ch {
+            let v = ((i as i32 * 257) % 10000) as i16;
+            bytes[i * 4..i * 4 + 2].copy_from_slice(&v.to_le_bytes());
+            bytes[i * 4 + 2..i * 4 + 4].copy_from_slice(&(-v).to_le_bytes());
+        }
+        let mut pkt = Packet::new(Buffer::from_slice(&bytes), TrackId(0), tb);
+        pkt.pts = Timestamp::new(0);
+        pkt.dts = Timestamp::new(0);
+        pkt.duration = samples_per_ch as i64;
+        pkt.flags = PacketFlags::KEY;
+        muxer.write_packet(&pkt).unwrap();
+        muxer.finalize().unwrap();
+    }
+
+    #[test]
+    fn test_inspect_json_and_verify_on_vp9_red_ivf() {
+        let ivf = vp9_red_ivf();
+        assert!(
+            ivf.exists(),
+            "missing bundled test vector {}",
+            ivf.display()
+        );
+
+        let reg = default_registry();
+        let mut req = InspectReq::new(ivf.to_string_lossy().to_string());
+        req.level = InspectLevel::Nal;
+        req.verify = true;
+        let rep = run_inspect(&reg, &req).unwrap();
+        assert_eq!(rep.format_name, "ivf");
+        assert!(rep.verified);
+        assert_eq!(rep.decoded_units, 1);
+        assert!(rep.health.is_clean);
+        assert_eq!(rep.tracks.len(), 1);
+        assert_eq!(rep.tracks[0].codec, "vp9");
+        assert_eq!(rep.tracks[0].width, Some(64));
+        assert_eq!(rep.tracks[0].height, Some(64));
+        assert_eq!(rep.packets.len(), 1);
+        assert!(rep.packets[0].is_key);
+        assert!(!rep.packets[0].units.is_empty());
+
+        let parsed = JsonValue::parse(&rep.to_json()).unwrap();
+        assert_eq!(
+            parsed.get("verified").and_then(JsonValue::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            parsed.get("decoded_units").and_then(JsonValue::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            parsed
+                .get("health")
+                .and_then(|h| h.get("is_clean"))
+                .and_then(JsonValue::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_explain_and_transcode_av1_mp4_in_process() {
+        let ivf = vp9_red_ivf();
+        let reg = default_registry();
+        let out_mp4 = temp_path("inproc_av1.mp4");
+
+        let mut tr = TranscodeReq::new(
+            ivf.to_string_lossy().to_string(),
+            out_mp4.to_string_lossy().to_string(),
+        );
+        tr.video_codec = Some("av1".to_string());
+        tr.size = Some((32, 32));
+        tr.overwrite = true;
+
+        let plan = run_explain(&reg, &ExplainReq::new(tr.clone())).unwrap();
+        assert!(!out_mp4.exists(), "explain must not write output file");
+        assert!(plan.nodes.iter().any(|n| n.name == "sws_op_list"));
+        assert!(!plan.conversion_notes.is_empty());
+
+        let rep = run_transcode(&reg, &tr).unwrap();
+        assert!(out_mp4.exists());
+        assert_eq!(rep.format, "mp4");
+        assert!(rep.health.is_clean);
+
+        let _ = std::fs::remove_file(&out_mp4);
+    }
+
+    #[test]
+    fn test_mcp_jsonrpc_unit_roundtrip() {
+        let reg = default_registry();
+        let ivf = vp9_red_ivf();
+
+        let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+        let r1 = JsonValue::parse(&mcp::handle_jsonrpc_line(&reg, init).unwrap()).unwrap();
+        assert_eq!(r1.get("id").and_then(JsonValue::as_i64), Some(1));
+
+        let notif = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+        assert!(mcp::handle_jsonrpc_line(&reg, notif).is_none());
+
+        let list = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
+        let r2 = JsonValue::parse(&mcp::handle_jsonrpc_line(&reg, list).unwrap()).unwrap();
+        assert_eq!(
+            r2.get("result")
+                .and_then(|r| r.get("tools"))
+                .and_then(JsonValue::as_arr)
+                .map(<[JsonValue]>::len),
+            Some(5)
+        );
+
+        let call = JsonValue::obj(vec![
+            ("jsonrpc", "2.0".into()),
+            ("id", 3i64.into()),
+            ("method", "tools/call".into()),
+            (
+                "params",
+                JsonValue::obj(vec![
+                    ("name", "inspect".into()),
+                    (
+                        "arguments",
+                        JsonValue::obj(vec![
+                            ("input", ivf.to_string_lossy().to_string().into()),
+                            ("verify", true.into()),
+                        ]),
+                    ),
+                ]),
+            ),
+        ])
+        .to_compact();
+        let r3 = JsonValue::parse(&mcp::handle_jsonrpc_line(&reg, &call).unwrap()).unwrap();
+        assert_eq!(
+            r3.get("result")
+                .and_then(|r| r.get("isError"))
+                .and_then(JsonValue::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_mux_and_ffmpeg_vn_stream_index_remapping() {
+        let ivf = vp9_red_ivf();
+        let wav = temp_path("audio.wav");
+        let muxed_mkv = temp_path("muxed.mkv");
+        let audio_only_mkv = temp_path("audio_only.mkv");
+
+        create_synthetic_wav(&wav, 48_000, 4800);
+
+        let reg = default_registry();
+        let mut mux_req = MuxReq::new(muxed_mkv.to_string_lossy().to_string());
+        mux_req.video_inputs.push(ivf.to_string_lossy().to_string());
+        mux_req.audio_inputs.push(wav.to_string_lossy().to_string());
+        mux_req
+            .tags
+            .push(("title".to_string(), "Wedeo Mux Test".to_string()));
+        mux_req.overwrite = true;
+        let mux_rep = run_mux(&reg, &mux_req).unwrap();
+        assert_eq!(mux_rep.tracks, 2);
+
+        // Execute `wedeo ffmpeg` compat translator with `-vn` (remaps track #1 -> track #0)
+        let args: Vec<String> = vec![
+            "-i",
+            muxed_mkv.to_str().unwrap(),
+            "-vn",
+            "-c:a",
+            "copy",
+            "-y",
+            audio_only_mkv.to_str().unwrap(),
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let res = execute_ffmpeg(&reg, &args).unwrap();
+        assert!(matches!(res, FfmpegResult::Report(_)));
+
+        let inspect_out = run_inspect(
+            &reg,
+            &InspectReq {
+                input: audio_only_mkv.to_string_lossy().to_string(),
+                level: InspectLevel::Container,
+                verify: true,
+                max_packets: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(inspect_out.tracks.len(), 1);
+        assert_eq!(inspect_out.tracks[0].media_type, "audio");
+        assert!(inspect_out.health.is_clean);
+        assert!(inspect_out.decoded_units > 0);
+
+        let _ = std::fs::remove_file(&wav);
+        let _ = std::fs::remove_file(&muxed_mkv);
+        let _ = std::fs::remove_file(&audio_only_mkv);
+    }
+
+    #[test]
+    fn test_cut_modes_on_multi_frame_ivf() {
+        let ivf = vp9_testsrc_ivf();
+        assert!(
+            ivf.exists(),
+            "missing bundled test vector {}",
+            ivf.display()
+        );
+        let reg = default_registry();
+
+        // 1. Keyframe cut on bundled VP9 IVF -> MKV
+        let out_kf = temp_path("cut_kf.mkv");
+        let mut req_kf = CutReq::new(
+            ivf.to_string_lossy().to_string(),
+            out_kf.to_string_lossy().to_string(),
+            0.0,
+            0.04,
+        );
+        req_kf.mode = CutMode::Keyframe;
+        req_kf.overwrite = true;
+        let rep_kf = run_cut(&reg, &req_kf).unwrap();
+        assert!(rep_kf.packets_processed > 0);
+        assert!(!rep_kf.smart_cut_segments.is_empty());
+
+        // 2. Build a 9-frame, 3-GOP synthetic AV1 MKV (keyframes at 0, 300ms, 600ms; 100ms/frame)
+        let av1_src = temp_path("cut_src_av1.mkv");
+        let pool = wedeo::BufferPool::new();
+        let tb = Rational::new(1, 1000);
+        let mut vp = wedeo::VideoStreamParams::new(64, 64, wedeo::PixelLayout::YUV420P);
+        vp.color = wedeo::ColorDesc::BT709_LIMITED;
+        let mut enc_track = TrackDescriptor::new(
+            TrackId(0),
+            CodecId::Av1,
+            tb,
+            StreamParams::Video(vp.clone()),
+        );
+        let mut enc = reg
+            .find_encoder(CodecId::Av1)
+            .unwrap()
+            .open(
+                &enc_track,
+                wedeo::CodecContext::new(std::sync::Arc::clone(&pool)),
+                wedeo::PassMode::Single,
+            )
+            .unwrap();
+        if let StreamParams::Video(ref mut vp_mut) = enc_track.params {
+            vp_mut.extradata = enc.extradata().to_vec();
+        }
+        let mut hdr = ContainerHeader::new("matroska");
+        hdr.time_base = tb;
+        hdr.tracks.push(enc_track);
+        let mut muxer = reg
+            .find_muxer_by_name("matroska")
+            .unwrap()
+            .create(Box::new(FileSink::create(&av1_src).unwrap()))
+            .unwrap();
+        muxer.write_header(&hdr).unwrap();
+
+        for i in 0..9i64 {
+            let mut y = wedeo::BorderedPlane::new(&pool, 64, 64, wedeo::BorderPadding::NONE);
+            for r in 0..64 {
+                y.row_mut(r).unwrap().fill((20 + i * 20) as u8);
+            }
+            let mut u = wedeo::BorderedPlane::new(&pool, 32, 32, wedeo::BorderPadding::NONE);
+            let mut v = wedeo::BorderedPlane::new(&pool, 32, 32, wedeo::BorderPadding::NONE);
+            for r in 0..32 {
+                u.row_mut(r).unwrap().fill(128);
+                v.row_mut(r).unwrap().fill(128);
+            }
+            let mut frame =
+                wedeo::VideoFrame::from_planes(64, 64, wedeo::PixelLayout::YUV420P, vec![y, u, v]);
+            frame.color = wedeo::ColorDesc::BT709_LIMITED;
+            frame.pts = Timestamp::new(i * 100);
+            frame.duration = 100;
+            frame.time_base = tb;
+            let hint = wedeo::EncodeHint {
+                force_keyframe: i % 3 == 0,
+                target_qp: None,
+            };
+            enc.send_unit(Some(&wedeo::MediaUnit::Video(frame)), hint)
+                .unwrap();
+            while let wedeo::RecvStatus::Ready(pkt) = enc.receive_packet().unwrap() {
+                muxer.write_packet(&pkt).unwrap();
+            }
+        }
+        enc.send_unit(None, wedeo::EncodeHint::default()).unwrap();
+        while let wedeo::RecvStatus::Ready(pkt) = enc.receive_packet().unwrap() {
+            muxer.write_packet(&pkt).unwrap();
+        }
+        muxer.finalize().unwrap();
+
+        // Cut [0.15s, 0.75s) -> ReencodeHead [150..300) + CopyInterior [300..600) + ReencodeTail [600..750)
+        let out_smart = temp_path("cut_smart_3gop.mkv");
+        let mut req_smart = CutReq::new(
+            av1_src.to_string_lossy().to_string(),
+            out_smart.to_string_lossy().to_string(),
+            0.15,
+            0.75,
+        );
+        req_smart.mode = CutMode::Smart;
+        req_smart.overwrite = true;
+        let rep_smart = run_cut(&reg, &req_smart).unwrap();
+        assert_eq!(
+            rep_smart.smart_cut_segments.len(),
+            3,
+            "segments: {:?}",
+            rep_smart.smart_cut_segments
+        );
+        assert!(rep_smart.smart_cut_segments[0].contains("ReencodeHead"));
+        assert!(rep_smart.smart_cut_segments[1].contains("CopyInterior"));
+        assert!(rep_smart.smart_cut_segments[2].contains("ReencodeTail"));
+
+        let ins = run_inspect(
+            &reg,
+            &InspectReq {
+                input: out_smart.to_string_lossy().to_string(),
+                level: InspectLevel::Packets,
+                verify: true,
+                max_packets: None,
+            },
+        )
+        .unwrap();
+        assert!(ins.health.is_clean);
+        assert_eq!(ins.decoded_units, 6); // frames at 200, 300, 400, 500, 600, 700 ms
+
+        let _ = std::fs::remove_file(&out_kf);
+        let _ = std::fs::remove_file(&av1_src);
+        let _ = std::fs::remove_file(&out_smart);
+    }
 }
