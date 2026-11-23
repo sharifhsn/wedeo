@@ -15,9 +15,5 @@ workspace = true
 name = "wedeo"
 path = "src/main.rs"
 
-[[bin]]
-name = "wedeo-cli"
-path = "src/main.rs"
-
 [dependencies]
 wedeo = { workspace = true, features = ["rav1d"] }
