@@ -312,3 +312,112 @@ fn cli_mux_and_ffmpeg_vn_stream_index_remapping() {
     let _ = std::fs::remove_file(&muxed);
     let _ = std::fs::remove_file(&audio_only);
 }
+
+#[test]
+fn cli_multicall_ffmpeg_and_ffprobe_ytdlp_shim() {
+    let shim_dir = temp_path("cli_shim_dir");
+    let ivf = vp9_red_ivf();
+    let wav = temp_path("cli_shim_audio.wav");
+    let merged = temp_path("cli_shim_merged.mkv");
+    let extracted = temp_path("cli_shim_extracted.wav");
+
+    create_synthetic_wav(&wav, 48_000, 4800);
+
+    let res_inst = Command::new(wedeo_bin())
+        .args(["install-shim"])
+        .arg(&shim_dir)
+        .output()
+        .unwrap();
+    assert!(
+        res_inst.status.success(),
+        "install-shim failed: {}",
+        String::from_utf8_lossy(&res_inst.stderr)
+    );
+
+    let ffmpeg_shim = shim_dir.join("ffmpeg");
+    let ffprobe_shim = shim_dir.join("ffprobe");
+
+    // 1. yt-dlp probes `-bsfs` for version + bitstream filter capabilities.
+    let bsfs = Command::new(&ffmpeg_shim).arg("-bsfs").output().unwrap();
+    assert!(bsfs.status.success());
+    let bsfs_out = String::from_utf8(bsfs.stdout).unwrap();
+    assert!(bsfs_out.contains("ffmpeg version 9.1-wedeo-"), "{bsfs_out}");
+    assert!(bsfs_out.contains("aac_adtstoasc"), "{bsfs_out}");
+
+    // 2. yt-dlp merges video + audio with `file:` URI prefixes and `-map 0:v:0 -map 1:a:0`.
+    let merge = Command::new(&ffmpeg_shim)
+        .args([
+            "-y",
+            "-loglevel",
+            "repeat+info",
+            "-i",
+            &format!("file:{}", ivf.display()),
+            "-i",
+            &format!("file:{}", wav.display()),
+            "-c",
+            "copy",
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-movflags",
+            "+faststart",
+            &format!("file:{}", merged.display()),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        merge.status.success(),
+        "shim merge failed: {}",
+        String::from_utf8_lossy(&merge.stderr)
+    );
+
+    // 3. yt-dlp probes merged file via both JSON and default `[STREAM]` ffprobe output.
+    let probe_json = Command::new(&ffprobe_shim)
+        .args([
+            "-hide_banner",
+            "-show_format",
+            "-show_streams",
+            "-print_format",
+            "json",
+            &format!("file:{}", merged.display()),
+        ])
+        .output()
+        .unwrap();
+    assert!(probe_json.status.success());
+    let pj = String::from_utf8(probe_json.stdout).unwrap();
+    assert!(pj.contains("\"codec_name\": \"vp9\""), "{pj}");
+    assert!(pj.contains("\"codec_name\": \"pcm_s16le\""), "{pj}");
+
+    let probe_ini = Command::new(&ffprobe_shim)
+        .args(["-show_streams", &format!("file:{}", merged.display())])
+        .output()
+        .unwrap();
+    assert!(probe_ini.status.success());
+    let pi = String::from_utf8(probe_ini.stdout).unwrap();
+    assert!(pi.contains("[STREAM]"), "{pi}");
+    assert!(pi.contains("codec_type=audio"), "{pi}");
+
+    // 4. yt-dlp extracts audio with `-vn` -> `.wav`.
+    let extract = Command::new(&ffmpeg_shim)
+        .args([
+            "-y",
+            "-i",
+            &format!("file:{}", merged.display()),
+            "-vn",
+            &format!("file:{}", extracted.display()),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        extract.status.success(),
+        "shim extract wav failed: {}",
+        String::from_utf8_lossy(&extract.stderr)
+    );
+    assert!(std::fs::metadata(&extracted).unwrap().len() > 1000);
+
+    let _ = std::fs::remove_dir_all(&shim_dir);
+    let _ = std::fs::remove_file(&wav);
+    let _ = std::fs::remove_file(&merged);
+    let _ = std::fs::remove_file(&extracted);
+}

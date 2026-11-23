@@ -10,11 +10,12 @@ mod mcp;
 mod ops;
 
 use std::env;
+use std::path::Path;
 use std::process;
 
 use wedeo::{Error, Registry, Result, default_registry};
 
-use crate::ffmpeg_compat::{FfmpegResult, execute_ffmpeg};
+use crate::ffmpeg_compat::{FfmpegResult, execute_ffmpeg, execute_ffprobe};
 use crate::ops::{
     CutMode, CutReq, ExplainReq, InspectLevel, InspectReq, MuxReq, TranscodeReq,
     format_codecs_table, format_formats_table, parse_pixel_layout, parse_size, parse_timestamp_sec,
@@ -22,8 +23,24 @@ use crate::ops::{
 };
 
 fn main() {
-    let args: Vec<String> = env::args().skip(1).collect();
-    if let Err(err) = dispatch(&args) {
+    let mut raw_args = env::args();
+    let argv0 = raw_args.next().unwrap_or_default();
+    let args: Vec<String> = raw_args.collect();
+
+    // Multi-call binary dispatch: symlinks named `ffmpeg` or `ffprobe` enter
+    // drop-in compatibility mode automatically (e.g. `yt-dlp --ffmpeg-location`).
+    let invoked_name = Path::new(&argv0)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("wedeo");
+
+    let res = match invoked_name {
+        "ffmpeg" => cmd_ffmpeg(&default_registry(), &args),
+        "ffprobe" => cmd_ffprobe(&default_registry(), &args),
+        _ => dispatch(&args),
+    };
+
+    if let Err(err) = res {
         eprintln!("Error: {err}");
         process::exit(1);
     }
@@ -54,6 +71,8 @@ fn dispatch(args: &[String]) -> Result<()> {
         "cut" => cmd_cut(&reg, rest),
         "mux" => cmd_mux(&reg, rest),
         "ffmpeg" => cmd_ffmpeg(&reg, rest),
+        "ffprobe" => cmd_ffprobe(&reg, rest),
+        "install-shim" => cmd_install_shim(rest),
         "mcp" => {
             mcp::serve_stdio(&reg).map_err(|e| Error::io("mcp", &e))?;
             Ok(())
@@ -81,15 +100,17 @@ Usage:
   wedeo <command> [options]
 
 Commands:
-  inspect    Inspect container AST, tracks, colorimetry, packets/GOP/NALs, and StreamHealth
-  explain    Compile pipeline via wedeo-graph without running (nodes, bridges, GPU notes)
-  transcode  Transcode or remux media preserving tracks, metadata, chapters, and rotation
-  cut        Cut time ranges (--mode keyframe|smart|reencode via wedeo_graph::timeline)
-  mux        Losslessly mux video/audio/subtitle/chapter/tag streams from multiple inputs
-  ffmpeg     Order-sensitive FFmpeg CLI compatibility mode (`wedeo ffmpeg ...`)
-  mcp        Start stdio JSON-RPC 2.0 MCP server exposing the 5 typed operations
-  codecs     List registered decoders and encoders
-  formats    List registered demuxers and muxers
+  inspect       Inspect container AST, tracks, colorimetry, packets/GOP/NALs, and StreamHealth
+  explain       Compile pipeline via wedeo-graph without running (nodes, bridges, GPU notes)
+  transcode     Transcode or remux media preserving tracks, metadata, chapters, and rotation
+  cut           Cut time ranges (--mode keyframe|smart|reencode via wedeo_graph::timeline)
+  mux           Losslessly mux video/audio/subtitle/chapter/tag streams from multiple inputs
+  ffmpeg        Drop-in FFmpeg CLI compatibility mode (`wedeo ffmpeg ...` or symlink `ffmpeg`)
+  ffprobe       Drop-in FFprobe JSON compatibility mode (`wedeo ffprobe ...` or symlink `ffprobe`)
+  install-shim  Create `ffmpeg` and `ffprobe` symlinks in `<dir>` (for `yt-dlp --ffmpeg-location`)
+  mcp           Start stdio JSON-RPC 2.0 MCP server exposing the 5 typed operations
+  codecs        List registered decoders and encoders
+  formats       List registered demuxers and muxers
 "
 }
 
@@ -510,8 +531,50 @@ fn cmd_mux(reg: &Registry, args: &[String]) -> Result<()> {
 fn cmd_ffmpeg(reg: &Registry, args: &[String]) -> Result<()> {
     match execute_ffmpeg(reg, args)? {
         FfmpegResult::Text(txt) => print!("{txt}"),
-        FfmpegResult::Report(rep) => print!("{}", rep.format_human()),
+        FfmpegResult::Report(rep) => eprint!("{}", rep.format_human()),
     }
+    Ok(())
+}
+
+fn cmd_ffprobe(reg: &Registry, args: &[String]) -> Result<()> {
+    let out = execute_ffprobe(reg, args)?;
+    print!("{out}");
+    Ok(())
+}
+
+fn cmd_install_shim(args: &[String]) -> Result<()> {
+    let dir = args
+        .first()
+        .map(String::as_str)
+        .filter(|s| !s.starts_with('-'))
+        .ok_or_else(|| {
+            Error::invalid_argument(
+                "install-shim",
+                "Usage: wedeo install-shim <directory> (creates `ffmpeg` and `ffprobe` symlinks)",
+            )
+        })?;
+    let dir_path = Path::new(dir);
+    std::fs::create_dir_all(dir_path).map_err(|e| Error::io("install-shim", &e))?;
+    let exe = env::current_exe().map_err(|e| Error::io("install-shim", &e))?;
+    for name in ["ffmpeg", "ffprobe"] {
+        let link = dir_path.join(name);
+        if link.exists() || link.symlink_metadata().is_ok() {
+            std::fs::remove_file(&link).map_err(|e| Error::io("install-shim", &e))?;
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&exe, &link).map_err(|e| Error::io("install-shim", &e))?;
+        #[cfg(not(unix))]
+        std::fs::copy(&exe, &link).map_err(|e| Error::io("install-shim", &e))?;
+    }
+    println!(
+        "Installed Wedeo drop-in shims in {}:\n  {}/ffmpeg -> {}\n  {}/ffprobe -> {}\n\nTry:\n  yt-dlp --ffmpeg-location {} -f \"bestvideo[ext=mp4]+bestaudio[ext=m4a]\" <url>",
+        dir_path.display(),
+        dir_path.display(),
+        exe.display(),
+        dir_path.display(),
+        exe.display(),
+        dir_path.display(),
+    );
     Ok(())
 }
 
