@@ -127,3 +127,5 @@ framecrc_*.txt
 # Internal planning & session state
 /plans/
 /tasks/
+
+!/web/samples/*.mp4
