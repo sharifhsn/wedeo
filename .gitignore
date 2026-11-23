@@ -102,7 +102,8 @@ scripts/.suite_*_snapshot.json
 /memory-setup.md
 /DEBUG_NOTES.md
 /CONFORMANCE_STATE.md
-/docs/
+/docs/*
+!/docs/ARCHITECTURE.md
 
 # Diagnostic & debug output
 diag_*.txt
