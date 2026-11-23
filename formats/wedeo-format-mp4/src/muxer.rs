@@ -5,7 +5,7 @@
 //! - **Non-seekable sinks** (pipes/streams): CMAF-ready fragmented MP4 (`ftyp` + `moov` [`mvex`/`trex`] + `moof`/`mdat` fragments).
 
 use wedeo_core::{
-    ByteSink, CodecId, ColorDesc, ContainerHeader, EditSegment, Error, MediaType, Muxer,
+    ByteSink, Chapter, CodecId, ColorDesc, ContainerHeader, EditSegment, Error, MediaType, Muxer,
     MuxerDescriptor, MuxerFactory, Packet, PacketFlags, Rational, Result, StreamParams, TrackId,
     rescale_q,
 };
@@ -73,6 +73,7 @@ pub struct Mp4Muxer {
     sink: Box<dyn ByteSink>,
     tracks: Vec<TrackState>,
     metadata: Vec<(String, String)>,
+    chapters: Vec<Chapter>,
     movie_timescale: u32,
     fragmented: bool,
     ftyp_len: u64,
@@ -91,6 +92,7 @@ impl Mp4Muxer {
             sink,
             tracks: Vec::new(),
             metadata: Vec::new(),
+            chapters: Vec::new(),
             movie_timescale: 1000,
             fragmented: false,
             ftyp_len: 0,
@@ -163,8 +165,13 @@ impl Mp4Muxer {
             .map(|t| t.chunk_offsets.clone())
             .collect();
 
-        let trial_moov =
-            atoms::write_moov(&self.tracks, self.movie_timescale, false, &self.metadata);
+        let trial_moov = atoms::write_moov(
+            &self.tracks,
+            self.movie_timescale,
+            false,
+            &self.metadata,
+            &self.chapters,
+        );
         let mut moov_size = trial_moov.len() as u64;
 
         for iter in 0..2 {
@@ -173,7 +180,13 @@ impl Mp4Muxer {
                 track.chunk_offsets = orig.iter().map(|&o| base + o).collect();
             }
 
-            let moov = atoms::write_moov(&self.tracks, self.movie_timescale, false, &self.metadata);
+            let moov = atoms::write_moov(
+                &self.tracks,
+                self.movie_timescale,
+                false,
+                &self.metadata,
+                &self.chapters,
+            );
             let new_size = moov.len() as u64;
             if new_size == moov_size || iter == 1 {
                 return moov;
@@ -199,6 +212,7 @@ impl Muxer for Mp4Muxer {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
+        self.chapters = header.chapters.clone();
 
         let mut has_video = false;
         let mut has_audio = false;
@@ -311,7 +325,13 @@ impl Muxer for Mp4Muxer {
             .map_err(|e| Error::io("mp4/muxer", &e))?;
 
         if self.fragmented {
-            let moov = atoms::write_moov(&self.tracks, self.movie_timescale, true, &self.metadata);
+            let moov = atoms::write_moov(
+                &self.tracks,
+                self.movie_timescale,
+                true,
+                &self.metadata,
+                &self.chapters,
+            );
             self.sink
                 .write_all(&moov)
                 .map_err(|e| Error::io("mp4/muxer", &e))?;

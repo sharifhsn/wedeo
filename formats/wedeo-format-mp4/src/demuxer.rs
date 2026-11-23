@@ -8,11 +8,11 @@
 use std::io;
 
 use wedeo_core::{
-    AudioStreamParams, BufByteSource, Buffer, ByteSource, ChannelLayout, CodecId, ColorDesc,
-    ContainerHeader, Demuxer, DemuxerDescriptor, DemuxerFactory, Error, ErrorPolicy, HealthEvent,
-    HealthIssue, Packet, PacketFlags, PixelLayout, Rational, RecvStatus, Result, SampleFormat,
-    SeekTarget, SideData, StreamHealth, StreamParams, Timestamp, TrackDescriptor, TrackDisposition,
-    TrackId, VideoStreamParams, reduce, rescale_q,
+    AudioStreamParams, BufByteSource, Buffer, ByteSource, ChannelLayout, Chapter, CodecId,
+    ColorDesc, ContainerHeader, Demuxer, DemuxerDescriptor, DemuxerFactory, Error, ErrorPolicy,
+    HealthEvent, HealthIssue, Metadata, Packet, PacketFlags, PixelLayout, Rational, RecvStatus,
+    Result, SampleFormat, SeekTarget, SideData, StreamHealth, StreamParams, Timestamp,
+    TrackDescriptor, TrackDisposition, TrackId, VideoStreamParams, reduce, rescale_q,
 };
 
 use crate::boxes::{self, ElstEntry, StsdEntry, Trex};
@@ -229,6 +229,8 @@ impl Mp4Demuxer {
         let mut trex_defaults: Vec<Trex> = Vec::new();
         let mut is_fragmented = false;
         let mut found_moov = false;
+        let mut parsed_metadata = Metadata::new();
+        let mut parsed_chapters: Vec<Chapter> = Vec::new();
 
         let file_limit = io.size_hint().unwrap_or(u64::MAX);
 
@@ -253,6 +255,8 @@ impl Mp4Demuxer {
                     &mut track_states,
                     &mut trex_defaults,
                     &mut is_fragmented,
+                    &mut parsed_metadata,
+                    &mut parsed_chapters,
                 )?;
                 let cur = io.tell();
                 if cur < box_end && box_end != u64::MAX {
@@ -411,6 +415,28 @@ impl Mp4Demuxer {
             ));
         }
         header.start_time = Timestamp::new(0);
+        header.metadata = parsed_metadata;
+        if !parsed_chapters.is_empty() {
+            let movie_end_100ns = if movie_timescale > 0 && movie_duration > 0 {
+                rescale_q(
+                    movie_duration as i64,
+                    Rational::new(1, movie_timescale as i32),
+                    Rational::new(1, 10_000_000),
+                )
+            } else {
+                0
+            };
+            for idx in 0..parsed_chapters.len() {
+                if idx + 1 < parsed_chapters.len() {
+                    parsed_chapters[idx].end = parsed_chapters[idx + 1].start;
+                } else if movie_end_100ns >= parsed_chapters[idx].start.get().unwrap_or(0) {
+                    parsed_chapters[idx].end = Timestamp::new(movie_end_100ns);
+                } else {
+                    parsed_chapters[idx].end = parsed_chapters[idx].start;
+                }
+            }
+            header.chapters = parsed_chapters;
+        }
 
         Ok(Self {
             io,
@@ -936,6 +962,7 @@ fn map_audio_codec(stsd: &StsdEntry) -> Option<(CodecId, SampleFormat)> {
 // `moov` box recursive parser
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn parse_moov(
     io: &mut BufByteSource,
     end_pos: u64,
@@ -944,6 +971,8 @@ fn parse_moov(
     tracks: &mut Vec<TrackParseState>,
     trex_defaults: &mut Vec<Trex>,
     is_fragmented: &mut bool,
+    metadata: &mut Metadata,
+    chapters: &mut Vec<Chapter>,
 ) -> Result<()> {
     while io.tell() + 8 <= end_pos {
         let box_start = io.tell();
@@ -969,6 +998,9 @@ fn parse_moov(
                 *is_fragmented = true;
                 parse_mvex(io, box_end, trex_defaults)?;
             }
+            b"udta" => {
+                parse_udta(io, box_end, metadata, chapters)?;
+            }
             _ => {}
         }
 
@@ -979,6 +1011,188 @@ fn parse_moov(
         }
     }
     Ok(())
+}
+
+fn parse_udta(
+    io: &mut BufByteSource,
+    end_pos: u64,
+    metadata: &mut Metadata,
+    chapters: &mut Vec<Chapter>,
+) -> Result<()> {
+    while io.tell() + 8 <= end_pos {
+        let box_start = io.tell();
+        let header = boxes::read_box_header(io)?;
+        let box_end = if header.size == 0 {
+            end_pos
+        } else {
+            box_start.saturating_add(header.size).min(end_pos)
+        };
+
+        match &header.box_type {
+            b"meta" => {
+                let payload_len = box_end.saturating_sub(io.tell()) as usize;
+                if (5..=4 * 1024 * 1024).contains(&payload_len) {
+                    let mut buf = vec![0u8; payload_len];
+                    io.read_exact_bytes(&mut buf)
+                        .map_err(|e| Error::io("mp4/meta", &e))?;
+                    parse_meta_bytes(&buf, metadata);
+                }
+            }
+            b"chpl" => {
+                let payload_len = box_end.saturating_sub(io.tell()) as usize;
+                if (5..=1024 * 1024).contains(&payload_len) {
+                    let mut buf = vec![0u8; payload_len];
+                    io.read_exact_bytes(&mut buf)
+                        .map_err(|e| Error::io("mp4/chpl", &e))?;
+                    parse_chpl_bytes(&buf, chapters);
+                }
+            }
+            _ => {}
+        }
+
+        let current = io.tell();
+        if current < box_end {
+            io.skip(box_end - current)
+                .map_err(|e| Error::io("mp4/udta", &e))?;
+        }
+    }
+    Ok(())
+}
+
+fn parse_meta_bytes(buf: &[u8], metadata: &mut Metadata) {
+    // ISOBMFF `meta` is a full-box (4-byte version+flags); QuickTime omits those 4 bytes.
+    let mut off = if buf.len() >= 12 && (&buf[8..12] == b"hdlr" || &buf[8..12] == b"ilst") {
+        4
+    } else if buf.len() >= 8 && (&buf[4..8] == b"hdlr" || &buf[4..8] == b"ilst") {
+        0
+    } else {
+        4
+    };
+
+    while off + 8 <= buf.len() {
+        let size =
+            u32::from_be_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]) as usize;
+        let btype = &buf[off + 4..off + 8];
+        if size < 8 || off + size > buf.len() {
+            break;
+        }
+        if btype == b"ilst" {
+            parse_ilst_bytes(&buf[off + 8..off + size], metadata);
+        }
+        off += size;
+    }
+}
+
+fn parse_ilst_bytes(buf: &[u8], metadata: &mut Metadata) {
+    let mut off = 0usize;
+    while off + 8 <= buf.len() {
+        let size =
+            u32::from_be_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]) as usize;
+        let btype = &buf[off + 4..off + 8];
+        if size < 8 || off + size > buf.len() {
+            break;
+        }
+        let key: Option<&str> = match btype {
+            b"\xA9nam" => Some("title"),
+            b"\xA9ART" => Some("artist"),
+            b"\xA9alb" => Some("album"),
+            b"aART" => Some("album_artist"),
+            b"\xA9day" => Some("date"),
+            b"\xA9gen" => Some("genre"),
+            b"\xA9cmt" => Some("comment"),
+            b"desc" => Some("description"),
+            b"ldes" => Some("synopsis"),
+            b"\xA9too" => Some("encoder"),
+            b"\xA9wrt" => Some("composer"),
+            b"\xA9grp" => Some("grouping"),
+            b"cprt" => Some("copyright"),
+            b"\xA9lyr" => Some("lyrics"),
+            _ => None,
+        };
+        if let Some(tag_key) = key {
+            let item = &buf[off + 8..off + size];
+            let mut ioff = 0usize;
+            while ioff + 8 <= item.len() {
+                let dsize = u32::from_be_bytes([
+                    item[ioff],
+                    item[ioff + 1],
+                    item[ioff + 2],
+                    item[ioff + 3],
+                ]) as usize;
+                let dtype = &item[ioff + 4..ioff + 8];
+                if dsize < 8 || ioff + dsize > item.len() {
+                    break;
+                }
+                if dtype == b"data" && dsize >= 16 {
+                    let data_type = u32::from_be_bytes([
+                        item[ioff + 8],
+                        item[ioff + 9],
+                        item[ioff + 10],
+                        item[ioff + 11],
+                    ]);
+                    // Type 1 = UTF-8 text.
+                    if data_type == 1
+                        && let Ok(val) = std::str::from_utf8(&item[ioff + 16..ioff + dsize])
+                    {
+                        metadata.set(tag_key, val);
+                    }
+                }
+                ioff += dsize;
+            }
+        }
+        off += size;
+    }
+}
+
+fn parse_chpl_bytes(buf: &[u8], chapters: &mut Vec<Chapter>) {
+    if buf.len() < 5 {
+        return;
+    }
+    let version = buf[0];
+    let (count, mut off) = if version == 1 {
+        if buf.len() < 9 {
+            return;
+        }
+        let n = u32::from_be_bytes([buf[5], buf[6], buf[7], buf[8]]) as usize;
+        (n, 9usize)
+    } else {
+        (buf[4] as usize, 5usize)
+    };
+    let chpl_tb = Rational::new(1, 10_000_000);
+    for idx in 0..count {
+        if off + 9 > buf.len() {
+            break;
+        }
+        let start_100ns = u64::from_be_bytes([
+            buf[off],
+            buf[off + 1],
+            buf[off + 2],
+            buf[off + 3],
+            buf[off + 4],
+            buf[off + 5],
+            buf[off + 6],
+            buf[off + 7],
+        ]);
+        let title_len = buf[off + 8] as usize;
+        off += 9;
+        if off + title_len > buf.len() {
+            break;
+        }
+        let title = String::from_utf8_lossy(&buf[off..off + title_len]).into_owned();
+        off += title_len;
+        let mut meta = Metadata::new();
+        if !title.is_empty() {
+            meta.set("title", title);
+        }
+        let ts = Timestamp::new(start_100ns.min(i64::MAX as u64) as i64);
+        chapters.push(Chapter {
+            id: (idx + 1) as i64,
+            time_base: chpl_tb,
+            start: ts,
+            end: ts,
+            metadata: meta,
+        });
+    }
 }
 
 fn parse_mvex(io: &mut BufByteSource, end_pos: u64, trex_defaults: &mut Vec<Trex>) -> Result<()> {

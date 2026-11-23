@@ -1718,6 +1718,9 @@ fn build_transcode_graph(
                     remap.max_packets = req.frames_video;
                     if let Some(clip) = trim_clip {
                         remap.trim = Some((clip, true));
+                        if clip.start.get().unwrap_or(0) > 0 {
+                            remap.wait_for_keyframe = true;
+                        }
                     }
                     let n_remap = builder.add_node(Box::new(remap));
                     builder.connect(n_demux, in_port, n_remap, 0)?;
@@ -3008,6 +3011,13 @@ struct PacketTransformNode {
     max_packets: Option<u64>,
     sent_packets: u64,
     trim: Option<(wedeo::graph::ClipRange, bool)>,
+    wait_for_keyframe: bool,
+    seen_keyframe: bool,
+    /// Compressed packets since the most recent keyframe before `clip.start`,
+    /// retained as a fallback if `[clip.start, clip.end)` contains no keyframe.
+    pre_gop: Vec<Packet>,
+    /// Packets inside `[clip.start, clip.end)` seen before any in-clip keyframe.
+    in_clip_pre_kf: Vec<Packet>,
 }
 
 impl PacketTransformNode {
@@ -3025,6 +3035,10 @@ impl PacketTransformNode {
             max_packets: None,
             sent_packets: 0,
             trim: None,
+            wait_for_keyframe: false,
+            seen_keyframe: false,
+            pre_gop: Vec::new(),
+            in_clip_pre_kf: Vec::new(),
         }
     }
 }
@@ -3070,7 +3084,32 @@ impl GraphNode for PacketTransformNode {
                 clip.time_base
             };
             if !clip.contains(ts, tb) {
+                // While waiting for a keyframe before `clip.start`, keep the latest GOP
+                // in case the trimmed window has no keyframe of its own.
+                if self.wait_for_keyframe
+                    && !self.seen_keyframe
+                    && let Some(start_raw) = clip.start.get()
+                {
+                    let ts_in_clip = rescale_q(ts.raw(), tb, clip.time_base);
+                    if ts_in_clip < start_raw {
+                        if pkt.flags.contains(PacketFlags::KEY) {
+                            self.pre_gop.clear();
+                        }
+                        if !self.pre_gop.is_empty() || pkt.flags.contains(PacketFlags::KEY) {
+                            self.pre_gop.push(pkt);
+                        }
+                    }
+                }
                 return Ok(Vec::new());
+            }
+            if self.wait_for_keyframe && !self.seen_keyframe {
+                if !pkt.flags.contains(PacketFlags::KEY) {
+                    self.in_clip_pre_kf.push(pkt);
+                    return Ok(Vec::new());
+                }
+                self.seen_keyframe = true;
+                self.pre_gop.clear();
+                self.in_clip_pre_kf.clear();
             }
             if zero_based && let Some(start_raw) = clip.start.get() {
                 let start_in_tb = if clip.time_base.is_valid() && tb.is_valid() {
@@ -3088,6 +3127,53 @@ impl GraphNode for PacketTransformNode {
     }
 
     fn flush(&mut self, _pool: &BufferPool) -> Result<Vec<(usize, GraphItem)>> {
+        if self.wait_for_keyframe
+            && !self.seen_keyframe
+            && !self.in_clip_pre_kf.is_empty()
+            && let Some((clip, zero_based)) = self.trim
+        {
+            // The requested window had no keyframe of its own: emit from the preceding
+            // keyframe (`pre_gop`) through `in_clip_pre_kf` so the output decodes cleanly.
+            let mut combined = std::mem::take(&mut self.pre_gop);
+            combined.append(&mut self.in_clip_pre_kf);
+            let base_ts = combined.first().and_then(|p| {
+                let ts = if p.pts.is_known() { p.pts } else { p.dts };
+                let tb = if p.time_base.is_valid() {
+                    p.time_base
+                } else {
+                    clip.time_base
+                };
+                ts.get().map(|v| (v, tb))
+            });
+            let mut out = Vec::with_capacity(combined.len());
+            for mut pkt in combined {
+                if let Some(max) = self.max_packets
+                    && self.sent_packets >= max
+                {
+                    break;
+                }
+                if zero_based && let Some((base_raw, base_tb)) = base_ts {
+                    let tb = if pkt.time_base.is_valid() {
+                        pkt.time_base
+                    } else {
+                        base_tb
+                    };
+                    let start_in_tb = if base_tb.is_valid() && tb.is_valid() {
+                        rescale_q(base_raw, base_tb, tb)
+                    } else {
+                        base_raw
+                    };
+                    pkt.pts = pkt.pts.checked_sub(start_in_tb).unwrap_or(pkt.pts);
+                    pkt.dts = pkt.dts.checked_sub(start_in_tb).unwrap_or(pkt.dts);
+                }
+                pkt.track_id = self.target_track_id;
+                self.sent_packets += 1;
+                out.push((0, GraphItem::Packet(pkt)));
+            }
+            return Ok(out);
+        }
+        self.pre_gop.clear();
+        self.in_clip_pre_kf.clear();
         Ok(Vec::new())
     }
 

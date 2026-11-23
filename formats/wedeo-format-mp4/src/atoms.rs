@@ -1,6 +1,8 @@
 //! MP4 / ISOBMFF box (atom) building utilities for classic faststart and fragmented MP4 (fMP4).
 
-use wedeo_core::{CodecId, ColorDesc, ColorRange, EditSegment, MediaType, Rational, rescale_q};
+use wedeo_core::{
+    Chapter, CodecId, ColorDesc, ColorRange, EditSegment, MediaType, Rational, rescale_q,
+};
 
 use crate::boxes::{self, IDENTITY_MATRIX_I32};
 use crate::muxer::{FragmentTrackData, TrackState};
@@ -89,6 +91,7 @@ pub fn write_moov(
     movie_timescale: u32,
     fragmented: bool,
     metadata: &[(String, String)],
+    chapters: &[Chapter],
 ) -> Vec<u8> {
     let movie_duration: u64 = if fragmented {
         0
@@ -133,8 +136,8 @@ pub fn write_moov(
         moov_content.extend_from_slice(&write_mvex(tracks));
     }
 
-    if !metadata.is_empty() {
-        let udta = write_udta_metadata(metadata);
+    if !metadata.is_empty() || !chapters.is_empty() {
+        let udta = write_udta(metadata, chapters);
         if !udta.is_empty() {
             moov_content.extend_from_slice(&udta);
         }
@@ -143,8 +146,63 @@ pub fn write_moov(
     mp4_box(b"moov", &moov_content)
 }
 
-/// Build standard iTunes/MP4 `udta` -> `meta` -> `hdlr("mdir")` + `ilst` box.
-fn write_udta_metadata(metadata: &[(String, String)]) -> Vec<u8> {
+/// Build `udta` box containing iTunes `meta`/`ilst` tags and/or Nero `chpl` chapters.
+fn write_udta(metadata: &[(String, String)], chapters: &[Chapter]) -> Vec<u8> {
+    let mut udta_content = Vec::new();
+    let meta = write_itunes_meta(metadata);
+    if !meta.is_empty() {
+        udta_content.extend_from_slice(&meta);
+    }
+    let chpl = write_nero_chpl(chapters);
+    if !chpl.is_empty() {
+        udta_content.extend_from_slice(&chpl);
+    }
+    if udta_content.is_empty() {
+        return Vec::new();
+    }
+    mp4_box(b"udta", &udta_content)
+}
+
+/// Build Nero `chpl` chapter list full-box (version 1, timestamps in 100ns units).
+fn write_nero_chpl(chapters: &[Chapter]) -> Vec<u8> {
+    if chapters.is_empty() {
+        return Vec::new();
+    }
+    let chpl_tb = Rational::new(1, 10_000_000);
+    let mut c = Vec::with_capacity(5 + chapters.len() * 24);
+    c.push(0u8); // reserved byte (chpl v1)
+    c.extend_from_slice(&(chapters.len() as u32).to_be_bytes());
+    for (idx, ch) in chapters.iter().enumerate() {
+        let start_raw = ch.start.get().unwrap_or(0).max(0);
+        let start_100ns = if ch.time_base.is_valid() {
+            rescale_q(start_raw, ch.time_base, chpl_tb).max(0) as u64
+        } else {
+            start_raw as u64
+        };
+        let fallback = format!("Chapter {}", idx + 1);
+        let title = ch
+            .metadata
+            .get("title")
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&fallback);
+        // Nero chpl stores a 1-byte length prefix (max 255 UTF-8 bytes).
+        let mut title_bytes = title.as_bytes();
+        if title_bytes.len() > 255 {
+            let mut cut = 255;
+            while cut > 0 && !title.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            title_bytes = &title.as_bytes()[..cut];
+        }
+        c.extend_from_slice(&start_100ns.to_be_bytes());
+        c.push(title_bytes.len() as u8);
+        c.extend_from_slice(title_bytes);
+    }
+    full_box(b"chpl", 1, 0, &c)
+}
+
+/// Build standard iTunes/MP4 `meta` -> `hdlr("mdir")` + `ilst` box.
+fn write_itunes_meta(metadata: &[(String, String)]) -> Vec<u8> {
     let mut ilst_content = Vec::new();
     for (k, v) in metadata {
         if v.is_empty() {
@@ -195,8 +253,7 @@ fn write_udta_metadata(metadata: &[(String, String)]) -> Vec<u8> {
     let mut meta_content = Vec::with_capacity(hdlr.len() + ilst.len());
     meta_content.extend_from_slice(&hdlr);
     meta_content.extend_from_slice(&ilst);
-    let meta = full_box(b"meta", 0, 0, &meta_content);
-    mp4_box(b"udta", &meta)
+    full_box(b"meta", 0, 0, &meta_content)
 }
 
 fn write_mvex(tracks: &[TrackState]) -> Vec<u8> {
