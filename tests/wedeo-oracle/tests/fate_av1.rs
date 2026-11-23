@@ -1,391 +1,238 @@
-//! FATE-style integration tests for the AV1 decode pipeline via rav1d.
-//!
-//! Since wedeo doesn't have an IVF/OBU demuxer, these tests parse IVF
-//! inline (trivial format) and feed packets directly to the decoder.
-//! Decoded YUV frames are checksummed and compared against FFmpeg's
-//! framecrc output for bitexact conformance.
+//! FATE-style live AV1 decode tests via `wedeo::default_registry()` (`rav1d` zero-copy
+//! `CpuExternal` + odd-dimension `div_ceil` chroma + CICP colorimetry) vs FFmpeg.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
+use std::sync::Arc;
 
-// Ensure the rav1d decoder is registered.
-use wedeo_rav1d as _;
+use wedeo::core::{
+    BorderPadding, BorderedPlane, BufferPool, CodecContext, CodecId, ColorDesc, ContainerHeader,
+    EncodeHint, FileSink, MediaUnit, PassMode, PixelLayout, Rational, RecvStatus, SendStatus,
+    StreamParams, Timestamp, TrackDescriptor, TrackId, VideoFrame, VideoStreamParams,
+};
+use wedeo::default_registry;
+use wedeo_oracle::{
+    FramecrcCompareOpts, compare_framecrc_full, ffprobe_oracle_bin, run_wedeo_framecrc,
+    system_ffmpeg_bin, temp_test_dir,
+};
 
-use wedeo_codec::decoder::{CodecParameters, Decoder, DecoderBuilder};
-use wedeo_core::buffer::Buffer;
-use wedeo_core::codec_id::CodecId;
-use wedeo_core::error::Error;
-use wedeo_core::media_type::MediaType;
-use wedeo_core::packet::Packet;
-
-// ---------------------------------------------------------------------------
-// Minimal IVF parser
-// ---------------------------------------------------------------------------
-
-#[allow(dead_code)] // parsed but not always used; kept for debugging
-struct IvfHeader {
-    width: u16,
-    height: u16,
-}
-
-struct IvfFrame {
-    timestamp: i64,
-    data: Vec<u8>,
-}
-
-fn parse_ivf(data: &[u8]) -> Option<(IvfHeader, Vec<IvfFrame>)> {
-    if data.len() < 32 {
-        return None;
-    }
-    // Signature: "DKIF"
-    if &data[0..4] != b"DKIF" {
-        return None;
-    }
-    let header_len = u16::from_le_bytes([data[6], data[7]]) as usize;
-    let width = u16::from_le_bytes([data[12], data[13]]);
-    let height = u16::from_le_bytes([data[14], data[15]]);
-
-    let header = IvfHeader { width, height };
-
-    let mut frames = Vec::new();
-    let mut pos = header_len.max(32);
-    while pos + 12 <= data.len() {
-        let frame_size =
-            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
-        let timestamp = i64::from_le_bytes(data[pos + 4..pos + 12].try_into().ok()?);
-        pos += 12;
-        if pos + frame_size > data.len() {
-            break;
-        }
-        frames.push(IvfFrame {
-            timestamp,
-            data: data[pos..pos + frame_size].to_vec(),
-        });
-        pos += frame_size;
-    }
-
-    Some((header, frames))
-}
-
-// ---------------------------------------------------------------------------
-// Adler-32 matching FFmpeg's non-standard init (s1=0, s2=0)
-// ---------------------------------------------------------------------------
-
-fn adler32(data: &[u8]) -> u32 {
-    let mut hasher = adler2::Adler32::from_checksum(0);
-    hasher.write_slice(data);
-    hasher.checksum()
-}
-
-// ---------------------------------------------------------------------------
-// Decode an IVF file through wedeo's rav1d adapter
-// ---------------------------------------------------------------------------
-
-/// Decoded frame info for comparison.
-struct DecodedFrame {
-    pts: i64,
-    size: usize,
-    crc: u32,
-}
-
-fn decode_ivf(path: &Path) -> Vec<DecodedFrame> {
-    let file_data = std::fs::read(path).expect("failed to read IVF file");
-    let (_header, frames) = parse_ivf(&file_data).expect("failed to parse IVF");
-
-    let params = CodecParameters::new(CodecId::Av1, MediaType::Video);
-    let mut decoder = DecoderBuilder::new(params)
-        .open()
-        .expect("failed to open AV1 decoder");
-
-    let mut decoded = Vec::new();
-
-    // Feed all packets
-    for ivf_frame in &frames {
-        let mut pkt = Packet::new();
-        pkt.data = Buffer::from_slice(&ivf_frame.data);
-        pkt.pts = ivf_frame.timestamp;
-        pkt.duration = 1;
-        pkt.stream_index = 0;
-
-        decoder.send_packet(Some(&pkt)).expect("send_packet failed");
-        drain_decoder(&mut *decoder, &mut decoded);
-    }
-
-    // Drain remaining frames
-    decoder.send_packet(None).expect("send_packet(None) failed");
-    drain_decoder(&mut *decoder, &mut decoded);
-
-    decoded
-}
-
-fn drain_decoder(decoder: &mut dyn Decoder, out: &mut Vec<DecodedFrame>) {
-    while let Some(frame) = drain_one(decoder) {
-        out.push(frame);
-    }
-}
-
-fn drain_one(decoder: &mut dyn Decoder) -> Option<DecodedFrame> {
-    match decoder.receive_frame() {
-        Ok(frame) => {
-            let video = frame.video()?;
-            let width = video.width as usize;
-            let height = video.height as usize;
-            let chroma_width = width / 2;
-            let chroma_height = height / 2;
-
-            let mut raw = Vec::with_capacity(width * height * 3 / 2);
-
-            // Y plane
-            let y_plane = &video.planes[0];
-            let y_data = y_plane.buffer.data();
-            for row in 0..height {
-                let start = y_plane.offset + row * y_plane.linesize;
-                raw.extend_from_slice(&y_data[start..start + width]);
-            }
-
-            // U plane
-            if video.planes.len() > 1 {
-                let u_plane = &video.planes[1];
-                let u_data = u_plane.buffer.data();
-                for row in 0..chroma_height {
-                    let start = u_plane.offset + row * u_plane.linesize;
-                    raw.extend_from_slice(&u_data[start..start + chroma_width]);
-                }
-            }
-
-            // V plane
-            if video.planes.len() > 2 {
-                let v_plane = &video.planes[2];
-                let v_data = v_plane.buffer.data();
-                for row in 0..chroma_height {
-                    let start = v_plane.offset + row * v_plane.linesize;
-                    raw.extend_from_slice(&v_data[start..start + chroma_width]);
-                }
-            }
-
-            let crc = adler32(&raw);
-            Some(DecodedFrame {
-                pts: frame.pts,
-                size: raw.len(),
-                crc,
-            })
-        }
-        Err(Error::Again) | Err(Error::Eof) => None,
-        Err(e) => panic!("decode error: {e:?}"),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Run FFmpeg framecrc on an IVF file
-// ---------------------------------------------------------------------------
-
-fn run_ffmpeg_framecrc(path: &Path) -> Option<Vec<String>> {
-    let output = Command::new("ffmpeg")
-        .args([
-            "-bitexact",
-            "-i",
-            path.to_str().unwrap(),
-            "-f",
-            "framecrc",
-            "-",
-        ])
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Some(
-        stdout
-            .lines()
-            .filter(|l| !l.starts_with('#'))
-            .filter(|l| !l.is_empty())
-            .map(|l| l.to_string())
-            .collect(),
-    )
-}
-
-/// Parse a framecrc data line into (size, checksum).
-fn parse_framecrc_line(line: &str) -> Option<(usize, String)> {
-    let fields: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
-    if fields.len() < 6 {
-        return None;
-    }
-    let size: usize = fields[4].parse().ok()?;
-    let crc = fields[5].to_string();
-    Some((size, crc))
-}
-
-// ---------------------------------------------------------------------------
-// Test helpers
-// ---------------------------------------------------------------------------
-
-fn generate_test_ivf(path: &Path, width: u32, height: u32, frames: u32) -> bool {
-    let result = Command::new("ffmpeg")
+fn generate_even_av1_ivf(path: &Path, width: u32, height: u32, frames: u32) {
+    let status = Command::new(system_ffmpeg_bin())
         .args([
             "-y",
+            "-v",
+            "error",
             "-f",
             "lavfi",
             "-i",
             &format!(
-                "testsrc=size={width}x{height}:rate=25:duration={}",
+                "testsrc2=size={width}x{height}:rate=25:duration={:.3}",
                 frames as f64 / 25.0
             ),
+            "-pix_fmt",
+            "yuv420p",
             "-c:v",
-            "libsvtav1",
-            "-preset",
+            "libaom-av1",
+            "-cpu-used",
             "8",
             "-crf",
-            "35",
+            "32",
             path.to_str().unwrap(),
         ])
-        .output();
-
-    match result {
-        Ok(output) => output.status.success(),
-        Err(_) => false,
-    }
+        .status()
+        .expect("run system ffmpeg libaom-av1");
+    assert!(status.success(), "libaom-av1 IVF generation failed");
 }
 
-fn test_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join("wedeo-fate-av1");
-    std::fs::create_dir_all(&dir).ok();
-    dir
-}
+fn generate_odd_bt709_av1_ivf(path: &Path, width: u32, height: u32, frames: u32) {
+    let reg = default_registry();
+    let pool = BufferPool::new();
+    let tb = Rational::new(1, 25);
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-/// Smoke test: create decoder, verify it can be opened for AV1.
-#[test]
-fn av1_decoder_opens() {
-    let params = CodecParameters::new(CodecId::Av1, MediaType::Video);
-    let decoder = DecoderBuilder::new(params).open();
-    assert!(
-        decoder.is_ok(),
-        "failed to open AV1 decoder: {:?}",
-        decoder.err()
+    let mut vparams = VideoStreamParams::new(width, height, PixelLayout::YUV420P);
+    vparams.color = ColorDesc::BT709_LIMITED;
+    let track = TrackDescriptor::new(
+        TrackId(0),
+        CodecId::Av1,
+        tb,
+        StreamParams::Video(vparams.clone()),
     );
-    assert_eq!(decoder.unwrap().descriptor().name, "av1_rav1d");
-}
+    let mut enc = reg
+        .find_encoder(CodecId::Av1)
+        .unwrap()
+        .open(
+            &track,
+            CodecContext::new(Arc::clone(&pool)),
+            PassMode::Single,
+        )
+        .unwrap();
 
-/// Decode a small AV1 IVF file and verify we get the expected number of frames.
-#[test]
-fn av1_decode_frame_count() {
-    let ivf_path = test_dir().join("test_framecount.ivf");
-
-    if !generate_test_ivf(&ivf_path, 176, 144, 5) {
-        eprintln!("SKIP: ffmpeg with libsvtav1 not available");
-        return;
-    }
-
-    let decoded = decode_ivf(&ivf_path);
-    assert!(
-        !decoded.is_empty(),
-        "decoder produced no frames from 5-frame IVF"
-    );
-    assert_eq!(
-        decoded.len(),
-        5,
-        "expected 5 decoded frames, got {}",
-        decoded.len()
-    );
-
-    // Verify frame dimensions via size: YUV420p 176x144 = 176*144*3/2 = 38016
-    for (i, frame) in decoded.iter().enumerate() {
+    let mut packets = Vec::new();
+    for i in 0..frames {
+        let mut y = BorderedPlane::new(&pool, width as usize, height as usize, BorderPadding::NONE);
+        for r in 0..height as usize {
+            let row = y.row_mut(r).unwrap();
+            for (c, px) in row.iter_mut().enumerate() {
+                *px = (((c * 3 + r * 5 + i as usize * 13) % 219) + 16) as u8;
+            }
+        }
+        let cw = width.div_ceil(2) as usize;
+        let ch = height.div_ceil(2) as usize;
+        let mut u = BorderedPlane::new(&pool, cw, ch, BorderPadding::NONE);
+        let mut v = BorderedPlane::new(&pool, cw, ch, BorderPadding::NONE);
+        for r in 0..ch {
+            u.row_mut(r).unwrap().fill(110);
+            v.row_mut(r).unwrap().fill(145);
+        }
+        let mut frame = VideoFrame::from_planes(width, height, PixelLayout::YUV420P, vec![y, u, v]);
+        frame.pts = Timestamp::new(i as i64);
+        frame.duration = 1;
+        frame.time_base = tb;
+        frame.color = ColorDesc::BT709_LIMITED;
         assert_eq!(
-            frame.size, 38016,
-            "frame {i} has unexpected size {} (expected 38016 for 176x144 YUV420p)",
-            frame.size
+            enc.send_unit(Some(&MediaUnit::Video(frame)), EncodeHint::default())
+                .unwrap(),
+            SendStatus::Accepted
         );
+        while let RecvStatus::Ready(p) = enc.receive_packet().unwrap() {
+            packets.push(p);
+        }
     }
-}
-
-/// Bitexact test: decode AV1 IVF and compare YUV checksums against FFmpeg.
-#[test]
-fn av1_bitexact_vs_ffmpeg() {
-    let ivf_path = test_dir().join("test_bitexact.ivf");
-
-    if !generate_test_ivf(&ivf_path, 176, 144, 10) {
-        eprintln!("SKIP: ffmpeg with libsvtav1 not available");
-        return;
-    }
-
-    // Decode with wedeo/rav1d
-    let decoded = decode_ivf(&ivf_path);
-    assert!(!decoded.is_empty(), "decoder produced no frames");
-
-    // Get FFmpeg reference
-    let Some(ffmpeg_lines) = run_ffmpeg_framecrc(&ivf_path) else {
-        eprintln!("SKIP: ffmpeg not available for cross-validation");
-        return;
-    };
-
     assert_eq!(
-        decoded.len(),
-        ffmpeg_lines.len(),
-        "frame count mismatch: wedeo={}, ffmpeg={}",
-        decoded.len(),
-        ffmpeg_lines.len()
+        enc.send_unit(None, EncodeHint::default()).unwrap(),
+        SendStatus::Accepted
     );
-
-    let mut mismatches = 0;
-    for (i, (wedeo_frame, ffmpeg_line)) in decoded.iter().zip(ffmpeg_lines.iter()).enumerate() {
-        let Some((ff_size, ff_crc)) = parse_framecrc_line(ffmpeg_line) else {
-            panic!("failed to parse ffmpeg framecrc line {i}: {ffmpeg_line}");
-        };
-
-        let wedeo_crc = format!("0x{:08x}", wedeo_frame.crc);
-
-        if wedeo_frame.size != ff_size || wedeo_crc != ff_crc {
-            eprintln!(
-                "DIFF frame {i}: wedeo(size={}, crc={wedeo_crc}) vs ffmpeg(size={ff_size}, crc={ff_crc})",
-                wedeo_frame.size,
-            );
-            mismatches += 1;
+    loop {
+        match enc.receive_packet().unwrap() {
+            RecvStatus::Ready(p) => packets.push(p),
+            RecvStatus::NeedMore => continue,
+            RecvStatus::Eof => break,
         }
     }
 
-    if mismatches == 0 {
-        eprintln!(
-            "PASS: AV1 BITEXACT — {}/{} frames match FFmpeg",
-            decoded.len(),
-            decoded.len()
-        );
-    } else {
-        // AV1 is an integer-only spec, so bitexact SHOULD be achievable.
-        // If mismatches occur, it could be film grain or a rav1d/dav1d difference.
-        panic!(
-            "AV1 NOT BITEXACT: {mismatches}/{} frames differ from FFmpeg",
-            decoded.len()
-        );
+    let mut hdr = ContainerHeader::new("ivf");
+    hdr.tracks.push(track);
+    let sink = FileSink::create(path).unwrap();
+    let mut muxer = reg
+        .find_muxer_by_name("ivf")
+        .unwrap()
+        .create(Box::new(sink))
+        .unwrap();
+    muxer.write_header(&hdr).unwrap();
+    for p in &packets {
+        muxer.write_packet(p).unwrap();
     }
+    muxer.finalize().unwrap();
 }
 
-/// Decode a 10-frame sequence and verify PTS values are monotonically increasing.
+/// Run AV1 `framecrc` decode using `libdav1d` on system FFmpeg (the pinned
+/// `ffmpeg-oracle` build omits `libdav1d` and only builds hwaccel `av1`).
+fn run_av1_ffmpeg_framecrc(path: &Path) -> Vec<String> {
+    let out = Command::new(system_ffmpeg_bin())
+        .args([
+            "-v",
+            "error",
+            "-bitexact",
+            "-c:v",
+            "libdav1d",
+            "-i",
+            path.to_str().unwrap(),
+            "-f",
+            "framecrc",
+            "-flags",
+            "+bitexact",
+            "-fflags",
+            "+bitexact",
+            "-",
+        ])
+        .output()
+        .expect("run ffmpeg libdav1d framecrc");
+    assert!(
+        out.status.success(),
+        "ffmpeg libdav1d framecrc failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
 #[test]
-fn av1_pts_ordering() {
-    let ivf_path = test_dir().join("test_pts.ivf");
+fn av1_decoder_opens_via_default_registry() {
+    let reg = default_registry();
+    let factory = reg
+        .find_decoder(CodecId::Av1)
+        .expect("av1_rav1d registered");
+    assert_eq!(factory.descriptor().name, "av1_rav1d");
+}
 
-    if !generate_test_ivf(&ivf_path, 176, 144, 10) {
-        eprintln!("SKIP: ffmpeg with libsvtav1 not available");
-        return;
-    }
+#[test]
+fn av1_even_and_odd_dims_bitexact_vs_ffmpeg_oracle() {
+    let dir = temp_test_dir("av1_decode");
 
-    let decoded = decode_ivf(&ivf_path);
-    assert!(!decoded.is_empty(), "no frames decoded");
+    let even_ivf = dir.join("av1_176x144.ivf");
+    generate_even_av1_ivf(&even_ivf, 176, 144, 8);
 
-    // PTS should be non-decreasing (may have reordering for B-frames,
-    // but testsrc at low frame count typically produces I+P only)
-    for window in decoded.windows(2) {
-        assert!(
-            window[1].pts >= window[0].pts,
-            "PTS went backwards: {} -> {}",
-            window[0].pts,
-            window[1].pts
-        );
+    let odd_ivf = dir.join("av1_odd_101x75_bt709.ivf");
+    generate_odd_bt709_av1_ivf(&odd_ivf, 101, 75, 5);
+
+    // Confirm ffprobe oracle sees exact odd dimensions 101x75.
+    let probe = Command::new(ffprobe_oracle_bin())
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=width,height",
+            odd_ivf.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(probe.status.success());
+    let probe_txt = String::from_utf8_lossy(&probe.stdout);
+    assert!(probe_txt.contains("width=101"), "{probe_txt}");
+    assert!(probe_txt.contains("height=75"), "{probe_txt}");
+
+    for (ivf, w, h, count, bt709) in [
+        (&even_ivf, 176u32, 144u32, 8u32, false),
+        (&odd_ivf, 101, 75, 5, true),
+    ] {
+        let wd_lines = run_wedeo_framecrc(ivf).expect("wedeo-framecrc AV1 IVF");
+        let ff_lines = run_av1_ffmpeg_framecrc(ivf);
+
+        compare_framecrc_full(
+            &wd_lines,
+            &ff_lines,
+            FramecrcCompareOpts::STRICT_TIMING_AND_HEADERS,
+        )
+        .unwrap_or_else(|e| panic!("AV1 decode framecrc mismatch on {}:\n{e}", ivf.display()));
+
+        let reg = default_registry();
+        let mut reader = wedeo::video::VideoReader::open(&reg, ivf).unwrap();
+        assert_eq!(reader.header().format_name, "ivf");
+
+        let mut prev_pts = None;
+        let mut decoded = 0u32;
+        while let Some(frame) = reader.next_frame().unwrap() {
+            assert_eq!(frame.display_size(), (w, h));
+            assert_eq!(frame.layout, PixelLayout::YUV420P);
+            let planes = frame.planes().expect("CPU planes");
+            assert_eq!(planes.len(), 3);
+            assert_eq!(planes[1].width_bytes, w.div_ceil(2) as usize);
+            assert_eq!(planes[1].height, h.div_ceil(2) as usize);
+            if bt709 {
+                assert_eq!(frame.color.primaries, ColorDesc::BT709_LIMITED.primaries);
+                assert_eq!(frame.color.transfer, ColorDesc::BT709_LIMITED.transfer);
+                assert_eq!(frame.color.matrix, ColorDesc::BT709_LIMITED.matrix);
+            }
+            let pts = frame.pts.get().unwrap();
+            if let Some(p) = prev_pts {
+                assert!(pts >= p, "PTS went backwards: {p} -> {pts}");
+            }
+            prev_pts = Some(pts);
+            decoded += 1;
+        }
+        assert_eq!(decoded, count);
+        assert!(reader.health().is_clean());
     }
 }

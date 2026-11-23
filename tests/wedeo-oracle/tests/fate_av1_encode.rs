@@ -1,376 +1,219 @@
-//! FATE-style integration tests for the AV1 encode pipeline via rav1e.
-//!
-//! Validation uses FFmpeg/ffprobe as the external oracle — no self-referential
-//! testing. Tests skip gracefully if FFmpeg is unavailable.
+//! FATE-style live AV1 encode (`rav1e` `Encoder::extradata()` → `Mp4Muxer`)
+//! verified against FFmpeg `n9.1` (`ffprobe` + `ffmpeg` `framecrc`) and `rav1d`.
 
-use std::path::PathBuf;
+use std::path::Path;
 use std::process::Command;
+use std::sync::Arc;
 
-// Ensure codec/format registrations are linked.
-use wedeo_codec_pcm as _;
-use wedeo_format_mp4 as _;
-use wedeo_rav1d as _;
-use wedeo_rav1e as _;
+use wedeo::core::{
+    BorderPadding, BorderedPlane, BufferPool, CodecContext, CodecId, ColorDesc, ContainerHeader,
+    EncodeHint, FileSink, MediaUnit, PassMode, PixelLayout, Rational, RecvStatus, SendStatus,
+    StreamParams, Timestamp, TrackDescriptor, TrackId, VideoFrame, VideoStreamParams,
+};
+use wedeo::default_registry;
+use wedeo_oracle::{
+    FramecrcCompareOpts, compare_framecrc_full, ffprobe_oracle_bin, run_wedeo_framecrc,
+    system_ffmpeg_bin, temp_test_dir,
+};
 
-use wedeo_codec::decoder::DecoderBuilder;
-use wedeo_codec::encoder::EncoderBuilder;
-use wedeo_core::buffer::Buffer;
-use wedeo_core::codec_id::CodecId;
-use wedeo_core::error::Error;
-use wedeo_core::frame::{Frame, FrameData, FramePlane};
-use wedeo_core::media_type::MediaType;
-use wedeo_core::packet::PacketFlags;
-use wedeo_core::pixel_format::PixelFormat;
-use wedeo_core::rational::Rational;
-use wedeo_format::context::{InputContext, OutputContext};
-use wedeo_format::demuxer::Stream;
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn test_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join("wedeo-fate-av1-encode");
-    std::fs::create_dir_all(&dir).ok();
-    dir
-}
-
-/// Generate a synthetic YUV420p frame with a gradient pattern.
-fn generate_frame(width: u32, height: u32, frame_idx: u32) -> Frame {
+fn build_synthetic_frame(
+    pool: &Arc<BufferPool>,
+    width: u32,
+    height: u32,
+    frame_idx: u32,
+    pts: i64,
+    time_base: Rational,
+) -> VideoFrame {
     let w = width as usize;
     let h = height as usize;
-    let cw = w / 2;
-    let ch = h / 2;
+    let cw = w.div_ceil(2);
+    let ch = h.div_ceil(2);
 
-    // Y: gradient shifting per frame
-    let mut y = vec![0u8; w * h];
+    let mut y = BorderedPlane::new(pool, w, h, BorderPadding::NONE);
     for row in 0..h {
-        for col in 0..w {
-            y[row * w + col] = ((col + row * 2 + frame_idx as usize * 17) % 235 + 16) as u8;
+        let line = y.row_mut(row).unwrap();
+        for (col, px) in line.iter_mut().enumerate() {
+            *px = (((col + row * 2 + frame_idx as usize * 17) % 219) + 16) as u8;
         }
     }
-    // U/V: neutral chroma
-    let u = vec![128u8; cw * ch];
-    let v = vec![128u8; cw * ch];
 
-    let mut frame = Frame::new_video(width, height, PixelFormat::Yuv420p);
-    frame.pts = frame_idx as i64;
-    frame.duration = 1;
-
-    if let FrameData::Video(ref mut video) = frame.data {
-        video.planes = vec![
-            FramePlane {
-                buffer: Buffer::from_slice(&y),
-                offset: 0,
-                linesize: w,
-            },
-            FramePlane {
-                buffer: Buffer::from_slice(&u),
-                offset: 0,
-                linesize: cw,
-            },
-            FramePlane {
-                buffer: Buffer::from_slice(&v),
-                offset: 0,
-                linesize: cw,
-            },
-        ];
+    let mut u = BorderedPlane::new(pool, cw, ch, BorderPadding::NONE);
+    let mut v = BorderedPlane::new(pool, cw, ch, BorderPadding::NONE);
+    for row in 0..ch {
+        u.row_mut(row).unwrap().fill(128);
+        v.row_mut(row).unwrap().fill(128);
     }
 
+    let mut frame = VideoFrame::from_planes(width, height, PixelLayout::YUV420P, vec![y, u, v]);
+    frame.pts = Timestamp::new(pts);
+    frame.duration = 1;
+    frame.time_base = time_base;
+    frame.color = ColorDesc::BT709_LIMITED;
     frame
 }
 
-/// Encode synthetic frames and mux to MP4. Returns (output_path, frame_count).
-fn encode_to_mp4(
+fn encode_rav1e_to_mp4(
     width: u32,
     height: u32,
     num_frames: u32,
-    output_path: &std::path::Path,
+    mp4_path: &Path,
 ) -> (usize, Vec<u8>) {
-    let mut builder = EncoderBuilder::new(CodecId::Av1, MediaType::Video);
-    builder.width = width;
-    builder.height = height;
-    builder.pixel_format = PixelFormat::Yuv420p;
-    builder.time_base = Rational::new(1, 30);
-    builder = builder.option("speed", "10"); // fastest for tests
+    let reg = default_registry();
+    let pool = BufferPool::new();
+    let tb = Rational::new(1, 30);
 
-    let (mut encoder, extradata) =
-        wedeo_rav1e::create_av1_encoder(builder).expect("failed to create AV1 encoder");
-
-    // Collect all encoded packets
-    let mut packets = Vec::new();
-
-    for i in 0..num_frames {
-        let frame = generate_frame(width, height, i);
-        encoder.send_frame(Some(&frame)).expect("send_frame failed");
-
-        // Drain available packets
-        loop {
-            match encoder.receive_packet() {
-                Ok(pkt) => packets.push(pkt),
-                Err(Error::Again) => break,
-                Err(e) => panic!("receive_packet error: {e:?}"),
-            }
-        }
-    }
-
-    // Signal end-of-stream and drain remaining
-    encoder.send_frame(None).expect("flush failed");
-    loop {
-        match encoder.receive_packet() {
-            Ok(pkt) => packets.push(pkt),
-            Err(Error::Eof | Error::Again) => break,
-            Err(e) => panic!("drain error: {e:?}"),
-        }
-    }
-
-    let packet_count = packets.len();
-
-    // Mux to MP4
-    let mut params = wedeo_codec::decoder::CodecParameters::new(CodecId::Av1, MediaType::Video);
-    params.width = width;
-    params.height = height;
-    params.pixel_format = PixelFormat::Yuv420p;
-    params.extradata = extradata.clone();
-    params.time_base = Rational::new(1, 30);
-
-    let stream = Stream::new(0, params);
-    let mut out_ctx = OutputContext::create(output_path.to_str().unwrap(), "mp4", &[stream])
-        .expect("failed to create output");
-
-    for pkt in &packets {
-        out_ctx.write_packet(pkt).expect("write_packet failed");
-    }
-    out_ctx.finish().expect("finish failed");
-
-    (packet_count, extradata)
-}
-
-fn ffmpeg_available() -> bool {
-    Command::new("ffmpeg")
-        .arg("-version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-/// Smoke test: encoder opens and reports correct descriptor.
-#[test]
-fn av1_encoder_opens() {
-    let mut builder = EncoderBuilder::new(CodecId::Av1, MediaType::Video);
-    builder.width = 64;
-    builder.height = 64;
-    builder.pixel_format = PixelFormat::Yuv420p;
-    builder.time_base = Rational::new(1, 30);
-    builder = builder.option("speed", "10");
-
-    let encoder = builder.open();
-    assert!(
-        encoder.is_ok(),
-        "failed to open AV1 encoder: {:?}",
-        encoder.err()
+    let mut vparams = VideoStreamParams::new(width, height, PixelLayout::YUV420P);
+    vparams.color = ColorDesc::BT709_LIMITED;
+    let track = TrackDescriptor::new(
+        TrackId(1),
+        CodecId::Av1,
+        tb,
+        StreamParams::Video(vparams.clone()),
     );
-}
 
-/// Encode 5 synthetic frames, verify packets come back with KEY flag on first.
-#[test]
-fn av1_encode_basic() {
-    let mut builder = EncoderBuilder::new(CodecId::Av1, MediaType::Video);
-    builder.width = 64;
-    builder.height = 64;
-    builder.pixel_format = PixelFormat::Yuv420p;
-    builder.time_base = Rational::new(1, 30);
-    builder = builder.option("speed", "10");
+    let enc_factory = reg.find_encoder(CodecId::Av1).expect("av1_rav1e encoder");
+    assert_eq!(enc_factory.descriptor().name, "av1_rav1e");
+    let mut encoder = enc_factory
+        .open(
+            &track,
+            CodecContext::new(Arc::clone(&pool)),
+            PassMode::Single,
+        )
+        .expect("open av1_rav1e");
 
-    let (mut encoder, _extradata) =
-        wedeo_rav1e::create_av1_encoder(builder).expect("create encoder");
+    // Zero-backdoor av1C extradata directly from Encoder::extradata().
+    let extradata = encoder.extradata().to_vec();
+    assert!(
+        extradata.len() >= 4 && (extradata[0] & 0x80) != 0,
+        "expected valid av1C extradata"
+    );
 
     let mut packets = Vec::new();
-
-    for i in 0..5 {
-        let frame = generate_frame(64, 64, i);
-        encoder.send_frame(Some(&frame)).unwrap();
-        loop {
-            match encoder.receive_packet() {
-                Ok(pkt) => packets.push(pkt),
-                Err(Error::Again) => break,
-                Err(e) => panic!("error: {e:?}"),
-            }
-        }
-    }
-
-    // Drain
-    encoder.send_frame(None).unwrap();
-    loop {
-        match encoder.receive_packet() {
-            Ok(pkt) => packets.push(pkt),
-            Err(Error::Eof | Error::Again) => break,
-            Err(e) => panic!("drain error: {e:?}"),
+    for i in 0..num_frames {
+        let frame = build_synthetic_frame(&pool, width, height, i, i as i64, tb);
+        let hint = EncodeHint {
+            force_keyframe: i == 0 || i == num_frames / 2,
+            target_qp: None,
+        };
+        assert_eq!(
+            encoder
+                .send_unit(Some(&MediaUnit::Video(frame)), hint)
+                .unwrap(),
+            SendStatus::Accepted
+        );
+        while let RecvStatus::Ready(pkt) = encoder.receive_packet().unwrap() {
+            packets.push(pkt);
         }
     }
 
     assert_eq!(
-        packets.len(),
-        5,
-        "expected 5 packets after drain, got {}",
-        packets.len()
+        encoder.send_unit(None, EncodeHint::default()).unwrap(),
+        SendStatus::Accepted
     );
-    assert!(
-        !packets[0].data.data().is_empty(),
-        "first packet should have data"
-    );
-    assert!(
-        packets[0].flags.contains(PacketFlags::KEY),
-        "first packet should be a keyframe"
-    );
-}
-
-/// Encode → mux MP4 → ffprobe validates the output.
-#[test]
-fn av1_encode_ffprobe_validates() {
-    if !ffmpeg_available() {
-        eprintln!("SKIP: ffmpeg/ffprobe not available");
-        return;
+    loop {
+        match encoder.receive_packet().unwrap() {
+            RecvStatus::Ready(pkt) => packets.push(pkt),
+            RecvStatus::NeedMore => continue,
+            RecvStatus::Eof => break,
+        }
     }
 
-    let output = test_dir().join("ffprobe_test.mp4");
-    encode_to_mp4(176, 144, 10, &output);
+    let mut mux_params = vparams;
+    mux_params.extradata = extradata.clone();
+    let mux_track = TrackDescriptor::new(
+        TrackId(1),
+        CodecId::Av1,
+        tb,
+        StreamParams::Video(mux_params),
+    );
+    let mut header = ContainerHeader::new("mp4");
+    header.tracks.push(mux_track);
 
-    // ffprobe should succeed and report an AV1 stream
-    let result = Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-show_streams",
-            "-of",
-            "csv=p=0",
-            output.to_str().unwrap(),
-        ])
+    let mux_factory = reg.find_muxer_by_name("mp4").expect("mp4 muxer");
+    let sink = FileSink::create(mp4_path).expect("create mp4 file");
+    let mut muxer = mux_factory
+        .create(Box::new(sink))
+        .expect("create mp4 muxer");
+    muxer.write_header(&header).unwrap();
+    for pkt in &packets {
+        muxer.write_packet(pkt).unwrap();
+    }
+    muxer.finalize().unwrap();
+
+    (packets.len(), extradata)
+}
+
+#[test]
+fn av1_encode_mp4_validated_and_decoded_bitexact_by_ffmpeg_oracle_and_rav1d() {
+    let dir = temp_test_dir("av1_encode");
+    let mp4_path = dir.join("rav1e_bt709.mp4");
+
+    let (pkt_count, extradata) = encode_rav1e_to_mp4(176, 144, 6, &mp4_path);
+    assert_eq!(pkt_count, 6);
+    assert!(!extradata.is_empty());
+
+    // 1. ffprobe oracle confirms valid AV1 MP4 stream with BT.709 metadata.
+    let probe = Command::new(ffprobe_oracle_bin())
+        .args(["-v", "error", "-show_streams", mp4_path.to_str().unwrap()])
         .output()
-        .expect("ffprobe failed to run");
-
+        .expect("run ffprobe oracle");
     assert!(
-        result.status.success(),
-        "ffprobe failed: {}",
-        String::from_utf8_lossy(&result.stderr)
+        probe.status.success(),
+        "ffprobe oracle failed: {}",
+        String::from_utf8_lossy(&probe.stderr)
     );
+    let probe_out = String::from_utf8_lossy(&probe.stdout);
+    assert!(probe_out.contains("codec_name=av1"), "{probe_out}");
+    assert!(probe_out.contains("width=176"), "{probe_out}");
+    assert!(probe_out.contains("height=144"), "{probe_out}");
+    assert!(probe_out.contains("color_primaries=bt709"), "{probe_out}");
 
-    let stdout = String::from_utf8_lossy(&result.stdout);
-    assert!(
-        stdout.contains("av1") || stdout.contains("av01"),
-        "ffprobe output should mention AV1: {stdout}"
-    );
-}
-
-/// Encode → mux MP4 → FFmpeg decodes without error, frame count matches.
-#[test]
-fn av1_encode_ffmpeg_decodes() {
-    if !ffmpeg_available() {
-        eprintln!("SKIP: ffmpeg not available");
-        return;
-    }
-
-    let output = test_dir().join("ffmpeg_decode_test.mp4");
-    let (packet_count, _) = encode_to_mp4(176, 144, 10, &output);
-
-    // FFmpeg should decode the file without errors
-    let result = Command::new("ffmpeg")
+    // 2. FFmpeg (libdav1d) decodes MP4 cleanly, and wedeo-framecrc matches it bit-exact!
+    let ff_out = Command::new(system_ffmpeg_bin())
         .args([
             "-v",
             "error",
+            "-bitexact",
+            "-c:v",
+            "libdav1d",
             "-i",
-            output.to_str().unwrap(),
+            mp4_path.to_str().unwrap(),
             "-f",
             "framecrc",
+            "-flags",
+            "+bitexact",
+            "-fflags",
+            "+bitexact",
             "-",
         ])
         .output()
-        .expect("ffmpeg failed to run");
-
+        .expect("run ffmpeg libdav1d framecrc on rav1e MP4");
     assert!(
-        result.status.success(),
-        "ffmpeg decode failed: {}",
-        String::from_utf8_lossy(&result.stderr)
+        ff_out.status.success(),
+        "ffmpeg libdav1d decode failed: {}",
+        String::from_utf8_lossy(&ff_out.stderr)
     );
-
-    // Count decoded frames from framecrc output
-    let stdout = String::from_utf8_lossy(&result.stdout);
-    let frame_count = stdout
+    let ff_lines: Vec<String> = String::from_utf8_lossy(&ff_out.stdout)
         .lines()
-        .filter(|l| !l.starts_with('#') && !l.is_empty())
-        .count();
+        .map(ToOwned::to_owned)
+        .collect();
+    let wd_lines = run_wedeo_framecrc(&mp4_path).expect("wedeo-framecrc decode rav1e MP4");
+    compare_framecrc_full(
+        &wd_lines,
+        &ff_lines,
+        FramecrcCompareOpts::STRICT_TIMING_AND_HEADERS,
+    )
+    .expect("rav1e MP4 decode parity mismatch between wedeo (rav1d) and FFmpeg libdav1d");
 
-    assert_eq!(
-        frame_count, packet_count,
-        "frame count mismatch: ffmpeg decoded {frame_count}, encoder produced {packet_count}"
-    );
-    eprintln!("PASS: FFmpeg decoded {frame_count}/{packet_count} frames from wedeo/rav1e MP4");
-}
-
-/// Round-trip: encode → mux MP4 → demux → decode (rav1d) → compare PSNR.
-#[test]
-fn av1_roundtrip_decode() {
-    let output = test_dir().join("roundtrip_test.mp4");
-    let width = 176u32;
-    let height = 144u32;
-    let num_frames = 5u32;
-
-    encode_to_mp4(width, height, num_frames, &output);
-
-    // Demux and decode the MP4 with wedeo
-    let mut ctx = InputContext::open(output.to_str().unwrap()).expect("failed to open MP4");
-    let stream = ctx.streams.first().expect("no streams");
-    assert_eq!(stream.codec_params.codec_id, CodecId::Av1);
-    assert_eq!(stream.codec_params.width, width);
-    assert_eq!(stream.codec_params.height, height);
-
-    let params = stream.codec_params.clone();
-    let mut decoder = DecoderBuilder::new(params)
-        .open()
-        .expect("failed to open decoder");
-
-    let mut decoded_count = 0u32;
-
-    loop {
-        match ctx.read_packet() {
-            Ok(packet) => {
-                decoder.send_packet(Some(&packet)).unwrap();
-                loop {
-                    match decoder.receive_frame() {
-                        Ok(frame) => {
-                            let video = frame.video().expect("not a video frame");
-                            assert_eq!(video.width, width);
-                            assert_eq!(video.height, height);
-                            assert_eq!(video.planes.len(), 3);
-                            decoded_count += 1;
-                        }
-                        Err(Error::Again) => break,
-                        Err(e) => panic!("decode error: {e:?}"),
-                    }
-                }
-            }
-            Err(Error::Eof) => break,
-            Err(e) => panic!("demux error: {e:?}"),
-        }
+    // 3. Also verify VideoReader decodes all 6 frames cleanly.
+    let reg = default_registry();
+    let mut reader = wedeo::video::VideoReader::open(&reg, &mp4_path).unwrap();
+    let mut count = 0usize;
+    while let Some(f) = reader.next_frame().unwrap() {
+        assert_eq!(f.display_size(), (176, 144));
+        assert_eq!(f.color.primaries, ColorDesc::BT709_LIMITED.primaries);
+        count += 1;
     }
-
-    // Drain
-    decoder.send_packet(None).unwrap();
-    loop {
-        match decoder.receive_frame() {
-            Ok(_) => decoded_count += 1,
-            Err(Error::Eof | Error::Again) => break,
-            Err(e) => panic!("drain error: {e:?}"),
-        }
-    }
-
-    assert_eq!(
-        decoded_count, num_frames,
-        "round-trip frame count mismatch: decoded {decoded_count}, expected {num_frames}"
-    );
-    eprintln!("PASS: AV1 round-trip {decoded_count}/{num_frames} frames (encode → MP4 → decode)");
+    assert_eq!(count, 6);
+    assert!(reader.health().is_clean());
 }

@@ -1,13 +1,14 @@
-//! Bitexact port of FFmpeg's tests/audiogen.c
+//! Bit-exact Rust port of FFmpeg `tests/audiogen.c`.
 //!
-//! Generates a synthetic test WAV file using integer-only math and a
-//! deterministic PRNG. Output is bit-identical to FFmpeg's audiogen.
+//! Generates a synthetic 16-bit PCM test stream (with a WAV header when the
+//! output filename ends with `.wav`) using integer-only math and a
+//! deterministic LCG PRNG. Output is bit-identical to `FFmpeg/tests/audiogen.c`.
 
 use std::env;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 
-const MAX_CHANNELS: usize = 12;
+const MAX_CHANNELS: usize = 16;
 const FRAC_BITS: i32 = 16;
 const FRAC_ONE: i32 = 1 << FRAC_BITS;
 const COS_TABLE_BITS: i32 = 7;
@@ -61,7 +62,7 @@ fn put32(w: &mut impl Write, v: u32) {
 }
 
 fn put_wav_header(w: &mut impl Write, sample_rate: u32, channels: u16, nb_samples: u32) {
-    let block_align: u16 = 2 * channels; // SAMPLE_SIZE=2
+    let block_align: u16 = 2 * channels;
     let data_size = block_align as u32 * nb_samples;
 
     w.write_all(b"RIFF").unwrap();
@@ -79,6 +80,10 @@ fn put_wav_header(w: &mut impl Write, sample_rate: u32, channels: u16, nb_sample
     put32(w, data_size);
 }
 
+fn has_wav_extension(path: &str) -> bool {
+    path.rsplit_once('.').is_some_and(|(_, ext)| ext == "wav")
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 || args.len() > 5 {
@@ -93,25 +98,38 @@ fn main() {
     }
 
     let sample_rate: i32 = if args.len() > 2 {
-        args[2].parse().unwrap()
+        args[2].parse().unwrap_or(0)
     } else {
         44100
     };
+    if sample_rate <= 0 {
+        eprintln!("invalid sample rate: {sample_rate}");
+        std::process::exit(1);
+    }
+
     let nb_channels: i32 = if args.len() > 3 {
-        args[3].parse().unwrap()
+        args[3].parse().unwrap_or(0)
     } else {
         2
     };
+    if nb_channels < 1 || nb_channels > MAX_CHANNELS as i32 {
+        eprintln!("invalid number of channels: {nb_channels}");
+        std::process::exit(1);
+    }
+
     let mut seed: u32 = if args.len() > 4 {
-        args[4].parse().unwrap()
+        args[4].parse::<i32>().unwrap_or(1) as u32
     } else {
         1
     };
 
-    let file = File::create(&args[1]).unwrap();
+    let file = File::create(&args[1]).unwrap_or_else(|e| {
+        eprintln!("{}: {e}", args[1]);
+        std::process::exit(1);
+    });
     let mut w = BufWriter::new(file);
 
-    if args[1].ends_with(".wav") {
+    if has_wav_extension(&args[1]) {
         put_wav_header(
             &mut w,
             sample_rate as u32,
@@ -127,7 +145,7 @@ fn main() {
         for _j in 0..nb_channels {
             put16(&mut w, v as i16);
         }
-        a += (1000 * FRAC_ONE) / sample_rate;
+        a = a.wrapping_add((1000 * FRAC_ONE) / sample_rate);
     }
 
     // 1 second of varying frequency between 100 and 10000 Hz
@@ -138,7 +156,7 @@ fn main() {
             put16(&mut w, v as i16);
         }
         let f = 100 + (((10000 - 100) * i) / sample_rate);
-        a += (f * FRAC_ONE) / sample_rate;
+        a = a.wrapping_add((f * FRAC_ONE) / sample_rate);
     }
 
     // 0.5 second of low amplitude white noise
@@ -171,7 +189,7 @@ fn main() {
             let v = (int_cos(taba[j]) * 10000) >> FRAC_BITS;
             put16(&mut w, v as i16);
             let f = tabf1[j] + (((tabf2[j] - tabf1[j]) * i) / sample_rate);
-            taba[j] += (f * FRAC_ONE) / sample_rate;
+            taba[j] = taba[j].wrapping_add((f * FRAC_ONE) / sample_rate);
         }
     }
 
@@ -186,8 +204,8 @@ fn main() {
             }
             let v = (int_cos(a) * amp) >> FRAC_BITS;
             put16(&mut w, v as i16);
-            a += (500 * FRAC_ONE) / sample_rate;
-            ampa += (2 * FRAC_ONE) / sample_rate;
+            a = a.wrapping_add((500 * FRAC_ONE) / sample_rate);
+            ampa = ampa.wrapping_add((2 * FRAC_ONE) / sample_rate);
         }
     }
 

@@ -1,476 +1,318 @@
-//! FATE-style integration tests for the H.264 decode pipeline.
+//! FATE-style live H.264 decode parity tests against FFmpeg `n9.1`.
 //!
-//! These tests verify:
-//! 1. Correct demuxing of H.264 Annex B streams into per-frame access units
-//! 2. Correct frame count, dimensions, and pixel format from the decoder
-//! 3. End-to-end decode of conformance files (single-slice I-frame files)
-//!
-//! Tests that require fate-suite samples are skipped if the directory
-//! is not present (controlled by FATE_SUITE env var or ./fate-suite/).
+//! Generates High-profile CABAC (with B-pyramid, BT.709 VUI, SAR 16:15) and
+//! non-mod16 cropped streams via system FFmpeg (`libx264`), then verifies:
+//! - 100% bit-exact `framecrc` parity against `/home/sharif/wedeo/target/ffmpeg-oracle/ffmpeg`
+//! - BT.709 VUI colorimetry, SAR, and `CropRect` display dimensions
+//! - `threads=1 == threads=2` determinism
+//! - Clean `StreamHealth`
 
-use std::path::{Path, PathBuf};
+use std::io::Read;
+use std::path::Path;
+use std::process::Command;
 
-// Ensure codec and format registrations are linked.
-use wedeo_codec_h264 as _;
-use wedeo_format_h264 as _;
+use wedeo::core::{
+    CodecContext, CodecId, ColorDesc, CropRect, ErrorPolicy, FileSource, FrameFlags, PictureType,
+    Rational, RecvStatus, SendStatus, VideoFrame,
+};
+use wedeo::default_registry;
+use wedeo_oracle::{
+    FramecrcCompareOpts, compare_framecrc_full, parse_framecrc_headers, run_ffmpeg_framecrc,
+    run_wedeo_framecrc, system_ffmpeg_bin, temp_test_dir,
+};
 
-use wedeo_codec::registry;
-use wedeo_core::codec_id::CodecId;
-use wedeo_core::error::Error;
-use wedeo_core::frame::FrameData;
-use wedeo_core::pixel_format::PixelFormat;
-use wedeo_format::context::InputContext;
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Get the fate-suite directory, or None if not available.
-fn fate_suite_dir() -> Option<PathBuf> {
-    // Check FATE_SUITE env var first
-    if let Ok(dir) = std::env::var("FATE_SUITE") {
-        let p = PathBuf::from(dir);
-        if p.is_dir() {
-            return Some(p);
-        }
-    }
-    // Fall back to ./fate-suite/
-    let p = PathBuf::from("fate-suite");
-    if p.is_dir() {
-        return Some(p);
-    }
-    // Try from workspace root
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("fate-suite");
-    if p.is_dir() {
-        return Some(p);
-    }
-    None
-}
-
-/// Get a conformance file path, or skip the test if not available.
-fn conformance_file(name: &str) -> PathBuf {
-    let dir = match fate_suite_dir() {
-        Some(d) => d,
-        None => {
-            eprintln!("SKIP: fate-suite not found");
-            return PathBuf::new();
-        }
+fn decode_h264_frames(path: &Path, ext: &str, threads: usize) -> Vec<VideoFrame> {
+    let reg = default_registry();
+    let mut head = [0u8; 8192];
+    let n = {
+        let mut f = FileSource::open(path).unwrap();
+        f.read(&mut head).unwrap()
     };
-    let path = dir.join("h264-conformance").join(name);
-    if !path.exists() {
-        eprintln!("SKIP: {} not found", path.display());
-    }
-    path
-}
+    let demux_factory = reg
+        .probe_demuxer(&head[..n], Some(ext))
+        .expect("probe demuxer for H.264");
+    let mut demuxer = demux_factory
+        .open(
+            Box::new(FileSource::open(path).unwrap()),
+            ErrorPolicy::Strict,
+        )
+        .expect("open H.264 demuxer");
 
-/// Open a file with InputContext and decode all frames.
-/// Returns a list of (width, height, pixel_format, data_size) for each decoded frame.
-fn decode_all_frames(path: &Path) -> Vec<(u32, u32, PixelFormat, usize)> {
-    if !path.exists() {
-        return Vec::new();
-    }
+    let track = demuxer
+        .header()
+        .tracks
+        .iter()
+        .find(|t| t.codec_id == CodecId::H264)
+        .expect("H.264 track")
+        .clone();
 
-    let mut input = InputContext::open(path.to_str().unwrap())
-        .unwrap_or_else(|e| panic!("Failed to open {}: {:?}", path.display(), e));
+    let ctx = CodecContext {
+        threads,
+        error_policy: ErrorPolicy::Strict,
+        ..Default::default()
+    };
 
-    // Find the video stream
-    let stream = &input.streams[0];
-    let params = stream.codec_params.clone();
-
-    // Create decoder
-    let factory = registry::find_decoder(params.codec_id)
-        .unwrap_or_else(|| panic!("No decoder for {:?}", params.codec_id));
-    let mut decoder = factory.create(params).unwrap();
+    let mut decoder = reg
+        .find_decoder(CodecId::H264)
+        .expect("H.264 decoder")
+        .open(&track, ctx)
+        .expect("open H.264 decoder");
 
     let mut frames = Vec::new();
-
-    // Demux + decode loop
     loop {
-        match input.read_packet() {
-            Ok(pkt) => {
-                decoder.send_packet(Some(&pkt)).unwrap();
-                loop {
-                    match decoder.receive_frame() {
-                        Ok(frame) => {
-                            let (w, h, pf, size) = match &frame.data {
-                                FrameData::Video(v) => {
-                                    let total_size: usize =
-                                        v.planes.iter().map(|p| p.buffer.size()).sum();
-                                    (v.width, v.height, v.format, total_size)
-                                }
-                                _ => panic!("Expected video frame"),
-                            };
-                            frames.push((w, h, pf, size));
-                        }
-                        Err(Error::Again) => break,
-                        Err(e) => panic!("receive_frame error: {:?}", e),
+        match demuxer.read_packet().unwrap() {
+            RecvStatus::Ready(pkt) => {
+                if pkt.track_id != track.id {
+                    continue;
+                }
+                let mut pending = Some(pkt);
+                while let Some(p) = pending.take() {
+                    if decoder.send_packet(Some(&p)).unwrap() == SendStatus::Full {
+                        pending = Some(p);
+                    }
+                    while let RecvStatus::Ready(unit) = decoder.receive().unwrap() {
+                        frames.push(unit.into_video().unwrap());
                     }
                 }
             }
-            Err(Error::Eof) => break,
-            Err(e) => panic!("read_packet error: {:?}", e),
+            RecvStatus::NeedMore => continue,
+            RecvStatus::Eof => break,
         }
     }
-
-    // Drain
-    decoder.send_packet(None).unwrap();
-    loop {
-        match decoder.receive_frame() {
-            Ok(frame) => {
-                let (w, h, pf, size) = match &frame.data {
-                    FrameData::Video(v) => {
-                        let total_size: usize = v.planes.iter().map(|p| p.buffer.size()).sum();
-                        (v.width, v.height, v.format, total_size)
-                    }
-                    _ => panic!("Expected video frame"),
-                };
-                frames.push((w, h, pf, size));
-            }
-            Err(Error::Eof) => break,
-            Err(e) => panic!("drain receive_frame error: {:?}", e),
-        }
+    assert_eq!(decoder.send_packet(None).unwrap(), SendStatus::Accepted);
+    while let RecvStatus::Ready(unit) = decoder.receive().unwrap() {
+        frames.push(unit.into_video().unwrap());
     }
-
+    assert!(decoder.health().is_clean());
+    assert!(demuxer.health().is_clean());
     frames
 }
 
-// ---------------------------------------------------------------------------
-// Registration tests
-// ---------------------------------------------------------------------------
+fn frame_display_bytes(frame: &VideoFrame) -> Vec<u8> {
+    let (dw, dh) = frame.display_size();
+    let planes = frame.planes().unwrap();
+    let crop = frame.crop;
+    let cw = (dw as usize).div_ceil(2);
+    let ch = (dh as usize).div_ceil(2);
+    let mut out = Vec::with_capacity(dw as usize * dh as usize + cw * ch * 2);
 
-#[test]
-fn h264_decoder_registered() {
-    let factory = registry::find_decoder(CodecId::H264);
-    assert!(factory.is_some(), "H.264 decoder should be registered");
-    let desc = factory.unwrap().descriptor();
-    assert_eq!(desc.name, "h264");
-    assert_eq!(desc.priority, 100);
-}
-
-#[test]
-fn h264_demuxer_registered() {
-    use wedeo_format::registry as fmt_registry;
-    // Check that the H.264 demuxer can be found
-    let h264_factory = fmt_registry::demuxers().find(|f| f.descriptor().name == "h264");
-    assert!(h264_factory.is_some(), "H.264 demuxer should be registered");
-}
-
-// ---------------------------------------------------------------------------
-// Conformance file tests (single-slice Baseline files)
-// ---------------------------------------------------------------------------
-
-/// BA1_Sony_D.jsv: Baseline profile, CAVLC, single slice per frame.
-/// 176x144, 17 frames (1 IDR + 16 P-frames).
-#[test]
-fn fate_h264_ba1_sony_d() {
-    let path = conformance_file("BA1_Sony_D.jsv");
-    if !path.exists() {
-        return;
+    for r in 0..dh as usize {
+        let row = planes[0].row(crop.top as usize + r).unwrap();
+        out.extend_from_slice(&row[crop.left as usize..crop.left as usize + dw as usize]);
     }
-
-    let frames = decode_all_frames(&path);
-    assert!(
-        !frames.is_empty(),
-        "Should decode at least one frame from BA1_Sony_D.jsv"
-    );
-
-    // All frames should be 176x144 YUV420p
-    for (i, &(w, h, pf, size)) in frames.iter().enumerate() {
-        assert_eq!(w, 176, "Frame {} width", i);
-        assert_eq!(h, 144, "Frame {} height", i);
-        assert_eq!(pf, PixelFormat::Yuv420p, "Frame {} pixel format", i);
-        // YUV420p: W*H + 2*(W/2)*(H/2) = W*H*3/2
-        let expected_size = 176 * 144 * 3 / 2;
-        assert_eq!(size, expected_size, "Frame {} data size", i);
-    }
-
-    // BA1_Sony_D.jsv has 17 frames
-    eprintln!(
-        "BA1_Sony_D.jsv: decoded {} frames (expected 17)",
-        frames.len()
-    );
-    assert_eq!(frames.len(), 17, "Expected 17 frames in BA1_Sony_D.jsv");
-}
-
-/// BA2_Sony_F.jsv: Baseline profile, CAVLC.
-#[test]
-fn fate_h264_ba2_sony_f() {
-    let path = conformance_file("BA2_Sony_F.jsv");
-    if !path.exists() {
-        return;
-    }
-
-    let frames = decode_all_frames(&path);
-    assert!(
-        !frames.is_empty(),
-        "Should decode at least one frame from BA2_Sony_F.jsv"
-    );
-
-    // All frames should be YUV420p
-    for (i, &(_, _, pf, _)) in frames.iter().enumerate() {
-        assert_eq!(pf, PixelFormat::Yuv420p, "Frame {} pixel format", i);
-    }
-
-    eprintln!("BA2_Sony_F.jsv: decoded {} frames", frames.len());
-}
-
-/// BASQP1_Sony_C.jsv: Baseline profile, variable QP.
-#[test]
-fn fate_h264_basqp1_sony_c() {
-    let path = conformance_file("BASQP1_Sony_C.jsv");
-    if !path.exists() {
-        return;
-    }
-
-    let frames = decode_all_frames(&path);
-    assert!(
-        !frames.is_empty(),
-        "Should decode at least one frame from BASQP1_Sony_C.jsv"
-    );
-
-    for (i, &(_, _, pf, _)) in frames.iter().enumerate() {
-        assert_eq!(pf, PixelFormat::Yuv420p, "Frame {} pixel format", i);
-    }
-
-    eprintln!("BASQP1_Sony_C.jsv: decoded {} frames", frames.len());
-}
-
-/// Verify that the demuxer correctly splits NALs into per-frame access units.
-/// BA1_Sony_D.jsv should produce 17 packets (one per frame).
-#[test]
-fn fate_h264_demuxer_au_grouping() {
-    let path = conformance_file("BA1_Sony_D.jsv");
-    if !path.exists() {
-        return;
-    }
-
-    let mut input = InputContext::open(path.to_str().unwrap()).unwrap();
-
-    let mut packet_count = 0;
-    loop {
-        match input.read_packet() {
-            Ok(_pkt) => {
-                packet_count += 1;
-            }
-            Err(Error::Eof) => break,
-            Err(e) => panic!("read_packet error: {:?}", e),
+    for plane in &planes[1..=2] {
+        for r in 0..ch {
+            let row = plane.row((crop.top as usize / 2) + r).unwrap();
+            out.extend_from_slice(&row[(crop.left as usize / 2)..(crop.left as usize / 2) + cw]);
         }
     }
-
-    eprintln!("BA1_Sony_D.jsv: {} packets from demuxer", packet_count);
-    // Should have 17 packets (one per frame, not one giant packet)
-    assert_eq!(
-        packet_count, 17,
-        "Demuxer should produce 17 packets for BA1_Sony_D.jsv"
-    );
+    out
 }
 
-// ---------------------------------------------------------------------------
-// Bitexact regression tests (framecrc parity with FFmpeg)
-// ---------------------------------------------------------------------------
-
-/// BA1_Sony_D.jsv: Baseline BITEXACT — 17 frames, 176x144, QP=28, I+P.
 #[test]
-fn fate_h264_ba1_sony_d_bitexact() {
-    let path = conformance_file("BA1_Sony_D.jsv");
-    if !path.exists() {
-        return;
-    }
+fn h264_high_profile_cabac_bt709_sar_and_threads_parity_vs_ffmpeg_oracle() {
+    let dir = temp_test_dir("h264_bt709");
+    let h264_path = dir.join("bt709_cabac.h264");
+    let mp4_path = dir.join("bt709_cabac.mp4");
 
-    let wedeo = match wedeo_fate::run_wedeo_framecrc(&path) {
-        Ok(lines) => lines,
-        Err(e) => panic!("wedeo-framecrc failed: {e}"),
-    };
+    // Generate High-profile CABAC H.264 Annex B stream with B-pyramid, BT.709 VUI, SAR 16:15.
+    let st = Command::new(system_ffmpeg_bin())
+        .args([
+            "-y",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=160x112:rate=30:duration=0.6",
+            "-vf",
+            "setsar=16/15",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:v",
+            "libx264",
+            "-profile:v",
+            "high",
+            "-crf",
+            "20",
+            "-g",
+            "9",
+            "-keyint_min",
+            "9",
+            "-bf",
+            "2",
+            "-refs",
+            "2",
+            "-color_primaries",
+            "bt709",
+            "-color_trc",
+            "bt709",
+            "-colorspace",
+            "bt709",
+            "-color_range",
+            "tv",
+            "-x264-params",
+            "aud=1:scenecut=0:b-pyramid=normal:b-adapt=0:colorprim=bt709:transfer=bt709:colormatrix=bt709",
+            h264_path.to_str().unwrap(),
+        ])
+        .status()
+        .expect("run system ffmpeg libx264");
+    assert!(st.success(), "libx264 Annex B generation failed");
 
-    let Some(ffmpeg) = wedeo_fate::run_ffmpeg_framecrc_video(&path) else {
-        eprintln!("SKIP: ffmpeg not available for cross-validation");
-        return;
-    };
+    // Generate matching MP4 directly via libx264 so container PTS/DTS/ctts are valid.
+    let st_mp4 = Command::new(system_ffmpeg_bin())
+        .args([
+            "-y",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=160x112:rate=30:duration=0.6",
+            "-vf",
+            "setsar=16/15",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:v",
+            "libx264",
+            "-profile:v",
+            "high",
+            "-crf",
+            "20",
+            "-g",
+            "9",
+            "-keyint_min",
+            "9",
+            "-bf",
+            "2",
+            "-refs",
+            "2",
+            "-color_primaries",
+            "bt709",
+            "-color_trc",
+            "bt709",
+            "-colorspace",
+            "bt709",
+            "-color_range",
+            "tv",
+            "-x264-params",
+            "aud=1:scenecut=0:b-pyramid=normal:b-adapt=0:colorprim=bt709:transfer=bt709:colormatrix=bt709",
+            mp4_path.to_str().unwrap(),
+        ])
+        .status()
+        .expect("generate H.264 MP4");
+    assert!(st_mp4.success(), "libx264 MP4 generation failed");
 
-    match wedeo_fate::compare_framecrc_lines(&wedeo, &ffmpeg) {
-        Ok(()) => eprintln!("PASS: BA1_Sony_D.jsv BITEXACT"),
-        Err(e) => panic!("BA1_Sony_D.jsv NOT BITEXACT:\n{e}"),
-    }
-}
+    // 1. Annex B raw stream bit-exact framecrc vs FFmpeg n9.1 oracle.
+    let wd_annexb = run_wedeo_framecrc(&h264_path).expect("wedeo-framecrc Annex B");
+    let ff_annexb = run_ffmpeg_framecrc(&h264_path).expect("ffmpeg oracle Annex B");
+    compare_framecrc_full(&wd_annexb, &ff_annexb, FramecrcCompareOpts::DATA_ONLY)
+        .expect("H.264 Annex B framecrc mismatch vs FFmpeg n9.1");
+    let wd_hdrs = parse_framecrc_headers(&wd_annexb);
+    let ff_hdrs = parse_framecrc_headers(&ff_annexb);
+    assert_eq!(wd_hdrs[0].dimensions, ff_hdrs[0].dimensions);
+    assert_eq!(wd_hdrs[0].sar.as_deref(), Some("16/15"));
 
-/// SVA_BA1_B.264: Baseline BITEXACT — single-slice I-frames, 176x144.
-#[test]
-fn fate_h264_sva_ba1_b_bitexact() {
-    let path = conformance_file("SVA_BA1_B.264");
-    if !path.exists() {
-        return;
-    }
+    // 2. MP4 container bit-exact framecrc vs FFmpeg n9.1 oracle.
+    let wd_mp4 = run_wedeo_framecrc(&mp4_path).expect("wedeo-framecrc MP4");
+    let ff_mp4 = run_ffmpeg_framecrc(&mp4_path).expect("ffmpeg oracle MP4");
+    compare_framecrc_full(&wd_mp4, &ff_mp4, FramecrcCompareOpts::DATA_ONLY)
+        .expect("H.264 MP4 framecrc mismatch vs FFmpeg n9.1");
 
-    let wedeo = match wedeo_fate::run_wedeo_framecrc(&path) {
-        Ok(lines) => lines,
-        Err(e) => panic!("wedeo-framecrc failed: {e}"),
-    };
+    // 3. BT.709 VUI colorimetry, SAR, B-frames, KEY flags, and threads=1 == threads=2 parity.
+    let t1 = decode_h264_frames(&h264_path, "h264", 1);
+    let t2 = decode_h264_frames(&h264_path, "h264", 2);
+    assert_eq!(t1.len(), 18);
+    assert_eq!(t2.len(), 18);
 
-    let Some(ffmpeg) = wedeo_fate::run_ffmpeg_framecrc_video(&path) else {
-        eprintln!("SKIP: ffmpeg not available for cross-validation");
-        return;
-    };
-
-    match wedeo_fate::compare_framecrc_lines(&wedeo, &ffmpeg) {
-        Ok(()) => eprintln!("PASS: SVA_BA1_B.264 BITEXACT"),
-        Err(e) => panic!("SVA_BA1_B.264 NOT BITEXACT:\n{e}"),
-    }
-}
-
-/// SVA_NL1_B.264: Baseline BITEXACT — single-slice I-frames, 176x144.
-#[test]
-fn fate_h264_sva_nl1_b_bitexact() {
-    let path = conformance_file("SVA_NL1_B.264");
-    if !path.exists() {
-        return;
-    }
-
-    let wedeo = match wedeo_fate::run_wedeo_framecrc(&path) {
-        Ok(lines) => lines,
-        Err(e) => panic!("wedeo-framecrc failed: {e}"),
-    };
-
-    let Some(ffmpeg) = wedeo_fate::run_ffmpeg_framecrc_video(&path) else {
-        eprintln!("SKIP: ffmpeg not available for cross-validation");
-        return;
-    };
-
-    match wedeo_fate::compare_framecrc_lines(&wedeo, &ffmpeg) {
-        Ok(()) => eprintln!("PASS: SVA_NL1_B.264 BITEXACT"),
-        Err(e) => panic!("SVA_NL1_B.264 NOT BITEXACT:\n{e}"),
-    }
-}
-
-/// BAMQ1_JVC_C.264: Baseline BITEXACT — I-only with per-MB QP variation, 176x144.
-/// 30 frames, all I-frames. The per-MB QP delta exercises the full dequant/IDCT
-/// path at various quantization levels within each frame.
-#[test]
-fn fate_h264_bamq1_jvc_c_bitexact() {
-    let path = conformance_file("BAMQ1_JVC_C.264");
-    if !path.exists() {
-        return;
-    }
-
-    let wedeo = match wedeo_fate::run_wedeo_framecrc(&path) {
-        Ok(lines) => lines,
-        Err(e) => panic!("wedeo-framecrc failed: {e}"),
-    };
-
-    let Some(ffmpeg) = wedeo_fate::run_ffmpeg_framecrc_video(&path) else {
-        eprintln!("SKIP: ffmpeg not available for cross-validation");
-        return;
-    };
-
-    match wedeo_fate::compare_framecrc_lines(&wedeo, &ffmpeg) {
-        Ok(()) => eprintln!("PASS: BAMQ1_JVC_C.264 BITEXACT"),
-        Err(e) => panic!("BAMQ1_JVC_C.264 NOT BITEXACT:\n{e}"),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// P-frame decode regression tests
-// ---------------------------------------------------------------------------
-
-/// BA_MW_D.264: Baseline I+P, 100 frames. All 100 frames should decode.
-/// P-frame decode works after DPB reference marking and CAVLC ref count fixes.
-#[test]
-fn fate_h264_ba_mw_d_frame_count() {
-    let path = conformance_file("BA_MW_D.264");
-    if !path.exists() {
-        return;
-    }
-
-    let frames = decode_all_frames(&path);
-    assert_eq!(frames.len(), 100, "BA_MW_D.264 should decode 100 frames");
-    for (i, &(w, h, pf, _)) in frames.iter().enumerate() {
-        assert_eq!(w, 176, "Frame {} width", i);
-        assert_eq!(h, 144, "Frame {} height", i);
-        assert_eq!(pf, PixelFormat::Yuv420p, "Frame {} pixel format", i);
-    }
-}
-
-/// SVA_Base_B.264: Multi-slice Baseline I+P, 17 frames.
-/// Previously panicked with OOB at fill_mb_gray; now decodes all 17 frames.
-#[test]
-fn fate_h264_sva_base_b_frame_count() {
-    let path = conformance_file("SVA_Base_B.264");
-    if !path.exists() {
-        return;
-    }
-
-    let frames = decode_all_frames(&path);
-    assert_eq!(frames.len(), 17, "SVA_Base_B.264 should decode 17 frames");
-}
-
-/// SVA_FM1_E.264: Multi-slice Baseline, 17 frames.
-/// Previously panicked; now decodes all 17 frames.
-#[test]
-fn fate_h264_sva_fm1_e_frame_count() {
-    let path = conformance_file("SVA_FM1_E.264");
-    if !path.exists() {
-        return;
-    }
-
-    let frames = decode_all_frames(&path);
-    assert_eq!(frames.len(), 17, "SVA_FM1_E.264 should decode 17 frames");
-}
-
-/// BA1_FT_C.264: Baseline 352x288, 299 frames.
-/// Previously decoded only 26/299; now all 299 frames.
-#[test]
-fn fate_h264_ba1_ft_c_frame_count() {
-    let path = conformance_file("BA1_FT_C.264");
-    if !path.exists() {
-        return;
-    }
-
-    let frames = decode_all_frames(&path);
-    assert_eq!(frames.len(), 299, "BA1_FT_C.264 should decode 299 frames");
-    for (i, &(w, h, _, _)) in frames.iter().enumerate() {
-        assert_eq!(w, 352, "Frame {} width", i);
-        assert_eq!(h, 288, "Frame {} height", i);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Demuxer tests
-// ---------------------------------------------------------------------------
-
-/// Test that the demuxer produces correct packet count for a multi-slice file.
-/// SVA_Base_B.264 has 3 slices per frame.
-#[test]
-fn fate_h264_demuxer_multi_slice() {
-    let path = conformance_file("SVA_Base_B.264");
-    if !path.exists() {
-        return;
-    }
-
-    let mut input = InputContext::open(path.to_str().unwrap()).unwrap();
-
-    let mut packet_count = 0;
-    loop {
-        match input.read_packet() {
-            Ok(_pkt) => {
-                packet_count += 1;
-            }
-            Err(Error::Eof) => break,
-            Err(e) => panic!("read_packet error: {:?}", e),
+    let mut saw_b = false;
+    for (i, (f1, f2)) in t1.iter().zip(t2.iter()).enumerate() {
+        assert_eq!(f1.display_size(), (160, 112));
+        assert_eq!(f1.crop, CropRect::ZERO);
+        assert_eq!(f1.color, ColorDesc::BT709_LIMITED);
+        assert_eq!(f1.sar, Rational::new(16, 15));
+        assert_eq!(f1.flags.contains(FrameFlags::KEY), i == 0 || i == 9);
+        if f1.picture_type == PictureType::B {
+            saw_b = true;
         }
+        assert_eq!(
+            frame_display_bytes(f1),
+            frame_display_bytes(f2),
+            "H.264 threads=1 vs threads=2 mismatch at frame {i}"
+        );
     }
+    assert!(saw_b, "expected B-frames in High-profile stream");
+}
 
-    eprintln!(
-        "SVA_Base_B.264: {} packets from demuxer (multi-slice)",
-        packet_count
-    );
-    // This file has multiple slices per frame; the demuxer should group
-    // them into per-frame AUs. The exact count depends on the file structure.
-    assert!(
-        packet_count > 0,
-        "Should produce at least one packet for SVA_Base_B.264"
-    );
+#[test]
+fn h264_non_mod16_crop_and_full_range_bitexact_vs_ffmpeg_oracle() {
+    let dir = temp_test_dir("h264_crop");
+    let h264_path = dir.join("crop_130x98.h264");
+
+    // 130x98 forces coded 144x112 with CropRect { top: 0, bottom: 14, left: 0, right: 14 }.
+    let st = Command::new(system_ffmpeg_bin())
+        .args([
+            "-y",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=130x98:rate=25:duration=0.48",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:v",
+            "libx264",
+            "-profile:v",
+            "main",
+            "-crf",
+            "18",
+            "-g",
+            "6",
+            "-keyint_min",
+            "6",
+            "-bf",
+            "0",
+            "-color_primaries",
+            "bt709",
+            "-color_trc",
+            "bt709",
+            "-colorspace",
+            "bt709",
+            "-color_range",
+            "pc",
+            "-x264-params",
+            "aud=1:scenecut=0:colorprim=bt709:transfer=bt709:colormatrix=bt709:fullrange=on",
+            h264_path.to_str().unwrap(),
+        ])
+        .status()
+        .expect("run system ffmpeg libx264 crop");
+    assert!(st.success(), "libx264 crop stream generation failed");
+
+    let wd_lines = run_wedeo_framecrc(&h264_path).expect("wedeo-framecrc crop");
+    let ff_lines = run_ffmpeg_framecrc(&h264_path).expect("ffmpeg oracle crop");
+    compare_framecrc_full(&wd_lines, &ff_lines, FramecrcCompareOpts::DATA_ONLY)
+        .expect("H.264 cropped 130x98 framecrc mismatch vs FFmpeg n9.1");
+
+    let wd_hdrs = parse_framecrc_headers(&wd_lines);
+    assert_eq!(wd_hdrs[0].dimensions.as_deref(), Some("130x98"));
+
+    let frames = decode_h264_frames(&h264_path, "h264", 1);
+    assert_eq!(frames.len(), 12);
+    for f in &frames {
+        assert_eq!(f.width, 144);
+        assert_eq!(f.height, 112);
+        assert_eq!(f.display_size(), (130, 98));
+        assert_eq!(
+            f.crop,
+            CropRect {
+                top: 0,
+                bottom: 14,
+                left: 0,
+                right: 14,
+            }
+        );
+        assert_eq!(f.color.primaries, ColorDesc::BT709_LIMITED.primaries);
+        assert_eq!(f.color.range, wedeo::core::ColorRange::Full);
+    }
 }

@@ -1,368 +1,407 @@
-//! FATE-style integration tests for PCM/WAV pipeline.
-//!
-//! These tests verify bit-exact parity between wedeo and FFmpeg by:
-//! 1. Generating synthetic audio with the bitexact audiogen
-//! 2. Demuxing + decoding with wedeo
-//! 3. Comparing framecrc output or raw MD5 against FFmpeg reference values
-//!
-//! Tests that require fate-suite samples are skipped if the directory
-//! is not present (controlled by FATE_SUITE env var or ./fate-suite/).
+//! FATE-style bit-exact oracle tests for native `WavDemuxer` + `PcmDecoder`
+//! + `PcmEncoder` + `WavMuxer` + `wedeo-audiogen` against FFmpeg `n9.1`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
-// ---- Helpers ----
+use wedeo::core::{
+    CodecContext, CodecId, ContainerHeader, ErrorPolicy, FileSink, FileSource, MediaUnit, PassMode,
+    RecvStatus, SendStatus, StreamParams, TrackDescriptor, TrackId, adler32_ffmpeg,
+};
+use wedeo::{default_registry, native_registry};
+use wedeo_oracle::{
+    FramecrcCompareOpts, compare_framecrc_full, ffmpeg_oracle_bin, find_oracle_bin, md5_bytes,
+    parse_framecrc_headers, parse_framecrc_record, run_ffmpeg_packet_framecrc, run_wedeo_framecrc,
+    temp_test_dir, workspace_root,
+};
 
-fn wedeo_audiogen() -> String {
-    env!("CARGO_BIN_EXE_wedeo-audiogen").to_string()
+fn wedeo_audiogen_bin() -> PathBuf {
+    find_oracle_bin("wedeo-audiogen", Some("CARGO_BIN_EXE_wedeo-audiogen"))
+        .expect("wedeo-audiogen binary must exist")
 }
 
-fn wedeo_framecrc() -> String {
-    env!("CARGO_BIN_EXE_wedeo-framecrc").to_string()
-}
-
-fn tmp_dir() -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join("wedeo-fate");
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
-/// Generate a synthetic WAV file using wedeo-audiogen.
-fn generate_test_wav(name: &str, sample_rate: u32, channels: u32) -> std::path::PathBuf {
-    let path = tmp_dir().join(name);
-    let status = Command::new(wedeo_audiogen())
-        .arg(path.to_str().unwrap())
-        .arg(sample_rate.to_string())
-        .arg(channels.to_string())
+fn generate_wav(dir: &Path, name: &str, sample_rate: u32, channels: u32, seed: u32) -> PathBuf {
+    let path = dir.join(name);
+    let status = Command::new(wedeo_audiogen_bin())
+        .args([
+            path.to_str().unwrap(),
+            &sample_rate.to_string(),
+            &channels.to_string(),
+            &seed.to_string(),
+        ])
         .status()
-        .expect("failed to run wedeo-audiogen");
-    assert!(status.success(), "audiogen failed");
+        .expect("run wedeo-audiogen");
+    assert!(status.success(), "wedeo-audiogen failed");
     path
 }
 
-/// Run wedeo-framecrc on a file and return stdout.
-fn framecrc(input: &Path) -> String {
-    let output = Command::new(wedeo_framecrc())
-        .arg(input.to_str().unwrap())
-        .output()
-        .expect("failed to run wedeo-framecrc");
-    assert!(
-        output.status.success(),
-        "wedeo-framecrc failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+/// Demux all raw packet payloads via native `WavDemuxer`, verify continuous
+/// `(dts, pts, duration)` timestamps, and verify chunked `adler32_ffmpeg` matches
+/// FFmpeg `n9.1` `-c copy -f framecrc` byte-for-byte.
+fn assert_wav_packets_match_ffmpeg(wav: &Path, expected_codec: CodecId) {
+    let reg = default_registry();
+    let wedeo_lines = run_wedeo_framecrc(wav).expect("wedeo-framecrc");
+    let ffmpeg_lines = run_ffmpeg_packet_framecrc(wav).expect("ffmpeg -c copy framecrc");
+
+    // 1. Stream headers (#tb, #media_type, #codec_id, #sample_rate, #channel_layout_name)
+    //    must match FFmpeg n9.1 identically.
+    let w_hdrs = parse_framecrc_headers(&wedeo_lines);
+    let f_hdrs = parse_framecrc_headers(&ffmpeg_lines);
+    assert_eq!(
+        w_hdrs,
+        f_hdrs,
+        "WAV stream headers differ for {}",
+        wav.display()
     );
-    String::from_utf8(output.stdout).unwrap()
+
+    // 2. Collect FFmpeg packet records and verify Wedeo's native WavDemuxer emits the exact
+    //    same total byte stream, sample CRCs, and contiguous timeline.
+    let ff_records: Vec<_> = ffmpeg_lines
+        .iter()
+        .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+        .map(|l| parse_framecrc_record(l).unwrap())
+        .collect();
+    let wd_records: Vec<_> = wedeo_lines
+        .iter()
+        .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+        .map(|l| parse_framecrc_record(l).unwrap())
+        .collect();
+
+    assert!(!wd_records.is_empty());
+    let mut expected_ts = 0i64;
+    for rec in &wd_records {
+        assert_eq!(rec.dts, rec.pts);
+        assert_eq!(rec.dts, expected_ts);
+        expected_ts += rec.duration;
+    }
+
+    let ff_total_bytes: usize = ff_records.iter().map(|r| r.size).sum();
+    let wd_total_bytes: usize = wd_records.iter().map(|r| r.size).sum();
+    assert_eq!(
+        wd_total_bytes, ff_total_bytes,
+        "total WAV payload byte count differs"
+    );
+
+    // 3. Read raw packets directly via native WavDemuxer and verify per-chunk Adler-32
+    //    against FFmpeg's exact packet boundaries.
+    let src = FileSource::open(wav).unwrap();
+    let mut head = [0u8; 64];
+    {
+        use std::io::Read;
+        let mut peek = FileSource::open(wav).unwrap();
+        let n = peek.read(&mut head).unwrap();
+        let factory = reg.probe_demuxer(&head[..n], Some("wav")).unwrap();
+        assert_eq!(factory.descriptor().name, "wav");
+    }
+    let factory = reg.find_demuxer_by_name("wav").unwrap();
+    let mut demux = factory.open(Box::new(src), ErrorPolicy::Strict).unwrap();
+    assert_eq!(demux.header().tracks[0].codec_id, expected_codec);
+
+    let mut all_pkt_bytes = Vec::with_capacity(wd_total_bytes);
+    let mut pkt_idx = 0usize;
+    loop {
+        match demux.read_packet().unwrap() {
+            RecvStatus::Ready(pkt) => {
+                let data = pkt.data.data();
+                let crc = format!("0x{:08x}", adler32_ffmpeg(0, data));
+                assert_eq!(wd_records[pkt_idx].size, data.len());
+                assert_eq!(wd_records[pkt_idx].crc, crc);
+                all_pkt_bytes.extend_from_slice(data);
+                pkt_idx += 1;
+            }
+            RecvStatus::NeedMore => continue,
+            RecvStatus::Eof => break,
+        }
+    }
+    assert_eq!(pkt_idx, wd_records.len());
+
+    let mut off = 0usize;
+    for (i, ff) in ff_records.iter().enumerate() {
+        let chunk = &all_pkt_bytes[off..off + ff.size];
+        let crc = format!("0x{:08x}", adler32_ffmpeg(0, chunk));
+        assert_eq!(
+            crc, ff.crc,
+            "FFmpeg chunk {i} Adler-32 mismatch (expected {}, got {crc})",
+            ff.crc
+        );
+        off += ff.size;
+    }
+    assert_eq!(off, all_pkt_bytes.len());
 }
 
-/// Run FFmpeg's framecrc on a file (if ffmpeg is available).
-fn ffmpeg_framecrc(input: &Path) -> Option<String> {
-    let output = Command::new("ffmpeg")
+#[test]
+fn audiogen_is_bitexact_vs_ffmpeg_c_source() {
+    let audiogen_c = workspace_root().join("FFmpeg/tests/audiogen.c");
+    assert!(
+        audiogen_c.exists(),
+        "missing FFmpeg/tests/audiogen.c at {}",
+        audiogen_c.display()
+    );
+
+    let dir = temp_test_dir("pcm_wav_audiogen");
+    let c_bin = dir.join("ffmpeg-audiogen");
+    let compile = Command::new("cc")
         .args([
+            "-O2",
+            "-o",
+            c_bin.to_str().unwrap(),
+            audiogen_c.to_str().unwrap(),
+        ])
+        .status()
+        .expect("run cc on FFmpeg/tests/audiogen.c");
+    assert!(compile.success(), "cc failed to compile audiogen.c");
+
+    for (sr, ch, seed) in [
+        (44100u32, 2u32, 1u32),
+        (44100, 1, 1),
+        (96000, 1, 1),
+        (48000, 6, 42),
+    ] {
+        let ff_wav = dir.join(format!("ff-{sr}-{ch}-{seed}.wav"));
+        let wd_wav = dir.join(format!("wd-{sr}-{ch}-{seed}.wav"));
+
+        let st_ff = Command::new(&c_bin)
+            .args([
+                ff_wav.to_str().unwrap(),
+                &sr.to_string(),
+                &ch.to_string(),
+                &seed.to_string(),
+            ])
+            .status()
+            .unwrap();
+        assert!(st_ff.success(), "C audiogen failed");
+
+        let st_wd = Command::new(wedeo_audiogen_bin())
+            .args([
+                wd_wav.to_str().unwrap(),
+                &sr.to_string(),
+                &ch.to_string(),
+                &seed.to_string(),
+            ])
+            .status()
+            .unwrap();
+        assert!(st_wd.success(), "Rust wedeo-audiogen failed");
+
+        let ff_bytes = std::fs::read(&ff_wav).unwrap();
+        let wd_bytes = std::fs::read(&wd_wav).unwrap();
+        assert_eq!(
+            ff_bytes.len(),
+            wd_bytes.len(),
+            "WAV size mismatch for ({sr}, {ch}, {seed})"
+        );
+        assert_eq!(
+            ff_bytes, wd_bytes,
+            "wedeo-audiogen output differs from FFmpeg/tests/audiogen.c for ({sr}, {ch}, {seed})"
+        );
+    }
+}
+
+#[test]
+fn wav_packet_framecrc_bitexact_vs_ffmpeg_oracle() {
+    let dir = temp_test_dir("pcm_wav_pkt_crc");
+    for (name, sr, ch) in [
+        ("asynth-44100-2.wav", 44100u32, 2u32),
+        ("asynth-44100-1.wav", 44100, 1),
+        ("asynth-96000-1.wav", 96000, 1),
+    ] {
+        let wav = generate_wav(&dir, name, sr, ch, 1);
+        assert_wav_packets_match_ffmpeg(&wav, CodecId::PcmS16le);
+    }
+}
+
+#[test]
+fn wav_decoded_samples_bitexact_vs_ffmpeg_oracle() {
+    let dir = temp_test_dir("pcm_wav_samples");
+    let wav = generate_wav(&dir, "decoded-44100-2.wav", 44100, 2, 1);
+
+    // Decode with Wedeo's AudioReader using default_registry (must use native WAV + native PCM).
+    let reg = default_registry();
+    let mut reader = wedeo::audio::AudioReader::open(&reg, &wav).expect("AudioReader open WAV");
+    assert_eq!(reader.header().format_name, "wav");
+    assert_eq!(reader.params().sample_rate, 44100);
+    assert_eq!(reader.params().channel_layout.nb_channels, 2);
+
+    let mut wedeo_pcm = Vec::new();
+    while let Some(block) = reader.next_block().expect("next_block") {
+        assert_eq!(block.planes.len(), 1);
+        wedeo_pcm.extend_from_slice(block.planes[0].data());
+    }
+    assert!(reader.health().is_clean());
+    assert!(reader.demuxer_health().is_clean());
+
+    // Decode with FFmpeg n9.1 oracle to raw s16le PCM.
+    let out = Command::new(ffmpeg_oracle_bin())
+        .args([
+            "-v",
+            "error",
             "-bitexact",
             "-i",
-            input.to_str().unwrap(),
+            wav.to_str().unwrap(),
             "-f",
-            "framecrc",
-            "-flags",
-            "+bitexact",
-            "-fflags",
-            "+bitexact",
+            "s16le",
+            "-acodec",
+            "pcm_s16le",
             "-",
         ])
         .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    Some(String::from_utf8_lossy(&output.stdout).to_string())
-}
-
-/// Compare framecrc outputs, ignoring comment lines that may differ.
-fn compare_framecrc(wedeo_output: &str, ffmpeg_output: &str) -> Result<(), String> {
-    let wedeo_data: Vec<&str> = wedeo_output
-        .lines()
-        .filter(|l| !l.starts_with('#'))
-        .collect();
-    let ffmpeg_data: Vec<&str> = ffmpeg_output
-        .lines()
-        .filter(|l| !l.starts_with('#'))
-        .collect();
-
-    if wedeo_data.len() != ffmpeg_data.len() {
-        return Err(format!(
-            "Packet count differs: wedeo={}, ffmpeg={}",
-            wedeo_data.len(),
-            ffmpeg_data.len()
-        ));
-    }
-
-    for (i, (w, f)) in wedeo_data.iter().zip(ffmpeg_data.iter()).enumerate() {
-        // Compare fields: stream_index, dts, pts, duration, size, checksum
-        let w_fields: Vec<&str> = w.split(',').map(|s| s.trim()).collect();
-        let f_fields: Vec<&str> = f.split(',').map(|s| s.trim()).collect();
-
-        if w_fields.len() < 6 || f_fields.len() < 6 {
-            return Err(format!(
-                "Line {}: malformed framecrc line\n  wedeo:  {w}\n  ffmpeg: {f}",
-                i + 1
-            ));
-        }
-
-        // Compare size and checksum (fields 4 and 5) — these are the critical ones
-        if w_fields[4] != f_fields[4] || w_fields[5] != f_fields[5] {
-            return Err(format!(
-                "Line {} data mismatch:\n  wedeo:  {w}\n  ffmpeg: {f}",
-                i + 1
-            ));
-        }
-    }
-
-    Ok(())
-}
-
-/// Compute MD5 of raw decoded output from wedeo.
-#[allow(dead_code)]
-fn wedeo_decode_md5(input: &Path) -> String {
-    let output = Command::new(env!("CARGO_BIN_EXE_wedeo-framecrc"))
-        .arg(input.to_str().unwrap())
-        .output()
-        .expect("failed to run");
-    assert!(output.status.success());
-
-    // Parse framecrc output and concatenate all decoded data checksums
-    // For MD5 comparison, we need the raw decoded bytes.
-    // Use the CLI decode command instead.
-    let cli = std::env::current_dir()
-        .unwrap()
-        .join("target/debug/wedeo-cli");
-    if !cli.exists() {
-        // Fallback: return framecrc output hash
-        return wedeo_fate::md5_bytes(&output.stdout);
-    }
-
-    let decode_output = Command::new(cli)
-        .args(["decode", input.to_str().unwrap()])
-        .output()
-        .expect("failed to run wedeo-cli decode");
-    assert!(decode_output.status.success());
-
-    wedeo_fate::md5_bytes(&decode_output.stdout)
-}
-
-// ---- Tests ----
-
-/// Test that audiogen produces a valid WAV file that wedeo can demux.
-#[test]
-fn test_audiogen_44100_stereo() {
-    let wav = generate_test_wav("asynth-44100-2.wav", 44100, 2);
-    let output = framecrc(&wav);
-
-    // Verify we got framecrc output with the expected header
-    assert!(output.contains("#tb 0:"), "Missing timebase header");
+        .expect("run ffmpeg oracle raw pcm");
     assert!(
-        output.contains("#codec_id 0: pcm_s16le"),
-        "Wrong codec: {output}"
+        out.status.success(),
+        "ffmpeg oracle pcm decode failed: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
-    assert!(
-        output.contains("#sample_rate 0: 44100"),
-        "Wrong sample rate"
-    );
+    let ffmpeg_pcm = out.stdout;
 
-    // Verify we got data lines (6 seconds * 44100 Hz, packets should exist)
-    let data_lines: Vec<&str> = output.lines().filter(|l| !l.starts_with('#')).collect();
-    assert!(!data_lines.is_empty(), "No data packets in framecrc output");
-
-    // Every line should have an adler32 checksum
-    for line in &data_lines {
-        assert!(line.contains("0x"), "Missing checksum in: {line}");
-    }
-}
-
-/// Test mono audio generation.
-#[test]
-fn test_audiogen_44100_mono() {
-    let wav = generate_test_wav("asynth-44100-1.wav", 44100, 1);
-    let output = framecrc(&wav);
-    assert!(output.contains("#codec_id 0: pcm_s16le"));
-    // Mono = FC channel layout
-    assert!(output.contains("FC") || output.contains("mono") || output.contains("1 channels"));
-}
-
-/// Test 96kHz audio generation.
-#[test]
-fn test_audiogen_96000_mono() {
-    let wav = generate_test_wav("asynth-96000-1.wav", 96000, 1);
-    let output = framecrc(&wav);
-    assert!(output.contains("#sample_rate 0: 96000"));
-}
-
-/// Bitexact audiogen parity: verify the generated WAV matches FFmpeg's audiogen byte-for-byte.
-///
-/// This test compiles and runs FFmpeg's audiogen.c, then compares the output
-/// with wedeo's audiogen. Skipped if cc is not available.
-#[test]
-fn test_audiogen_bitexact_vs_ffmpeg() {
-    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap();
-    let ffmpeg_audiogen_c = workspace_root.join("FFmpeg/tests/audiogen.c");
-    if !ffmpeg_audiogen_c.exists() {
-        eprintln!("Skipping: FFmpeg/tests/audiogen.c not found");
-        return;
-    }
-
-    // Compile FFmpeg's audiogen
-    let ffmpeg_bin = tmp_dir().join("ffmpeg-audiogen");
-    let compile = Command::new("cc")
-        .args([
-            "-o",
-            ffmpeg_bin.to_str().unwrap(),
-            ffmpeg_audiogen_c.to_str().unwrap(),
-        ])
-        .status();
-
-    let Ok(status) = compile else {
-        eprintln!("Skipping: cc not available");
-        return;
-    };
-    if !status.success() {
-        eprintln!("Skipping: failed to compile audiogen.c");
-        return;
-    }
-
-    // Generate with both
-    let ffmpeg_wav = tmp_dir().join("ffmpeg-asynth-44100-2.wav");
-    let wedeo_wav = tmp_dir().join("wedeo-asynth-44100-2.wav");
-
-    Command::new(ffmpeg_bin.to_str().unwrap())
-        .args([ffmpeg_wav.to_str().unwrap(), "44100", "2"])
-        .status()
-        .unwrap();
-
-    Command::new(wedeo_audiogen())
-        .args([wedeo_wav.to_str().unwrap(), "44100", "2"])
-        .status()
-        .unwrap();
-
-    // Compare byte-for-byte
-    let ffmpeg_data = std::fs::read(&ffmpeg_wav).unwrap();
-    let wedeo_data = std::fs::read(&wedeo_wav).unwrap();
-
+    assert_eq!(wedeo_pcm.len(), ffmpeg_pcm.len());
     assert_eq!(
-        ffmpeg_data.len(),
-        wedeo_data.len(),
-        "File sizes differ: ffmpeg={} wedeo={}",
-        ffmpeg_data.len(),
-        wedeo_data.len()
+        md5_bytes(&wedeo_pcm),
+        md5_bytes(&ffmpeg_pcm),
+        "decoded PCM sample MD5 differs from FFmpeg n9.1 oracle"
     );
-
-    assert_eq!(
-        ffmpeg_data,
-        wedeo_data,
-        "audiogen output is NOT bitexact! First difference at byte {}",
-        ffmpeg_data
-            .iter()
-            .zip(wedeo_data.iter())
-            .position(|(a, b)| a != b)
-            .unwrap_or(0)
-    );
+    assert_eq!(wedeo_pcm, ffmpeg_pcm);
 }
 
-/// Cross-validate decoded audio data against FFmpeg (if available).
-///
-/// Since the symphonia WAV demuxer uses different packet sizes than FFmpeg,
-/// we compare the total concatenated packet data rather than per-packet
-/// framecrc lines. Both must produce the same total bytes (same raw PCM).
 #[test]
-fn test_framecrc_parity_with_ffmpeg() {
-    let wav = generate_test_wav("fate-parity-44100-2.wav", 44100, 2);
-    let wedeo_output = framecrc(&wav);
+fn wav_native_roundtrip_demux_decode_encode_mux_bitexact() {
+    let dir = temp_test_dir("pcm_wav_roundtrip");
+    let wav = generate_wav(&dir, "rt-src.wav", 48000, 2, 7);
 
-    let Some(ffmpeg_output) = ffmpeg_framecrc(&wav) else {
-        eprintln!("Skipping: ffmpeg not available for cross-validation");
-        return;
-    };
+    let reg = native_registry();
+    let mut reader = wedeo::audio::AudioReader::open(&reg, &wav).expect("open source WAV");
+    let audio_params = reader.params().clone();
 
-    // Extract data lines (non-comment) and compare total byte counts.
-    // Symphonia may split data into different packet sizes, but the total
-    // raw PCM data must be identical.
-    let wedeo_data: Vec<&str> = wedeo_output
-        .lines()
-        .filter(|l| !l.starts_with('#'))
-        .collect();
-    let ffmpeg_data: Vec<&str> = ffmpeg_output
-        .lines()
-        .filter(|l| !l.starts_with('#'))
-        .collect();
-
-    // Parse size field (field index 4) from each line and sum
-    let parse_total_size = |lines: &[&str]| -> usize {
-        lines
-            .iter()
-            .filter_map(|line| {
-                let fields: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
-                fields.get(4).and_then(|s| s.parse::<usize>().ok())
-            })
-            .sum()
-    };
-
-    let wedeo_total = parse_total_size(&wedeo_data);
-    let ffmpeg_total = parse_total_size(&ffmpeg_data);
-
-    assert_eq!(
-        wedeo_total,
-        ffmpeg_total,
-        "Total packet data size differs: wedeo={wedeo_total} ({} packets), ffmpeg={ffmpeg_total} ({} packets)",
-        wedeo_data.len(),
-        ffmpeg_data.len()
+    let track = TrackDescriptor::new(
+        TrackId(0),
+        CodecId::PcmS16le,
+        wedeo::core::Rational::new(1, audio_params.sample_rate as i32),
+        StreamParams::Audio(audio_params),
     );
+    let enc_factory = reg.find_encoder(CodecId::PcmS16le).expect("pcm_s16le enc");
+    let mut encoder = enc_factory
+        .open(&track, CodecContext::default(), PassMode::Single)
+        .expect("open pcm encoder");
 
-    eprintln!(
-        "PASS: total PCM data matches FFmpeg ({wedeo_total} bytes; wedeo={} packets, ffmpeg={} packets)",
-        wedeo_data.len(),
-        ffmpeg_data.len()
-    );
-}
+    let mut encoded_pkts = Vec::new();
+    let mut original_pcm = Vec::new();
 
-/// Test with a FATE suite WAV sample (if available).
-#[test]
-fn test_fate_suite_wav_sample() {
-    let Some(sample) = wedeo_fate::fate_sample("wav/200828-005.wav") else {
-        eprintln!("Skipping: fate-suite/wav/200828-005.wav not found");
-        eprintln!("Set FATE_SUITE env var or place samples in ./fate-suite/");
-        return;
-    };
-
-    let output = framecrc(&sample);
-    assert!(
-        output.contains("#codec_id 0:"),
-        "Failed to demux FATE WAV sample"
-    );
-
-    let data_lines: Vec<&str> = output.lines().filter(|l| !l.starts_with('#')).collect();
-    assert!(
-        !data_lines.is_empty(),
-        "No packets decoded from FATE WAV sample"
-    );
-
-    // Cross-validate with FFmpeg if available
-    if let Some(ffmpeg_output) = ffmpeg_framecrc(&sample) {
-        match compare_framecrc(&output, &ffmpeg_output) {
-            Ok(()) => eprintln!("PASS: FATE WAV sample matches FFmpeg"),
-            Err(e) => panic!("FATE WAV sample parity FAILED:\n{e}"),
+    while let Some(block) = reader.next_block().unwrap() {
+        original_pcm.extend_from_slice(block.planes[0].data());
+        assert_eq!(
+            encoder
+                .send_unit(
+                    Some(&MediaUnit::Audio(block)),
+                    wedeo::core::EncodeHint::default()
+                )
+                .unwrap(),
+            SendStatus::Accepted
+        );
+        while let RecvStatus::Ready(pkt) = encoder.receive_packet().unwrap() {
+            encoded_pkts.push(pkt);
         }
     }
+    assert_eq!(
+        encoder
+            .send_unit(None, wedeo::core::EncodeHint::default())
+            .unwrap(),
+        SendStatus::Accepted
+    );
+    while let RecvStatus::Ready(pkt) = encoder.receive_packet().unwrap() {
+        encoded_pkts.push(pkt);
+    }
+
+    let mux_factory = reg.find_muxer_by_name("wav").expect("wav muxer");
+    let rt_path = dir.join("rt-out.wav");
+    let file_sink = FileSink::create(&rt_path).expect("create rt-out.wav");
+    let mut muxer = mux_factory.create(Box::new(file_sink)).unwrap();
+    let mut hdr = ContainerHeader::new("wav");
+    hdr.tracks.push(track);
+    muxer.write_header(&hdr).unwrap();
+    for pkt in &encoded_pkts {
+        muxer.write_packet(pkt).unwrap();
+    }
+    muxer.finalize().unwrap();
+
+    let mut rt_reader = wedeo::audio::AudioReader::open(&reg, &rt_path).expect("re-open rt WAV");
+    let mut roundtrip_pcm = Vec::new();
+    while let Some(block) = rt_reader.next_block().unwrap() {
+        roundtrip_pcm.extend_from_slice(block.planes[0].data());
+    }
+    assert_eq!(original_pcm, roundtrip_pcm);
+
+    // Cross-check the roundtripped WAV against original WAV via wedeo-framecrc!
+    let orig_crc = run_wedeo_framecrc(&wav).unwrap();
+    let rt_crc = run_wedeo_framecrc(&rt_path).unwrap();
+    compare_framecrc_full(
+        &rt_crc,
+        &orig_crc,
+        FramecrcCompareOpts::STRICT_TIMING_AND_HEADERS,
+    )
+    .expect("roundtripped WAV must match original WAV framecrc");
+
+    assert_wav_packets_match_ffmpeg(&rt_path, CodecId::PcmS16le);
 }
 
-/// Self-consistency test: decode the same file twice, verify identical output.
 #[test]
-fn test_deterministic_output() {
-    let wav = generate_test_wav("deterministic-test.wav", 44100, 2);
-    let output1 = framecrc(&wav);
-    let output2 = framecrc(&wav);
-    assert_eq!(output1, output2, "Non-deterministic output detected!");
+fn wav_native_decode_matches_deterministic_and_supports_all_pcm_subtypes() {
+    let dir = temp_test_dir("pcm_wav_subtypes");
+    let src_wav = generate_wav(&dir, "sub-src.wav", 22050, 1, 3);
+
+    for (codec_name, codec_id, ff_fmt) in [
+        ("pcm_u8", CodecId::PcmU8, "u8"),
+        ("pcm_s16le", CodecId::PcmS16le, "s16le"),
+        ("pcm_s24le", CodecId::PcmS24le, "s32le"),
+        ("pcm_s32le", CodecId::PcmS32le, "s32le"),
+        ("pcm_f32le", CodecId::PcmF32le, "f32le"),
+    ] {
+        let out_wav = dir.join(format!("sub-{codec_name}.wav"));
+        let status = Command::new(ffmpeg_oracle_bin())
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-i",
+                src_wav.to_str().unwrap(),
+                "-t",
+                "0.5",
+                "-c:a",
+                codec_name,
+                out_wav.to_str().unwrap(),
+            ])
+            .status()
+            .expect("convert wav subtype");
+        assert!(status.success(), "ffmpeg failed converting to {codec_name}");
+
+        assert_wav_packets_match_ffmpeg(&out_wav, codec_id);
+
+        // Also confirm AudioReader decoded samples match FFmpeg oracle raw PCM byte-for-byte.
+        let reg = native_registry();
+        let mut reader = wedeo::audio::AudioReader::open(&reg, &out_wav).unwrap();
+        assert_eq!(reader.header().tracks[0].codec_id, codec_id);
+        let mut wedeo_pcm = Vec::new();
+        while let Some(b) = reader.next_block().unwrap() {
+            wedeo_pcm.extend_from_slice(b.planes[0].data());
+        }
+        assert!(!wedeo_pcm.is_empty(), "expected samples for {codec_name}");
+
+        let ff_out = Command::new(ffmpeg_oracle_bin())
+            .args([
+                "-v",
+                "error",
+                "-bitexact",
+                "-i",
+                out_wav.to_str().unwrap(),
+                "-f",
+                ff_fmt,
+                "-acodec",
+                &format!("pcm_{ff_fmt}"),
+                "-",
+            ])
+            .output()
+            .unwrap();
+        assert!(ff_out.status.success());
+        assert_eq!(
+            wedeo_pcm, ff_out.stdout,
+            "decoded PCM samples differ from FFmpeg oracle for {codec_name}"
+        );
+    }
 }
