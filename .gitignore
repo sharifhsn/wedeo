@@ -1,5 +1,7 @@
 # Build
 /target
+/dist
+/web/wedeo.wasm
 
 # FATE test samples (download via scripts/fetch-fate-suite.sh)
 /fate-suite

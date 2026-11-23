@@ -1,0 +1,31 @@
+[package]
+name = "wedeo-wasm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure-Rust WebAssembly entrypoint for Wedeo (inspect, H.264/VP9/audio decode, SwsOpList, remux)"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+wedeo = { path = "../../crates/wedeo", default-features = false, features = [
+    "audio-ops",
+    "video-ops",
+    "syntax",
+    "graph",
+    "pcm",
+    "wav",
+    "h264",
+    "vp9",
+    "mp4",
+    "mkv",
+    "ivf",
+    "symphonia",
+] }

@@ -2519,6 +2519,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "wedeo-wasm"
+version = "0.3.0"
+dependencies = [
+ "wedeo",
+]
+
+[[package]]
 name = "wgpu"
 version = "29.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

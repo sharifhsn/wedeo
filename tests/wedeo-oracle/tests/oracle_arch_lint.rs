@@ -473,7 +473,7 @@ fn arch_dag_and_dependency_invariants() {
             "wedeo-codec-pcm" | "wedeo-codec-h264" | "wedeo-codec-vp9" | "wedeo-format-wav"
             | "wedeo-format-mp4" | "wedeo-format-mkv" | "wedeo-format-ivf" | "wedeo-rav1d"
             | "wedeo-rav1e" | "wedeo-symphonia" => 2,
-            "wedeo" | "wedeo-cli" => 3,
+            "wedeo" | "wedeo-cli" | "wedeo-wasm" => 3,
             "wedeo-oracle" => 4,
             other => panic!("unclassified workspace crate `{other}` in DAG lint"),
         }
@@ -495,7 +495,7 @@ fn arch_dag_and_dependency_invariants() {
                                 "wedeo-video-ops" | "wedeo-audio-ops" | "wedeo-syntax"
                             ))
                         || (name == "wedeo-gpu-wgpu" && dep_name == "wedeo-video-ops")
-                        || (name == "wedeo-cli" && dep_name == "wedeo"),
+                        || (matches!(name, "wedeo-cli" | "wedeo-wasm") && dep_name == "wedeo"),
                     "layer inversion: `{name}` (L{my_layer}) depends on `{dep_name}` (L{dep_layer})"
                 );
                 assert_ne!(

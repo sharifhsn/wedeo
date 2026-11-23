@@ -224,6 +224,7 @@ pub fn native_registry() -> Registry {
 /// registered **first**, followed by raw elementary demuxers, and finally
 /// segregated external adapters (`rav1d`, `rav1e`, and `symphonia` last).
 pub fn default_registry() -> Registry {
+    #[allow(unused_mut)]
     let mut reg = native_registry();
 
     #[cfg(feature = "rav1d")]

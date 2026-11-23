@@ -43,6 +43,7 @@ pub fn detected_backend() -> SimdBackend {
 
 /// Return all backends executable on the current CPU (used by `checkasm`).
 pub fn available_backends() -> Vec<SimdBackend> {
+    #[allow(unused_mut)]
     let mut out = vec![SimdBackend::Scalar];
     #[cfg(target_arch = "x86_64")]
     {

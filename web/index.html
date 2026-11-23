@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Wedeo — Pure-Rust A/V Adapter in WebAssembly</title>
+  <meta name="description" content="Inspect containers, decode H.264/VP9/audio, run SwsOpList color conversion, resample audio, and remux MP4/MKV/WAV 100% client-side in pure Rust WebAssembly." />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">wedeo</span>
+      <span class="pill" id="wasm-status">loading wasm…</span>
+    </div>
+    <div class="meta-links">
+      <span class="tag">Pure Rust · Zero C/FFI · FFmpeg 9.1 Oracle</span>
+      <a href="https://github.com/sharifhsn/wedeo/tree/v2" target="_blank" rel="noopener">GitHub</a>
+    </div>
+  </header>
+
+  <main class="shell">
+    <section class="drop-bar" id="dropzone">
+      <div class="drop-copy">
+        <strong>Drop a media file</strong>
+        <span>.mp4 · .mkv · .webm · .ivf · .wav · .h264 — processed 100% locally in your browser (zero upload)</span>
+      </div>
+      <div class="drop-actions">
+        <label class="btn primary">
+          Choose File
+          <input type="file" id="file-input" hidden />
+        </label>
+        <button class="btn" data-sample="samples/h264_aac_320x240.mp4">H.264 + AAC MP4</button>
+        <button class="btn" data-sample="samples/vp9_smpte_320x240.mkv">VP9 MKV</button>
+        <button class="btn" data-sample="samples/chord_48k.wav">48 kHz WAV</button>
+      </div>
+    </section>
+
+    <div class="error-banner" id="error-banner" hidden></div>
+
+    <section class="grid" id="workspace">
+      <div class="panel player-panel">
+        <div class="panel-head">
+          <h2>Live WASM Decoder &amp; Player</h2>
+          <span class="mono muted" id="file-label">no file loaded</span>
+        </div>
+
+        <div class="stage">
+          <canvas id="video-canvas" width="320" height="240"></canvas>
+          <div class="stage-empty" id="stage-empty">
+            Select a sample above or drop a video/audio file to run Wedeo in WebAssembly.
+          </div>
+        </div>
+
+        <div class="controls" id="video-controls">
+          <button class="btn primary" id="btn-play" disabled>Play</button>
+          <button class="btn" id="btn-step" disabled>Step +1</button>
+          <button class="btn" id="btn-rewind" disabled>Rewind</button>
+          <input type="range" id="scrubber" min="0" max="0" value="0" disabled />
+          <span class="mono" id="frame-readout">0 / 0</span>
+        </div>
+
+        <div class="telemetry mono" id="video-telemetry">
+          <span>codec: —</span>
+          <span>sws: —</span>
+          <span>decode: —</span>
+          <span>pts: —</span>
+        </div>
+
+        <div class="audio-box">
+          <div class="panel-subhead">
+            <h3>Audio Engine <span class="muted">(wedeo-audio-ops + Web Audio)</span></h3>
+            <div class="audio-btns">
+              <button class="btn" id="btn-audio-play" disabled>Play Audio</button>
+              <button class="btn" id="btn-audio-stop" disabled>Stop</button>
+            </div>
+          </div>
+          <canvas id="wave-canvas" width="600" height="72"></canvas>
+          <div class="mono muted small" id="audio-telemetry">No audio track decoded yet.</div>
+        </div>
+
+        <div class="export-box">
+          <div class="panel-subhead">
+            <h3>In-Browser Remux &amp; Audio Export</h3>
+            <span class="mono muted small" id="export-status"></span>
+          </div>
+          <div class="export-row">
+            <button class="btn" id="btn-remux-mkv" disabled>Remux → .mkv</button>
+            <button class="btn" id="btn-remux-mp4" disabled>Remux → .mp4</button>
+            <div class="divider"></div>
+            <select id="wav-rate" class="select">
+              <option value="0">Native Hz</option>
+              <option value="48000">48 kHz</option>
+              <option value="16000" selected>16 kHz</option>
+              <option value="8000">8 kHz</option>
+            </select>
+            <select id="wav-ch" class="select">
+              <option value="0">Native ch</option>
+              <option value="1" selected>Mono</option>
+              <option value="2">Stereo</option>
+            </select>
+            <button class="btn primary" id="btn-export-wav" disabled>Export Resampled .wav</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel inspect-panel">
+        <div class="panel-head">
+          <h2>Container Inspector &amp; AST</h2>
+          <span class="badge" id="health-badge">—</span>
+        </div>
+
+        <div class="summary-cards" id="summary-cards">
+          <div class="stat"><label>Format</label><span class="mono" id="stat-format">—</span></div>
+          <div class="stat"><label>Size</label><span class="mono" id="stat-size">—</span></div>
+          <div class="stat"><label>Duration</label><span class="mono" id="stat-dur">—</span></div>
+          <div class="stat"><label>Tracks</label><span class="mono" id="stat-tracks">—</span></div>
+        </div>
+
+        <div class="subblock">
+          <h3>Tracks</h3>
+          <div id="tracks-list" class="tracks-list muted small">Load a file to inspect tracks.</div>
+        </div>
+
+        <div class="subblock ast-block">
+          <h3>Container Box / EBML / RIFF AST</h3>
+          <div id="ast-tree" class="ast-tree mono muted small">No container AST loaded.</div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <span>Built from 14 pure-Rust crates in Wedeo v2 (H.264, VP9, PCM, Symphonia, SwsOpList, AudioOpList, MP4, MKV, WAV, IVF) compiled directly to <code>wasm32-unknown-unknown</code> without Emscripten or SharedArrayBuffer.</span>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>

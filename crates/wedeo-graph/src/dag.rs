@@ -816,6 +816,20 @@ impl GraphNode for AudioOpsNode {
                 "AudioOpsNode expects MediaUnit::Audio",
             ));
         };
+        if block.format != self.ops.src.format
+            || block.sample_rate != self.ops.src.sample_rate
+            || block.channel_layout != self.ops.src.channel_layout
+        {
+            let actual_src = AudioContract {
+                format: block.format,
+                sample_rate: block.sample_rate,
+                channel_layout: block.channel_layout.clone(),
+                frame_size: self.ops.src.frame_size,
+            };
+            let rebuilt = AudioOpList::build(actual_src, self.ops.dst.clone())?;
+            self.compiled = CompiledAudioOps::compile(&rebuilt)?;
+            self.ops = rebuilt;
+        }
         let blocks = self.compiled.process(block, &self.internal_pool)?;
         Ok(blocks
             .into_iter()
