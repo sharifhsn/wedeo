@@ -4,11 +4,18 @@
 //! section 7.3.2.1. The parsing logic follows FFmpeg's
 //! `ff_h264_decode_seq_parameter_set` in `libavcodec/h264_ps.c`.
 
-use wedeo_codec::bitstream::{BitRead, BitReadBE, get_se_golomb, get_ue_golomb};
-use wedeo_core::rational::Rational;
-use wedeo_core::{Error, Result};
+use wedeo_core::{
+    ChromaLocation, ColorDesc, ColorPrimaries, ColorRange, CropRect, Error, MatrixCoefficients,
+    Rational, Result, TransferCharacteristic,
+};
 
+use crate::bitstream::{BitRead, BitReadBE, get_se_golomb, get_ue_golomb};
 use crate::tables::{DEFAULT_SCALING4, DEFAULT_SCALING8, ZIGZAG_SCAN_4X4, ZIGZAG_SCAN_8X8};
+
+#[inline]
+fn invalid_data(msg: &'static str) -> Error {
+    Error::invalid_data("h264/sps", msg)
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -150,6 +157,7 @@ pub struct Sps {
     pub colour_primaries: u8,
     pub transfer_characteristics: u8,
     pub matrix_coefficients: u8,
+    pub color: ColorDesc,
 
     // Scaling lists
     pub scaling_matrix4: [[u8; 16]; 6],
@@ -208,6 +216,7 @@ impl Default for Sps {
             colour_primaries: 2,         // "Unspecified"
             transfer_characteristics: 2, // "Unspecified"
             matrix_coefficients: 2,      // "Unspecified"
+            color: ColorDesc::UNSPECIFIED,
             scaling_matrix4: [[16; 16]; 6],
             scaling_matrix8: [[16; 64]; 6],
             scaling_matrix_present: false,
@@ -224,6 +233,26 @@ impl Sps {
     /// Pixel height after cropping.
     pub fn height(&self) -> u32 {
         self.mb_height * 16 - self.crop_top - self.crop_bottom
+    }
+
+    /// Coded width in luma samples (macroblock-aligned).
+    pub fn coded_width(&self) -> u32 {
+        self.mb_width * 16
+    }
+
+    /// Coded height in luma samples (macroblock-aligned).
+    pub fn coded_height(&self) -> u32 {
+        self.mb_height * 16
+    }
+
+    /// Cropping margins as a `CropRect`.
+    pub fn crop_rect(&self) -> CropRect {
+        CropRect {
+            top: self.crop_top,
+            bottom: self.crop_bottom,
+            left: self.crop_left,
+            right: self.crop_right,
+        }
     }
 
     /// Frame rate derived from VUI timing info, if present.
@@ -281,7 +310,7 @@ fn decode_scaling_list(
         if next != 0 {
             let delta = get_se_golomb(br)?;
             if !(-128..=127).contains(&delta) {
-                return Err(Error::InvalidData);
+                return Err(invalid_data("delta_scale out of range"));
             }
             next = (last + delta) & 0xff;
         }
@@ -460,19 +489,47 @@ fn parse_vui(br: &mut BitReadBE<'_>, sps: &mut Sps) -> Result<()> {
     if sps.video_signal_type_present {
         sps.video_format = br.get_bits_32(3) as u8;
         sps.video_full_range_flag = br.get_bit();
+        sps.color.range = if sps.video_full_range_flag {
+            ColorRange::Full
+        } else {
+            ColorRange::Limited
+        };
         sps.colour_description_present = br.get_bit();
         if sps.colour_description_present {
             sps.colour_primaries = br.get_bits_32(8) as u8;
             sps.transfer_characteristics = br.get_bits_32(8) as u8;
             sps.matrix_coefficients = br.get_bits_32(8) as u8;
+            sps.color.primaries = match sps.colour_primaries {
+                0 | 3 => ColorPrimaries::Unspecified,
+                v => ColorPrimaries::from_cicp(v),
+            };
+            sps.color.transfer = match sps.transfer_characteristics {
+                0 | 3 => TransferCharacteristic::Unspecified,
+                v => TransferCharacteristic::from_cicp(v),
+            };
+            sps.color.matrix = match sps.matrix_coefficients {
+                3 => MatrixCoefficients::Unspecified,
+                v => MatrixCoefficients::from_cicp(v),
+            };
         }
     }
 
     // chroma_loc_info
     let chroma_loc_info_present = br.get_bit();
     if chroma_loc_info_present {
-        let _chroma_sample_loc_type_top = get_ue_golomb(br)?;
+        let chroma_sample_loc_type_top = get_ue_golomb(br)?;
         let _chroma_sample_loc_type_bottom = get_ue_golomb(br)?;
+        sps.color.chroma_location = match chroma_sample_loc_type_top {
+            0 => ChromaLocation::Left,
+            1 => ChromaLocation::Center,
+            2 => ChromaLocation::TopLeft,
+            3 => ChromaLocation::Top,
+            4 => ChromaLocation::BottomLeft,
+            5 => ChromaLocation::Bottom,
+            _ => ChromaLocation::Unspecified,
+        };
+    } else {
+        sps.color.chroma_location = ChromaLocation::Left;
     }
 
     // -- H.264-specific VUI params --
@@ -532,7 +589,7 @@ fn parse_vui(br: &mut BitReadBE<'_>, sps: &mut Sps) -> Result<()> {
 fn skip_hrd_parameters(br: &mut BitReadBE<'_>) -> Result<()> {
     let cpb_count = get_ue_golomb(br)? + 1;
     if cpb_count > 32 {
-        return Err(Error::InvalidData);
+        return Err(invalid_data("cpb_count exceeds 32"));
     }
     let _bit_rate_scale = br.get_bits_32(4);
     let _cpb_size_scale = br.get_bits_32(4);
@@ -593,20 +650,23 @@ pub fn parse_sps(data: &[u8]) -> Result<Sps> {
     // 2. sps_id
     sps.sps_id = get_ue_golomb(&mut br)?;
     if sps.sps_id >= MAX_SPS_COUNT {
-        return Err(Error::InvalidData);
+        return Err(invalid_data("sps_id out of range"));
     }
 
     // 3. High profile extensions
     if is_high_profile(sps.profile_idc) {
         sps.chroma_format_idc = get_ue_golomb(&mut br)? as u8;
         if sps.chroma_format_idc > 3 {
-            return Err(Error::InvalidData);
+            return Err(invalid_data("chroma_format_idc out of range"));
         }
         if sps.chroma_format_idc == 3 {
             sps.residual_color_transform_flag = br.get_bit();
             if sps.residual_color_transform_flag {
                 // Separate color planes not supported
-                return Err(Error::InvalidData);
+                return Err(Error::unsupported(
+                    "h264/sps",
+                    "separate colour planes not supported",
+                ));
             }
         }
 
@@ -620,7 +680,7 @@ pub fn parse_sps(data: &[u8]) -> Result<Sps> {
             || sps.bit_depth_chroma < 8
             || sps.bit_depth_chroma > 14
         {
-            return Err(Error::InvalidData);
+            return Err(invalid_data("bit_depth out of range"));
         }
 
         sps.transform_bypass = br.get_bit();
@@ -641,7 +701,7 @@ pub fn parse_sps(data: &[u8]) -> Result<Sps> {
     // 4. log2_max_frame_num
     let log2_max_frame_num_minus4 = get_ue_golomb(&mut br)?;
     if log2_max_frame_num_minus4 > MAX_LOG2_MAX_FRAME_NUM - MIN_LOG2_MAX_FRAME_NUM {
-        return Err(Error::InvalidData);
+        return Err(invalid_data("log2_max_frame_num_minus4 out of range"));
     }
     sps.log2_max_frame_num = (log2_max_frame_num_minus4 + 4) as u8;
 
@@ -651,7 +711,9 @@ pub fn parse_sps(data: &[u8]) -> Result<Sps> {
         0 => {
             let log2_max_poc_lsb_minus4 = get_ue_golomb(&mut br)?;
             if log2_max_poc_lsb_minus4 > 12 {
-                return Err(Error::InvalidData);
+                return Err(invalid_data(
+                    "log2_max_pic_order_cnt_lsb_minus4 out of range",
+                ));
             }
             sps.log2_max_poc_lsb = (log2_max_poc_lsb_minus4 + 4) as u8;
         }
@@ -662,7 +724,7 @@ pub fn parse_sps(data: &[u8]) -> Result<Sps> {
 
             let poc_cycle_length = get_ue_golomb(&mut br)? as usize;
             if poc_cycle_length >= MAX_POC_CYCLE_LENGTH {
-                return Err(Error::InvalidData);
+                return Err(invalid_data("poc_cycle_length overflow"));
             }
             sps.num_ref_frames_in_poc_cycle = poc_cycle_length as u8;
 
@@ -675,14 +737,14 @@ pub fn parse_sps(data: &[u8]) -> Result<Sps> {
             // No additional data for poc_type 2
         }
         _ => {
-            return Err(Error::InvalidData);
+            return Err(invalid_data("illegal poc_type"));
         }
     }
 
     // 6. Reference frames
     sps.max_num_ref_frames = get_ue_golomb(&mut br)?;
     if sps.max_num_ref_frames > 16 {
-        return Err(Error::InvalidData);
+        return Err(invalid_data("max_num_ref_frames exceeds 16"));
     }
     sps.gaps_in_frame_num_allowed = br.get_bit();
 
@@ -723,7 +785,7 @@ pub fn parse_sps(data: &[u8]) -> Result<Sps> {
         // Validate crop values don't exceed frame dimensions
         if (crop_left + crop_right) * step_x >= width || (crop_top + crop_bottom) * step_y >= height
         {
-            return Err(Error::InvalidData);
+            return Err(invalid_data("crop values exceed frame dimensions"));
         }
 
         sps.crop_left = crop_left * step_x;
@@ -964,7 +1026,10 @@ mod tests {
         // Byte 3-4: ue(32) = 00000_100001 = 0000_0100_001x_xxxx
         //           byte3 = 0x04, byte4 = 0x20
         let data: &[u8] = &[0x42, 0x00, 0x1E, 0x04, 0x20];
-        assert_eq!(parse_sps(data), Err(Error::InvalidData));
+        assert_eq!(
+            parse_sps(data).unwrap_err().kind,
+            wedeo_core::ErrorKind::InvalidData
+        );
     }
 
     #[test]

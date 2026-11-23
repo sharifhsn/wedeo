@@ -7,8 +7,6 @@
 // Reference: ITU-T H.264 Sections 8.2.4 (list construction) and
 // 8.2.5 (reference picture marking), FFmpeg libavcodec/h264_refs.c
 
-use tracing::debug;
-
 use crate::dpb::{Dpb, RefStatus};
 use crate::slice::{MmcoOp, RefPicListModification, SliceHeader};
 
@@ -96,6 +94,10 @@ pub fn build_ref_list_p(
     // any remaining NULL entries with the default ref.
     let max_refs = slice_hdr.num_ref_idx_l0_active as usize;
     let available_len = list.len();
+    if available_len == 0 {
+        list.clear();
+        return list;
+    }
     if list.len() < max_refs {
         list.resize(max_refs, usize::MAX);
     }
@@ -502,29 +504,15 @@ fn apply_mmco(
             } => {
                 let pic_num = current_frame_num.wrapping_sub(difference_of_pic_nums_minus1 + 1)
                     % max_frame_num;
-                let found = dpb.find_short_term(pic_num);
-                if let Some(idx) = found {
+                if let Some(idx) = dpb.find_short_term(pic_num) {
                     dpb.mark_unused(idx);
                 }
-                debug!(
-                    op = "SHORT_UNUSED",
-                    pic_num,
-                    found = found.is_some(),
-                    "MMCO"
-                );
             }
 
             MmcoOp::LongTermUnused { long_term_pic_num } => {
-                let found = dpb.find_long_term(*long_term_pic_num);
-                if let Some(idx) = found {
+                if let Some(idx) = dpb.find_long_term(*long_term_pic_num) {
                     dpb.mark_unused(idx);
                 }
-                debug!(
-                    op = "LT_UNUSED",
-                    long_term_pic_num,
-                    found = found.is_some(),
-                    "MMCO"
-                );
             }
 
             MmcoOp::ShortTermToLongTerm {
@@ -536,20 +524,12 @@ fn apply_mmco(
                 if let Some(old_lt) = dpb.find_long_term(*long_term_frame_idx) {
                     dpb.mark_unused(old_lt);
                 }
-                let found = dpb.find_short_term(pic_num);
-                if let Some(idx) = found
+                if let Some(idx) = dpb.find_short_term(pic_num)
                     && let Some(entry) = dpb.get_mut(idx)
                 {
                     entry.status = RefStatus::LongTerm;
                     entry.long_term_frame_idx = *long_term_frame_idx;
                 }
-                debug!(
-                    op = "SHORT_TO_LONG",
-                    pic_num,
-                    long_term_frame_idx,
-                    found = found.is_some(),
-                    "MMCO"
-                );
             }
 
             MmcoOp::MaxLongTermFrameIdx {
@@ -566,15 +546,12 @@ fn apply_mmco(
                         }
                     })
                     .collect();
-                let removed = to_remove.len();
                 for i in to_remove {
                     dpb.mark_unused(i);
                 }
-                debug!(op = "MAX_LT_IDX", max_idx, removed, "MMCO");
             }
 
             MmcoOp::Reset => {
-                debug!(op = "RESET", "MMCO");
                 // Clear all entries except the current one
                 for (i, entry) in dpb.entries.iter_mut().enumerate() {
                     if Some(i) == current_dpb_idx {
@@ -614,7 +591,6 @@ fn apply_mmco(
                     entry.long_term_frame_idx = *long_term_frame_idx;
                 }
                 current_marked = true;
-                debug!(op = "CUR_TO_LONG", long_term_frame_idx, "MMCO");
             }
         }
     }
@@ -725,14 +701,14 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "pre-existing failure from dirty tree (refs.rs refactor)"]
     fn test_build_ref_list_p_sorted_by_frame_num_desc() {
         let mut dpb = Dpb::new(4);
         dpb.store(make_entry(3, 6, RefStatus::ShortTerm));
         dpb.store(make_entry(7, 14, RefStatus::ShortTerm));
         dpb.store(make_entry(5, 10, RefStatus::ShortTerm));
 
-        let hdr = default_slice_header();
+        let mut hdr = default_slice_header();
+        hdr.num_ref_idx_l0_active = 3;
         let list = build_ref_list_p(&dpb, &hdr, 8, 256);
 
         assert_eq!(list.len(), 3);
@@ -744,7 +720,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "pre-existing failure from dirty tree (refs.rs refactor)"]
     fn test_build_ref_list_p_long_term_appended() {
         let mut dpb = Dpb::new(4);
         dpb.store(make_entry(5, 10, RefStatus::ShortTerm));
@@ -753,7 +728,8 @@ mod tests {
         lt_entry.long_term_frame_idx = 1;
         dpb.store(lt_entry);
 
-        let hdr = default_slice_header();
+        let mut hdr = default_slice_header();
+        hdr.num_ref_idx_l0_active = 2;
         let list = build_ref_list_p(&dpb, &hdr, 8, 256);
 
         assert_eq!(list.len(), 2);
@@ -776,7 +752,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "pre-existing failure from dirty tree (refs.rs refactor)"]
     fn test_build_ref_list_p_empty_dpb() {
         let dpb = Dpb::new(4);
         let hdr = default_slice_header();
@@ -796,14 +771,14 @@ mod tests {
     /// With wrap-around: pic_num(0)=0, pic_num(15)=15-16=-1, pic_num(14)=-2
     /// → sorted desc: [0, -1, -2] → frame_nums [0, 15, 14] (correct).
     #[test]
-    #[ignore = "pre-existing failure from dirty tree (refs.rs refactor)"]
     fn test_build_ref_list_p_frame_num_wraparound() {
         let mut dpb = Dpb::new(4);
         dpb.store(make_entry(0, 0, RefStatus::ShortTerm)); // most recent (after wrap)
         dpb.store(make_entry(15, 30, RefStatus::ShortTerm)); // one before wrap
         dpb.store(make_entry(14, 28, RefStatus::ShortTerm)); // two before wrap
 
-        let hdr = default_slice_header();
+        let mut hdr = default_slice_header();
+        hdr.num_ref_idx_l0_active = 3;
         // CurrFrameNum=1 (wrapped), MaxFrameNum=16
         let list = build_ref_list_p(&dpb, &hdr, 1, 16);
 

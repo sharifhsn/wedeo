@@ -3,11 +3,16 @@
 // Reference: ITU-T H.264 Section 7.3.2.2, FFmpeg libavcodec/h264_ps.c
 // (`ff_h264_decode_picture_parameter_set`)
 
-use wedeo_codec::bitstream::{BitRead, BitReadBE, get_se_golomb, get_ue_golomb};
 use wedeo_core::error::{Error, Result};
 
+use crate::bitstream::{BitRead, BitReadBE, get_se_golomb, get_ue_golomb};
 use crate::sps::Sps;
 use crate::tables::{DEFAULT_SCALING4, DEFAULT_SCALING8, ZIGZAG_SCAN_4X4, ZIGZAG_SCAN_8X8};
+
+#[inline]
+fn invalid_data(msg: &'static str) -> Error {
+    Error::invalid_data("h264/pps", msg)
+}
 
 /// Maximum PPS count (H.264 spec allows pps_id 0..255).
 pub const MAX_PPS_COUNT: usize = 256;
@@ -72,10 +77,7 @@ fn more_rbsp_data_in_pps(sps: &Sps) -> bool {
     let constraint_flags_low3 = u8::from(sps.constraint_set0_flag)
         | (u8::from(sps.constraint_set1_flag) << 1)
         | (u8::from(sps.constraint_set2_flag) << 2);
-    if (profile == 66 || profile == 77 || profile == 88) && constraint_flags_low3 != 0 {
-        return false;
-    }
-    true
+    !((profile == 66 || profile == 77 || profile == 88) && constraint_flags_low3 != 0)
 }
 
 /// Decode a single scaling list from the bitstream.
@@ -111,7 +113,7 @@ fn decode_scaling_list(
         if next != 0 {
             let delta = get_se_golomb(br)?;
             if !(-128..=127).contains(&delta) {
-                return Err(Error::InvalidData);
+                return Err(invalid_data("delta_scale out of range"));
             }
             next = (last as i32 + delta) as u8; // wraps via & 0xff naturally
         }
@@ -289,25 +291,28 @@ pub fn parse_pps(data: &[u8], sps_list: &[Option<Sps>; 32]) -> Result<Pps> {
     // pps_id
     let pps_id = get_ue_golomb(&mut br)?;
     if pps_id >= MAX_PPS_COUNT as u32 {
-        return Err(Error::InvalidData);
+        return Err(invalid_data("pps_id out of range"));
     }
 
     // sps_id
     let sps_id = get_ue_golomb(&mut br)?;
     if sps_id >= MAX_SPS_COUNT as u32 {
-        return Err(Error::InvalidData);
+        return Err(invalid_data("sps_id out of range"));
     }
 
     let sps = sps_list[sps_id as usize]
         .as_ref()
-        .ok_or(Error::InvalidData)?;
+        .ok_or_else(|| invalid_data("referenced SPS not found"))?;
 
     // Validate bit depth
     if sps.bit_depth_luma > 14 {
-        return Err(Error::InvalidData);
+        return Err(invalid_data("bit_depth_luma out of range"));
     }
     if sps.bit_depth_luma == 11 || sps.bit_depth_luma == 13 {
-        return Err(Error::PatchwelcomeNotImplemented);
+        return Err(Error::unsupported(
+            "h264/pps",
+            "unsupported 11-bit or 13-bit H.264 stream",
+        ));
     }
 
     let entropy_coding_mode_flag = br.get_bit();
@@ -317,13 +322,13 @@ pub fn parse_pps(data: &[u8], sps_list: &[Option<Sps>; 32]) -> Result<Pps> {
     let num_slice_groups = num_slice_groups_minus1 + 1;
     if num_slice_groups > 1 {
         // FMO (Flexible Macroblock Ordering) not supported.
-        return Err(Error::PatchwelcomeNotImplemented);
+        return Err(Error::unsupported("h264/pps", "FMO slice groups > 1"));
     }
 
     let ref_count_l0 = get_ue_golomb(&mut br)? + 1;
     let ref_count_l1 = get_ue_golomb(&mut br)? + 1;
     if ref_count_l0 > 32 || ref_count_l1 > 32 {
-        return Err(Error::InvalidData);
+        return Err(invalid_data("num_ref_idx_default_active exceeds 32"));
     }
 
     let qp_bd_offset = 6 * (sps.bit_depth_luma as i32 - 8);
@@ -336,7 +341,7 @@ pub fn parse_pps(data: &[u8], sps_list: &[Option<Sps>; 32]) -> Result<Pps> {
 
     let chroma_qp_index_offset_0 = get_se_golomb(&mut br)?;
     if !(-12..=12).contains(&chroma_qp_index_offset_0) {
-        return Err(Error::InvalidData);
+        return Err(invalid_data("chroma_qp_index_offset out of range"));
     }
 
     let deblocking_filter_parameters_present = br.get_bit();
@@ -370,33 +375,8 @@ pub fn parse_pps(data: &[u8], sps_list: &[Option<Sps>; 32]) -> Result<Pps> {
         // second_chroma_qp_index_offset
         chroma_qp_index_offset_1 = get_se_golomb(&mut br)?;
         if !(-12..=12).contains(&chroma_qp_index_offset_1) {
-            return Err(Error::InvalidData);
+            return Err(invalid_data("second_chroma_qp_index_offset out of range"));
         }
-    }
-
-    tracing::debug!(
-        pps_id,
-        sps_id,
-        entropy_coding_mode_flag,
-        transform_8x8_mode,
-        chroma_qp_index_offset_0,
-        chroma_qp_index_offset_1,
-        scaling_matrix_present,
-        pic_init_qp,
-        weighted_pred_flag,
-        weighted_bipred_idc,
-        "PPS parsed"
-    );
-
-    if scaling_matrix_present {
-        tracing::debug!(
-            pps_id,
-            sm4_intra_y_sum = scaling_matrix4[0].iter().map(|&x| x as u32).sum::<u32>(),
-            sm4_inter_y_sum = scaling_matrix4[3].iter().map(|&x| x as u32).sum::<u32>(),
-            sm8_intra_y_sum = scaling_matrix8[0].iter().map(|&x| x as u32).sum::<u32>(),
-            sm8_inter_y_sum = scaling_matrix8[3].iter().map(|&x| x as u32).sum::<u32>(),
-            "PPS_SCALING"
-        );
     }
 
     Ok(Pps {
@@ -608,7 +588,7 @@ mod tests {
 
         let data = bits_to_bytes(&bits);
         let result = parse_pps(&data, &sps_list);
-        assert_eq!(result, Err(Error::InvalidData));
+        assert_eq!(result.unwrap_err().kind, wedeo_core::ErrorKind::InvalidData);
     }
 
     #[test]
@@ -627,7 +607,7 @@ mod tests {
 
         let data = bits_to_bytes(&bits);
         let result = parse_pps(&data, &sps_list);
-        assert_eq!(result, Err(Error::InvalidData));
+        assert_eq!(result.unwrap_err().kind, wedeo_core::ErrorKind::InvalidData);
     }
 
     #[test]

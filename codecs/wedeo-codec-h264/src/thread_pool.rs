@@ -12,8 +12,11 @@
 // `mpsc::Receiver<FrameResult>` on main thread. Results may arrive
 // out of order; callers use `sequence_id` for FIFO ordering.
 
+use std::collections::VecDeque;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+
+use wedeo_core::{ColorDesc, CropRect, Error, Rational, Timestamp};
 
 use crate::deblock;
 use crate::decoder::H264Decoder;
@@ -62,12 +65,21 @@ pub(crate) struct FrameWork {
     pub frame_num_h264: u32,
     pub nal_ref_idc: u8,
     pub is_idr: bool,
+    pub is_key: bool,
     pub last_hdr: SliceHeader,
     pub ref_list_l0: Vec<usize>,
     pub ref_list_l1: Vec<usize>,
-    pub dpb_idx: Option<usize>,
-    /// Packet PTS from the demuxer, propagated to the output frame.
-    pub pkt_pts: i64,
+    /// VFR timing propagated from the input packet.
+    pub pts: Timestamp,
+    pub dts: Timestamp,
+    pub duration: i64,
+    pub time_base: Rational,
+    /// Active stream metadata captured at frame dispatch time.
+    pub coded_width: u32,
+    pub coded_height: u32,
+    pub color: ColorDesc,
+    pub sar: Rational,
+    pub crop: CropRect,
 }
 
 /// Result of a completed frame decode.
@@ -83,24 +95,45 @@ pub(crate) struct InFlightDecode {
     pub frame_num_h264: u32,
     pub nal_ref_idc: u8,
     pub is_idr: bool,
+    pub is_key: bool,
     pub last_hdr: SliceHeader,
     pub ref_list_l0: Vec<usize>,
     pub ref_list_l1: Vec<usize>,
-    pub dpb_idx: Option<usize>,
-    /// Packet PTS from the demuxer, propagated to the output frame.
-    pub pkt_pts: i64,
+    /// VFR timing propagated from the input packet.
+    pub pts: Timestamp,
+    pub dts: Timestamp,
+    pub duration: i64,
+    pub time_base: Rational,
+    /// Active stream metadata captured at frame dispatch time.
+    pub coded_width: u32,
+    pub coded_height: u32,
+    pub color: ColorDesc,
+    pub sar: Rational,
+    pub crop: CropRect,
+    /// First slice decode error encountered, if any.
+    pub decode_error: Option<Error>,
 }
 
-/// Persistent thread pool for frame decode workers.
+/// Persistent thread pool for frame decode workers (or inline mode when `num_workers <= 1`).
 pub(crate) struct DecodeThreadPool {
     workers: Vec<std::thread::JoinHandle<()>>,
-    work_tx: mpsc::Sender<Option<Box<FrameWork>>>,
-    result_rx: mpsc::Receiver<FrameResult>,
+    work_tx: Option<mpsc::Sender<Option<Box<FrameWork>>>>,
+    result_rx: Option<mpsc::Receiver<FrameResult>>,
+    inline_results: VecDeque<FrameResult>,
 }
 
 impl DecodeThreadPool {
-    /// Create a new pool with `num_workers` threads.
+    /// Create a new pool with `num_workers` threads (`<= 1` runs inline with zero threads spawned).
     pub fn new(num_workers: usize) -> Self {
+        if num_workers <= 1 {
+            return Self {
+                workers: Vec::new(),
+                work_tx: None,
+                result_rx: None,
+                inline_results: VecDeque::new(),
+            };
+        }
+
         let (work_tx, work_rx) = mpsc::channel::<Option<Box<FrameWork>>>();
         let (result_tx, result_rx) = mpsc::channel::<FrameResult>();
         let work_rx = Arc::new(Mutex::new(work_rx));
@@ -117,28 +150,41 @@ impl DecodeThreadPool {
 
         Self {
             workers,
-            work_tx,
-            result_rx,
+            work_tx: Some(work_tx),
+            result_rx: Some(result_rx),
+            inline_results: VecDeque::new(),
         }
     }
 
-    /// Submit a frame for decode. Non-blocking.
-    /// Takes a Box<FrameWork> to avoid stack overflow from large struct.
-    pub fn submit(&self, work: Box<FrameWork>) {
-        self.work_tx
-            .send(Some(work))
-            .expect("pool work channel closed");
+    /// Submit a frame for decode. Executes inline when no worker threads are running.
+    pub fn submit(&mut self, work: Box<FrameWork>) {
+        if let Some(tx) = &self.work_tx {
+            tx.send(Some(work)).expect("pool work channel closed");
+        } else {
+            let sequence_id = work.sequence_id;
+            let decode = decode_frame(*work);
+            self.inline_results.push_back(FrameResult {
+                decode,
+                sequence_id,
+            });
+        }
     }
 
     /// Receive the next completed frame result. Blocks until one is available.
-    pub fn recv(&self) -> Option<FrameResult> {
-        self.result_rx.recv().ok()
+    pub fn recv(&mut self) -> Option<FrameResult> {
+        if let Some(rx) = &self.result_rx {
+            rx.recv().ok()
+        } else {
+            self.inline_results.pop_front()
+        }
     }
 
     /// Shut down the pool: send N shutdown sentinels and join all workers.
     pub fn shutdown(&mut self) {
-        for _ in &self.workers {
-            let _ = self.work_tx.send(None);
+        if let Some(tx) = &self.work_tx {
+            for _ in &self.workers {
+                let _ = tx.send(None);
+            }
         }
         for handle in self.workers.drain(..) {
             let _ = handle.join();
@@ -205,6 +251,8 @@ fn decode_frame(fw: FrameWork) -> Box<InFlightDecode> {
 fn decode_frame_sequential(fw: FrameWork) -> Box<InFlightDecode> {
     let mut fdc = fw.fdc;
 
+    let mut decode_error: Option<Error> = None;
+
     // Decode the single slice (or all slices sequentially for safety)
     for slice in fw.slices.into_iter() {
         // Sequential path: move data instead of cloning (original behavior)
@@ -225,7 +273,7 @@ fn decode_frame_sequential(fw: FrameWork) -> Box<InFlightDecode> {
         fdc.implicit_weight = slice.implicit_weight;
         fdc.cur_poc = slice.cur_poc;
 
-        let _ = H264Decoder::decode_slice_into(
+        if let Err(err) = H264Decoder::decode_slice_into(
             &slice.rbsp,
             &slice.hdr,
             &slice.sps,
@@ -233,7 +281,10 @@ fn decode_frame_sequential(fw: FrameWork) -> Box<InFlightDecode> {
             &mut fdc,
             &slice.ref_pics_l0,
             &slice.ref_pics_l1,
-        );
+        ) && decode_error.is_none()
+        {
+            decode_error = Some(err);
+        }
     }
 
     // Last-row deblock (inline deblock defers by 1 row)
@@ -246,11 +297,20 @@ fn decode_frame_sequential(fw: FrameWork) -> Box<InFlightDecode> {
         frame_num_h264: fw.frame_num_h264,
         nal_ref_idc: fw.nal_ref_idc,
         is_idr: fw.is_idr,
+        is_key: fw.is_key,
         last_hdr: fw.last_hdr,
         ref_list_l0: fw.ref_list_l0,
         ref_list_l1: fw.ref_list_l1,
-        dpb_idx: fw.dpb_idx,
-        pkt_pts: fw.pkt_pts,
+        pts: fw.pts,
+        dts: fw.dts,
+        duration: fw.duration,
+        time_base: fw.time_base,
+        coded_width: fw.coded_width,
+        coded_height: fw.coded_height,
+        color: fw.color,
+        sar: fw.sar,
+        crop: fw.crop,
+        decode_error,
     })
 }
 

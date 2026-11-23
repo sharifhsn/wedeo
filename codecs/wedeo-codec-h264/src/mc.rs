@@ -118,17 +118,10 @@ fn copy_block_direct<const W: usize>(
     src_offset: usize,
     block_h: usize,
 ) {
-    // SAFETY: caller guarantees is_interior — all reads/writes are in bounds.
-    unsafe {
-        let src_ptr = src.as_ptr().add(src_offset);
-        let dst_ptr = dst.as_mut_ptr();
-        for j in 0..block_h {
-            std::ptr::copy_nonoverlapping(
-                src_ptr.add(j * src_stride),
-                dst_ptr.add(j * dst_stride),
-                W,
-            );
-        }
+    for j in 0..block_h {
+        let s = src_offset + j * src_stride;
+        let d = j * dst_stride;
+        dst[d..d + W].copy_from_slice(&src[s..s + W]);
     }
 }
 
@@ -143,17 +136,10 @@ fn copy_block_direct_generic(
     block_w: usize,
     block_h: usize,
 ) {
-    // SAFETY: caller guarantees is_interior — all reads/writes are in bounds.
-    unsafe {
-        let src_ptr = src.as_ptr().add(src_offset);
-        let dst_ptr = dst.as_mut_ptr();
-        for j in 0..block_h {
-            std::ptr::copy_nonoverlapping(
-                src_ptr.add(j * src_stride),
-                dst_ptr.add(j * dst_stride),
-                block_w,
-            );
-        }
+    for j in 0..block_h {
+        let s = src_offset + j * src_stride;
+        let d = j * dst_stride;
+        dst[d..d + block_w].copy_from_slice(&src[s..s + block_w]);
     }
 }
 
@@ -430,21 +416,18 @@ fn h_lowpass_direct_w<const W: usize>(
 ) {
     for j in 0..block_h {
         let row = src_offset + j * src_stride;
+        let src_row = &src[row..row + W + 5];
+        let dst_row = &mut dst[j * dst_stride..j * dst_stride + W];
         for i in 0..W {
-            let off = row + i;
-            // SAFETY: caller guarantees all accesses are in-bounds (interior block check).
-            // The 6-tap filter reads src[off..off+6], and is_interior ensures
-            // ref_x - 2 >= 0 and ref_x + block_w + 3 <= pic_w, so all 6 taps are valid.
-            unsafe {
-                let a = *src.get_unchecked(off) as i32;
-                let b = *src.get_unchecked(off + 1) as i32;
-                let c = *src.get_unchecked(off + 2) as i32;
-                let d = *src.get_unchecked(off + 3) as i32;
-                let e = *src.get_unchecked(off + 4) as i32;
-                let f = *src.get_unchecked(off + 5) as i32;
-                let val = filter6(a, b, c, d, e, f);
-                *dst.get_unchecked_mut(j * dst_stride + i) = clip_u8((val + 16) >> 5);
-            }
+            let val = filter6(
+                src_row[i] as i32,
+                src_row[i + 1] as i32,
+                src_row[i + 2] as i32,
+                src_row[i + 3] as i32,
+                src_row[i + 4] as i32,
+                src_row[i + 5] as i32,
+            );
+            dst_row[i] = clip_u8((val + 16) >> 5);
         }
     }
 }
@@ -486,19 +469,18 @@ fn h_lowpass_direct_w_generic(
 ) {
     for j in 0..block_h {
         let row = src_offset + j * src_stride;
+        let src_row = &src[row..row + block_w + 5];
+        let dst_row = &mut dst[j * dst_stride..j * dst_stride + block_w];
         for i in 0..block_w {
-            let off = row + i;
-            // SAFETY: caller guarantees all accesses are in-bounds (interior block check).
-            unsafe {
-                let a = *src.get_unchecked(off) as i32;
-                let b = *src.get_unchecked(off + 1) as i32;
-                let c = *src.get_unchecked(off + 2) as i32;
-                let d = *src.get_unchecked(off + 3) as i32;
-                let e = *src.get_unchecked(off + 4) as i32;
-                let f = *src.get_unchecked(off + 5) as i32;
-                let val = filter6(a, b, c, d, e, f);
-                *dst.get_unchecked_mut(j * dst_stride + i) = clip_u8((val + 16) >> 5);
-            }
+            let val = filter6(
+                src_row[i] as i32,
+                src_row[i + 1] as i32,
+                src_row[i + 2] as i32,
+                src_row[i + 3] as i32,
+                src_row[i + 4] as i32,
+                src_row[i + 5] as i32,
+            );
+            dst_row[i] = clip_u8((val + 16) >> 5);
         }
     }
 }
@@ -515,21 +497,19 @@ fn v_lowpass_direct_w<const W: usize>(
     block_h: usize,
 ) {
     for j in 0..block_h {
-        for i in 0..W {
-            let base = src_offset + j * src_stride + i;
-            // SAFETY: caller guarantees all accesses are in-bounds (interior block check).
-            // The 6-tap filter reads 6 rows starting at base, stepping by src_stride.
-            // is_interior ensures ref_y - 2 >= 0 and ref_y + block_h + 3 <= pic_h.
-            unsafe {
-                let a = *src.get_unchecked(base) as i32;
-                let b = *src.get_unchecked(base + src_stride) as i32;
-                let c = *src.get_unchecked(base + 2 * src_stride) as i32;
-                let d = *src.get_unchecked(base + 3 * src_stride) as i32;
-                let e = *src.get_unchecked(base + 4 * src_stride) as i32;
-                let f = *src.get_unchecked(base + 5 * src_stride) as i32;
-                let val = filter6(a, b, c, d, e, f);
-                *dst.get_unchecked_mut(j * dst_stride + i) = clip_u8((val + 16) >> 5);
-            }
+        let row_base = src_offset + j * src_stride;
+        let dst_row = &mut dst[j * dst_stride..j * dst_stride + W];
+        for (i, dst_px) in dst_row.iter_mut().enumerate().take(W) {
+            let base = row_base + i;
+            let val = filter6(
+                src[base] as i32,
+                src[base + src_stride] as i32,
+                src[base + 2 * src_stride] as i32,
+                src[base + 3 * src_stride] as i32,
+                src[base + 4 * src_stride] as i32,
+                src[base + 5 * src_stride] as i32,
+            );
+            *dst_px = clip_u8((val + 16) >> 5);
         }
     }
 }
@@ -570,19 +550,19 @@ fn v_lowpass_direct_w_generic(
     block_h: usize,
 ) {
     for j in 0..block_h {
-        for i in 0..block_w {
-            let base = src_offset + j * src_stride + i;
-            // SAFETY: caller guarantees all accesses are in-bounds (interior block check).
-            unsafe {
-                let a = *src.get_unchecked(base) as i32;
-                let b = *src.get_unchecked(base + src_stride) as i32;
-                let c = *src.get_unchecked(base + 2 * src_stride) as i32;
-                let d = *src.get_unchecked(base + 3 * src_stride) as i32;
-                let e = *src.get_unchecked(base + 4 * src_stride) as i32;
-                let f = *src.get_unchecked(base + 5 * src_stride) as i32;
-                let val = filter6(a, b, c, d, e, f);
-                *dst.get_unchecked_mut(j * dst_stride + i) = clip_u8((val + 16) >> 5);
-            }
+        let row_base = src_offset + j * src_stride;
+        let dst_row = &mut dst[j * dst_stride..j * dst_stride + block_w];
+        for (i, dst_px) in dst_row.iter_mut().enumerate().take(block_w) {
+            let base = row_base + i;
+            let val = filter6(
+                src[base] as i32,
+                src[base + src_stride] as i32,
+                src[base + 2 * src_stride] as i32,
+                src[base + 3 * src_stride] as i32,
+                src[base + 4 * src_stride] as i32,
+                src[base + 5 * src_stride] as i32,
+            );
+            *dst_px = clip_u8((val + 16) >> 5);
         }
     }
 }
@@ -604,38 +584,33 @@ fn hv_lowpass_direct_w<const W: usize>(
     // First pass: horizontal filter from u8 reference into i32 tmp.
     for j in 0..tmp_h {
         let row = src_offset + j * src_stride;
+        let src_row = &src[row..row + W + 5];
+        let tmp_row = &mut tmp[j * W..j * W + W];
         for i in 0..W {
-            let off = row + i;
-            // SAFETY: caller guarantees all accesses are in-bounds (interior block check).
-            // is_interior with tap_margin=2 ensures ref_x-2..ref_x+block_w+3 and
-            // ref_y-2..ref_y+block_h+3 are all within picture bounds.
-            unsafe {
-                let a = *src.get_unchecked(off) as i32;
-                let b = *src.get_unchecked(off + 1) as i32;
-                let c = *src.get_unchecked(off + 2) as i32;
-                let d = *src.get_unchecked(off + 3) as i32;
-                let e = *src.get_unchecked(off + 4) as i32;
-                let f = *src.get_unchecked(off + 5) as i32;
-                *tmp.get_unchecked_mut(j * W + i) = filter6(a, b, c, d, e, f);
-            }
+            tmp_row[i] = filter6(
+                src_row[i] as i32,
+                src_row[i + 1] as i32,
+                src_row[i + 2] as i32,
+                src_row[i + 3] as i32,
+                src_row[i + 4] as i32,
+                src_row[i + 5] as i32,
+            );
         }
     }
 
     // Second pass: vertical filter on the tmp buffer — row-major for cache locality.
     for j in 0..block_h {
+        let dst_row = &mut dst[j * dst_stride..j * dst_stride + W];
         for i in 0..W {
-            // SAFETY: tmp is pre-allocated to at least (block_h + 5) * W elements,
-            // and j + 5 < tmp_h = block_h + 5, so all accesses are in-bounds.
-            unsafe {
-                let a = *tmp.get_unchecked(j * W + i);
-                let b = *tmp.get_unchecked((j + 1) * W + i);
-                let c = *tmp.get_unchecked((j + 2) * W + i);
-                let d = *tmp.get_unchecked((j + 3) * W + i);
-                let e = *tmp.get_unchecked((j + 4) * W + i);
-                let f = *tmp.get_unchecked((j + 5) * W + i);
-                let val = filter6(a, b, c, d, e, f);
-                *dst.get_unchecked_mut(j * dst_stride + i) = clip_u8((val + 512) >> 10);
-            }
+            let val = filter6(
+                tmp[j * W + i],
+                tmp[(j + 1) * W + i],
+                tmp[(j + 2) * W + i],
+                tmp[(j + 3) * W + i],
+                tmp[(j + 4) * W + i],
+                tmp[(j + 5) * W + i],
+            );
+            dst_row[i] = clip_u8((val + 512) >> 10);
         }
     }
 }
@@ -684,31 +659,31 @@ fn hv_lowpass_direct_w_generic(
 
     for j in 0..tmp_h {
         let row = src_offset + j * src_stride;
+        let src_row = &src[row..row + block_w + 5];
+        let tmp_row = &mut tmp[j * tmp_stride..j * tmp_stride + block_w];
         for i in 0..block_w {
-            let off = row + i;
-            // SAFETY: caller guarantees all accesses are in-bounds (interior block check).
-            unsafe {
-                let a = *src.get_unchecked(off) as i32;
-                let b = *src.get_unchecked(off + 1) as i32;
-                let c = *src.get_unchecked(off + 2) as i32;
-                let d = *src.get_unchecked(off + 3) as i32;
-                let e = *src.get_unchecked(off + 4) as i32;
-                let f = *src.get_unchecked(off + 5) as i32;
-                *tmp.get_unchecked_mut(j * tmp_stride + i) = filter6(a, b, c, d, e, f);
-            }
+            tmp_row[i] = filter6(
+                src_row[i] as i32,
+                src_row[i + 1] as i32,
+                src_row[i + 2] as i32,
+                src_row[i + 3] as i32,
+                src_row[i + 4] as i32,
+                src_row[i + 5] as i32,
+            );
         }
     }
 
     for j in 0..block_h {
+        let dst_row = &mut dst[j * dst_stride..j * dst_stride + block_w];
         for i in 0..block_w {
-            let a = tmp[(j) * tmp_stride + i];
+            let a = tmp[j * tmp_stride + i];
             let b = tmp[(j + 1) * tmp_stride + i];
             let c = tmp[(j + 2) * tmp_stride + i];
             let d = tmp[(j + 3) * tmp_stride + i];
             let e = tmp[(j + 4) * tmp_stride + i];
             let f = tmp[(j + 5) * tmp_stride + i];
             let val = filter6(a, b, c, d, e, f);
-            dst[j * dst_stride + i] = clip_u8((val + 512) >> 10);
+            dst_row[i] = clip_u8((val + 512) >> 10);
         }
     }
 }
@@ -1355,29 +1330,8 @@ pub fn mc_luma(
     pic_height: u32,
     scratch: &mut McScratch,
 ) {
-    // Try NEON assembly for interior 16×16 and 8×8 blocks.
-    #[cfg(has_asm)]
-    if crate::asm_dispatch::mc_luma_asm(
-        dst,
-        dst_stride,
-        ref_y,
-        ref_stride,
-        ref_x,
-        ref_y_pos,
-        dx,
-        dy,
-        block_w,
-        block_h,
-        pic_width as i32,
-        pic_height as i32,
-    ) {
-        return;
-    }
-
-    let pw = pic_width as i32;
-    let ph = pic_height as i32;
-
     scratch.ensure_capacity(block_w, block_h);
+    let (pw, ph) = (pic_width as i32, pic_height as i32);
 
     match (dx, dy) {
         // ------------------------------------------------------------------
@@ -1734,25 +1688,6 @@ pub fn mc_chroma(
 ) {
     debug_assert!(dx < 8 && dy < 8);
 
-    // Try NEON assembly for interior blocks with matching strides.
-    #[cfg(has_asm)]
-    if crate::asm_dispatch::mc_chroma_asm(
-        dst,
-        dst_stride,
-        ref_uv,
-        ref_stride,
-        ref_x,
-        ref_y_pos,
-        dx,
-        dy,
-        block_w,
-        block_h,
-        pic_width as i32,
-        pic_height as i32,
-    ) {
-        return;
-    }
-
     chroma_mc_scalar(
         dst,
         dst_stride,
@@ -1794,24 +1729,6 @@ pub fn mc_chroma_avg(
 ) {
     debug_assert!(dx < 8 && dy < 8);
 
-    #[cfg(has_asm)]
-    if crate::asm_dispatch::mc_chroma_avg_asm(
-        dst,
-        dst_stride,
-        ref_uv,
-        ref_stride,
-        ref_x,
-        ref_y_pos,
-        dx,
-        dy,
-        block_w,
-        block_h,
-        pic_width as i32,
-        pic_height as i32,
-    ) {
-        return;
-    }
-
     chroma_mc_scalar(
         dst,
         dst_stride,
@@ -1847,23 +1764,19 @@ fn chroma_mc_bilinear_w<const W: usize>(
     avg: bool,
 ) {
     for j in 0..block_h {
-        for i in 0..W {
-            let off = src_offset + j * ref_stride + i;
-            // SAFETY: caller verified is_interior with tap_margin=1, so all accesses
-            // from off to off + ref_stride + 1 are in-bounds.
-            unsafe {
-                let s00 = *ref_uv.get_unchecked(off) as i32;
-                let s10 = *ref_uv.get_unchecked(off + 1) as i32;
-                let s01 = *ref_uv.get_unchecked(off + ref_stride) as i32;
-                let s11 = *ref_uv.get_unchecked(off + ref_stride + 1) as i32;
-                let val = ((a * s00 + b * s10 + c * s01 + d * s11 + 32) >> 6) as u8;
-                let idx = j * dst_stride + i;
-                if avg {
-                    *dst.get_unchecked_mut(idx) =
-                        ((*dst.get_unchecked(idx) as u16 + val as u16 + 1) >> 1) as u8;
-                } else {
-                    *dst.get_unchecked_mut(idx) = val;
-                }
+        let row_off = src_offset + j * ref_stride;
+        let dst_row = &mut dst[j * dst_stride..j * dst_stride + W];
+        for (i, dst_px) in dst_row.iter_mut().enumerate().take(W) {
+            let off = row_off + i;
+            let s00 = ref_uv[off] as i32;
+            let s10 = ref_uv[off + 1] as i32;
+            let s01 = ref_uv[off + ref_stride] as i32;
+            let s11 = ref_uv[off + ref_stride + 1] as i32;
+            let val = ((a * s00 + b * s10 + c * s01 + d * s11 + 32) >> 6) as u8;
+            if avg {
+                *dst_px = ((*dst_px as u16 + val as u16 + 1) >> 1) as u8;
+            } else {
+                *dst_px = val;
             }
         }
     }
@@ -1886,20 +1799,17 @@ fn chroma_mc_2tap_w<const W: usize>(
     avg: bool,
 ) {
     for j in 0..block_h {
-        for i in 0..W {
-            let off = src_offset + j * ref_stride + i;
-            // SAFETY: caller verified is_interior with tap_margin=1.
-            unsafe {
-                let s0 = *ref_uv.get_unchecked(off) as i32;
-                let s1 = *ref_uv.get_unchecked(off + step) as i32;
-                let val = ((a * s0 + e * s1 + 32) >> 6) as u8;
-                let idx = j * dst_stride + i;
-                if avg {
-                    *dst.get_unchecked_mut(idx) =
-                        ((*dst.get_unchecked(idx) as u16 + val as u16 + 1) >> 1) as u8;
-                } else {
-                    *dst.get_unchecked_mut(idx) = val;
-                }
+        let row_off = src_offset + j * ref_stride;
+        let dst_row = &mut dst[j * dst_stride..j * dst_stride + W];
+        for (i, dst_px) in dst_row.iter_mut().enumerate().take(W) {
+            let off = row_off + i;
+            let s0 = ref_uv[off] as i32;
+            let s1 = ref_uv[off + step] as i32;
+            let val = ((a * s0 + e * s1 + 32) >> 6) as u8;
+            if avg {
+                *dst_px = ((*dst_px as u16 + val as u16 + 1) >> 1) as u8;
+            } else {
+                *dst_px = val;
             }
         }
     }
@@ -1920,19 +1830,15 @@ fn chroma_mc_copy_w<const W: usize>(
     avg: bool,
 ) {
     for j in 0..block_h {
+        let row_off = src_offset + j * ref_stride;
+        let dst_row = &mut dst[j * dst_stride..j * dst_stride + W];
         for i in 0..W {
-            let off = src_offset + j * ref_stride + i;
-            // SAFETY: caller verified is_interior with tap_margin=1.
-            unsafe {
-                let s0 = *ref_uv.get_unchecked(off) as i32;
-                let val = ((a * s0 + 32) >> 6) as u8;
-                let idx = j * dst_stride + i;
-                if avg {
-                    *dst.get_unchecked_mut(idx) =
-                        ((*dst.get_unchecked(idx) as u16 + val as u16 + 1) >> 1) as u8;
-                } else {
-                    *dst.get_unchecked_mut(idx) = val;
-                }
+            let s0 = ref_uv[row_off + i] as i32;
+            let val = ((a * s0 + 32) >> 6) as u8;
+            if avg {
+                dst_row[i] = ((dst_row[i] as u16 + val as u16 + 1) >> 1) as u8;
+            } else {
+                dst_row[i] = val;
             }
         }
     }
@@ -2087,22 +1993,19 @@ fn chroma_mc_bilinear_generic(
     avg: bool,
 ) {
     for j in 0..block_h {
-        for i in 0..block_w {
-            let off = src_offset + j * ref_stride + i;
-            // SAFETY: caller verified is_interior with tap_margin=1.
-            unsafe {
-                let s00 = *ref_uv.get_unchecked(off) as i32;
-                let s10 = *ref_uv.get_unchecked(off + 1) as i32;
-                let s01 = *ref_uv.get_unchecked(off + ref_stride) as i32;
-                let s11 = *ref_uv.get_unchecked(off + ref_stride + 1) as i32;
-                let val = ((a * s00 + b * s10 + c * s01 + d * s11 + 32) >> 6) as u8;
-                let idx = j * dst_stride + i;
-                if avg {
-                    *dst.get_unchecked_mut(idx) =
-                        ((*dst.get_unchecked(idx) as u16 + val as u16 + 1) >> 1) as u8;
-                } else {
-                    *dst.get_unchecked_mut(idx) = val;
-                }
+        let row_off = src_offset + j * ref_stride;
+        let dst_row = &mut dst[j * dst_stride..j * dst_stride + block_w];
+        for (i, dst_px) in dst_row.iter_mut().enumerate().take(block_w) {
+            let off = row_off + i;
+            let s00 = ref_uv[off] as i32;
+            let s10 = ref_uv[off + 1] as i32;
+            let s01 = ref_uv[off + ref_stride] as i32;
+            let s11 = ref_uv[off + ref_stride + 1] as i32;
+            let val = ((a * s00 + b * s10 + c * s01 + d * s11 + 32) >> 6) as u8;
+            if avg {
+                *dst_px = ((*dst_px as u16 + val as u16 + 1) >> 1) as u8;
+            } else {
+                *dst_px = val;
             }
         }
     }
@@ -2125,20 +2028,17 @@ fn chroma_mc_2tap_generic(
     avg: bool,
 ) {
     for j in 0..block_h {
-        for i in 0..block_w {
-            let off = src_offset + j * ref_stride + i;
-            // SAFETY: caller verified is_interior with tap_margin=1.
-            unsafe {
-                let s0 = *ref_uv.get_unchecked(off) as i32;
-                let s1 = *ref_uv.get_unchecked(off + step) as i32;
-                let val = ((a * s0 + e * s1 + 32) >> 6) as u8;
-                let idx = j * dst_stride + i;
-                if avg {
-                    *dst.get_unchecked_mut(idx) =
-                        ((*dst.get_unchecked(idx) as u16 + val as u16 + 1) >> 1) as u8;
-                } else {
-                    *dst.get_unchecked_mut(idx) = val;
-                }
+        let row_off = src_offset + j * ref_stride;
+        let dst_row = &mut dst[j * dst_stride..j * dst_stride + block_w];
+        for (i, dst_px) in dst_row.iter_mut().enumerate().take(block_w) {
+            let off = row_off + i;
+            let s0 = ref_uv[off] as i32;
+            let s1 = ref_uv[off + step] as i32;
+            let val = ((a * s0 + e * s1 + 32) >> 6) as u8;
+            if avg {
+                *dst_px = ((*dst_px as u16 + val as u16 + 1) >> 1) as u8;
+            } else {
+                *dst_px = val;
             }
         }
     }
@@ -2159,19 +2059,15 @@ fn chroma_mc_copy_generic(
     avg: bool,
 ) {
     for j in 0..block_h {
+        let row_off = src_offset + j * ref_stride;
+        let dst_row = &mut dst[j * dst_stride..j * dst_stride + block_w];
         for i in 0..block_w {
-            let off = src_offset + j * ref_stride + i;
-            // SAFETY: caller verified is_interior with tap_margin=1.
-            unsafe {
-                let s0 = *ref_uv.get_unchecked(off) as i32;
-                let val = ((a * s0 + 32) >> 6) as u8;
-                let idx = j * dst_stride + i;
-                if avg {
-                    *dst.get_unchecked_mut(idx) =
-                        ((*dst.get_unchecked(idx) as u16 + val as u16 + 1) >> 1) as u8;
-                } else {
-                    *dst.get_unchecked_mut(idx) = val;
-                }
+            let s0 = ref_uv[row_off + i] as i32;
+            let val = ((a * s0 + 32) >> 6) as u8;
+            if avg {
+                dst_row[i] = ((dst_row[i] as u16 + val as u16 + 1) >> 1) as u8;
+            } else {
+                dst_row[i] = val;
             }
         }
     }

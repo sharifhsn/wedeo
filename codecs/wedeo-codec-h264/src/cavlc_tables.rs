@@ -11,8 +11,14 @@
 // simpler and avoids global mutable state. Performance can be improved later with
 // precomputed lookup tables if profiling shows this is a bottleneck.
 
-use wedeo_codec::bitstream::{BitRead, BitReadBE};
 use wedeo_core::error::{Error, Result};
+
+use crate::bitstream::{BitRead, BitReadBE};
+
+#[inline]
+fn invalid_data(msg: &'static str) -> Error {
+    Error::invalid_data("h264/cavlc", msg)
+}
 
 // ---------------------------------------------------------------------------
 // coeff_token tables (H.264 spec Table 9-5)
@@ -219,7 +225,7 @@ fn decode_vlc(
         }
     }
 
-    Err(Error::InvalidData)
+    Err(invalid_data("invalid coeff_token VLC"))
 }
 
 // ---------------------------------------------------------------------------
@@ -439,11 +445,11 @@ pub fn read_coeff_token(br: &mut BitReadBE<'_>, nc: i32) -> Result<(u8, u8)> {
             br.skip_bits(len as usize);
             return Ok((tc, to));
         }
-        return Err(Error::InvalidData);
+        return Err(invalid_data("invalid chroma DC coeff_token"));
     }
 
     if nc < -1 {
-        return Err(Error::InvalidData);
+        return Err(invalid_data("invalid nC for coeff_token"));
     }
 
     let nc_clamped = nc.min(16) as usize;
@@ -485,7 +491,7 @@ pub fn read_coeff_token(br: &mut BitReadBE<'_>, nc: i32) -> Result<(u8, u8)> {
                 br.skip_bits(len as usize);
                 return Ok((tc, to));
             }
-            Err(Error::InvalidData)
+            Err(invalid_data("invalid coeff_token ctx 2"))
         }
         3 => {
             // nC >= 8: single-level 6-bit peek.
@@ -496,7 +502,7 @@ pub fn read_coeff_token(br: &mut BitReadBE<'_>, nc: i32) -> Result<(u8, u8)> {
                 br.skip_bits(len as usize);
                 return Ok((tc, to));
             }
-            Err(Error::InvalidData)
+            Err(invalid_data("invalid coeff_token ctx 3"))
         }
         _ => unreachable!(),
     }
@@ -511,7 +517,7 @@ pub fn read_coeff_token(br: &mut BitReadBE<'_>, nc: i32) -> Result<(u8, u8)> {
 /// `total_coeff` must be 1..15.
 pub fn read_total_zeros(br: &mut BitReadBE<'_>, total_coeff: u8) -> Result<u8> {
     if total_coeff == 0 || total_coeff > 15 {
-        return Err(Error::InvalidData);
+        return Err(invalid_data("invalid total_coeff for total_zeros"));
     }
 
     let table_idx = (total_coeff - 1) as usize;
@@ -531,7 +537,7 @@ pub fn read_total_zeros(br: &mut BitReadBE<'_>, total_coeff: u8) -> Result<u8> {
 /// `total_coeff` must be 1..3.
 pub fn read_total_zeros_chroma_dc(br: &mut BitReadBE<'_>, total_coeff: u8) -> Result<u8> {
     if total_coeff == 0 || total_coeff > 3 {
-        return Err(Error::InvalidData);
+        return Err(invalid_data("invalid chroma DC total_coeff"));
     }
 
     let table_idx = (total_coeff - 1) as usize;
@@ -554,7 +560,7 @@ pub fn read_total_zeros_chroma_dc(br: &mut BitReadBE<'_>, total_coeff: u8) -> Re
 /// `zeros_left` must be >= 1.
 pub fn read_run_before(br: &mut BitReadBE<'_>, zeros_left: u8) -> Result<u8> {
     if zeros_left == 0 {
-        return Err(Error::InvalidData);
+        return Err(invalid_data("zeros_left must be >= 1"));
     }
 
     let table_idx = (zeros_left.min(7) - 1) as usize;

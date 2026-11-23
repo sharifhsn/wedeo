@@ -5,12 +5,17 @@
 // h264_refs.c (`ff_h264_decode_ref_pic_list_reordering`),
 // h264_refs.c (`ff_h264_decode_ref_pic_marking`).
 
-use wedeo_codec::bitstream::{BitRead, BitReadBE, get_se_golomb, get_ue_golomb};
 use wedeo_core::error::{Error, Result};
 
+use crate::bitstream::{BitRead, BitReadBE, get_se_golomb, get_ue_golomb};
 use crate::nal::NalUnitType;
 use crate::pps::Pps;
 use crate::sps::Sps;
+
+#[inline]
+fn invalid_data(msg: &'static str) -> Error {
+    Error::invalid_data("h264/slice", msg)
+}
 
 // ---------------------------------------------------------------------------
 // SliceType
@@ -41,7 +46,7 @@ impl SliceType {
             2 => Ok(SliceType::I),
             3 => Ok(SliceType::SP),
             4 => Ok(SliceType::SI),
-            _ => Err(Error::InvalidData),
+            _ => Err(invalid_data("invalid slice_type")),
         }
     }
 
@@ -261,21 +266,21 @@ fn parse_ref_pic_list_modification(br: &mut BitReadBE<'_>) -> Result<Vec<RefPicL
             break;
         }
         if idc > 5 {
-            return Err(Error::InvalidData);
+            return Err(invalid_data("invalid ref_pic_list_modification idc"));
         }
 
         let val = match idc {
             0 | 1 => get_ue_golomb(br)?, // abs_diff_pic_num_minus1
             2 => get_ue_golomb(br)?,     // long_term_pic_num
             4 | 5 => get_ue_golomb(br)?, // abs_diff_view_idx_minus1 (MVC)
-            _ => return Err(Error::InvalidData),
+            _ => return Err(invalid_data("invalid ref_pic_list_modification idc")),
         };
 
         mods.push(RefPicListModification { idc, val });
 
         // Safety limit: prevent infinite loops on malformed streams
         if mods.len() > 128 {
-            return Err(Error::InvalidData);
+            return Err(invalid_data("ref_pic_list_modification overflow"));
         }
     }
 
@@ -345,14 +350,14 @@ fn parse_dec_ref_pic_marking(
                             long_term_frame_idx: ltfi,
                         }
                     }
-                    _ => return Err(Error::InvalidData),
+                    _ => return Err(invalid_data("invalid MMCO op")),
                 };
 
                 mmco_ops.push(op);
 
                 // Safety limit
                 if mmco_ops.len() > 66 {
-                    return Err(Error::InvalidData);
+                    return Err(invalid_data("MMCO op count overflow"));
                 }
             }
         }
@@ -380,14 +385,14 @@ fn parse_pred_weight_table(
 ) -> Result<()> {
     hdr.luma_log2_weight_denom = get_ue_golomb(br)?;
     if hdr.luma_log2_weight_denom > 7 {
-        return Err(Error::InvalidData);
+        return Err(invalid_data("luma_log2_weight_denom out of range"));
     }
     let luma_def = 1i32 << hdr.luma_log2_weight_denom;
 
     if chroma_format_idc != 0 {
         hdr.chroma_log2_weight_denom = get_ue_golomb(br)?;
         if hdr.chroma_log2_weight_denom > 7 {
-            return Err(Error::InvalidData);
+            return Err(invalid_data("chroma_log2_weight_denom out of range"));
         }
     }
     let chroma_def = 1i32 << hdr.chroma_log2_weight_denom;
@@ -480,27 +485,27 @@ pub fn parse_slice_header(
     // 2. slice_type (ue), values 0-9
     let raw_slice_type = get_ue_golomb(&mut br)?;
     if raw_slice_type > 9 {
-        return Err(Error::InvalidData);
+        return Err(invalid_data("slice_type out of range"));
     }
     hdr.slice_type_fixed = raw_slice_type >= 5;
     hdr.slice_type = SliceType::from_raw(raw_slice_type)?;
 
     // IDR slices must be I or SI
     if is_idr && !hdr.slice_type.is_intra() {
-        return Err(Error::InvalidData);
+        return Err(invalid_data("IDR slice is not intra"));
     }
 
     // 3. pps_id (ue), look up PPS then SPS
     hdr.pps_id = get_ue_golomb(&mut br)?;
     if hdr.pps_id >= 256 {
-        return Err(Error::InvalidData);
+        return Err(invalid_data("pps_id out of range"));
     }
     let pps = pps_list[hdr.pps_id as usize]
         .as_ref()
-        .ok_or(Error::InvalidData)?;
+        .ok_or_else(|| invalid_data("referenced PPS not found"))?;
     let sps = sps_list[pps.sps_id as usize]
         .as_ref()
-        .ok_or(Error::InvalidData)?;
+        .ok_or_else(|| invalid_data("referenced SPS not found"))?;
 
     // 4. frame_num (u(log2_max_frame_num) bits)
     hdr.frame_num = br.get_bits_32(sps.log2_max_frame_num as usize);
@@ -562,10 +567,10 @@ pub fn parse_slice_header(
         // Validate ref counts: max 16 for frames, 32 for fields
         let max_ref = if hdr.field_pic_flag { 32 } else { 16 };
         if hdr.num_ref_idx_l0_active > max_ref {
-            return Err(Error::InvalidData);
+            return Err(invalid_data("num_ref_idx_l0_active out of range"));
         }
         if hdr.slice_type.is_b() && hdr.num_ref_idx_l1_active > max_ref {
-            return Err(Error::InvalidData);
+            return Err(invalid_data("num_ref_idx_l1_active out of range"));
         }
     }
 
@@ -604,7 +609,7 @@ pub fn parse_slice_header(
     if pps.entropy_coding_mode_flag && !hdr.slice_type.is_intra() {
         hdr.cabac_init_idc = get_ue_golomb(&mut br)?;
         if hdr.cabac_init_idc > 2 {
-            return Err(Error::InvalidData);
+            return Err(invalid_data("cabac_init_idc out of range"));
         }
     }
 
@@ -624,13 +629,13 @@ pub fn parse_slice_header(
     if pps.deblocking_filter_parameters_present {
         hdr.disable_deblocking_filter_idc = get_ue_golomb(&mut br)?;
         if hdr.disable_deblocking_filter_idc > 2 {
-            return Err(Error::InvalidData);
+            return Err(invalid_data("disable_deblocking_filter_idc out of range"));
         }
         if hdr.disable_deblocking_filter_idc != 1 {
             let alpha_div2 = get_se_golomb(&mut br)?;
             let beta_div2 = get_se_golomb(&mut br)?;
             if !(-6..=6).contains(&alpha_div2) || !(-6..=6).contains(&beta_div2) {
-                return Err(Error::InvalidData);
+                return Err(invalid_data("deblocking filter offset out of range"));
             }
             hdr.slice_alpha_c0_offset = alpha_div2 * 2;
             hdr.slice_beta_offset = beta_div2 * 2;

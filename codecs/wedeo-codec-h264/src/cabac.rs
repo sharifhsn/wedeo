@@ -8,8 +8,12 @@
 //
 // Reference: FFmpeg libavcodec/cabac.c, cabac_functions.h, cabac.h, h264_cabac.c
 
-use tracing::trace;
 use wedeo_core::error::{Error, Result};
+
+#[inline]
+fn invalid_data(msg: &'static str) -> Error {
+    Error::invalid_data("h264/cabac", msg)
+}
 
 use crate::cabac_tables::{
     COEFF_ABS_LEVEL_M1_OFFSET, COEFF_ABS_LEVEL_TRANSITION, COEFF_ABS_LEVEL1_CTX,
@@ -52,14 +56,14 @@ impl<'a> CabacReader<'a> {
     /// through the NAL parsing chain.
     pub fn new(data: &'a [u8]) -> Result<Self> {
         if data.len() < 2 {
-            return Err(Error::InvalidData);
+            return Err(invalid_data("CABAC stream shorter than 2 bytes"));
         }
 
         let low = ((data[0] as i32) << 18) | ((data[1] as i32) << 10) | (1 << 9);
         let range = 0x1FE;
 
         if (range << (CABAC_BITS + 1)) < low {
-            return Err(Error::InvalidData);
+            return Err(invalid_data("invalid initial CABAC low/range"));
         }
 
         Ok(Self {
@@ -102,17 +106,9 @@ impl<'a> CabacReader<'a> {
     }
 
     /// Read a byte from the data buffer, returning 0 if past the end.
-    ///
-    /// SAFETY: The RBSP data is padded with AV_INPUT_BUFFER_PADDING_SIZE (64)
-    /// zero bytes after the end. All CABAC reads stay well within this padding
-    /// because refill reads at most 2 bytes per ~16 decoded bins. We use
-    /// unchecked access to eliminate bounds checks on the hot path.
     #[inline(always)]
     fn byte_at(&self, pos: usize) -> u8 {
-        // SAFETY: RBSP is padded with 64 zero bytes after the data. The CABAC
-        // engine refills at most 2 bytes per renormalization cycle, and the
-        // padding guarantees at least 64 bytes are readable beyond data.len().
-        unsafe { *self.data.get_unchecked(pos) }
+        self.data.get(pos).copied().unwrap_or(0)
     }
 
     /// Decode one context-adaptive binary symbol.
@@ -234,7 +230,7 @@ impl<'a> CabacReader<'a> {
 
         let new_start = ptr + n;
         if new_start + 2 > self.data.len() {
-            return Err(Error::InvalidData);
+            return Err(invalid_data("CABAC I_PCM skip out of bounds"));
         }
 
         // Re-init the engine from the new position (aligned path)
@@ -272,7 +268,7 @@ impl<'a> CabacReader<'a> {
     /// Used for I_PCM sample data within CABAC slices.
     pub fn read_byte(&mut self) -> Result<u8> {
         if self.pos >= self.data.len() {
-            return Err(Error::InvalidData);
+            return Err(invalid_data("CABAC read_byte past end of buffer"));
         }
         let b = self.data[self.pos];
         self.pos += 1;
@@ -872,23 +868,11 @@ fn decode_cabac_intra_mb_type(
         {
             ctx += 1;
         }
-        trace!(
-            "CABAC_INTRA_MB_TYPE ctx_base={} ctx={} state_idx={}",
-            ctx_base,
-            ctx,
-            ctx_base + ctx
-        );
         if reader.get_cabac(&mut state[ctx_base + ctx]) == 0 {
             return 0; // I_4x4
         }
-    } else {
-        trace!(
-            "CABAC_INTRA_MB_TYPE ctx_base={} ctx=0 state_idx={} (inter_slice)",
-            ctx_base, ctx_base
-        );
-        if reader.get_cabac(&mut state[ctx_base]) == 0 {
-            return 0; // I_4x4
-        }
+    } else if reader.get_cabac(&mut state[ctx_base]) == 0 {
+        return 0; // I_4x4
     }
 
     // Check for I_PCM
@@ -1266,7 +1250,7 @@ fn decode_cabac_mb_dqp(
         val += 1;
         if val > 102 {
             // prevent infinite loop (2 * max_qp)
-            return Err(Error::InvalidData);
+            return Err(invalid_data("CABAC dqp out of range"));
         }
     }
 
@@ -1868,8 +1852,8 @@ fn decode_cabac_chroma_residual(
 
     // Chroma AC (cat=4): 15 coefficients per 4x4 block
     if cbp & 0x20 != 0 {
-        for c in 0..2usize {
-            for i in 0..4usize {
+        for (c, plane_ac) in mb.chroma_ac.iter_mut().enumerate() {
+            for (i, blk_ac) in plane_ac.iter_mut().enumerate() {
                 let _block_idx = 16 + 4 * c + i;
                 let nz_idx = 16 + 4 * c + i;
                 let cbf_ctx = get_cabac_cbf_ctx(
@@ -1888,7 +1872,7 @@ fn decode_cabac_chroma_residual(
                     let nz = decode_cabac_residual(
                         reader,
                         state,
-                        &mut mb.chroma_ac[c][i],
+                        blk_ac,
                         4,
                         15,
                         &scan_4x4[1..],
@@ -1937,11 +1921,6 @@ pub fn decode_mb_cabac(
     let nb_left_bot = nb.left_idx_bot;
     let nb_top = nb.top_idx;
     let left_block_option = nb.left_block_option;
-
-    trace!(
-        "CABAC_MB_START mb_x={} mb_y={} slice_type={:?}",
-        mb_x, mb_y, slice_type
-    );
 
     // 1. Parse mb_type
     let is_intra;
@@ -1995,8 +1974,6 @@ pub fn decode_mb_cabac(
             {
                 b_ctx += 1;
             }
-
-            trace!("CABAC_B_MB_TYPE b_ctx={} state_idx={}", b_ctx, 27 + b_ctx);
 
             if reader.get_cabac(&mut state[27 + b_ctx]) == 0 {
                 // B_Direct_16x16
@@ -2096,7 +2073,7 @@ pub fn decode_mb_cabac(
         // Read raw samples from the recovered position
         let pcm_data = reader.data();
         if ptr + mb_size > pcm_data.len() {
-            return Err(Error::InvalidData);
+            return Err(invalid_data("CABAC I_PCM buffer truncated"));
         }
 
         let mut byte_pos = ptr;
@@ -2111,12 +2088,12 @@ pub fn decode_mb_cabac(
         }
         // Read 64 Cb then 64 Cr — absent for monochrome.
         if decode_chroma {
-            for plane_idx in 0..2usize {
+            for plane_ac in &mut mb.chroma_ac {
                 for y in 0..8u32 {
                     for x in 0..8u32 {
                         let blk = ((y / 4) * 2 + (x / 4)) as usize;
                         let sub = ((y % 4) * 4 + (x % 4)) as usize;
-                        mb.chroma_ac[plane_idx][blk][sub] = pcm_data[byte_pos] as i16;
+                        plane_ac[blk][sub] = pcm_data[byte_pos] as i16;
                         byte_pos += 1;
                     }
                 }
@@ -2130,9 +2107,7 @@ pub fn decode_mb_cabac(
             mb.non_zero_count = [16; 24];
         } else {
             mb.non_zero_count = [0; 24];
-            for i in 0..16 {
-                mb.non_zero_count[i] = 16;
-            }
+            mb.non_zero_count[..16].fill(16);
         }
         mb.mb_qp_delta = 0;
         // I_PCM: all blocks are coded. Set CBP so neighbor context derivation
@@ -2237,7 +2212,6 @@ pub fn decode_mb_cabac(
     }
 
     // 4. Chroma prediction mode (for intra MBs)
-    trace!("CABAC_SECTION chroma_pred_mode");
     if is_intra && decode_chroma {
         mb.chroma_pred_mode =
             decode_cabac_mb_chroma_pre_mode(reader, state, cabac_nb, nb_left, nb_top);
@@ -2321,8 +2295,8 @@ pub fn decode_mb_cabac(
             }
             3 | 4 => {
                 // P_8x8 / P_8x8ref0
-                for i in 0..4 {
-                    mb.sub_mb_type[i] = decode_cabac_p_mb_sub_type(reader, state);
+                for sub_mt in &mut mb.sub_mb_type {
+                    *sub_mt = decode_cabac_p_mb_sub_type(reader, state);
                 }
                 // Restrict dct8x8_allowed: only 8x8 sub-partitions (raw type 0) allow 8x8 DCT.
                 // Reference: FFmpeg h264_mvpred.h:157 get_dct8x8_allowed()
@@ -2393,8 +2367,8 @@ pub fn decode_mb_cabac(
     if !is_intra && slice_type == SliceType::B && !mb.is_direct {
         if mb.mb_type == 22 {
             // B_8x8
-            for i in 0..4 {
-                mb.sub_mb_type[i] = decode_cabac_b_mb_sub_type(reader, state);
+            for sub_mt in &mut mb.sub_mb_type {
+                *sub_mt = decode_cabac_b_mb_sub_type(reader, state);
             }
             // Restrict dct8x8_allowed for B_8x8: sub-8x8 partitions (raw type >= 4) disallow,
             // and B_Direct_8x8 (raw type 0) requires direct_8x8_inference_flag.
@@ -2599,7 +2573,6 @@ pub fn decode_mb_cabac(
     }
 
     // 6. CBP (for non-I16x16)
-    trace!("CABAC_SECTION cbp");
     if !mb.is_intra16x16 {
         let left_cbp = cabac_nb.left_cbp_mbaff(nb_left, nb_left_bot, is_intra, left_block_option);
         let top_cbp = cabac_nb.top_cbp(nb_top, is_intra);
@@ -2609,7 +2582,7 @@ pub fn decode_mb_cabac(
         }
     } else if !decode_chroma && cbp > 15 {
         // I16x16 with chroma CBP in monochrome stream — invalid.
-        return Err(Error::InvalidData);
+        return Err(invalid_data("I16x16 chroma CBP in monochrome stream"));
     }
     mb.cbp = cbp;
 
@@ -2626,7 +2599,6 @@ pub fn decode_mb_cabac(
     }
 
     // 7. QP delta and residual coefficients
-    trace!("CABAC_SECTION qp_delta_and_residual cbp={}", cbp);
     let mut stored_cbp = cbp;
     let is_i16x16 = mb.is_intra16x16;
     if cbp > 0 || is_i16x16 {
@@ -2634,7 +2606,6 @@ pub fn decode_mb_cabac(
         mb.mb_qp_delta = decode_cabac_mb_dqp(reader, state, last_qscale_diff)?;
 
         // Decode luma residual
-        trace!("CABAC_SECTION luma_residual");
         decode_cabac_luma_residual(
             reader,
             state,
@@ -2651,7 +2622,6 @@ pub fn decode_mb_cabac(
         );
 
         // Decode chroma residual (4:2:0)
-        trace!("CABAC_SECTION chroma_residual");
         decode_cabac_chroma_residual(
             reader,
             state,
@@ -2667,36 +2637,6 @@ pub fn decode_mb_cabac(
             left_block_option,
         );
 
-        // Per-MB coefficient summary for pipeline-stage tracing
-        {
-            let luma_sum: u32 = if mb.transform_size_8x8_flag {
-                mb.luma_8x8_coeffs
-                    .iter()
-                    .flat_map(|c| c.iter())
-                    .map(|&c| c.unsigned_abs() as u32)
-                    .sum()
-            } else {
-                mb.luma_coeffs
-                    .iter()
-                    .flat_map(|c| c.iter())
-                    .map(|&c| c.unsigned_abs() as u32)
-                    .sum()
-            };
-            let chroma_dc_cb: i16 = mb.chroma_dc[0].iter().sum();
-            let chroma_dc_cr: i16 = mb.chroma_dc[1].iter().sum();
-            trace!(
-                mb_x,
-                mb_y,
-                t8x8 = mb.transform_size_8x8_flag,
-                luma_sum,
-                chroma_dc_cb,
-                chroma_dc_cr,
-                cbp,
-                i16x16 = is_i16x16,
-                "COEFF_CABAC"
-            );
-        }
-
         // Store the luma DC coded flag if I16x16 had non-zero DC
         if is_i16x16 && mb.luma_dc.iter().any(|&c| c != 0) {
             stored_cbp |= 0x100;
@@ -2706,24 +2646,13 @@ pub fn decode_mb_cabac(
     // Update stored cbp
     mb.cbp = stored_cbp;
 
-    trace!(
-        mb_x,
-        mb_y,
-        mb_type = mb.mb_type,
-        cbp = mb.cbp,
-        is_intra4x4 = mb.is_intra4x4,
-        is_intra16x16 = mb.is_intra16x16,
-        is_pcm = mb.is_pcm,
-        "CABAC decoded MB"
-    );
-
     Ok(mb)
 }
 
 /// Decode intra mb_type fields into the Macroblock struct.
 fn decode_intra_mb_cabac(mb: &mut Macroblock, raw_mt: u32) -> Result<()> {
     if raw_mt > 25 {
-        return Err(Error::InvalidData);
+        return Err(invalid_data("intra mb_type out of range"));
     }
 
     if raw_mt == 0 {

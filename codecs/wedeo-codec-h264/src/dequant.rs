@@ -62,14 +62,14 @@ impl Dequant4Table {
         };
 
         for (i, sm) in scaling_matrix4.iter().enumerate() {
-            for q in 0..52 {
+            for (q, row) in table.coeffs[i].iter_mut().enumerate() {
                 let shift = (q / 6) + 2;
                 let idx = q % 6;
                 for x in 0..16u32 {
                     // No transpose — both coefficients and scaling matrices are in raster order.
                     // FFmpeg also stores at position x directly (init_dequant4_coeff_table, h264_ps.c).
                     let scale_idx = ((x & 1) + ((x >> 2) & 1)) as usize;
-                    table.coeffs[i][q][x as usize] = ((DEQUANT4_COEFF_INIT[idx][scale_idx] as u32)
+                    row[x as usize] = ((DEQUANT4_COEFF_INIT[idx][scale_idx] as u32)
                         * (sm[x as usize] as u32))
                         << shift;
                 }
@@ -106,7 +106,7 @@ impl Dequant8Table {
         };
 
         for (i, sm) in scaling_matrix8.iter().enumerate() {
-            for q in 0..52 {
+            for (q, row) in table.coeffs[i].iter_mut().enumerate() {
                 let shift = q / 6;
                 let idx = q % 6;
                 for x in 0..64u32 {
@@ -116,7 +116,7 @@ impl Dequant8Table {
                     // store at the standard position x directly (no transpose).
                     let scan_idx =
                         DEQUANT8_COEFF_INIT_SCAN[(((x >> 1) & 12) | (x & 3)) as usize] as usize;
-                    table.coeffs[i][q][x as usize] = ((DEQUANT8_COEFF_INIT[idx][scan_idx] as u32)
+                    row[x as usize] = ((DEQUANT8_COEFF_INIT[idx][scan_idx] as u32)
                         * (sm[x as usize] as u32))
                         << shift;
                 }

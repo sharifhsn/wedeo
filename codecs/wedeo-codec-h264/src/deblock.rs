@@ -7,20 +7,7 @@
 // Reference: ITU-T H.264 spec section 8.7, FFmpeg libavcodec/h264_loopfilter.c
 // and h264dsp_template.c.
 
-use std::sync::atomic::{AtomicU32, Ordering};
-
-use tracing::{debug, trace};
-
 use crate::tables::CHROMA_QP_TABLE;
-
-/// Wrapper to send a `*mut PictureBuffer` across scoped threads.
-///
-/// SAFETY: Only used within `std::thread::scope` where the wavefront ordering
-/// guarantees disjoint row access. All threads are joined before the pointer
-/// is invalidated.
-struct SyncPic(*mut PictureBuffer);
-unsafe impl Send for SyncPic {}
-unsafe impl Sync for SyncPic {}
 
 // ---------------------------------------------------------------------------
 // Threshold tables from the H.264 spec (Table 8-16) and FFmpeg.
@@ -562,14 +549,13 @@ fn filter_mb_edge_luma(
     qp: u8,
     alpha_offset: i32,
     beta_offset: i32,
-    mb_x: u32,
-    mb_y: u32,
+    _mb_x: u32,
+    _mb_y: u32,
 ) {
-    let (alpha, beta, index_a) = get_thresholds(qp, alpha_offset, beta_offset);
+    let (alpha, beta, _index_a) = get_thresholds(qp, alpha_offset, beta_offset);
     if alpha == 0 || beta == 0 {
         return;
     }
-    let _ = index_a; // used by #[cfg(has_asm)] below
 
     // For vertical edges: fixed x = edge*4, varying y.
     // For horizontal edges: fixed y = edge*4, varying x.
@@ -579,21 +565,6 @@ fn filter_mb_edge_luma(
         edge * 4 * stride // y offset within MB
     };
     let base = mb_base_offset + edge_pixel_offset;
-
-    // Try NEON assembly: processes all 16 pixel pairs in one call.
-    #[cfg(has_asm)]
-    if crate::asm_dispatch::deblock_luma_edge_asm(
-        plane,
-        base,
-        stride,
-        is_vertical,
-        bs,
-        index_a,
-        alpha,
-        beta,
-    ) {
-        return;
-    }
 
     // Step size across the edge boundary (hoisted out of inner loop).
     let step = if is_vertical { 1 } else { stride };
@@ -629,82 +600,35 @@ fn filter_mb_edge_luma(
                 base + i as usize * 4 + d
             };
 
-            // SAFETY: bounds proven by the assert above — off is within
-            // [base, base+max_along] and cross-edge +-4*step is in bounds.
-            let (p0, p1, p2, q0, q1, q2);
-            unsafe {
-                let pp = plane.as_ptr();
-                p0 = *pp.add(off - step) as i32;
-                p1 = *pp.add(off - 2 * step) as i32;
-                p2 = *pp.add(off - 3 * step) as i32;
-                q0 = *pp.add(off) as i32;
-                q1 = *pp.add(off + step) as i32;
-                q2 = *pp.add(off + 2 * step) as i32;
-            }
-
-            trace!(
-                mb_x,
-                mb_y,
-                is_vertical,
-                edge,
-                i,
-                d,
-                cur_bs,
-                p0,
-                p1,
-                p2,
-                q0,
-                q1,
-                q2,
-                alpha,
-                beta,
-                qp,
-                "DEBLOCK_PIXEL_IN"
-            );
+            let p0 = plane[off - step] as i32;
+            let p1 = plane[off - 2 * step] as i32;
+            let p2 = plane[off - 3 * step] as i32;
+            let q0 = plane[off] as i32;
+            let q1 = plane[off + step] as i32;
+            let q2 = plane[off + 2 * step] as i32;
 
             if cur_bs < 4 {
                 let tc0 = get_tc0(qp, alpha_offset, cur_bs);
                 if let Some((new_p0, new_p1, new_q0, new_q1)) =
                     filter_normal_luma(p0, p1, p2, q0, q1, q2, alpha, beta, tc0)
                 {
-                    trace!(
-                        mb_x,
-                        mb_y, is_vertical, edge, i, d, new_p0, new_q0, tc0, "DEBLOCK_PIXEL_OUT"
-                    );
-                    // SAFETY: same bounds proof as reads above.
-                    unsafe {
-                        let pp = plane.as_mut_ptr();
-                        *pp.add(off - step) = new_p0;
-                        *pp.add(off - 2 * step) = new_p1;
-                        *pp.add(off) = new_q0;
-                        *pp.add(off + step) = new_q1;
-                    }
+                    plane[off - step] = new_p0;
+                    plane[off - 2 * step] = new_p1;
+                    plane[off] = new_q0;
+                    plane[off + step] = new_q1;
                 }
             } else {
-                // SAFETY: bounds proven by the assert above (off - 4*step, off + 3*step).
-                let (p3, q3);
-                unsafe {
-                    let pp = plane.as_ptr();
-                    p3 = *pp.add(off - 4 * step) as i32;
-                    q3 = *pp.add(off + 3 * step) as i32;
-                }
+                let p3 = plane[off - 4 * step] as i32;
+                let q3 = plane[off + 3 * step] as i32;
                 if let Some((new_p0, new_p1, new_p2, new_q0, new_q1, new_q2)) =
                     filter_strong_luma(p0, p1, p2, p3, q0, q1, q2, q3, alpha, beta)
                 {
-                    trace!(
-                        mb_x,
-                        mb_y, is_vertical, edge, i, d, new_p0, new_q0, "DEBLOCK_PIXEL_OUT"
-                    );
-                    // SAFETY: same bounds proof as reads above.
-                    unsafe {
-                        let pp = plane.as_mut_ptr();
-                        *pp.add(off - step) = new_p0;
-                        *pp.add(off - 2 * step) = new_p1;
-                        *pp.add(off - 3 * step) = new_p2;
-                        *pp.add(off) = new_q0;
-                        *pp.add(off + step) = new_q1;
-                        *pp.add(off + 2 * step) = new_q2;
-                    }
+                    plane[off - step] = new_p0;
+                    plane[off - 2 * step] = new_p1;
+                    plane[off - 3 * step] = new_p2;
+                    plane[off] = new_q0;
+                    plane[off + step] = new_q1;
+                    plane[off + 2 * step] = new_q2;
                 }
             }
         }
@@ -735,11 +659,10 @@ fn filter_mb_edge_chroma(
     alpha_offset: i32,
     beta_offset: i32,
 ) {
-    let (alpha, beta, index_a) = get_thresholds(qp, alpha_offset, beta_offset);
+    let (alpha, beta, _index_a) = get_thresholds(qp, alpha_offset, beta_offset);
     if alpha == 0 || beta == 0 {
         return;
     }
-    let _ = index_a;
 
     let edge_pixel_offset = if is_vertical {
         edge * 4
@@ -747,20 +670,6 @@ fn filter_mb_edge_chroma(
         edge * 4 * stride
     };
     let base = mb_base_offset + edge_pixel_offset;
-
-    #[cfg(has_asm)]
-    if crate::asm_dispatch::deblock_chroma_edge_asm(
-        plane,
-        base,
-        stride,
-        is_vertical,
-        bs,
-        index_a,
-        alpha,
-        beta,
-    ) {
-        return;
-    }
 
     let step = if is_vertical { 1 } else { stride };
 
@@ -1576,14 +1485,6 @@ fn deblock_mb(
     let chroma_qp_index_offset = params.chroma_qp_index_offset;
 
     // Compute field-aware pixel offsets and strides for this MB.
-    trace!(
-        mb_x,
-        mb_y,
-        cur_mb_field,
-        cur_qp,
-        y_stride = pic.y_stride,
-        "DEBLOCK_MB_START"
-    );
     let (luma_base, luma_stride) = deblock_luma_offset(pic.y_stride, mb_x, mb_y, cur_mb_field);
     let (chroma_base_u, chroma_stride) =
         deblock_chroma_offset(pic.uv_stride, mb_x, mb_y, cur_mb_field);
@@ -1652,14 +1553,6 @@ fn deblock_mb(
             !top_available
         };
         let luma_bs = compute_luma_bs(is_vertical, mb_info, mb_x, mb_y, mb_width);
-
-        trace!(
-            mb_x, mb_y, is_vertical,
-            bs0 = ?luma_bs[0], bs1 = ?luma_bs[1], bs2 = ?luma_bs[2], bs3 = ?luma_bs[3],
-            cur_qp,
-            alpha_c0_offset, beta_offset,
-            "DEBLOCK_EDGE"
-        );
 
         // --- Luma edges ---
         for (edge, &bs_edge) in luma_bs.iter().enumerate() {
@@ -1766,7 +1659,6 @@ fn deblock_mb(
 /// * `mb_info` - per-macroblock deblocking info (mb_width * mb_height entries, raster order)
 /// * `slice_table` - per-macroblock slice number (same layout as mb_info)
 /// * `slice_params` - deblocking parameters for each slice
-#[tracing::instrument(skip_all, fields(mb_width = pic.mb_width, mb_height = pic.mb_height))]
 pub fn deblock_frame(
     pic: &mut PictureBuffer,
     mb_info: &[MbDeblockInfo],
@@ -1774,87 +1666,12 @@ pub fn deblock_frame(
     slice_params: &[SliceDeblockParams],
     is_mbaff: bool,
 ) {
-    let mb_width = pic.mb_width;
-    let mb_height = pic.mb_height;
-
-    debug!(mb_width, mb_height, is_mbaff, "deblocking frame");
-
     debug_assert_eq!(
         mb_info.len(),
-        (mb_width * mb_height) as usize,
+        (pic.mb_width * pic.mb_height) as usize,
         "mb_info length must equal mb_width * mb_height"
     );
-
-    // MBAFF uses column-first pair iteration — complex ordering, keep sequential.
-    // Tiny frames (<=2 rows) have no parallelism benefit.
-    if is_mbaff || mb_height <= 2 {
-        deblock_frame_sequential(pic, mb_info, slice_table, slice_params, is_mbaff);
-        return;
-    }
-
-    // Progressive parallel deblocking: row-wavefront with work-stealing.
-    //
-    // SAFETY argument: Each MB row Y writes to luma pixel rows [Y*16-3 .. Y*16+15]
-    // and chroma [Y*8-1 .. Y*8+7]. The wavefront guarantee (row Y-1 complete before
-    // row Y starts) ensures no concurrent writes to overlapping regions.
-    // The Acquire/Release ordering ensures pixel writes from row Y-1 are visible to
-    // row Y's thread.
-
-    let num_threads = std::thread::available_parallelism()
-        .map(|n| n.get().min(mb_height as usize / 2).max(1))
-        .unwrap_or(1);
-
-    if num_threads <= 1 {
-        deblock_frame_sequential(pic, mb_info, slice_table, slice_params, false);
-        return;
-    }
-
-    let row_progress: Vec<AtomicU32> = (0..mb_height).map(|_| AtomicU32::new(0)).collect();
-    let next_row = AtomicU32::new(0);
-
-    // SAFETY: thread::scope joins all threads before returning, and the
-    // wavefront ensures disjoint row access. See SyncPic doc comment.
-    let sync_pic = SyncPic(pic as *mut PictureBuffer);
-
-    std::thread::scope(|s| {
-        for _ in 0..num_threads {
-            let sync_pic = &sync_pic;
-            let row_progress = &row_progress;
-            let next_row = &next_row;
-            s.spawn(move || {
-                loop {
-                    let my_row = next_row.fetch_add(1, Ordering::Relaxed);
-                    if my_row >= mb_height {
-                        break;
-                    }
-
-                    // Wait for dependency: row my_row - 1 must be done
-                    if my_row > 0 {
-                        while row_progress[(my_row - 1) as usize].load(Ordering::Acquire) == 0 {
-                            std::hint::spin_loop();
-                        }
-                    }
-
-                    // SAFETY: Row my_row writes to pixels disjoint from all other active rows.
-                    // Row my_row-1 is complete (checked above), so its pixel writes are visible.
-                    let pic = unsafe { &mut *sync_pic.0 };
-                    for mb_x in 0..mb_width {
-                        deblock_mb_if_enabled(
-                            pic,
-                            mb_info,
-                            mb_x,
-                            my_row,
-                            mb_width,
-                            slice_table,
-                            slice_params,
-                        );
-                    }
-
-                    row_progress[my_row as usize].store(1, Ordering::Release);
-                }
-            });
-        }
-    });
+    deblock_frame_sequential(pic, mb_info, slice_table, slice_params, is_mbaff);
 }
 
 /// Deblock a single MB row (progressive, non-MBAFF).
@@ -1977,6 +1794,7 @@ fn deblock_mb_if_enabled(
 
     deblock_mb(pic, mb_info, mb_x, mb_y, slice_table, slice_params);
 
+    #[cfg(feature = "dev-trace")]
     {
         let mb_field = mb_info[mb_idx].mb_field;
         let (y_base, y_stride) = deblock_luma_offset(pic.y_stride, mb_x, mb_y, mb_field);
@@ -1985,12 +1803,20 @@ fn deblock_mb_if_enabled(
         let y_sum = deblock_plane_sum(&pic.y, y_base, y_stride, 16);
         let u_sum = deblock_plane_sum(&pic.u, u_base, uv_stride, 8);
         let v_sum = deblock_plane_sum(&pic.v, v_base, uv_stride, 8);
-        tracing::trace!(mb_x, mb_y, y_sum, u_sum, v_sum, "MB_DEBLOCK");
+        crate::dev_trace!(
+            "MB_DEBLOCK mb_x={} mb_y={} y_sum={} u_sum={} v_sum={}",
+            mb_x,
+            mb_y,
+            y_sum,
+            u_sum,
+            v_sum
+        );
     }
 }
 
 /// Compute pixel sum for a macroblock region (for deblock tracing).
 /// Uses pre-computed base offset and stride (field-aware for MBAFF).
+#[cfg(feature = "dev-trace")]
 fn deblock_plane_sum(plane: &[u8], base_offset: usize, stride: usize, size: u32) -> u32 {
     let mut sum = 0u32;
     for dy in 0..size as usize {

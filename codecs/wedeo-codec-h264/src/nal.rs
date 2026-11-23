@@ -25,6 +25,11 @@ pub enum NalUnitType {
     Filler = 12,
 }
 
+#[inline]
+fn invalid_data(msg: &'static str) -> Error {
+    Error::invalid_data("h264/nal", msg)
+}
+
 impl TryFrom<u8> for NalUnitType {
     type Error = Error;
 
@@ -42,7 +47,7 @@ impl TryFrom<u8> for NalUnitType {
             10 => Ok(NalUnitType::EndSequence),
             11 => Ok(NalUnitType::EndStream),
             12 => Ok(NalUnitType::Filler),
-            _ => Err(Error::InvalidData),
+            _ => Err(invalid_data("unsupported NAL unit type")),
         }
     }
 }
@@ -86,7 +91,7 @@ fn remove_emulation_prevention_bytes(data: &[u8]) -> Vec<u8> {
 fn parse_nal_header(header_byte: u8) -> Result<(u8, NalUnitType)> {
     let forbidden_zero_bit = (header_byte >> 7) & 1;
     if forbidden_zero_bit != 0 {
-        return Err(Error::InvalidData);
+        return Err(invalid_data("NAL forbidden_zero_bit is set"));
     }
     let nal_ref_idc = (header_byte >> 5) & 0x03;
     let nal_type_raw = header_byte & 0x1F;
@@ -100,7 +105,7 @@ fn parse_nal_header(header_byte: u8) -> Result<(u8, NalUnitType)> {
 /// length prefix removal), starting with the header byte.
 fn parse_nal_unit(raw: &[u8]) -> Result<NalUnit> {
     if raw.is_empty() {
-        return Err(Error::InvalidData);
+        return Err(invalid_data("empty NAL unit"));
     }
     let (nal_ref_idc, nal_type) = parse_nal_header(raw[0])?;
     let rbsp = remove_emulation_prevention_bytes(&raw[1..]);

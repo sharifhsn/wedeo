@@ -1,16 +1,13 @@
-// Thread-safe picture with row-level progress tracking for frame-level threading.
+// Safe pooled picture buffers and immutable reference pictures for H.264 decode.
 //
-// One writer thread decodes rows top-to-bottom, calling `publish_row()` after
-// each MB row. Reader threads (decoding later frames) call `wait_for_row()`
-// before accessing reference pixels.
-//
-// Reference: FFmpeg libavcodec/pthread_frame.c (ff_thread_report_progress,
-// ff_thread_await_progress), WEDEO_SYNTHESIS.md §4 (hybrid spin→condvar).
+// `PicHandle` is uniquely owned (`&mut`) by `FrameDecodeContext` during macroblock
+// decoding and in-loop deblocking. Once decoding finishes, `PicHandle::into_shared()`
+// moves the completed `PictureBuffer` into an immutable `Arc<SharedPicture>` for DPB
+// reference storage, returning the underlying buffer to `BufferPool` when the last
+// reference drops — with zero `UnsafeCell` and zero `unsafe` code.
 
-use std::cell::UnsafeCell;
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 
 use crate::deblock::PictureBuffer;
 
@@ -21,10 +18,7 @@ pub const PROGRESS_COMPLETE: i32 = i32::MAX;
 // BufferPool — reuse PictureBuffer allocations across frames
 // ---------------------------------------------------------------------------
 
-/// Pool of reusable PictureBuffers to avoid per-frame malloc/free.
-///
-/// Lives on `H264Decoder`. On resolution change, the pool is flushed
-/// (mismatched buffers are dropped, not recycled).
+/// Pool of reusable `PictureBuffer`s to avoid per-frame allocations.
 pub struct BufferPool {
     free: Vec<PictureBuffer>,
     width: u32,
@@ -46,9 +40,7 @@ impl BufferPool {
         }
     }
 
-    /// Acquire a buffer of the given dimensions, pre-filled with `y_fill` / `uv_fill`.
-    /// Returns a pooled buffer if one is available and dimensions match;
-    /// otherwise allocates fresh.
+    /// Acquire a buffer of the given dimensions, pre-filled with `0` (luma) / `uv_fill` (chroma).
     pub fn acquire(
         &mut self,
         width: u32,
@@ -57,7 +49,6 @@ impl BufferPool {
         mb_height: u32,
         uv_fill: u8,
     ) -> PictureBuffer {
-        // Resolution change: flush all pooled buffers
         if width != self.width || height != self.height {
             self.free.clear();
             self.width = width;
@@ -65,13 +56,11 @@ impl BufferPool {
         }
 
         if let Some(mut buf) = self.free.pop() {
-            // Reuse: fill with zeros (luma) and uv_fill (chroma)
             buf.y.fill(0);
             buf.u.fill(uv_fill);
             buf.v.fill(uv_fill);
             buf
         } else {
-            // Fresh allocation
             let y_stride = width as usize;
             let uv_stride = (width / 2) as usize;
             PictureBuffer {
@@ -90,124 +79,63 @@ impl BufferPool {
 
     /// Return a buffer to the pool for reuse.
     pub fn reclaim(&mut self, buf: PictureBuffer) {
-        // Only keep buffers that match current dimensions
         if buf.width == self.width && buf.height == self.height && !buf.y.is_empty() {
             self.free.push(buf);
         }
     }
 }
 
-/// Thread-safe picture with row-level progress tracking.
-///
-/// SAFETY: Concurrent access is mediated by `row_progress`:
-/// - Writer has exclusive access to rows > row_progress
-/// - Readers may access rows <= row_progress.load(Acquire)
+/// Immutable reference picture stored in the DPB and shared across worker threads.
 pub struct SharedPicture {
-    data: UnsafeCell<PictureBuffer>,
-    row_progress: AtomicI32,
+    data: PictureBuffer,
     mb_height: u32,
-    // For blocking wait when spin is insufficient
-    progress_mutex: Mutex<()>,
-    progress_cond: Condvar,
-    /// If set, the buffer returns to this pool when the last Arc drops.
     return_to: Option<Arc<Mutex<BufferPool>>>,
 }
-
-// SAFETY: Concurrent access is mediated by `row_progress` atomic.
-// Writer has exclusive access to rows > row_progress; readers only
-// access rows <= row_progress.load(Acquire).
-unsafe impl Sync for SharedPicture {}
 
 impl SharedPicture {
     pub fn new(pic: PictureBuffer) -> Arc<Self> {
         let mb_height = pic.mb_height;
         Arc::new(Self {
-            data: UnsafeCell::new(pic),
-            row_progress: AtomicI32::new(-1),
+            data: pic,
             mb_height,
-            progress_mutex: Mutex::new(()),
-            progress_cond: Condvar::new(),
             return_to: None,
         })
     }
 
-    /// Create a SharedPicture that returns its buffer to `pool` on drop.
+    /// Create a `SharedPicture` that returns its buffer to `pool` on drop.
     pub fn new_pooled(pic: PictureBuffer, pool: &Arc<Mutex<BufferPool>>) -> Arc<Self> {
         let mb_height = pic.mb_height;
         Arc::new(Self {
-            data: UnsafeCell::new(pic),
-            row_progress: AtomicI32::new(-1),
+            data: pic,
             mb_height,
-            progress_mutex: Mutex::new(()),
-            progress_cond: Condvar::new(),
             return_to: Some(Arc::clone(pool)),
         })
     }
 
-    /// Get a shared reference to the inner PictureBuffer.
-    ///
-    /// # Safety
-    ///
-    /// Caller must only access pixel rows that have been published
-    /// (rows <= self.row_progress). For fully-complete pictures
-    /// (PROGRESS_COMPLETE), all access is safe.
-    pub unsafe fn data(&self) -> &PictureBuffer {
-        unsafe { &*self.data.get() }
+    /// Get a shared reference to the completed `PictureBuffer`.
+    #[inline]
+    pub fn data(&self) -> &PictureBuffer {
+        &self.data
     }
 
-    /// Get a mutable reference to the inner PictureBuffer.
-    ///
-    /// # Safety
-    ///
-    /// Caller must be the sole writer, accessing rows > row_progress.
-    /// Only the decode thread for this picture should call this.
-    /// This returns `&mut` from `&self` via `UnsafeCell`, which is the
-    /// standard interior mutability pattern for concurrent data structures.
-    #[allow(clippy::mut_from_ref)]
-    pub unsafe fn data_mut(&self) -> &mut PictureBuffer {
-        unsafe { &mut *self.data.get() }
-    }
+    /// No-op for completed immutable reference pictures (kept for call-site compatibility).
+    #[inline]
+    pub fn publish_row(&self, _row: i32) {}
 
-    /// Called by decode thread after completing MB row `row`.
-    pub fn publish_row(&self, row: i32) {
-        self.row_progress.store(row, Ordering::Release);
-        self.progress_cond.notify_all();
-    }
+    /// No-op for completed immutable reference pictures (all reference frames are joined before dispatch).
+    #[inline]
+    pub fn wait_for_row(&self, _row: i32) {}
 
-    /// Called by reader threads before accessing reference pixels from `row`.
-    /// Uses hybrid spin → condvar strategy (WEDEO_SYNTHESIS §4).
-    pub fn wait_for_row(&self, row: i32) {
-        // Fast path: already done
-        if self.row_progress.load(Ordering::Acquire) >= row {
-            return;
-        }
+    /// No-op for completed immutable reference pictures.
+    #[inline]
+    pub fn mark_complete(&self) {}
 
-        // Phase 1: brief spin (microsecond waits)
-        let mut spin = 0;
-        while self.row_progress.load(Ordering::Relaxed) < row && spin < 100 {
-            spin += 1;
-            std::hint::spin_loop();
-        }
-        if self.row_progress.load(Ordering::Acquire) >= row {
-            return;
-        }
-
-        // Phase 2: condvar wait (millisecond+ waits)
-        let mut guard = self.progress_mutex.lock().unwrap();
-        while self.row_progress.load(Ordering::Acquire) < row {
-            guard = self.progress_cond.wait(guard).unwrap();
-        }
-    }
-
-    /// Mark picture as fully complete (all rows decoded + deblocked).
-    pub fn mark_complete(&self) {
-        self.publish_row(PROGRESS_COMPLETE);
-    }
-
+    #[inline]
     pub fn is_complete(&self) -> bool {
-        self.row_progress.load(Ordering::Relaxed) == PROGRESS_COMPLETE
+        true
     }
 
+    #[inline]
     pub fn mb_height(&self) -> u32 {
         self.mb_height
     }
@@ -216,9 +144,7 @@ impl SharedPicture {
 impl Drop for SharedPicture {
     fn drop(&mut self) {
         if let Some(pool) = self.return_to.take() {
-            // SAFETY: &mut self in drop() guarantees exclusive access.
-            // No other references exist (Arc refcount hit 0).
-            let buf = std::mem::replace(self.data.get_mut(), PictureBuffer::empty());
+            let buf = std::mem::replace(&mut self.data, PictureBuffer::empty());
             if let Ok(mut pool) = pool.lock() {
                 pool.reclaim(buf);
             }
@@ -227,70 +153,80 @@ impl Drop for SharedPicture {
 }
 
 // ---------------------------------------------------------------------------
-// PicHandle — transparent Deref wrapper for current-frame decode
+// PicHandle — single-owner mutable wrapper for current-frame decode
 // ---------------------------------------------------------------------------
 
 /// Handle to the current frame's picture during decode.
 ///
-/// Derefs to `PictureBuffer` transparently, so `ctx.pic.y[offset]` works
-/// without any changes to mb.rs, mc.rs, intra_pred.rs. Holds an
-/// `Arc<SharedPicture>` that can be extracted for DPB storage.
+/// Uniquely owns `PictureBuffer` during decode (`Deref` + `DerefMut` with zero `unsafe`),
+/// then transitions into an immutable `Arc<SharedPicture>` via `into_shared()` when stored
+/// in the DPB. If dropped without `into_shared()` (e.g. non-reference B-frame), returns
+/// its buffer directly to the pool.
 pub struct PicHandle {
-    shared: Arc<SharedPicture>,
+    pic: PictureBuffer,
+    return_to: Option<Arc<Mutex<BufferPool>>>,
 }
 
 impl PicHandle {
     pub fn new(pic: PictureBuffer) -> Self {
         Self {
-            shared: SharedPicture::new(pic),
+            pic,
+            return_to: None,
         }
     }
 
-    /// Create a PicHandle whose buffer returns to `pool` when all references drop.
+    /// Create a `PicHandle` whose buffer returns to `pool` when all references drop.
     pub fn new_pooled(pic: PictureBuffer, pool: &Arc<Mutex<BufferPool>>) -> Self {
         Self {
-            shared: SharedPicture::new_pooled(pic, pool),
+            pic,
+            return_to: Some(Arc::clone(pool)),
         }
     }
 
-    /// Extract the inner Arc<SharedPicture> (consumes the handle).
-    /// Used when storing in the DPB after decode + deblock.
-    pub fn into_shared(self) -> Arc<SharedPicture> {
-        self.shared
+    /// Convert into an immutable `Arc<SharedPicture>` for DPB storage.
+    pub fn into_shared(mut self) -> Arc<SharedPicture> {
+        let pic = std::mem::replace(&mut self.pic, PictureBuffer::empty());
+        let return_to = self.return_to.take();
+        let mb_height = pic.mb_height;
+        Arc::new(SharedPicture {
+            data: pic,
+            mb_height,
+            return_to,
+        })
     }
 
-    /// Get the Arc for cloning (e.g., for in-flight ref pic lists).
-    pub fn shared(&self) -> &Arc<SharedPicture> {
-        &self.shared
-    }
-
-    /// Signal a row is decoded (delegates to SharedPicture).
-    pub fn publish_row(&self, row: i32) {
-        self.shared.publish_row(row);
-    }
+    /// Signal a row is decoded.
+    #[inline]
+    pub fn publish_row(&self, _row: i32) {}
 
     /// Mark picture as fully complete.
-    pub fn mark_complete(&self) {
-        self.shared.mark_complete();
-    }
+    #[inline]
+    pub fn mark_complete(&self) {}
 }
 
 impl Deref for PicHandle {
     type Target = PictureBuffer;
 
+    #[inline]
     fn deref(&self) -> &PictureBuffer {
-        // SAFETY: During decode, only one PicHandle exists per frame, and the
-        // decode thread is the sole writer. Deref for read access is safe because
-        // no other thread accesses this picture's data until it's published.
-        unsafe { self.shared.data() }
+        &self.pic
     }
 }
 
 impl DerefMut for PicHandle {
+    #[inline]
     fn deref_mut(&mut self) -> &mut PictureBuffer {
-        // SAFETY: PicHandle has exclusive ownership semantics — only one exists
-        // per frame, and &mut self guarantees no concurrent borrows. The decode
-        // thread is the sole writer to this picture's data.
-        unsafe { self.shared.data_mut() }
+        &mut self.pic
+    }
+}
+
+impl Drop for PicHandle {
+    fn drop(&mut self) {
+        if let Some(pool) = self.return_to.take() {
+            let buf = std::mem::replace(&mut self.pic, PictureBuffer::empty());
+            if let Ok(mut pool) = pool.lock() {
+                pool.reclaim(buf);
+            }
+        }
     }
 }
