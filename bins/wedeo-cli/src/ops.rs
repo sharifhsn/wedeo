@@ -1424,6 +1424,7 @@ pub struct TranscodeReq {
     pub preserve_all: bool,
     pub overwrite: bool,
     pub prefer_gpu: bool,
+    pub tags: Vec<(String, String)>,
     pub codec_options: Vec<(String, String)>,
 }
 
@@ -1450,6 +1451,7 @@ impl TranscodeReq {
             preserve_all: true,
             overwrite: false,
             prefer_gpu: false,
+            tags: Vec::new(),
             codec_options: Vec::new(),
         }
     }
@@ -1665,6 +1667,9 @@ fn build_transcode_graph(
         out_header.metadata = in_hdr.metadata.clone();
         out_header.chapters = in_hdr.chapters.clone();
         out_header.attachments = in_hdr.attachments.clone();
+    }
+    for (k, v) in &req.tags {
+        out_header.metadata.set(k, v);
     }
 
     let mut mux_inputs: Vec<PortContract> = Vec::new();

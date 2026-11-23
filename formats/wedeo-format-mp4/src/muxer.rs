@@ -72,6 +72,7 @@ pub struct FragmentTrackData {
 pub struct Mp4Muxer {
     sink: Box<dyn ByteSink>,
     tracks: Vec<TrackState>,
+    metadata: Vec<(String, String)>,
     movie_timescale: u32,
     fragmented: bool,
     ftyp_len: u64,
@@ -89,6 +90,7 @@ impl Mp4Muxer {
         Self {
             sink,
             tracks: Vec::new(),
+            metadata: Vec::new(),
             movie_timescale: 1000,
             fragmented: false,
             ftyp_len: 0,
@@ -161,7 +163,8 @@ impl Mp4Muxer {
             .map(|t| t.chunk_offsets.clone())
             .collect();
 
-        let trial_moov = atoms::write_moov(&self.tracks, self.movie_timescale, false);
+        let trial_moov =
+            atoms::write_moov(&self.tracks, self.movie_timescale, false, &self.metadata);
         let mut moov_size = trial_moov.len() as u64;
 
         for iter in 0..2 {
@@ -170,7 +173,7 @@ impl Mp4Muxer {
                 track.chunk_offsets = orig.iter().map(|&o| base + o).collect();
             }
 
-            let moov = atoms::write_moov(&self.tracks, self.movie_timescale, false);
+            let moov = atoms::write_moov(&self.tracks, self.movie_timescale, false, &self.metadata);
             let new_size = moov.len() as u64;
             if new_size == moov_size || iter == 1 {
                 return moov;
@@ -191,6 +194,11 @@ impl Muxer for Mp4Muxer {
         }
 
         self.fragmented = !self.sink.is_seekable();
+        self.metadata = header
+            .metadata
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
 
         let mut has_video = false;
         let mut has_audio = false;
@@ -303,7 +311,7 @@ impl Muxer for Mp4Muxer {
             .map_err(|e| Error::io("mp4/muxer", &e))?;
 
         if self.fragmented {
-            let moov = atoms::write_moov(&self.tracks, self.movie_timescale, true);
+            let moov = atoms::write_moov(&self.tracks, self.movie_timescale, true, &self.metadata);
             self.sink
                 .write_all(&moov)
                 .map_err(|e| Error::io("mp4/muxer", &e))?;

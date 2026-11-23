@@ -84,7 +84,12 @@ fn rescale_duration(duration_ts: u64, media_timescale: u32, movie_timescale: u32
 }
 
 /// Build the complete `moov` box for all tracks (classic or fragmented with `mvex`).
-pub fn write_moov(tracks: &[TrackState], movie_timescale: u32, fragmented: bool) -> Vec<u8> {
+pub fn write_moov(
+    tracks: &[TrackState],
+    movie_timescale: u32,
+    fragmented: bool,
+    metadata: &[(String, String)],
+) -> Vec<u8> {
     let movie_duration: u64 = if fragmented {
         0
     } else {
@@ -128,7 +133,70 @@ pub fn write_moov(tracks: &[TrackState], movie_timescale: u32, fragmented: bool)
         moov_content.extend_from_slice(&write_mvex(tracks));
     }
 
+    if !metadata.is_empty() {
+        let udta = write_udta_metadata(metadata);
+        if !udta.is_empty() {
+            moov_content.extend_from_slice(&udta);
+        }
+    }
+
     mp4_box(b"moov", &moov_content)
+}
+
+/// Build standard iTunes/MP4 `udta` -> `meta` -> `hdlr("mdir")` + `ilst` box.
+fn write_udta_metadata(metadata: &[(String, String)]) -> Vec<u8> {
+    let mut ilst_content = Vec::new();
+    for (k, v) in metadata {
+        if v.is_empty() {
+            continue;
+        }
+        let atom: Option<[u8; 4]> = match k.to_ascii_lowercase().as_str() {
+            "title" => Some(*b"\xA9nam"),
+            "artist" => Some(*b"\xA9ART"),
+            "album" => Some(*b"\xA9alb"),
+            "album_artist" => Some(*b"aART"),
+            "date" | "year" => Some(*b"\xA9day"),
+            "genre" => Some(*b"\xA9gen"),
+            "comment" => Some(*b"\xA9cmt"),
+            "description" => Some(*b"desc"),
+            "synopsis" => Some(*b"ldes"),
+            "encoder" | "tool" => Some(*b"\xA9too"),
+            "composer" => Some(*b"\xA9wrt"),
+            "grouping" => Some(*b"\xA9grp"),
+            "copyright" => Some(*b"cprt"),
+            "lyrics" => Some(*b"\xA9lyr"),
+            _ => None,
+        };
+        if let Some(tag_id) = atom {
+            // `data` atom: type=1 (UTF-8 text), locale=0, then UTF-8 payload.
+            let mut data_payload = Vec::with_capacity(8 + v.len());
+            data_payload.extend_from_slice(&1u32.to_be_bytes());
+            data_payload.extend_from_slice(&0u32.to_be_bytes());
+            data_payload.extend_from_slice(v.as_bytes());
+            let data_box = mp4_box(b"data", &data_payload);
+            ilst_content.extend_from_slice(&mp4_box(&tag_id, &data_box));
+        }
+    }
+    if ilst_content.is_empty() {
+        return Vec::new();
+    }
+
+    // `hdlr` inside `meta`: handler_type = "mdir", manufacturer = "appl".
+    let mut hdlr_payload = Vec::with_capacity(21);
+    hdlr_payload.extend_from_slice(&0u32.to_be_bytes()); // pre_defined
+    hdlr_payload.extend_from_slice(b"mdir");
+    hdlr_payload.extend_from_slice(b"appl");
+    hdlr_payload.extend_from_slice(&0u32.to_be_bytes());
+    hdlr_payload.extend_from_slice(&0u32.to_be_bytes());
+    hdlr_payload.push(0u8); // empty name NUL terminator
+    let hdlr = full_box(b"hdlr", 0, 0, &hdlr_payload);
+    let ilst = mp4_box(b"ilst", &ilst_content);
+
+    let mut meta_content = Vec::with_capacity(hdlr.len() + ilst.len());
+    meta_content.extend_from_slice(&hdlr);
+    meta_content.extend_from_slice(&ilst);
+    let meta = full_box(b"meta", 0, 0, &meta_content);
+    mp4_box(b"udta", &meta)
 }
 
 fn write_mvex(tracks: &[TrackState]) -> Vec<u8> {

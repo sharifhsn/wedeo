@@ -445,6 +445,7 @@ pub fn parse_ffmpeg_args(args: &[String]) -> Result<FfmpegAction> {
     tr.duration_sec = duration_sec;
     tr.strict = strict;
     tr.overwrite = overwrite;
+    tr.tags = tags;
     tr.codec_options = codec_options;
 
     Ok(FfmpegAction::Transcode(tr))

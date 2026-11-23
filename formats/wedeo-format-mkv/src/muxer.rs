@@ -9,8 +9,8 @@ use std::io::SeekFrom;
 use wedeo_core::{
     ByteSink, ChromaLocation, CodecId, ColorDesc, ColorPrimaries, ColorRange, ContainerHeader,
     CropRect, Error, MatrixCoefficients, MediaType, Muxer, MuxerDescriptor, MuxerFactory, Packet,
-    PacketFlags, Rational, Result, Rounding, StreamParams, Timestamp, TrackDisposition, TrackId,
-    TransferCharacteristic, rescale_q,
+    PacketFlags, Rational, Result, Rounding, SideData, StreamParams, Timestamp, TrackDisposition,
+    TrackId, TransferCharacteristic, rescale_q,
 };
 
 use crate::demuxer::CueEntry;
@@ -20,8 +20,8 @@ use crate::ebml::{
     CHAPTER_TIME_END, CHAPTER_TIME_START, CHAPTER_UID, CHAPTERS, CHROMA_SITING_HORZ,
     CHROMA_SITING_VERT, CLUSTER, CLUSTER_TIMECODE, CODEC_DELAY, CODEC_ID, CODEC_PRIVATE, COLOUR,
     CUE_CLUSTER_POSITION, CUE_POINT, CUE_TIME, CUE_TRACK, CUE_TRACK_POSITIONS, CUES,
-    DEFAULT_DURATION, DISPLAY_HEIGHT, DISPLAY_UNIT, DISPLAY_WIDTH, DURATION, EBML_DOCTYPE,
-    EBML_DOCTYPE_READ_VERSION, EBML_DOCTYPE_VERSION, EBML_HEADER, EBML_MAX_ID_LENGTH,
+    DEFAULT_DURATION, DISCARD_PADDING, DISPLAY_HEIGHT, DISPLAY_UNIT, DISPLAY_WIDTH, DURATION,
+    EBML_DOCTYPE, EBML_DOCTYPE_READ_VERSION, EBML_DOCTYPE_VERSION, EBML_HEADER, EBML_MAX_ID_LENGTH,
     EBML_MAX_SIZE_LENGTH, EBML_READ_VERSION, EBML_VERSION, EBML_VOID, EDITION_ENTRY, FILE_DATA,
     FILE_MIME_TYPE, FILE_NAME, FILE_UID, FLAG_COMMENTARY, FLAG_DEFAULT, FLAG_ENABLED, FLAG_FORCED,
     FLAG_HEARING_IMPAIRED, FLAG_VISUAL_IMPAIRED, INFO, LANGUAGE, MATRIX_COEFFICIENTS, MUXING_APP,
@@ -47,6 +47,7 @@ struct MuxTrackState {
     track_uid: u64,
     codec_id: CodecId,
     media_type: MediaType,
+    sample_rate: u32,
 }
 
 struct PendingCluster {
@@ -468,6 +469,10 @@ impl Muxer for MkvMuxer {
                 }
             }
 
+            let sample_rate = match &track.params {
+                StreamParams::Audio(a) => a.sample_rate,
+                _ => 0,
+            };
             write_master_element(&mut tracks_body, TRACK_ENTRY, &entry);
             self.tracks.push(MuxTrackState {
                 track_id: track.id,
@@ -475,6 +480,7 @@ impl Muxer for MkvMuxer {
                 track_uid,
                 codec_id: track.codec_id,
                 media_type,
+                sample_rate,
             });
         }
 
@@ -586,6 +592,7 @@ impl Muxer for MkvMuxer {
         let track_number = self.tracks[track_idx].track_number;
         let codec_id = self.tracks[track_idx].codec_id;
         let media_type = self.tracks[track_idx].media_type;
+        let sample_rate = self.tracks[track_idx].sample_rate;
 
         // Matroska blocks carry PTS. Fall back to DTS or 0 if PTS is unknown.
         let raw_ts = if pkt.pts.is_known() {
@@ -646,20 +653,37 @@ impl Muxer for MkvMuxer {
             cluster.cue_tracks.push((track_number, pts_ticks.max(0)));
         }
 
-        // Subtitles with explicit duration use BlockGroup + Block + BlockDuration;
-        // Video and Audio use compact SimpleBlock.
-        if media_type == MediaType::Subtitle && dur_ticks > 0 {
+        let discard_padding_ns: Option<i64> = if sample_rate > 0 {
+            pkt.side_data.iter().find_map(|sd| match *sd {
+                SideData::SampleTrim { skip_end, .. } if skip_end > 0 => {
+                    let ns = (u128::from(skip_end) * 1_000_000_000) / u128::from(sample_rate);
+                    Some(ns as i64)
+                }
+                _ => None,
+            })
+        } else {
+            None
+        };
+
+        // Subtitles with explicit duration or audio packets carrying DiscardPadding
+        // use BlockGroup + Block; ordinary Video/Audio use compact SimpleBlock.
+        if (media_type == MediaType::Subtitle && dur_ticks > 0) || discard_padding_ns.is_some() {
             let mut block_data = Vec::with_capacity(4 + payload.len());
             write_vint_size(&mut block_data, track_number);
             block_data.extend_from_slice(&delta.to_be_bytes());
             block_data.push(0x00); // Block flags (no keyframe bit in Block)
             block_data.extend_from_slice(payload);
 
-            let mut group_body = Vec::with_capacity(24 + block_data.len());
+            let mut group_body = Vec::with_capacity(32 + block_data.len());
             write_bytes_element(&mut group_body, BLOCK, &block_data);
-            write_uint_element(&mut group_body, BLOCK_DURATION, dur_ticks as u64);
+            if media_type == MediaType::Subtitle && dur_ticks > 0 {
+                write_uint_element(&mut group_body, BLOCK_DURATION, dur_ticks as u64);
+            }
             if !is_key {
                 write_sint_element(&mut group_body, REFERENCE_BLOCK, 0);
+            }
+            if let Some(pad_ns) = discard_padding_ns {
+                write_sint_element(&mut group_body, DISCARD_PADDING, pad_ns);
             }
             write_master_element(&mut cluster.body, BLOCK_GROUP, &group_body);
         } else {
