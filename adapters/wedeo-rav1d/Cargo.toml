@@ -13,5 +13,5 @@ workspace = true
 
 [dependencies]
 wedeo-core.workspace = true
-rav1d = { git = "https://github.com/memorysafety/rav1d", rev = "9d78516f3232fe8b9c2bfe9d9a7506163033aae6", default-features = true }
+rav1d = { git = "https://github.com/memorysafety/rav1d", default-features = true }
 libc = "0.2"
