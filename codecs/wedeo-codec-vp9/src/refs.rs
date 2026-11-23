@@ -11,6 +11,8 @@
 
 use std::sync::Arc;
 
+use wedeo_core::{ColorDesc, PixelLayout};
+
 use crate::recon::FrameBuffer;
 
 // ---------------------------------------------------------------------------
@@ -39,7 +41,7 @@ pub struct MvRefPair {
 /// Once constructed, a `RefFrame` is immutable and shared via `Arc` across
 /// reference slots and tile-decode threads.
 pub struct RefFrame {
-    /// Decoded YUV pixel data.
+    /// Decoded pixel data.
     pub fb: FrameBuffer,
     /// Per-4×4 MV grid (`rows_4x4 * cols_4x4` entries).
     pub mv_grid: Vec<MvRefPair>,
@@ -47,10 +49,20 @@ pub struct RefFrame {
     pub width: u32,
     /// Frame height in pixels.
     pub height: u32,
-    /// Columns in 4×4 units (`ceil(width / 4)`).
+    /// Columns in 4×4 units (`2 * ceil(width / 8)`).
     pub cols_4x4: usize,
-    /// Rows in 4×4 units (`ceil(height / 4)`).
+    /// Rows in 4×4 units (`2 * ceil(height / 8)`).
     pub rows_4x4: usize,
+    /// Output pixel layout for this frame.
+    pub layout: PixelLayout,
+    /// Colorimetry description for this frame.
+    pub color: ColorDesc,
+    /// Bit depth (`8`, `10`, `12`).
+    pub bit_depth: u8,
+    /// Horizontal chroma subsampling flag.
+    pub subsampling_x: bool,
+    /// Vertical chroma subsampling flag.
+    pub subsampling_y: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -86,9 +98,9 @@ impl RefStore {
     /// Each set bit `i` in the mask replaces `slots[i]` with `frame`.
     /// Multiple bits can point to the same `Arc<RefFrame>`.
     pub fn refresh(&mut self, mask: u8, frame: Arc<RefFrame>) {
-        for i in 0..8 {
+        for (i, slot) in self.slots.iter_mut().enumerate() {
             if mask & (1 << i) != 0 {
-                self.slots[i] = Some(Arc::clone(&frame));
+                *slot = Some(Arc::clone(&frame));
             }
         }
     }

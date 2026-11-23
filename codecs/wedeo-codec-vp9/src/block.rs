@@ -6,7 +6,7 @@
 // Only the keyframe (intra) path is implemented.  Inter-frame paths return
 // Error::PatchwelcomeNotImplemented.
 
-use wedeo_core::error::{Error, Result};
+use wedeo_core::Result;
 
 use crate::bool_decoder::BoolDecoder;
 use crate::context::{AboveContext, LeftContext};
@@ -137,8 +137,8 @@ impl<'a> TileDecodeContext<'a> {
     ) -> Self {
         let width = header.width as usize;
         let height = header.height as usize;
-        let cols_4x4 = width.div_ceil(4);
-        let rows_4x4 = height.div_ceil(4);
+        let cols_4x4 = width.div_ceil(8) * 2;
+        let rows_4x4 = height.div_ceil(8) * 2;
         let sb_cols = cols_4x4.div_ceil(16);
         let sb_rows = rows_4x4.div_ceil(16);
         Self {
@@ -221,12 +221,12 @@ pub fn decode_sb(
 
     if bl == BlockLevel::Bl8x8 {
         let tree_val = td.bd.get_tree(&PARTITION_TREE, &p);
-        bp = BlockPartition::try_from(tree_val as u8).map_err(|_| Error::InvalidData)?;
+        bp = BlockPartition::try_from(tree_val as u8).map_err(|_| crate::invalid_data())?;
         decode_block(td, row, col, bl, bp)?;
     } else if col + hbs < cols {
         if row + hbs < rows {
             let tree_val = td.bd.get_tree(&PARTITION_TREE, &p);
-            bp = BlockPartition::try_from(tree_val as u8).map_err(|_| Error::InvalidData)?;
+            bp = BlockPartition::try_from(tree_val as u8).map_err(|_| crate::invalid_data())?;
             match bp {
                 BlockPartition::None => {
                     decode_block(td, row, col, bl, bp)?;
@@ -241,7 +241,7 @@ pub fn decode_sb(
                 }
                 BlockPartition::Split => {
                     let next_bl =
-                        BlockLevel::try_from(bl as u8 + 1).map_err(|_| Error::InvalidData)?;
+                        BlockLevel::try_from(bl as u8 + 1).map_err(|_| crate::invalid_data())?;
                     decode_sb(td, row, col, next_bl)?;
                     decode_sb(td, row, col + hbs, next_bl)?;
                     decode_sb(td, row + hbs, col, next_bl)?;
@@ -252,7 +252,8 @@ pub fn decode_sb(
             // Row overhang: can only be SPLIT or H.
             if td.bd.get_prob(p[1]) {
                 bp = BlockPartition::Split;
-                let next_bl = BlockLevel::try_from(bl as u8 + 1).map_err(|_| Error::InvalidData)?;
+                let next_bl =
+                    BlockLevel::try_from(bl as u8 + 1).map_err(|_| crate::invalid_data())?;
                 decode_sb(td, row, col, next_bl)?;
                 decode_sb(td, row, col + hbs, next_bl)?;
             } else {
@@ -264,7 +265,7 @@ pub fn decode_sb(
         // Column overhang: can only be SPLIT or V.
         if td.bd.get_prob(p[2]) {
             bp = BlockPartition::Split;
-            let next_bl = BlockLevel::try_from(bl as u8 + 1).map_err(|_| Error::InvalidData)?;
+            let next_bl = BlockLevel::try_from(bl as u8 + 1).map_err(|_| crate::invalid_data())?;
             decode_sb(td, row, col, next_bl)?;
             decode_sb(td, row + hbs, col, next_bl)?;
         } else {
@@ -274,7 +275,7 @@ pub fn decode_sb(
     } else {
         // Corner block, must split.
         bp = BlockPartition::Split;
-        let next_bl = BlockLevel::try_from(bl as u8 + 1).map_err(|_| Error::InvalidData)?;
+        let next_bl = BlockLevel::try_from(bl as u8 + 1).map_err(|_| crate::invalid_data())?;
         decode_sb(td, row, col, next_bl)?;
     }
 
@@ -294,7 +295,7 @@ pub fn decode_sb(
 /// Mirrors `enum BlockSize bs = bl * 3 + bp` in vp9block.c.
 fn bs_from_bl_bp(bl: BlockLevel, bp: BlockPartition) -> Result<BlockSize> {
     let v = bl as u8 * 3 + bp as u8;
-    BlockSize::try_from(v).map_err(|_| Error::InvalidData)
+    BlockSize::try_from(v).map_err(|_| crate::invalid_data())
 }
 
 /// Decode one block at (`row`, `col`) in 4×4 units.
@@ -373,7 +374,7 @@ fn decode_block(
             TxMode::Allow32x32 => 3u8,
             TxMode::TxModeSelect => max_tx,
         };
-        TxSize::try_from(mode_limit.min(max_tx)).map_err(|_| Error::InvalidData)?
+        TxSize::try_from(mode_limit.min(max_tx)).map_err(|_| crate::invalid_data())?
     };
 
     // --- UV transform size ---
@@ -625,7 +626,7 @@ fn decode_tx_size(
             }
             _ => 0, // TX_4X4
         };
-        TxSize::try_from(tx).map_err(|_| Error::InvalidData)
+        TxSize::try_from(tx).map_err(|_| crate::invalid_data())
     }
 }
 
@@ -715,7 +716,7 @@ fn decode_intra_mode(
     let uv_val = td
         .bd
         .get_tree(&INTRAMODE_TREE, &KF_UV_MODE_PROBS[last_y_clamped]);
-    let uv_mode = IntraMode::try_from(uv_val as u8).map_err(|_| Error::InvalidData)?;
+    let uv_mode = IntraMode::try_from(uv_val as u8).map_err(|_| crate::invalid_data())?;
 
     Ok((y_modes, uv_mode))
 }
@@ -726,7 +727,7 @@ fn read_kf_y_mode(bd: &mut BoolDecoder<'_>, above: u8, left: u8) -> Result<Intra
     let a = (above as usize).min(9);
     let l = (left as usize).min(9);
     let v = bd.get_tree(&INTRAMODE_TREE, &KF_Y_MODE_PROBS[a][l]);
-    IntraMode::try_from(v as u8).map_err(|_| Error::InvalidData)
+    IntraMode::try_from(v as u8).map_err(|_| crate::invalid_data())
 }
 
 /// Packed above/left mode context values for update_mode_ctx.
@@ -797,12 +798,12 @@ fn decode_non_kf_intra_mode(
     let y_modes = if is_sub8x8 {
         // Sub-8×8: read up to 4 modes from prob.y_mode[0] (size group 0).
         let m0 = td.bd.get_tree(&INTRAMODE_TREE, &td.header.prob.y_mode[0]);
-        let m0 = IntraMode::try_from(m0 as u8).map_err(|_| Error::InvalidData)?;
+        let m0 = IntraMode::try_from(m0 as u8).map_err(|_| crate::invalid_data())?;
         td.counts.y_mode[0][m0 as usize] += 1;
 
         let m1 = if bs != BlockSize::Bs8x4 {
             let m = td.bd.get_tree(&INTRAMODE_TREE, &td.header.prob.y_mode[0]);
-            let m = IntraMode::try_from(m as u8).map_err(|_| Error::InvalidData)?;
+            let m = IntraMode::try_from(m as u8).map_err(|_| crate::invalid_data())?;
             td.counts.y_mode[0][m as usize] += 1;
             m
         } else {
@@ -811,11 +812,11 @@ fn decode_non_kf_intra_mode(
 
         let (m2, m3) = if bs != BlockSize::Bs4x8 {
             let m2 = td.bd.get_tree(&INTRAMODE_TREE, &td.header.prob.y_mode[0]);
-            let m2 = IntraMode::try_from(m2 as u8).map_err(|_| Error::InvalidData)?;
+            let m2 = IntraMode::try_from(m2 as u8).map_err(|_| crate::invalid_data())?;
             td.counts.y_mode[0][m2 as usize] += 1;
             let m3 = if bs != BlockSize::Bs8x4 {
                 let m = td.bd.get_tree(&INTRAMODE_TREE, &td.header.prob.y_mode[0]);
-                let m = IntraMode::try_from(m as u8).map_err(|_| Error::InvalidData)?;
+                let m = IntraMode::try_from(m as u8).map_err(|_| crate::invalid_data())?;
                 td.counts.y_mode[0][m as usize] += 1;
                 m
             } else {
@@ -831,7 +832,7 @@ fn decode_non_kf_intra_mode(
         // >=8×8: single mode from prob.y_mode[SIZE_GROUP[bs]].
         let sz = SIZE_GROUP[bs as usize] as usize;
         let m = td.bd.get_tree(&INTRAMODE_TREE, &td.header.prob.y_mode[sz]);
-        let m = IntraMode::try_from(m as u8).map_err(|_| Error::InvalidData)?;
+        let m = IntraMode::try_from(m as u8).map_err(|_| crate::invalid_data())?;
         td.counts.y_mode[sz][m as usize] += 1;
         [m, m, m, m]
     };
@@ -841,7 +842,7 @@ fn decode_non_kf_intra_mode(
     let uv_val = td
         .bd
         .get_tree(&INTRAMODE_TREE, &td.header.prob.uv_mode[last_y.min(9)]);
-    let uv_mode = IntraMode::try_from(uv_val as u8).map_err(|_| Error::InvalidData)?;
+    let uv_mode = IntraMode::try_from(uv_val as u8).map_err(|_| crate::invalid_data())?;
     td.counts.uv_mode[last_y.min(9)][uv_mode as usize] += 1;
 
     Ok((y_modes, uv_mode))
@@ -979,8 +980,6 @@ fn decode_inter_mode(
         filter = hdr.filter_mode;
         filter_id = 0;
     }
-
-
 
     // --- MV search context ---
     // MV clamping bounds: cols_4x4/rows_4x4 and col/row are in 4×4 units,

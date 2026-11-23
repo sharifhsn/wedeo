@@ -447,11 +447,10 @@ pub fn adapt_probs(
     // FFmpeg iterates [4 levels][4 combined_ctx] where combined_ctx = above_bit | (left_bit<<1).
     // Rust ProbContext.partition is [block_level][above_bit][left_bit][3].
     for i in 0..4usize {
-        for j in 0..4usize {
+        for (j, c) in counts.partition[0][i].iter().enumerate() {
             // Map combined context j to separate above/left bits.
             let above_bit = j & 1;
             let left_bit = j >> 1;
-            let c = &counts.partition[0][i][j];
             adapt_prob(
                 &mut prob.partition[i][above_bit][left_bit][0],
                 c[0],

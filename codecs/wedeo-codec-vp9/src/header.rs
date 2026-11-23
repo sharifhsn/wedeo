@@ -7,7 +7,7 @@
 // The uncompressed header uses a minimal hand-rolled bit reader (GetBits)
 // because it is byte-aligned and does not use the range coder.
 
-use wedeo_core::error::{Error, Result};
+use wedeo_core::Result;
 
 use crate::bool_decoder::BoolDecoder;
 use crate::data::{DEFAULT_COEF_PROBS, PARETO8};
@@ -233,7 +233,7 @@ impl<'a> GetBits<'a> {
         for _ in 0..n {
             let byte_idx = self.pos / 8;
             if byte_idx >= self.data.len() {
-                return Err(Error::InvalidData);
+                return Err(crate::invalid_data());
             }
             let bit = (self.data[byte_idx] >> (7 - (self.pos % 8))) & 1;
             v = (v << 1) | bit as u32;
@@ -340,26 +340,26 @@ pub fn default_prob_context() -> ProbContext {
             [221, 135, 38, 194, 248, 121, 96, 85, 29],
         ],
         uv_mode: [
-            [ 48,  12, 154, 155, 139,  90,  34, 117, 119],
-            [ 67,   6,  25, 204, 243, 158,  13,  21,  96],
-            [120,   7,  76, 176, 208, 126,  28,  54, 103],
-            [ 97,   5,  44, 131, 176, 139,  48,  68,  97],
-            [ 83,   5,  42, 156, 111, 152,  26,  49, 152],
-            [ 80,   5,  58, 178,  74,  83,  33,  62, 145],
-            [ 86,   5,  32, 154, 192, 168,  14,  22, 163],
-            [ 77,   7,  64, 116, 132, 122,  37, 126, 120],
-            [ 85,   5,  32, 156, 216, 148,  19,  29,  73],
-            [101,  21, 107, 181, 192, 103,  19,  67, 125],
+            [48, 12, 154, 155, 139, 90, 34, 117, 119],
+            [67, 6, 25, 204, 243, 158, 13, 21, 96],
+            [120, 7, 76, 176, 208, 126, 28, 54, 103],
+            [97, 5, 44, 131, 176, 139, 48, 68, 97],
+            [83, 5, 42, 156, 111, 152, 26, 49, 152],
+            [80, 5, 58, 178, 74, 83, 33, 62, 145],
+            [86, 5, 32, 154, 192, 168, 14, 22, 163],
+            [77, 7, 64, 116, 132, 122, 37, 126, 120],
+            [85, 5, 32, 156, 216, 148, 19, 29, 73],
+            [101, 21, 107, 181, 192, 103, 19, 67, 125],
         ],
         filter: [[235, 162], [36, 255], [34, 3], [149, 144]],
         mv_mode: [
-            [  2, 173,  34],
-            [  7, 145,  85],
-            [  7, 166,  63],
-            [  7,  94,  66],
-            [  8,  64,  46],
-            [ 17,  81,  31],
-            [ 25,  29,  30],
+            [2, 173, 34],
+            [7, 145, 85],
+            [7, 166, 63],
+            [7, 94, 66],
+            [8, 64, 46],
+            [17, 81, 31],
+            [25, 29, 30],
         ],
         intra: [9, 102, 187, 225],
         comp: [239, 183, 119, 96, 41],
@@ -400,29 +400,29 @@ pub fn default_prob_context() -> ProbContext {
         partition: [
             // bl=0: 64x64 → 32x32
             [
-                [[222,  34,  30], [ 58,  32,  12], [0, 0, 0], [0, 0, 0]], // a=0: c=0, c=2
-                [[ 72,  16,  44], [ 10,   7,   6], [0, 0, 0], [0, 0, 0]], // a=1: c=1, c=3
+                [[222, 34, 30], [58, 32, 12], [0, 0, 0], [0, 0, 0]], // a=0: c=0, c=2
+                [[72, 16, 44], [10, 7, 6], [0, 0, 0], [0, 0, 0]],    // a=1: c=1, c=3
                 [[0, 0, 0]; 4],
                 [[0, 0, 0]; 4],
             ],
             // bl=1: 32x32 → 16x16
             [
-                [[177,  58,  59], [ 52,  79,  25], [0, 0, 0], [0, 0, 0]],
-                [[ 68,  26,  63], [ 17,  14,  12], [0, 0, 0], [0, 0, 0]],
+                [[177, 58, 59], [52, 79, 25], [0, 0, 0], [0, 0, 0]],
+                [[68, 26, 63], [17, 14, 12], [0, 0, 0], [0, 0, 0]],
                 [[0, 0, 0]; 4],
                 [[0, 0, 0]; 4],
             ],
             // bl=2: 16x16 → 8x8
             [
-                [[174,  73,  87], [ 82,  99,  50], [0, 0, 0], [0, 0, 0]],
-                [[ 92,  41,  83], [ 53,  39,  39], [0, 0, 0], [0, 0, 0]],
+                [[174, 73, 87], [82, 99, 50], [0, 0, 0], [0, 0, 0]],
+                [[92, 41, 83], [53, 39, 39], [0, 0, 0], [0, 0, 0]],
                 [[0, 0, 0]; 4],
                 [[0, 0, 0]; 4],
             ],
             // bl=3: 8x8 → 4x4
             [
                 [[199, 122, 141], [148, 133, 118], [0, 0, 0], [0, 0, 0]],
-                [[147,  63, 159], [121, 104, 114], [0, 0, 0], [0, 0, 0]],
+                [[147, 63, 159], [121, 104, 114], [0, 0, 0], [0, 0, 0]],
                 [[0, 0, 0]; 4],
                 [[0, 0, 0]; 4],
             ],
@@ -458,11 +458,11 @@ fn read_color_config(gb: &mut GetBits<'_>, profile: u8) -> Result<ColorConfig> {
         if profile & 1 != 0 {
             // Reserved bit must be zero.
             if gb.get_bit()? {
-                return Err(Error::InvalidData);
+                return Err(crate::invalid_data());
             }
         } else {
             // RGB not supported in profile 0.
-            return Err(Error::InvalidData);
+            return Err(crate::invalid_data());
         }
         (ColorRange::Full, false, false)
     } else {
@@ -476,11 +476,11 @@ fn read_color_config(gb: &mut GetBits<'_>, profile: u8) -> Result<ColorConfig> {
             let v = gb.get_bit()?;
             // YUV 4:2:0 not supported in odd profiles.
             if h && v {
-                return Err(Error::InvalidData);
+                return Err(crate::invalid_data());
             }
             // Reserved bit.
             if gb.get_bit()? {
-                return Err(Error::InvalidData);
+                return Err(crate::invalid_data());
             }
             (h, v)
         } else {
@@ -528,7 +528,7 @@ pub fn decode_frame_header(
 
     // Frame marker (2 bits, must be 0b10 = 2).
     if gb.get_bits(2)? != 2 {
-        return Err(Error::InvalidData);
+        return Err(crate::invalid_data());
     }
 
     // Profile: bit0 then bit1<<1; profile 3 has an additional reserved-zero bit.
@@ -538,14 +538,14 @@ pub fn decode_frame_header(
     if profile_raw == 3 {
         // Reserved zero bit.
         if gb.get_bit()? {
-            return Err(Error::InvalidData);
+            return Err(crate::invalid_data());
         }
     }
     if profile_raw > 3 {
-        return Err(Error::InvalidData);
+        return Err(crate::invalid_data());
     }
     // Clamp so TryFrom succeeds.
-    let profile = BitstreamProfile::try_from(profile_raw).map_err(|_| Error::InvalidData)?;
+    let profile = BitstreamProfile::try_from(profile_raw).map_err(|_| crate::invalid_data())?;
 
     // show_existing_frame flag.
     if gb.get_bit()? {
@@ -651,7 +651,7 @@ pub fn decode_frame_header(
         // Sync code: 0x49, 0x83, 0x42.
         let sync = gb.get_bits(24)?;
         if sync != 0x49_83_42 {
-            return Err(Error::InvalidData);
+            return Err(crate::invalid_data());
         }
         let cc = read_color_config(&mut gb, profile_raw)?;
         bit_depth = cc.bit_depth;
@@ -683,7 +683,7 @@ pub fn decode_frame_header(
         if intra_only {
             let sync = gb.get_bits(24)?;
             if sync != 0x49_83_42 {
-                return Err(Error::InvalidData);
+                return Err(crate::invalid_data());
             }
             if profile_raw >= 1 {
                 let cc = read_color_config(&mut gb, profile_raw)?;
@@ -847,8 +847,8 @@ pub fn decode_frame_header(
     if seg.enabled {
         seg.update_map = gb.get_bit()?;
         if seg.update_map {
-            for i in 0..7 {
-                seg.prob[i] = if gb.get_bit()? {
+            for p in &mut seg.prob {
+                *p = if gb.get_bit()? {
                     gb.get_bits(8)? as u8
                 } else {
                     255
@@ -856,8 +856,8 @@ pub fn decode_frame_header(
             }
             seg.temporal = gb.get_bit()?;
             if seg.temporal {
-                for i in 0..3 {
-                    seg.pred_prob[i] = if gb.get_bit()? {
+                for p in &mut seg.pred_prob {
+                    *p = if gb.get_bit()? {
                         gb.get_bits(8)? as u8
                     } else {
                         255
@@ -867,26 +867,26 @@ pub fn decode_frame_header(
         }
         if gb.get_bit()? {
             seg.absolute_vals = gb.get_bit()?;
-            for i in 0..8 {
+            for feat in &mut seg.feat {
                 let q_en = gb.get_bit()?;
-                seg.feat[i].q_enabled = q_en;
+                feat.q_enabled = q_en;
                 if q_en {
                     // 8-bit magnitude + sign bit (get_sbits_inv).
                     let mag = gb.get_bits(8)? as i16;
                     let neg = gb.get_bit()?;
-                    seg.feat[i].q_val = if neg { -mag } else { mag };
+                    feat.q_val = if neg { -mag } else { mag };
                 }
                 let lf_en = gb.get_bit()?;
-                seg.feat[i].lf_enabled = lf_en;
+                feat.lf_enabled = lf_en;
                 if lf_en {
-                    seg.feat[i].lf_val = get_sbits_inv(&mut gb, 6)?;
+                    feat.lf_val = get_sbits_inv(&mut gb, 6)?;
                 }
                 let ref_en = gb.get_bit()?;
-                seg.feat[i].ref_enabled = ref_en;
+                feat.ref_enabled = ref_en;
                 if ref_en {
-                    seg.feat[i].ref_val = gb.get_bits(2)? as u8;
+                    feat.ref_val = gb.get_bits(2)? as u8;
                 }
-                seg.feat[i].skip_enabled = gb.get_bit()?;
+                feat.skip_enabled = gb.get_bit()?;
             }
         }
     } else {
@@ -967,16 +967,16 @@ pub fn decode_frame_header(
 
     let tile_data_offset = compressed_header_offset + compressed_header_size as usize;
     if tile_data_offset > data.len() {
-        return Err(Error::InvalidData);
+        return Err(crate::invalid_data());
     }
 
     // --- Compressed header (BoolDecoder) ---
     let compressed_data = &data[compressed_header_offset..tile_data_offset];
-    let mut bd = BoolDecoder::new(compressed_data).ok_or(Error::InvalidData)?;
+    let mut bd = BoolDecoder::new(compressed_data).ok_or(crate::invalid_data())?;
 
     // Marker bit (must be 0).
     if bd.get_prob(128) {
-        return Err(Error::InvalidData);
+        return Err(crate::invalid_data());
     }
 
     // Initialize probability context from the selected context slot.
@@ -1001,27 +1001,27 @@ pub fn decode_frame_header(
         } else {
             raw
         };
-        TxMode::try_from(raw).map_err(|_| Error::InvalidData)?
+        TxMode::try_from(raw).map_err(|_| crate::invalid_data())?
     };
 
     // Tx prob updates (only when tx_mode == TxModeSelect).
     if tx_mode == TxMode::TxModeSelect {
-        for i in 0..2 {
+        for p in &mut prob.tx8p {
             if bd.get_prob(252) {
-                prob.tx8p[i] = update_prob(&mut bd, prob.tx8p[i]);
+                *p = update_prob(&mut bd, *p);
             }
         }
-        for i in 0..2 {
-            for j in 0..2 {
+        for row in &mut prob.tx16p {
+            for p in row {
                 if bd.get_prob(252) {
-                    prob.tx16p[i][j] = update_prob(&mut bd, prob.tx16p[i][j]);
+                    *p = update_prob(&mut bd, *p);
                 }
             }
         }
-        for i in 0..2 {
-            for j in 0..3 {
+        for row in &mut prob.tx32p {
+            for p in row {
                 if bd.get_prob(252) {
-                    prob.tx32p[i][j] = update_prob(&mut bd, prob.tx32p[i][j]);
+                    *p = update_prob(&mut bd, *p);
                 }
             }
         }
@@ -1074,19 +1074,19 @@ pub fn decode_frame_header(
     }
 
     // Skip prob updates.
-    for i in 0..3 {
+    for p in &mut prob.skip {
         if bd.get_prob(252) {
-            prob.skip[i] = update_prob(&mut bd, prob.skip[i]);
+            *p = update_prob(&mut bd, *p);
         }
     }
 
     // Inter-frame prob updates.
     if !is_keyframe && !intra_only {
         // MV mode.
-        for i in 0..7 {
-            for j in 0..3 {
+        for row in &mut prob.mv_mode {
+            for p in row {
                 if bd.get_prob(252) {
-                    prob.mv_mode[i][j] = update_prob(&mut bd, prob.mv_mode[i][j]);
+                    *p = update_prob(&mut bd, *p);
                 }
             }
         }
@@ -1094,19 +1094,19 @@ pub fn decode_frame_header(
         // Interpolation filter.
         if filter_mode == 4 {
             // FILTER_SWITCHABLE
-            for i in 0..4 {
-                for j in 0..2 {
+            for row in &mut prob.filter {
+                for p in row {
                     if bd.get_prob(252) {
-                        prob.filter[i][j] = update_prob(&mut bd, prob.filter[i][j]);
+                        *p = update_prob(&mut bd, *p);
                     }
                 }
             }
         }
 
         // Intra prob.
-        for i in 0..4 {
+        for p in &mut prob.intra {
             if bd.get_prob(252) {
-                prob.intra[i] = update_prob(&mut bd, prob.intra[i]);
+                *p = update_prob(&mut bd, *p);
             }
         }
 
@@ -1116,9 +1116,9 @@ pub fn decode_frame_header(
             comp_pred_mode = if cp0 == 1 { 1 + u8::from(bd.get()) } else { 0 };
             if comp_pred_mode == 2 {
                 // Switchable: update comp probs.
-                for i in 0..5 {
+                for p in &mut prob.comp {
                     if bd.get_prob(252) {
-                        prob.comp[i] = update_prob(&mut bd, prob.comp[i]);
+                        *p = update_prob(&mut bd, *p);
                     }
                 }
             }
@@ -1129,12 +1129,12 @@ pub fn decode_frame_header(
         // single_ref probs.
         if comp_pred_mode != 1 {
             // not PRED_COMPREF
-            for i in 0..5 {
+            for pair in &mut prob.single_ref {
                 if bd.get_prob(252) {
-                    prob.single_ref[i][0] = update_prob(&mut bd, prob.single_ref[i][0]);
+                    pair[0] = update_prob(&mut bd, pair[0]);
                 }
                 if bd.get_prob(252) {
-                    prob.single_ref[i][1] = update_prob(&mut bd, prob.single_ref[i][1]);
+                    pair[1] = update_prob(&mut bd, pair[1]);
                 }
             }
         }
@@ -1142,18 +1142,18 @@ pub fn decode_frame_header(
         // comp_ref probs.
         if comp_pred_mode != 0 {
             // not PRED_SINGLEREF
-            for i in 0..5 {
+            for p in &mut prob.comp_ref {
                 if bd.get_prob(252) {
-                    prob.comp_ref[i] = update_prob(&mut bd, prob.comp_ref[i]);
+                    *p = update_prob(&mut bd, *p);
                 }
             }
         }
 
         // Y mode probs.
-        for i in 0..4 {
-            for j in 0..9 {
+        for row in &mut prob.y_mode {
+            for p in row {
                 if bd.get_prob(252) {
-                    prob.y_mode[i][j] = update_prob(&mut bd, prob.y_mode[i][j]);
+                    *p = update_prob(&mut bd, *p);
                 }
             }
         }
@@ -1167,63 +1167,62 @@ pub fn decode_frame_header(
                 // j = above_bit | (left_bit << 1)
                 let above_bit = j & 1;
                 let left_bit = j >> 1;
-                for k in 0..3usize {
+                for p in &mut prob.partition[3 - i][above_bit][left_bit] {
                     if bd.get_prob(252) {
-                        prob.partition[3 - i][above_bit][left_bit][k] =
-                            update_prob(&mut bd, prob.partition[3 - i][above_bit][left_bit][k]);
+                        *p = update_prob(&mut bd, *p);
                     }
                 }
             }
         }
 
         // MV fields — use raw 7-bit reads (not update_prob subexp model).
-        for i in 0..3 {
+        for p in &mut prob.mv_joint {
             if bd.get_prob(252) {
-                prob.mv_joint[i] = (bd.get_uint(7) << 1) as u8 | 1;
+                *p = (bd.get_uint(7) << 1) as u8 | 1;
             }
         }
 
-        for i in 0..2 {
+        for comp in &mut prob.mv_comp {
             if bd.get_prob(252) {
-                prob.mv_comp[i].sign = (bd.get_uint(7) << 1) as u8 | 1;
+                comp.sign = (bd.get_uint(7) << 1) as u8 | 1;
             }
-            for j in 0..10 {
+            for p in &mut comp.classes {
                 if bd.get_prob(252) {
-                    prob.mv_comp[i].classes[j] = (bd.get_uint(7) << 1) as u8 | 1;
+                    *p = (bd.get_uint(7) << 1) as u8 | 1;
                 }
             }
             if bd.get_prob(252) {
-                prob.mv_comp[i].class0 = (bd.get_uint(7) << 1) as u8 | 1;
+                comp.class0 = (bd.get_uint(7) << 1) as u8 | 1;
             }
-            for j in 0..10 {
+            for p in &mut comp.bits {
                 if bd.get_prob(252) {
-                    prob.mv_comp[i].bits[j] = (bd.get_uint(7) << 1) as u8 | 1;
+                    *p = (bd.get_uint(7) << 1) as u8 | 1;
                 }
             }
         }
 
-        for i in 0..2 {
-            for j in 0..2 {
-                for k in 0..3 {
+        for comp in &mut prob.mv_comp {
+            for row in &mut comp.class0_fp {
+                for p in row {
                     if bd.get_prob(252) {
-                        prob.mv_comp[i].class0_fp[j][k] = (bd.get_uint(7) << 1) as u8 | 1;
+                        *p = (bd.get_uint(7) << 1) as u8 | 1;
                     }
                 }
             }
-            for j in 0..3 {
+            for p in &mut comp.fp {
                 if bd.get_prob(252) {
-                    prob.mv_comp[i].fp[j] = (bd.get_uint(7) << 1) as u8 | 1;
+                    *p = (bd.get_uint(7) << 1) as u8 | 1;
                 }
             }
         }
 
         if high_precision_mvs {
-            for i in 0..2 {
+            for comp in &mut prob.mv_comp {
                 if bd.get_prob(252) {
-                    prob.mv_comp[i].class0_hp = (bd.get_uint(7) << 1) as u8 | 1;
+                    comp.class0_hp = (bd.get_uint(7) << 1) as u8 | 1;
                 }
                 if bd.get_prob(252) {
-                    prob.mv_comp[i].hp = (bd.get_uint(7) << 1) as u8 | 1;
+                    comp.hp = (bd.get_uint(7) << 1) as u8 | 1;
                 }
             }
         }

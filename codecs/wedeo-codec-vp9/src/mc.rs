@@ -17,6 +17,42 @@ use crate::recon::FrameBuffer;
 use crate::refs::RefFrame;
 use crate::types::BlockSize;
 
+/// Stride of the compound-prediction temporary planes (max block width).
+pub const TMP_STRIDE: usize = 64;
+/// Stride of the edge-emulation buffer (64 + 7 columns fit comfortably).
+const EMU_STRIDE: usize = 160;
+const EMU_ROWS: usize = 80;
+
+/// Reusable motion-compensation scratch buffers (allocated once per decoder).
+pub struct McScratch {
+    /// Edge-emulation buffer (`EMU_STRIDE` x `EMU_ROWS`).
+    pub emu: Vec<u8>,
+    /// Second-reference luma prediction for compound blocks.
+    pub tmp_y: Vec<u8>,
+    /// Second-reference U prediction for compound blocks.
+    pub tmp_u: Vec<u8>,
+    /// Second-reference V prediction for compound blocks.
+    pub tmp_v: Vec<u8>,
+}
+
+impl McScratch {
+    /// Allocate the scratch buffers.
+    pub fn new() -> Self {
+        Self {
+            emu: vec![0u8; EMU_STRIDE * EMU_ROWS],
+            tmp_y: vec![0u8; TMP_STRIDE * 64],
+            tmp_u: vec![0u8; TMP_STRIDE * 64],
+            tmp_v: vec![0u8; TMP_STRIDE * 64],
+        }
+    }
+}
+
+impl Default for McScratch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 8-tap subpel filter application
 // ---------------------------------------------------------------------------
@@ -243,7 +279,7 @@ pub fn mc_luma(
         let emu_x = x - if mx_frac != 0 { 3 } else { 0 };
         let emu_y = y - if my_frac != 0 { 3 } else { 0 };
         emu_edge(
-            emu_buf, 160, ref_plane, ref_stride, emu_w, emu_h, emu_x, emu_y, ref_w, ref_h,
+            emu_buf, EMU_STRIDE, ref_plane, ref_stride, emu_w, emu_h, emu_x, emu_y, ref_w, ref_h,
         );
 
         // The emu buffer starts at (emu_x, emu_y) = (integer - 3, y - 3),
@@ -251,7 +287,7 @@ pub fn mc_luma(
         // src[0..7] with center at tap[3] = integer position). No offset needed.
         // (FFmpeg adds +3 here because its FILTER_8TAP reads src[x-3..x+4].)
         mc_apply(
-            dst, dst_stride, emu_buf, 160, bw, bh, mx_frac, my_frac, filter_idx, true,
+            dst, dst_stride, emu_buf, EMU_STRIDE, bw, bh, mx_frac, my_frac, filter_idx, true,
         );
     } else {
         // Position src 3 rows above and 3 pixels left of the block start
@@ -314,18 +350,18 @@ pub fn mc_chroma(
         // U plane — emu buffer starts at (x-3, y-3), no offset needed
         // (see mc_luma comment for why).
         emu_edge(
-            emu_buf, 160, ref_u, ref_stride, emu_w, emu_h, emu_x, emu_y, ref_w, ref_h,
+            emu_buf, EMU_STRIDE, ref_u, ref_stride, emu_w, emu_h, emu_x, emu_y, ref_w, ref_h,
         );
         mc_apply(
-            dst_u, dst_stride, emu_buf, 160, bw, bh, mx_frac, my_frac, filter_idx, false,
+            dst_u, dst_stride, emu_buf, EMU_STRIDE, bw, bh, mx_frac, my_frac, filter_idx, false,
         );
 
         // V plane
         emu_edge(
-            emu_buf, 160, ref_v, ref_stride, emu_w, emu_h, emu_x, emu_y, ref_w, ref_h,
+            emu_buf, EMU_STRIDE, ref_v, ref_stride, emu_w, emu_h, emu_x, emu_y, ref_w, ref_h,
         );
         mc_apply(
-            dst_v, dst_stride, emu_buf, 160, bw, bh, mx_frac, my_frac, filter_idx, false,
+            dst_v, dst_stride, emu_buf, EMU_STRIDE, bw, bh, mx_frac, my_frac, filter_idx, false,
         );
     } else {
         let offset_y = y as usize - if my_frac != 0 { 3 } else { 0 };
@@ -442,7 +478,14 @@ pub fn inter_pred(
     ref_idx: &[u8; 3],
     ss_h: bool,
     ss_v: bool,
+    scratch: &mut McScratch,
 ) {
+    let McScratch {
+        emu: emu_buf,
+        tmp_y,
+        tmp_u,
+        tmp_v,
+    } = scratch;
     let bs = block.bs as usize;
     let bw4 = BWH_TAB[0][bs][0] as usize;
     let bh4 = BWH_TAB[0][bs][1] as usize;
@@ -460,13 +503,21 @@ pub fn inter_pred(
 
     let filter = block.filter;
 
-    // Allocate an edge-emulation buffer (160-byte stride, enough for 64+7 rows).
-    let mut emu_buf = vec![0u8; 160 * 80];
-
     // --- Luma MC for ref[0] ---
     if bs > BlockSize::Bs8x8 as usize {
         // Sub-8x8: per-sub-block MC.
-        sub8x8_luma_mc(fb, block, ref0, col_px, row_px, filter, &mut emu_buf);
+        let dst_off = row_px * fb.y_stride + col_px;
+        sub8x8_luma_mc_buf(
+            &mut fb.y[dst_off..],
+            fb.y_stride,
+            block,
+            ref0,
+            col_px,
+            row_px,
+            filter,
+            emu_buf,
+            0,
+        );
     } else {
         // Normal block: single MV.
         let dst_off = row_px * fb.y_stride + col_px;
@@ -483,35 +534,37 @@ pub fn inter_pred(
             bw,
             bh,
             filter,
-            &mut emu_buf,
+            emu_buf,
         );
     }
 
     // --- Chroma MC for ref[0] ---
-    let uv_bw4 = BWH_TAB[1][bs][0] as usize;
-    let uv_bh4 = BWH_TAB[1][bs][1] as usize;
+    let uv_bw4 = BWH_TAB[usize::from(ss_h)][bs][0] as usize;
+    let uv_bh4 = BWH_TAB[usize::from(ss_v)][bs][1] as usize;
     let uv_bw = uv_bw4 * 4;
     let uv_bh = uv_bh4 * 4;
-    let uv_col = col_px >> ss_h as usize;
-    let uv_row = row_px >> ss_v as usize;
-    let ref_uv_w = (ref0.width as usize).div_ceil(1 << ss_h as usize);
-    let ref_uv_h = (ref0.height as usize).div_ceil(1 << ss_v as usize);
+    let uv_col = col_px >> usize::from(ss_h);
+    let uv_row = row_px >> usize::from(ss_v);
+    let ref_uv_w = (ref0.width as usize).div_ceil(1 << usize::from(ss_h));
+    let ref_uv_h = (ref0.height as usize).div_ceil(1 << usize::from(ss_v));
 
     if bs > BlockSize::Bs8x8 as usize {
-        sub8x8_chroma_mc(
-            fb,
+        let u_off = uv_row * fb.uv_stride + uv_col;
+        sub8x8_chroma_mc_dst(
+            &mut fb.u[u_off..],
+            &mut fb.v[u_off..],
+            fb.uv_stride,
             block,
             ref0,
             uv_col,
             uv_row,
-            uv_bw,
-            uv_bh,
             ref_uv_w,
             ref_uv_h,
             filter,
             ss_h,
             ss_v,
-            &mut emu_buf,
+            emu_buf,
+            0,
         );
     } else {
         let u_off = uv_row * fb.uv_stride + uv_col;
@@ -533,7 +586,7 @@ pub fn inter_pred(
             filter,
             ss_h,
             ss_v,
-            &mut emu_buf,
+            emu_buf,
         );
     }
 
@@ -546,27 +599,17 @@ pub fn inter_pred(
         };
 
         // MC ref1 into temp buffers, then average with fb.
-        let mut tmp_y = vec![0u8; fb.y_stride * bh];
-        let mut tmp_u = vec![0u8; fb.uv_stride * uv_bh];
-        let mut tmp_v = vec![0u8; fb.uv_stride * uv_bh];
 
         // Luma ref1 — per-sub-block for sub-8x8, single MC for >=8x8.
         if bs > BlockSize::Bs8x8 as usize {
             sub8x8_luma_mc_buf(
-                &mut tmp_y,
-                fb.y_stride,
-                block,
-                ref1,
-                col_px,
-                row_px,
-                filter,
-                &mut emu_buf,
+                tmp_y, TMP_STRIDE, block, ref1, col_px, row_px, filter, emu_buf,
                 1, // ref_idx=1
             );
         } else {
             mc_luma(
-                &mut tmp_y,
-                fb.y_stride,
+                tmp_y,
+                TMP_STRIDE,
                 &ref1.fb.y,
                 ref1.fb.y_stride,
                 ref1.width as usize,
@@ -577,47 +620,26 @@ pub fn inter_pred(
                 bw,
                 bh,
                 filter,
-                &mut emu_buf,
+                emu_buf,
             );
         }
         // Average luma.
         let dst_off = row_px * fb.y_stride + col_px;
-        avg_block(
-            &mut fb.y[dst_off..],
-            fb.y_stride,
-            &tmp_y,
-            fb.y_stride,
-            bw,
-            bh,
-        );
+        avg_block(&mut fb.y[dst_off..], fb.y_stride, tmp_y, TMP_STRIDE, bw, bh);
 
         // Chroma ref1 — per-sub-block averaging for sub-8x8.
         let ref1_uv_w = (ref1.width as usize).div_ceil(1 << ss_h as usize);
         let ref1_uv_h = (ref1.height as usize).div_ceil(1 << ss_v as usize);
         if bs > BlockSize::Bs8x8 as usize {
-            sub8x8_chroma_mc_buf(
-                &mut tmp_u,
-                &mut tmp_v,
-                fb.uv_stride,
-                block,
-                ref1,
-                uv_col,
-                uv_row,
-                uv_bw,
-                uv_bh,
-                ref1_uv_w,
-                ref1_uv_h,
-                filter,
-                ss_h,
-                ss_v,
-                &mut emu_buf,
-                1, // ref_idx=1
+            sub8x8_chroma_mc_dst(
+                tmp_u, tmp_v, TMP_STRIDE, block, ref1, uv_col, uv_row, ref1_uv_w, ref1_uv_h,
+                filter, ss_h, ss_v, emu_buf, 1, // ref_idx=1
             );
         } else {
             mc_chroma(
-                &mut tmp_u,
-                &mut tmp_v,
-                fb.uv_stride,
+                tmp_u,
+                tmp_v,
+                TMP_STRIDE,
                 &ref1.fb.u,
                 &ref1.fb.v,
                 ref1.fb.uv_stride,
@@ -631,23 +653,23 @@ pub fn inter_pred(
                 filter,
                 ss_h,
                 ss_v,
-                &mut emu_buf,
+                emu_buf,
             );
         }
         let u_off = uv_row * fb.uv_stride + uv_col;
         avg_block(
             &mut fb.u[u_off..],
             fb.uv_stride,
-            &tmp_u,
-            fb.uv_stride,
+            tmp_u,
+            TMP_STRIDE,
             uv_bw,
             uv_bh,
         );
         avg_block(
             &mut fb.v[u_off..],
             fb.uv_stride,
-            &tmp_v,
-            fb.uv_stride,
+            tmp_v,
+            TMP_STRIDE,
             uv_bw,
             uv_bh,
         );
@@ -700,7 +722,7 @@ fn sub8x8_luma_mc_buf(
             }
         }
         BlockSize::Bs4x8 => {
-            for sub in 0..2 {
+            for (sub, mv_pair) in block.mv.iter().take(2).enumerate() {
                 let sub_col = col_px + sub * 4;
                 let dst_off = sub * 4;
                 mc_luma(
@@ -712,7 +734,7 @@ fn sub8x8_luma_mc_buf(
                     ref_h,
                     row_px,
                     sub_col,
-                    &block.mv[sub][ri],
+                    &mv_pair[ri],
                     4,
                     8,
                     filter,
@@ -721,7 +743,7 @@ fn sub8x8_luma_mc_buf(
             }
         }
         BlockSize::Bs4x4 => {
-            for sub in 0..4 {
+            for (sub, mv_pair) in block.mv.iter().enumerate() {
                 let sub_row = (sub >> 1) * 4;
                 let sub_col = (sub & 1) * 4;
                 let dst_off = sub_row * dst_stride + sub_col;
@@ -734,7 +756,7 @@ fn sub8x8_luma_mc_buf(
                     ref_h,
                     row_px + sub_row,
                     col_px + sub_col,
-                    &block.mv[sub][ri],
+                    &mv_pair[ri],
                     4,
                     4,
                     filter,
@@ -746,11 +768,9 @@ fn sub8x8_luma_mc_buf(
     }
 }
 
-/// MC chroma for sub-8x8 blocks into arbitrary buffers (for compound ref[1]).
-///
-/// `ri` selects which reference MV to use: 0 or 1.
+/// MC chroma for sub-8x8 blocks into `(dst_u, dst_v)` for reference `ri` (0 or 1).
 #[allow(clippy::too_many_arguments)]
-fn sub8x8_chroma_mc_buf(
+fn sub8x8_chroma_mc_dst(
     dst_u: &mut [u8],
     dst_v: &mut [u8],
     dst_stride: usize,
@@ -758,8 +778,6 @@ fn sub8x8_chroma_mc_buf(
     ref_frame: &RefFrame,
     uv_col: usize,
     uv_row: usize,
-    uv_bw: usize,
-    uv_bh: usize,
     ref_uv_w: usize,
     ref_uv_h: usize,
     filter: u8,
@@ -768,187 +786,85 @@ fn sub8x8_chroma_mc_buf(
     emu_buf: &mut [u8],
     ri: usize,
 ) {
-    let bs = block.bs;
-    let chroma_mv = match bs {
-        BlockSize::Bs8x4 if ss_v => rounded_div_mv_x2(block.mv[0][ri], block.mv[2][ri]),
-        BlockSize::Bs4x8 if ss_h => rounded_div_mv_x2(block.mv[0][ri], block.mv[1][ri]),
-        BlockSize::Bs4x4 if ss_h && ss_v => rounded_div_mv_x4(
-            block.mv[0][ri],
-            block.mv[1][ri],
-            block.mv[2][ri],
-            block.mv[3][ri],
-        ),
-        _ => block.mv[0][ri],
+    let mut call = |dx: usize, dy: usize, w: usize, h: usize, mv: &[i16; 2]| {
+        let off = dy * dst_stride + dx;
+        mc_chroma(
+            &mut dst_u[off..],
+            &mut dst_v[off..],
+            dst_stride,
+            &ref_frame.fb.u,
+            &ref_frame.fb.v,
+            ref_frame.fb.uv_stride,
+            ref_uv_w,
+            ref_uv_h,
+            uv_row + dy,
+            uv_col + dx,
+            mv,
+            w,
+            h,
+            filter,
+            ss_h,
+            ss_v,
+            emu_buf,
+        );
     };
-    mc_chroma(
-        dst_u,
-        dst_v,
-        dst_stride,
-        &ref_frame.fb.u,
-        &ref_frame.fb.v,
-        ref_frame.fb.uv_stride,
-        ref_uv_w,
-        ref_uv_h,
-        uv_row,
-        uv_col,
-        &chroma_mv,
-        uv_bw,
-        uv_bh,
-        filter,
-        ss_h,
-        ss_v,
-        emu_buf,
-    );
-}
 
-/// MC luma for sub-8x8 blocks (per-sub-block MVs).
-fn sub8x8_luma_mc(
-    fb: &mut FrameBuffer,
-    block: &BlockInfo,
-    ref_frame: &RefFrame,
-    col_px: usize,
-    row_px: usize,
-    filter: u8,
-    emu_buf: &mut [u8],
-) {
-    let bs = block.bs;
-    let ref_w = ref_frame.width as usize;
-    let ref_h = ref_frame.height as usize;
-
-    match bs {
+    match block.bs {
         BlockSize::Bs8x4 => {
-            // Two 8x4 sub-blocks stacked vertically.
-            for sub in 0..2 {
-                let sub_row = row_px + sub * 4;
-                let dst_off = sub_row * fb.y_stride + col_px;
-                mc_luma(
-                    &mut fb.y[dst_off..],
-                    fb.y_stride,
-                    &ref_frame.fb.y,
-                    ref_frame.fb.y_stride,
-                    ref_w,
-                    ref_h,
-                    sub_row,
-                    col_px,
-                    &block.mv[sub * 2][0],
-                    8,
-                    4,
-                    filter,
-                    emu_buf,
-                );
+            let bw = 8 >> usize::from(ss_h);
+            if ss_v {
+                let mv = rounded_div_mv_x2(block.mv[0][ri], block.mv[2][ri]);
+                call(0, 0, bw, 4, &mv);
+            } else {
+                call(0, 0, bw, 4, &block.mv[0][ri]);
+                let mv2 = if !ss_h {
+                    block.mv[2][ri]
+                } else {
+                    rounded_div_mv_x2(block.mv[0][ri], block.mv[2][ri])
+                };
+                call(0, 4, bw, 4, &mv2);
             }
         }
         BlockSize::Bs4x8 => {
-            // Two 4x8 sub-blocks side by side.
-            for sub in 0..2 {
-                let sub_col = col_px + sub * 4;
-                let dst_off = row_px * fb.y_stride + sub_col;
-                mc_luma(
-                    &mut fb.y[dst_off..],
-                    fb.y_stride,
-                    &ref_frame.fb.y,
-                    ref_frame.fb.y_stride,
-                    ref_w,
-                    ref_h,
-                    row_px,
-                    sub_col,
-                    &block.mv[sub][0],
-                    4,
-                    8,
-                    filter,
-                    emu_buf,
-                );
+            let bh = 8 >> usize::from(ss_v);
+            if ss_h {
+                let mv = rounded_div_mv_x2(block.mv[0][ri], block.mv[1][ri]);
+                call(0, 0, 4, bh, &mv);
+            } else {
+                call(0, 0, 4, bh, &block.mv[0][ri]);
+                call(4, 0, 4, bh, &block.mv[1][ri]);
             }
         }
-        BlockSize::Bs4x4 => {
-            // Four 4x4 sub-blocks.
-            for sub in 0..4 {
-                let sub_row = row_px + (sub >> 1) * 4;
-                let sub_col = col_px + (sub & 1) * 4;
-                let dst_off = sub_row * fb.y_stride + sub_col;
-                mc_luma(
-                    &mut fb.y[dst_off..],
-                    fb.y_stride,
-                    &ref_frame.fb.y,
-                    ref_frame.fb.y_stride,
-                    ref_w,
-                    ref_h,
-                    sub_row,
-                    sub_col,
-                    &block.mv[sub][0],
-                    4,
-                    4,
-                    filter,
-                    emu_buf,
+        BlockSize::Bs4x4 => match (ss_h, ss_v) {
+            (true, true) => {
+                let mv = rounded_div_mv_x4(
+                    block.mv[0][ri],
+                    block.mv[1][ri],
+                    block.mv[2][ri],
+                    block.mv[3][ri],
                 );
+                call(0, 0, 4, 4, &mv);
             }
-        }
+            (false, true) => {
+                let mv0 = rounded_div_mv_x2(block.mv[0][ri], block.mv[2][ri]);
+                let mv1 = rounded_div_mv_x2(block.mv[1][ri], block.mv[3][ri]);
+                call(0, 0, 4, 4, &mv0);
+                call(4, 0, 4, 4, &mv1);
+            }
+            (true, false) => {
+                let mv0 = rounded_div_mv_x2(block.mv[0][ri], block.mv[1][ri]);
+                let mv1 = rounded_div_mv_x2(block.mv[1][ri], block.mv[2][ri]);
+                call(0, 0, 4, 4, &mv0);
+                call(0, 4, 4, 4, &mv1);
+            }
+            (false, false) => {
+                for (sub, mv_pair) in block.mv.iter().enumerate() {
+                    let dx = (sub & 1) * 4;
+                    let dy = (sub >> 1) * 4;
+                    call(dx, dy, 4, 4, &mv_pair[ri]);
+                }
+            }
+        },
         _ => {}
     }
-}
-
-/// MC chroma for sub-8x8 blocks (averaged MVs for 4:2:0).
-#[allow(clippy::too_many_arguments)]
-fn sub8x8_chroma_mc(
-    fb: &mut FrameBuffer,
-    block: &BlockInfo,
-    ref_frame: &RefFrame,
-    uv_col: usize,
-    uv_row: usize,
-    uv_bw: usize,
-    uv_bh: usize,
-    ref_uv_w: usize,
-    ref_uv_h: usize,
-    filter: u8,
-    ss_h: bool,
-    ss_v: bool,
-    emu_buf: &mut [u8],
-) {
-    let bs = block.bs;
-
-    // For 4:2:0, sub-8x8 chroma uses averaged MVs from the luma sub-blocks.
-    let chroma_mv = match bs {
-        BlockSize::Bs8x4 if ss_v => {
-            // Two 8x4 luma sub-blocks → one chroma block. Average MVs.
-            rounded_div_mv_x2(block.mv[0][0], block.mv[2][0])
-        }
-        BlockSize::Bs4x8 if ss_h => {
-            // Two 4x8 luma sub-blocks → one chroma block. Average MVs.
-            rounded_div_mv_x2(block.mv[0][0], block.mv[1][0])
-        }
-        BlockSize::Bs4x4 if ss_h && ss_v => {
-            // Four 4x4 luma sub-blocks → one chroma block. Average all 4 MVs.
-            rounded_div_mv_x4(
-                block.mv[0][0],
-                block.mv[1][0],
-                block.mv[2][0],
-                block.mv[3][0],
-            )
-        }
-        _ => {
-            // No averaging needed — use the first sub-block MV.
-            block.mv[0][0]
-        }
-    };
-
-    let u_off = uv_row * fb.uv_stride + uv_col;
-    mc_chroma(
-        &mut fb.u[u_off..],
-        &mut fb.v[u_off..],
-        fb.uv_stride,
-        &ref_frame.fb.u,
-        &ref_frame.fb.v,
-        ref_frame.fb.uv_stride,
-        ref_uv_w,
-        ref_uv_h,
-        uv_row,
-        uv_col,
-        &chroma_mv,
-        uv_bw,
-        uv_bh,
-        filter,
-        ss_h,
-        ss_v,
-        emu_buf,
-    );
 }

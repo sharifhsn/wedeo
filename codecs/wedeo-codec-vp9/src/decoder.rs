@@ -11,49 +11,50 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use tracing::{debug, warn};
-use wedeo_codec::decoder::{CodecParameters, Decoder, DecoderDescriptor};
-use wedeo_codec::descriptor::{CodecCapabilities, CodecDescriptor, CodecProperties};
-use wedeo_codec::registry::DecoderFactory;
-use wedeo_core::buffer::Buffer;
-use wedeo_core::codec_id::CodecId;
-use wedeo_core::error::{Error, Result};
-use wedeo_core::frame::{Frame, FrameData, FrameFlags, FramePlane, PictureType};
-use wedeo_core::media_type::MediaType;
-use wedeo_core::packet::Packet;
-use wedeo_core::pixel_format::PixelFormat;
+use wedeo_core::{
+    BorderPadding, BorderedPlane, CodecContext, CodecId, ColorDesc, ColorPrimaries, ColorRange,
+    Decoder, DecoderDescriptor, DecoderFactory, Error, ErrorPolicy, FrameFlags, HealthEvent,
+    HealthIssue, MatrixCoefficients, MediaType, MediaUnit, Packet, PictureType, PixelLayout,
+    Rational, RecvStatus, Registry, Result, SendStatus, StreamHealth, StreamParams,
+    TransferCharacteristic, VideoFrame,
+};
 
 use crate::block::{BlockInfo, TileDecodeContext, decode_sb};
 use crate::bool_decoder::BoolDecoder;
 use crate::context::{AboveContext, LeftContext};
 use crate::data::DEFAULT_COEF_PROBS;
-use crate::header::{FrameType, decode_frame_header};
+use crate::header::{self, ColorSpace, FrameType, decode_frame_header};
 use crate::loopfilter::loop_filter_frame;
+use crate::mc::McScratch;
 use crate::prob::{CoefProbArray, CountContext, adapt_probs};
 use crate::recon::{FrameBuffer, reconstruct_inter_block, reconstruct_intra_block};
 use crate::refs::{MvRefPair, RefFrame, RefStore};
 use crate::types::{BlockLevel, CompPredMode, ProbContext};
 
+/// Register the pure-Rust VP9 decoder factory into `reg`.
+pub fn register_vp9(reg: &mut Registry) {
+    reg.register_decoder(Arc::new(Vp9DecoderFactory));
+}
+
 // ---------------------------------------------------------------------------
 // Decoder state
 // ---------------------------------------------------------------------------
 
-/// VP9 video decoder.
+/// Pure-Rust FFmpeg `n9.1` VP9 video decoder.
 pub struct Vp9Decoder {
-    // Stored for future use (e.g. thread count, pixel format override).
-    #[allow(dead_code)]
-    params: CodecParameters,
-    output_queue: VecDeque<Frame>,
+    ctx: CodecContext,
+    time_base: Rational,
+    sar: Rational,
+    fallback_color: ColorDesc,
+    output_queue: VecDeque<MediaUnit>,
     draining: bool,
-    codec_descriptor: CodecDescriptor,
+    health: StreamHealth,
     /// 4 probability context slots indexed by `frame_ctx_id`.
     prob_ctx: [ProbContext; 4],
     /// 4 coefficient probability context slots indexed by `frame_ctx_id`.
     coef_ctx: [CoefProbArray; 4],
     /// Whether the previous frame was a keyframe (for adapt_probs update factor).
     last_keyframe: bool,
-    /// Monotonic frame counter used for PTS when packets carry no PTS.
-    frame_count: u64,
     /// Reference frame storage for inter prediction.
     ref_store: RefStore,
     /// Previous frame's show_frame flag (FFmpeg: `last_invisible`).
@@ -62,113 +63,215 @@ pub struct Vp9Decoder {
     last_width: u32,
     /// Previous frame's height.
     last_height: u32,
+    /// Active stream bit depth (inherited by inter frames).
+    active_bit_depth: u8,
+    /// Active stream horizontal subsampling (inherited by inter frames).
+    active_ss_h: bool,
+    /// Active stream vertical subsampling (inherited by inter frames).
+    active_ss_v: bool,
+    /// Active stream VP9 color space (inherited by inter frames).
+    active_color_space: ColorSpace,
+    /// Active stream VP9 color range (inherited by inter frames).
+    active_color_range: header::ColorRange,
+    /// Reusable motion-compensation scratch buffers.
+    mc_scratch: McScratch,
 }
 
 impl Vp9Decoder {
-    /// Create a new VP9 decoder from codec parameters.
-    pub fn new(params: CodecParameters) -> Result<Self> {
+    /// Open a new VP9 decoder for `track` with runtime `ctx`.
+    pub fn open(track: &TrackDescriptorWrapper<'_>, ctx: CodecContext) -> Result<Self> {
+        let (sar, fallback_color) = match &track.0.params {
+            StreamParams::Video(v) => (v.sar, v.color),
+            _ => (Rational::new(1, 1), ColorDesc::UNSPECIFIED),
+        };
         Ok(Self {
-            params,
+            ctx,
+            time_base: track.0.time_base,
+            sar,
+            fallback_color,
             output_queue: VecDeque::new(),
             draining: false,
-            codec_descriptor: CodecDescriptor {
-                id: CodecId::Vp9,
-                media_type: MediaType::Video,
-                name: "vp9",
-                long_name: "VP9 Video",
-                properties: CodecProperties::LOSSY,
-                profiles: &[],
-            },
+            health: StreamHealth::new(),
             prob_ctx: Default::default(),
             coef_ctx: [DEFAULT_COEF_PROBS; 4],
             last_keyframe: false,
-            frame_count: 0,
             ref_store: RefStore::new(),
             last_show_frame: false,
             last_width: 0,
             last_height: 0,
+            active_bit_depth: 8,
+            active_ss_h: true,
+            active_ss_v: true,
+            active_color_space: ColorSpace::Unknown,
+            active_color_range: header::ColorRange::Limited,
+            mc_scratch: McScratch::new(),
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn build_video_frame(
+        &self,
+        fb: &FrameBuffer,
+        width: u32,
+        height: u32,
+        layout: PixelLayout,
+        color: ColorDesc,
+        picture_type: PictureType,
+        is_key: bool,
+        pkt: &Packet,
+    ) -> Result<VideoFrame> {
+        let src_planes = [
+            (&fb.y, fb.y_stride),
+            (&fb.u, fb.uv_stride),
+            (&fb.v, fb.uv_stride),
+        ];
+        let mut planes = Vec::with_capacity(3);
+        for (idx, (src, src_stride)) in src_planes.iter().enumerate() {
+            let (w_bytes, h_rows) = layout.plane_dims(width, height, idx).ok_or_else(|| {
+                Error::internal("vp9", "invalid plane index for VP9 pixel layout")
+            })?;
+            let mut plane =
+                BorderedPlane::new_reused(&self.ctx.pool, w_bytes, h_rows, BorderPadding::NONE);
+            for y in 0..h_rows {
+                let dst_row = plane
+                    .row_mut(y)
+                    .ok_or_else(|| Error::internal("vp9", "pooled plane row out of bounds"))?;
+                let src_off = y * *src_stride;
+                dst_row.copy_from_slice(&src[src_off..src_off + w_bytes]);
+            }
+            planes.push(plane);
+        }
+
+        let mut frame = VideoFrame::from_planes(width, height, layout, planes);
+        frame.color = color;
+        frame.sar = self.sar;
+        frame.picture_type = picture_type;
+        if is_key {
+            frame.flags |= FrameFlags::KEY;
+        }
+        frame.pts = if pkt.pts.is_known() { pkt.pts } else { pkt.dts };
+        frame.pkt_dts = pkt.dts;
+        frame.duration = pkt.duration;
+        frame.time_base = if pkt.time_base.is_valid() {
+            pkt.time_base
+        } else {
+            self.time_base
+        };
+        frame.side_data.clone_from(&pkt.side_data);
+        Ok(frame)
+    }
+
     /// Decode one VP9 frame from `data` and push the result to `output_queue`.
-    fn decode_frame(&mut self, data: &[u8], pts: i64) -> Result<()> {
+    fn decode_frame(&mut self, data: &[u8], pkt: &Packet) -> Result<()> {
         // --- 1. Parse frame header ---
-        let (header, _hdr_bytes) = decode_frame_header(data, &self.prob_ctx, &self.coef_ctx)?;
-
-        debug!(
-            frame_type = ?header.frame_type,
-            show_frame = header.show_frame,
-            show_existing = header.show_existing_frame,
-            width = header.width,
-            height = header.height,
-            "VP9 frame header decoded"
-        );
-
+        let (mut header, _hdr_bytes) =
+            match decode_frame_header(data, &self.prob_ctx, &self.coef_ctx) {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    self.health.record(HealthEvent {
+                        track: pkt.track_id,
+                        pts: pkt.pts,
+                        byte_offset: pkt.pos,
+                        kind: HealthIssue::CorruptSyntax,
+                        detail: "invalid VP9 frame header",
+                    });
+                    return Err(e);
+                }
+            };
 
         // show_existing_frame: output a previously decoded reference frame.
         if header.show_existing_frame {
             let ref_idx = header.show_existing_frame_ref as usize;
-            let rf = self.ref_store.slots[ref_idx]
-                .as_ref()
-                .ok_or(Error::InvalidData)?;
-            let fb = &rf.fb;
-            let mut frame = Frame::new_video(rf.width, rf.height, PixelFormat::Yuv420p);
-            frame.pts = pts;
-            if let FrameData::Video(ref mut video) = frame.data {
-                video.planes = vec![
-                    FramePlane {
-                        buffer: Buffer::from_slice(&fb.y),
-                        offset: 0,
-                        linesize: fb.y_stride,
-                    },
-                    FramePlane {
-                        buffer: Buffer::from_slice(&fb.u),
-                        offset: 0,
-                        linesize: fb.uv_stride,
-                    },
-                    FramePlane {
-                        buffer: Buffer::from_slice(&fb.v),
-                        offset: 0,
-                        linesize: fb.uv_stride,
-                    },
-                ];
-                video.picture_type = PictureType::P;
-            }
-            self.output_queue.push_back(frame);
-            self.frame_count += 1;
+            let Some(rf) = self.ref_store.slots[ref_idx].as_ref() else {
+                self.health.record(HealthEvent {
+                    track: pkt.track_id,
+                    pts: pkt.pts,
+                    byte_offset: pkt.pos,
+                    kind: HealthIssue::MissingRef,
+                    detail: "show_existing_frame references empty slot",
+                });
+                return Err(Error::invalid_data(
+                    "vp9",
+                    "show_existing_frame references empty reference slot",
+                ));
+            };
+            let frame = self.build_video_frame(
+                &rf.fb,
+                rf.width,
+                rf.height,
+                rf.layout,
+                rf.color,
+                PictureType::P,
+                false,
+                pkt,
+            )?;
+            self.output_queue.push_back(MediaUnit::Video(frame));
             return Ok(());
         }
 
-        // Only 8-bit 4:2:0 is fully supported for now.
-        if header.bit_depth != 8 {
-            warn!(
-                bit_depth = header.bit_depth,
-                "VP9 non-8-bit frame not yet supported"
-            );
-            return Ok(());
+        // Propagate active stream color/subsampling/bit-depth to inter frames
+        // (which do not carry a color_config in the VP9 bitstream).
+        let is_kf = header.frame_type == FrameType::KeyFrame || header.intra_only;
+        if is_kf {
+            self.active_bit_depth = header.bit_depth;
+            self.active_ss_h = header.subsampling_x;
+            self.active_ss_v = header.subsampling_y;
+            self.active_color_space = header.color_space;
+            self.active_color_range = header.color_range;
+        } else {
+            header.bit_depth = self.active_bit_depth;
+            header.subsampling_x = self.active_ss_h;
+            header.subsampling_y = self.active_ss_v;
+            header.color_space = self.active_color_space;
+            header.color_range = self.active_color_range;
         }
 
-        // On keyframe or error_resilient: reset all probability context slots to
-        // defaults. Matches FFmpeg vp9.c:883-893.
+        // Reject unsupported >8-bit profiles (Profiles 2/3) or 4:4:0 explicitly.
+        let layout = derive_pixel_layout(
+            header.bit_depth,
+            header.color_space,
+            header.subsampling_x,
+            header.subsampling_y,
+            header.profile as u8,
+        )?;
+        let color = derive_color_desc(
+            header.color_space,
+            header.color_range,
+            header.bit_depth,
+            self.fallback_color,
+        );
+
+        // On keyframe or error_resilient: reset all probability context slots to defaults.
         if header.frame_type == FrameType::KeyFrame || header.error_resilient {
             for slot in &mut self.prob_ctx {
                 *slot = crate::header::default_prob_context();
             }
-            self.coef_ctx = [crate::data::DEFAULT_COEF_PROBS; 4];
+            self.coef_ctx = [DEFAULT_COEF_PROBS; 4];
         }
         if header.frame_type == FrameType::KeyFrame {
             self.ref_store.clear();
         }
 
         // Resolve dimensions from reference frame if needed.
-        let mut header = header;
         if header.size_from_ref >= 0 {
             let ri = header.ref_idx[header.size_from_ref as usize] as usize;
             if let Some(rf) = &self.ref_store.slots[ri] {
                 header.width = rf.width;
                 header.height = rf.height;
             } else {
-                warn!("VP9: inter frame references empty slot for dimensions");
+                self.health.record(HealthEvent {
+                    track: pkt.track_id,
+                    pts: pkt.pts,
+                    byte_offset: pkt.pos,
+                    kind: HealthIssue::MissingRef,
+                    detail: "inter frame references empty slot for dimensions",
+                });
+                if self.ctx.error_policy == ErrorPolicy::Strict {
+                    return Err(Error::corrupt(
+                        "vp9",
+                        "inter frame references empty slot for dimensions",
+                    ));
+                }
                 return Ok(());
             }
         }
@@ -183,59 +286,52 @@ impl Vp9Decoder {
         // --- 2. Set up frame buffer and contexts ---
         let width = header.width;
         let height = header.height;
-        let mut fb = FrameBuffer::new(width, height);
+        let mut fb = FrameBuffer::new(width, height, header.subsampling_x, header.subsampling_y);
 
-        let cols_4x4 = (width as usize).div_ceil(4);
-        let rows_4x4 = (height as usize).div_ceil(4);
+        // Match FFmpeg's 8x8-aligned block grid (`2 * cols_8x8`, `2 * rows_8x8`).
+        let cols_4x4 = (width as usize).div_ceil(8) * 2;
+        let rows_4x4 = (height as usize).div_ceil(8) * 2;
         let sb_cols = cols_4x4.div_ceil(16);
         let sb_rows = rows_4x4.div_ceil(16);
-        let is_kf = header.frame_type == FrameType::KeyFrame || header.intra_only;
 
         let mut above = AboveContext::new(cols_4x4, sb_cols);
         above.reset(is_kf);
 
-        // Allocate per-4×4 MV grid for this frame.
         let mut cur_mv_grid = vec![MvRefPair::default(); rows_4x4 * cols_4x4];
 
-        // --- 3. Locate tile data ---
-        // `header.tile_data_offset` points to the first byte after the
-        // compressed header (= start of tile bitstream data).
+        // --- 3. Locate and decode tiles deterministically ---
         let tile_data = &data[header.tile_data_offset..];
-
-        // Tile grid dimensions.
         let tile_cols = 1usize << (header.tile_cols_log2 as usize);
         let tile_rows = 1usize << (header.tile_rows_log2 as usize);
 
-        // For each tile-row × tile-col we need to know the byte range.
-        // VP9 stores (tile_cols × tile_rows - 1) big-endian 32-bit sizes
-        // before the actual tile data, with the last tile getting all
-        // remaining bytes.
         let total_tiles = tile_cols * tile_rows;
         let mut tile_offsets: Vec<(usize, usize)> = Vec::with_capacity(total_tiles);
         {
             let mut read_pos = 0usize;
             for t in 0..total_tiles {
                 let tile_size = if t == total_tiles - 1 {
-                    tile_data.len() - read_pos
+                    tile_data.len().saturating_sub(read_pos)
                 } else {
                     if read_pos + 4 > tile_data.len() {
-                        return Err(Error::InvalidData);
+                        return Err(Error::invalid_data("vp9", "truncated VP9 tile size header"));
                     }
-                    let sz =
-                        u32::from_be_bytes(tile_data[read_pos..read_pos + 4].try_into().unwrap())
-                            as usize;
+                    let sz = u32::from_be_bytes([
+                        tile_data[read_pos],
+                        tile_data[read_pos + 1],
+                        tile_data[read_pos + 2],
+                        tile_data[read_pos + 3],
+                    ]) as usize;
                     read_pos += 4;
                     sz
                 };
+                if read_pos + tile_size > tile_data.len() {
+                    return Err(Error::invalid_data("vp9", "truncated VP9 tile payload"));
+                }
                 tile_offsets.push((read_pos, tile_size));
                 read_pos += tile_size;
             }
         }
 
-        // Decode all tiles and collect decoded blocks + symbol counts.
-        // When tile_cols > 1, tile columns within each tile row are decoded
-        // in parallel using std::thread::scope. Each tile column writes to
-        // a disjoint column range of AboveContext, so no data races.
         let mut all_blocks = Vec::new();
         let mut merged_counts = CountContext::default();
 
@@ -243,87 +339,37 @@ impl Vp9Decoder {
             let tr_start = tile_sb_offset(tile_row, header.tile_rows_log2, sb_rows);
             let tr_end = tile_sb_offset(tile_row + 1, header.tile_rows_log2, sb_rows).min(sb_rows);
 
-            if tile_cols <= 1 {
-                // Fast path: single tile column — sequential, zero overhead.
-                for tile_col in 0..tile_cols {
-                    let (blocks, counts) = decode_tile_column(
-                        tile_data,
-                        &tile_offsets,
-                        &header,
-                        &mut above,
-                        tile_row,
-                        tile_col,
-                        tile_cols,
-                        tr_start,
-                        tr_end,
-                        sb_cols,
-                        &mut cur_mv_grid,
-                        self.ref_store.prev_frame_mvs.as_deref(),
-                        self.ref_store.prev_cols_4x4,
-                    )?;
-                    all_blocks.extend(blocks);
-                    merged_counts.merge(&counts);
-                }
-            } else {
-                // Parallel tile columns via std::thread::scope.
-                // Use raw pointers to avoid creating multiple &mut references
-                // (UB under Rust aliasing rules even for disjoint access).
-                let sync_above = SyncAbove(&mut above as *mut AboveContext);
-                let sync_mv_grid = SyncMvGrid(&mut cur_mv_grid[..] as *mut [MvRefPair]);
-                let prev_mvs = self.ref_store.prev_frame_mvs.as_deref();
-                let prev_c4 = self.ref_store.prev_cols_4x4;
-
-                // Pre-validate tile data ranges before spawning threads.
-                for tile_col in 0..tile_cols {
-                    let tile_idx = tile_row * tile_cols + tile_col;
-                    let (tile_byte_start, tile_byte_len) = tile_offsets[tile_idx];
-                    if tile_byte_start + tile_byte_len > tile_data.len() {
-                        return Err(Error::InvalidData);
-                    }
-                }
-
-                let results: Vec<Result<(Vec<BlockInfo>, CountContext)>> =
-                    std::thread::scope(|s| {
-                        let mut handles = Vec::with_capacity(tile_cols);
-
-                        for tile_col in 0..tile_cols {
-                            let above_ref = &sync_above;
-                            let mv_ref = &sync_mv_grid;
-                            let header_ref = &header;
-                            let td = tile_data;
-                            let offsets = &tile_offsets;
-
-                            handles.push(s.spawn(move || {
-                                // SAFETY: Each tile column writes to disjoint column
-                                // ranges of AboveContext and MV grid.  Raw pointers
-                                // avoid the UB of multiple &mut references.
-                                let above = unsafe { &mut *above_ref.0 };
-                                let mv_grid = unsafe { &mut *mv_ref.0 };
-                                decode_tile_column(
-                                    td, offsets, header_ref, above, tile_row, tile_col, tile_cols,
-                                    tr_start, tr_end, sb_cols, mv_grid, prev_mvs, prev_c4,
-                                )
-                            }));
-                        }
-
-                        handles
-                            .into_iter()
-                            .map(|h| h.join().unwrap_or(Err(Error::InvalidData)))
-                            .collect()
-                    });
-
-                for result in results {
-                    let (blocks, counts) = result?;
-                    all_blocks.extend(blocks);
-                    merged_counts.merge(&counts);
-                }
+            for tile_col in 0..tile_cols {
+                let (blocks, counts) = decode_tile_column(
+                    tile_data,
+                    &tile_offsets,
+                    &header,
+                    &mut above,
+                    tile_row,
+                    tile_col,
+                    tile_cols,
+                    tr_start,
+                    tr_end,
+                    sb_cols,
+                    &mut cur_mv_grid,
+                    self.ref_store.prev_frame_mvs.as_deref(),
+                    self.ref_store.prev_cols_4x4,
+                )?;
+                all_blocks.extend(blocks);
+                merged_counts.merge(&counts);
             }
         }
 
         // --- 4. Reconstruct each decoded block ---
         for block in &all_blocks {
             if block.is_inter {
-                reconstruct_inter_block(&mut fb, block, &header, &self.ref_store.slots)?;
+                reconstruct_inter_block(
+                    &mut fb,
+                    block,
+                    &header,
+                    &self.ref_store.slots,
+                    &mut self.mc_scratch,
+                )?;
             } else {
                 reconstruct_intra_block(&mut fb, block, &header, block.tile_col_start)?;
             }
@@ -333,16 +379,11 @@ impl Vp9Decoder {
         loop_filter_frame(&mut fb, &all_blocks, &header);
 
         // --- 6. Probability context adaptation ---
-        // FFmpeg vp9.c:1726-1743: only update prob_ctx when refreshctx is set.
         let fctx = header.frame_ctx_id as usize;
         if header.refresh_ctx && header.parallel_mode {
-            // Parallel mode: store compressed-header probs without adaptation.
             self.prob_ctx[fctx] = header.prob.clone();
             self.coef_ctx[fctx] = header.coef;
         } else if header.refresh_ctx && !header.parallel_mode {
-            // Sequential mode: adapt probabilities using symbol counts.
-            // adapt_probs modifies prob_ctx[fctx] in-place (starting from its
-            // current value, NOT from header.prob), matching FFmpeg's behavior.
             let comp_pred_mode = CompPredMode::try_from(header.comp_pred_mode).unwrap_or_default();
             adapt_probs(
                 &mut self.prob_ctx[fctx],
@@ -355,9 +396,6 @@ impl Vp9Decoder {
                 header.tx_mode == crate::header::TxMode::TxModeSelect,
                 comp_pred_mode,
             );
-            // FFmpeg vp9prob.c:68-73: on keyframe/intra-only, adapt_probs
-            // returns early but first copies skip/tx probs from the decoded
-            // frame's header back into prob_ctx.
             if is_kf || header.intra_only {
                 self.prob_ctx[fctx].skip = header.prob.skip;
                 self.prob_ctx[fctx].tx32p = header.prob.tx32p;
@@ -365,111 +403,153 @@ impl Vp9Decoder {
                 self.prob_ctx[fctx].tx8p = header.prob.tx8p;
             }
         }
-        // If !refresh_ctx: prob_ctx stays unchanged (matches FFmpeg line 1741).
         self.last_keyframe = header.frame_type == FrameType::KeyFrame;
 
-        // --- 7. Reference frame management ---
-        let ref_frame = Arc::new(RefFrame {
-            fb: FrameBuffer {
-                y: fb.y.clone(),
-                u: fb.u.clone(),
-                v: fb.v.clone(),
-                y_stride: fb.y_stride,
-                uv_stride: fb.uv_stride,
+        // --- 7. Output frame (if show_frame is set) & update reference slots ---
+        if header.show_frame {
+            let picture_type = if is_kf {
+                PictureType::I
+            } else {
+                PictureType::P
+            };
+            let is_key = header.frame_type == FrameType::KeyFrame;
+            let frame = self.build_video_frame(
+                &fb,
                 width,
                 height,
-            },
+                layout,
+                color,
+                picture_type,
+                is_key,
+                pkt,
+            )?;
+            self.output_queue.push_back(MediaUnit::Video(frame));
+        }
+
+        let ref_frame = Arc::new(RefFrame {
+            fb,
             mv_grid: cur_mv_grid.clone(),
             width,
             height,
             cols_4x4,
             rows_4x4,
+            layout,
+            color,
+            bit_depth: header.bit_depth,
+            subsampling_x: header.subsampling_x,
+            subsampling_y: header.subsampling_y,
         });
         self.ref_store.refresh(header.refresh_ref_mask, ref_frame);
         self.ref_store.rotate_mvpair(cur_mv_grid, cols_4x4);
 
-        // Track frame state for use_last_frame_mvs in next frame.
         self.last_show_frame = header.show_frame;
         self.last_width = width;
         self.last_height = height;
-
-        // --- 7. Build output Frame (only if show_frame is set) ---
-        if header.show_frame {
-            let y_buf = Buffer::from_slice(&fb.y);
-            let u_buf = Buffer::from_slice(&fb.u);
-            let v_buf = Buffer::from_slice(&fb.v);
-            let y_plane = FramePlane {
-                buffer: y_buf,
-                offset: 0,
-                linesize: fb.y_stride,
-            };
-            let u_plane = FramePlane {
-                buffer: u_buf,
-                offset: 0,
-                linesize: fb.uv_stride,
-            };
-            let v_plane = FramePlane {
-                buffer: v_buf,
-                offset: 0,
-                linesize: fb.uv_stride,
-            };
-
-            let mut frame = Frame::new_video(width, height, PixelFormat::Yuv420p);
-            frame.pts = pts;
-            if let FrameData::Video(ref mut video) = frame.data {
-                video.planes = vec![y_plane, u_plane, v_plane];
-                video.picture_type = if is_kf {
-                    PictureType::I
-                } else {
-                    PictureType::P
-                };
-            }
-            // Only actual keyframes are KEY — intra_only frames are not
-            // keyframes in VP9's reference model.
-            if header.frame_type == FrameType::KeyFrame {
-                frame.flags |= FrameFlags::KEY;
-            }
-
-            self.output_queue.push_back(frame);
-            self.frame_count += 1;
-        }
 
         Ok(())
     }
 }
 
+/// Internal newtype to keep `Vp9Decoder::open` signature tidy.
+#[doc(hidden)]
+pub struct TrackDescriptorWrapper<'a>(pub &'a wedeo_core::TrackDescriptor);
+
 // ---------------------------------------------------------------------------
-// Parallel tile column helpers
+// Colorimetry & PixelLayout helpers
 // ---------------------------------------------------------------------------
 
-/// Raw pointer wrapper for `AboveContext` that implements `Send + Sync`.
-///
-/// SAFETY: VP9 tile columns write to disjoint column ranges of AboveContext.
-/// Each tile column only accesses positions in [tile_col_start_4x4, tile_col_end_4x4).
-/// We use raw pointers to avoid creating multiple `&mut` references (which
-/// would be UB under Rust's aliasing rules even for disjoint access).
-struct SyncAbove(*mut AboveContext);
+fn derive_pixel_layout(
+    bit_depth: u8,
+    cs: ColorSpace,
+    ss_h: bool,
+    ss_v: bool,
+    profile: u8,
+) -> Result<PixelLayout> {
+    if bit_depth != 8 {
+        return Err(Error::unsupported(
+            "vp9",
+            format!("VP9 {bit_depth}-bit decoding (profile {profile}) is not supported yet"),
+        ));
+    }
+    if cs == ColorSpace::Rgb {
+        return Ok(PixelLayout::GBRP);
+    }
+    match (ss_h, ss_v) {
+        (true, true) => Ok(PixelLayout::YUV420P),
+        (true, false) => Ok(PixelLayout::YUV422P),
+        (false, false) => Ok(PixelLayout::YUV444P),
+        (false, true) => Err(Error::unsupported(
+            "vp9",
+            "VP9 4:4:0 subsampling is not supported by PixelLayout",
+        )),
+    }
+}
 
-// SAFETY: Disjoint column ranges — see SyncAbove doc comment.
-unsafe impl Send for SyncAbove {}
-unsafe impl Sync for SyncAbove {}
+fn derive_color_desc(
+    cs: ColorSpace,
+    range: header::ColorRange,
+    bit_depth: u8,
+    fallback: ColorDesc,
+) -> ColorDesc {
+    let mut color = ColorDesc::UNSPECIFIED;
+    match cs {
+        ColorSpace::Unknown | ColorSpace::Reserved => {
+            color.matrix = fallback.matrix;
+            color.primaries = fallback.primaries;
+            color.transfer = fallback.transfer;
+        }
+        ColorSpace::Bt601 => {
+            color.matrix = MatrixCoefficients::Bt470bg;
+            color.primaries = ColorPrimaries::Bt470bg;
+            color.transfer = TransferCharacteristic::Smpte170m;
+        }
+        ColorSpace::Bt709 => {
+            color.matrix = MatrixCoefficients::Bt709;
+            color.primaries = ColorPrimaries::Bt709;
+            color.transfer = TransferCharacteristic::Bt709;
+        }
+        ColorSpace::Smpte170 => {
+            color.matrix = MatrixCoefficients::Smpte170m;
+            color.primaries = ColorPrimaries::Smpte170m;
+            color.transfer = TransferCharacteristic::Smpte170m;
+        }
+        ColorSpace::Smpte240 => {
+            color.matrix = MatrixCoefficients::Smpte240m;
+            color.primaries = ColorPrimaries::Smpte240m;
+            color.transfer = TransferCharacteristic::Smpte240m;
+        }
+        ColorSpace::Bt2020Ncl => {
+            color.matrix = MatrixCoefficients::Bt2020Ncl;
+            color.primaries = ColorPrimaries::Bt2020;
+            color.transfer = if bit_depth == 12 {
+                TransferCharacteristic::Bt2020_12
+            } else {
+                TransferCharacteristic::Bt2020_10
+            };
+        }
+        ColorSpace::Rgb => {
+            color.matrix = MatrixCoefficients::Identity;
+            color.primaries = ColorPrimaries::Bt709;
+            color.transfer = TransferCharacteristic::Srgb;
+        }
+    }
+    color.range = match range {
+        header::ColorRange::Full => ColorRange::Full,
+        header::ColorRange::Limited => ColorRange::Limited,
+    };
+    color.chroma_location = fallback.chroma_location;
+    color
+}
 
-/// Raw pointer wrapper for `[MvRefPair]` that implements `Send + Sync`.
-///
-/// SAFETY: Each tile column writes to disjoint 4×4 column ranges of the MV grid.
-struct SyncMvGrid(*mut [MvRefPair]);
+// ---------------------------------------------------------------------------
+// Tile column decoder
+// ---------------------------------------------------------------------------
 
-// SAFETY: Disjoint column ranges.
-unsafe impl Send for SyncMvGrid {}
-unsafe impl Sync for SyncMvGrid {}
-
-/// Decode all superblocks in one tile column for a given tile row.
-/// Returns the decoded blocks.
 #[allow(clippy::too_many_arguments)]
 fn decode_tile_column(
     tile_data: &[u8],
     tile_offsets: &[(usize, usize)],
-    header: &crate::header::FrameHeader,
+    header: &header::FrameHeader,
     above: &mut AboveContext,
     tile_row: usize,
     tile_col: usize,
@@ -489,14 +569,14 @@ fn decode_tile_column(
     let (tile_byte_start, tile_byte_len) = tile_offsets[tile_idx];
     let tile_byte_end = tile_byte_start + tile_byte_len;
     if tile_byte_end > tile_data.len() {
-        return Err(Error::InvalidData);
+        return Err(crate::invalid_data());
     }
     let tile_bytes = &tile_data[tile_byte_start..tile_byte_end];
 
-    let mut bd = BoolDecoder::new(tile_bytes).ok_or(Error::InvalidData)?;
+    let mut bd = BoolDecoder::new(tile_bytes).ok_or_else(crate::invalid_data)?;
     // Marker bit — must be 0 for valid streams.
     if bd.get_prob(128) {
-        return Err(Error::InvalidData);
+        return Err(crate::invalid_data());
     }
 
     let mut left = LeftContext::new();
@@ -512,7 +592,7 @@ fn decode_tile_column(
     );
 
     for sb_row in tr_start..tr_end {
-        let is_kf = header.frame_type == crate::header::FrameType::KeyFrame || header.intra_only;
+        let is_kf = header.frame_type == FrameType::KeyFrame || header.intra_only;
         tile_ctx.left.reset(is_kf);
         for sb_col in tile_col_start_sb..tile_col_end_sb {
             let row = sb_row * 16;
@@ -530,60 +610,8 @@ fn decode_tile_column(
 // Tile layout helpers  (matches set_tile_offset in vp9.c)
 // ---------------------------------------------------------------------------
 
-/// Compute the start SB index for tile number `tile_num` with `log2_tiles`
-/// columns/rows log2 and `n_sbs` total superblocks.
-///
-/// Matches FFmpeg's `set_tile_offset`: floor division via `>> log2_n`.
 fn tile_sb_offset(tile_num: usize, log2_tiles: u8, n_sbs: usize) -> usize {
     ((tile_num * n_sbs) >> (log2_tiles as usize)).min(n_sbs)
-}
-
-// ---------------------------------------------------------------------------
-// Superframe parsing  (VP9 Annex B)
-// ---------------------------------------------------------------------------
-
-/// Parse a VP9 superframe index and return sub-frame slices.
-///
-/// If the packet is not a superframe, returns a single-element vec
-/// containing the entire packet.
-fn parse_superframe(data: &[u8]) -> Vec<&[u8]> {
-    let len = data.len();
-    if len < 1 {
-        return vec![data];
-    }
-    let marker = data[len - 1];
-    // Superframe marker: top 3 bits = 0b110.
-    if marker & 0xE0 != 0xC0 {
-        return vec![data];
-    }
-    let num_frames = ((marker >> 3) & 0x03) as usize + 1;
-    let mag = (marker & 0x03) as usize + 1; // bytes per size field
-    let idx_sz = 2 + num_frames * mag; // marker byte + sizes + marker byte
-    if idx_sz > len {
-        return vec![data];
-    }
-    // Verify leading marker matches trailing marker.
-    if data[len - idx_sz] != marker {
-        return vec![data];
-    }
-    // Parse per-frame sizes.
-    let mut frames = Vec::with_capacity(num_frames);
-    let mut pos = len - idx_sz + 1; // skip leading marker byte
-    let mut data_pos = 0usize;
-    for _ in 0..num_frames {
-        let mut sz = 0usize;
-        for j in 0..mag {
-            sz |= (data[pos] as usize) << (j * 8);
-            pos += 1;
-        }
-        if data_pos + sz > len - idx_sz {
-            // Malformed — fall back to treating as single frame.
-            return vec![data];
-        }
-        frames.push(&data[data_pos..data_pos + sz]);
-        data_pos += sz;
-    }
-    frames
 }
 
 // ---------------------------------------------------------------------------
@@ -591,40 +619,36 @@ fn parse_superframe(data: &[u8]) -> Vec<&[u8]> {
 // ---------------------------------------------------------------------------
 
 impl Decoder for Vp9Decoder {
-    fn send_packet(&mut self, packet: Option<&Packet>) -> Result<()> {
-        match packet {
+    fn send_packet(&mut self, pkt: Option<&Packet>) -> Result<SendStatus> {
+        match pkt {
             None => {
-                // End-of-stream: switch to draining mode.
                 self.draining = true;
-                Ok(())
+                Ok(SendStatus::Accepted)
             }
             Some(pkt) => {
-                let data = pkt.data.data();
-                let pts = pkt.pts;
-                // Parse VP9 superframe index to split compound packets.
-                let sub_frames = parse_superframe(data);
-                for sub in &sub_frames {
-                    match self.decode_frame(sub, pts) {
-                        Ok(()) => {}
-                        Err(Error::PatchwelcomeNotImplemented) => {
-                            debug!("VP9: skipping unsupported frame");
-                        }
-                        Err(e) => return Err(e),
-                    }
+                if self.draining {
+                    return Err(Error::invalid_argument(
+                        "vp9",
+                        "decoder is draining; call flush() before sending new packets",
+                    ));
                 }
-                Ok(())
+                let data = pkt.data.data();
+                let ranges = wedeo_syntax::vp9::parse_superframe(data)?;
+                for range in ranges {
+                    self.decode_frame(&data[range], pkt)?;
+                }
+                Ok(SendStatus::Accepted)
             }
         }
     }
 
-    fn receive_frame(&mut self) -> Result<Frame> {
-        if let Some(frame) = self.output_queue.pop_front() {
-            return Ok(frame);
-        }
-        if self.draining {
-            Err(Error::Eof)
+    fn receive(&mut self) -> Result<RecvStatus<MediaUnit>> {
+        if let Some(unit) = self.output_queue.pop_front() {
+            Ok(RecvStatus::Ready(unit))
+        } else if self.draining {
+            Ok(RecvStatus::Eof)
         } else {
-            Err(Error::Again)
+            Ok(RecvStatus::NeedMore)
         }
     }
 
@@ -633,18 +657,22 @@ impl Decoder for Vp9Decoder {
         self.draining = false;
         self.ref_store.clear();
         self.last_show_frame = false;
+        self.last_keyframe = false;
+        self.last_width = 0;
+        self.last_height = 0;
     }
 
-    fn descriptor(&self) -> &CodecDescriptor {
-        &self.codec_descriptor
+    fn health(&self) -> &StreamHealth {
+        &self.health
     }
 }
 
 // ---------------------------------------------------------------------------
-// Factory & registry
+// Factory registration
 // ---------------------------------------------------------------------------
 
-struct Vp9DecoderFactory;
+/// Factory for opening a pure-Rust [`Vp9Decoder`].
+pub struct Vp9DecoderFactory;
 
 impl DecoderFactory for Vp9DecoderFactory {
     fn descriptor(&self) -> &DecoderDescriptor {
@@ -653,16 +681,27 @@ impl DecoderFactory for Vp9DecoderFactory {
             name: "vp9",
             long_name: "VP9 Video",
             media_type: MediaType::Video,
-            capabilities: CodecCapabilities::DR1,
-            properties: CodecProperties::LOSSY,
-            priority: 100,
         };
         &DESC
     }
 
-    fn create(&self, params: CodecParameters) -> Result<Box<dyn Decoder>> {
-        Ok(Box::new(Vp9Decoder::new(params)?))
+    fn open(
+        &self,
+        track: &wedeo_core::TrackDescriptor,
+        ctx: CodecContext,
+    ) -> Result<Box<dyn Decoder>> {
+        if track.codec_id != CodecId::Vp9 {
+            return Err(Error::invalid_argument(
+                "vp9",
+                format!(
+                    "codec id mismatch: expected vp9, got {}",
+                    track.codec_id.name()
+                ),
+            ));
+        }
+        Ok(Box::new(Vp9Decoder::open(
+            &TrackDescriptorWrapper(track),
+            ctx,
+        )?))
     }
 }
-
-inventory::submit!(&Vp9DecoderFactory as &dyn DecoderFactory);

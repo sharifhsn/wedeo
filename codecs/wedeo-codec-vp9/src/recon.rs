@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use wedeo_core::error::Result;
+use wedeo_core::Result;
 
 use crate::block::BlockInfo;
 use crate::data::{BWH_TAB, INTRA_TXFM_TYPE};
@@ -24,7 +24,7 @@ use crate::types::{IntraMode, TxSize, TxType};
 // Frame buffer
 // ---------------------------------------------------------------------------
 
-/// YUV 4:2:0 frame buffer holding one decoded frame.
+/// Decoded 8-bit frame buffer holding Y/G, U/B, V/R planes.
 pub struct FrameBuffer {
     pub y: Vec<u8>,
     pub u: Vec<u8>,
@@ -36,18 +36,20 @@ pub struct FrameBuffer {
 }
 
 impl FrameBuffer {
-    /// Allocate a zeroed frame buffer for a frame of the given dimensions.
-    pub fn new(width: u32, height: u32) -> Self {
+    /// Allocate a zeroed frame buffer for the given dimensions and chroma subsampling.
+    pub fn new(width: u32, height: u32, ss_h: bool, ss_v: bool) -> Self {
         let w = width as usize;
         let h = height as usize;
         // Round strides up to a multiple of 64 for alignment headroom.
         let y_stride = (w + 63) & !63;
-        let uv_w = w.div_ceil(2);
+        let uv_w = if ss_h { w.div_ceil(2) } else { w };
+        let uv_h = if ss_v { h.div_ceil(2) } else { h };
         let uv_stride = (uv_w + 63) & !63;
-        // Pad rows to the next superblock boundary (64 luma, 32 chroma)
+        // Pad rows to the next superblock boundary (64 luma, 64 >> ss_v chroma)
         // so edge-SB intra prediction can write past the visible frame.
         let y_rows = (h + 63) & !63;
-        let uv_rows = (h.div_ceil(2) + 31) & !31;
+        let uv_sb_h = 64usize >> usize::from(ss_v);
+        let uv_rows = (uv_h + uv_sb_h - 1) & !(uv_sb_h - 1);
         Self {
             y: vec![0u8; y_stride * y_rows],
             u: vec![0u8; uv_stride * uv_rows],
@@ -489,11 +491,10 @@ pub fn reconstruct_intra_block(
 
     // Luma reconstruction.
     {
-        // Scratch buffers for neighbor pixels.  Above needs tx_px + 4 entries
-        // (one for top-left at index 0, tx_px for above, and up to 4 for
-        // top-right).  Left needs tx_px entries.
-        let mut above_scratch = vec![128u8; tx_px + 5];
-        let mut left_scratch = vec![129u8; tx_px];
+        // Stack scratch buffers for neighbor pixels: [0] is top-left, [1..65] gives
+        // 64 entries so `2 * size - 1` (max 63 for 32x32) in intra_pred never panics.
+        let mut above_scratch = [128u8; 65];
+        let mut left_scratch = [129u8; 32];
 
         let mut coef_idx = 0usize;
         let coef_per_tx = tx_px * tx_px;
@@ -587,7 +588,6 @@ pub fn reconstruct_intra_block(
                                 eob,
                             );
                         }
-
                     }
                 }
 
@@ -614,8 +614,8 @@ pub fn reconstruct_intra_block(
     let uv_frame_h = rows_8x8 * (8 >> ss_v);
     let uv_tile_col_px = (tile_col_start * 4) >> ss_h;
 
-    let mut uv_above_scratch = vec![128u8; uv_tx_px + 5];
-    let mut uv_left_scratch = vec![129u8; uv_tx_px];
+    let mut uv_above_scratch = [128u8; 65];
+    let mut uv_left_scratch = [129u8; 32];
     let uv_stride = fb.uv_stride;
     let uv_mode = block.uv_mode;
     let coef_per_uv_tx = uv_tx_px * uv_tx_px;
@@ -634,11 +634,7 @@ pub fn reconstruct_intra_block(
                     .saturating_mul(uv_stride)
                     .saturating_add(px)
                     .saturating_add(uv_tx_px);
-                let uv_buf_ok = |buf: &[u8]| {
-                    dst_end <= buf.len()
-                        && px + uv_tx_px <= uv_frame_w
-                        && py + uv_tx_px <= uv_frame_h
-                };
+                let uv_buf_ok = |buf: &[u8]| dst_end <= buf.len();
                 if !uv_buf_ok(&fb.u) || !uv_buf_ok(&fb.v) {
                     coef_idx += coef_per_uv_tx;
                     continue;
@@ -720,11 +716,7 @@ pub fn reconstruct_intra_block(
                     .saturating_mul(uv_stride)
                     .saturating_add(px)
                     .saturating_add(uv_tx_px);
-                let uv_buf_ok = |buf: &[u8]| {
-                    dst_end <= buf.len()
-                        && px + uv_tx_px <= uv_frame_w
-                        && py + uv_tx_px <= uv_frame_h
-                };
+                let uv_buf_ok = |buf: &[u8]| dst_end <= buf.len();
                 if !uv_buf_ok(&fb.u) || !uv_buf_ok(&fb.v) {
                     coef_idx += coef_per_uv_tx;
                     continue;
@@ -809,6 +801,7 @@ pub fn reconstruct_inter_block(
     block: &BlockInfo,
     header: &FrameHeader,
     ref_slots: &[Option<Arc<RefFrame>>; 8],
+    mc_scratch: &mut mc::McScratch,
 ) -> Result<()> {
     let bit_depth = header.bit_depth;
 
@@ -820,6 +813,7 @@ pub fn reconstruct_inter_block(
         &header.ref_idx,
         header.subsampling_x,
         header.subsampling_y,
+        mc_scratch,
     );
 
     // 2. If skip, no residual to add.
@@ -873,12 +867,10 @@ pub fn reconstruct_inter_block(
     }
 
     // Chroma residual (U and V).
-    let ss_h = if header.subsampling_x { 1usize } else { 0 };
-    let ss_v = if header.subsampling_y { 1usize } else { 0 };
-    let uv_w4 = BWH_TAB[1][bs][0] as usize;
-    let uv_h4 = BWH_TAB[1][bs][1] as usize;
-    let uv_end_x = uv_w4.min(end_x >> ss_h);
-    let uv_end_y = uv_h4.min(end_y >> ss_v);
+    let ss_h = usize::from(header.subsampling_x);
+    let ss_v = usize::from(header.subsampling_y);
+    let uv_end_x = end_x >> ss_h;
+    let uv_end_y = end_y >> ss_v;
     let uv_tx_step = 1usize << (block.uv_tx_size as usize);
     let uv_tx_px = uv_tx_step * 4;
     let coef_per_uv_tx = uv_tx_px * uv_tx_px;
