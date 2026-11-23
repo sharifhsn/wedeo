@@ -1,0 +1,17 @@
+[package]
+name = "wedeo-graph"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "VFR-native flat DOD media DAG, auto-adapter, timeline algebra, and custom filter framework"
+
+[lints]
+workspace = true
+
+[dependencies]
+wedeo-core.workspace = true
+wedeo-syntax.workspace = true
+wedeo-video-ops.workspace = true
+wedeo-audio-ops.workspace = true

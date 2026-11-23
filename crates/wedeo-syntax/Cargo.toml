@@ -1,0 +1,22 @@
+[package]
+name = "wedeo-syntax"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Bitstream syntax parsing, CBS, BSFs, and generic raw elementary stream framing"
+
+[lints]
+workspace = true
+
+[features]
+default = ["h264", "vp9", "av1", "aac", "hevc"]
+h264 = []
+vp9 = []
+av1 = []
+aac = []
+hevc = []
+
+[dependencies]
+wedeo-core.workspace = true

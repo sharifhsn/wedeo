@@ -1,0 +1,17 @@
+[package]
+name = "wedeo-gpu-wgpu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Optional wgpu WGSL compute backend for SwsOpList and zero-copy GPU texture interop"
+
+[lints]
+workspace = true
+
+[dependencies]
+wedeo-core.workspace = true
+wedeo-video-ops.workspace = true
+wgpu.workspace = true
+pollster.workspace = true

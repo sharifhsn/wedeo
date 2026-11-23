@@ -1,0 +1,15 @@
+[package]
+name = "wedeo-format-mkv"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Native Matroska and WebM EBML demuxer and muxer"
+
+[lints]
+workspace = true
+
+[dependencies]
+wedeo-core.workspace = true
+wedeo-syntax.workspace = true

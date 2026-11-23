@@ -1,0 +1,14 @@
+[package]
+name = "wedeo-audio-ops"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure-Rust AudioOpList audio resampling, channel rematrixing, dithering, and reframing"
+
+[lints]
+workspace = true
+
+[dependencies]
+wedeo-core.workspace = true

@@ -1,36 +1,20 @@
 [workspace]
 members = [
-    "crates/wedeo",
     "crates/wedeo-core",
-    "crates/wedeo-codec",
-    "crates/wedeo-format",
-    "crates/wedeo-filter",
-    "crates/wedeo-resample",
-    "crates/wedeo-scale",
-    "codecs/wedeo-codec-pcm",
-    "codecs/wedeo-codec-h264",
-    "formats/wedeo-format-wav",
-    "formats/wedeo-format-h264",
-    "formats/wedeo-format-mp4",
-    "codecs/wedeo-codec-vp9",
-    "formats/wedeo-format-ivf",
-    "formats/wedeo-format-webm",
-    "adapters/wedeo-symphonia",
-    "adapters/wedeo-rav1d",
-    "adapters/wedeo-rav1e",
-    "bins/wedeo-cli",
-    "tests/fate",
+    "crates/wedeo-syntax",
+    "crates/wedeo-video-ops",
+    "crates/wedeo-audio-ops",
+    "crates/wedeo-graph",
+    "crates/wedeo-gpu-wgpu",
 ]
 resolver = "3"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.89"
 license = "LGPL-2.1-or-later"
-description = "Rust rewrite of FFmpeg"
 repository = "https://github.com/sharifhsn/wedeo"
-readme = "README.md"
 keywords = ["video", "ffmpeg", "h264", "codec", "multimedia"]
 categories = ["multimedia::video", "multimedia::encoding"]
 
@@ -39,28 +23,13 @@ all = { level = "deny", priority = -1 }
 
 [workspace.dependencies]
 bitflags = "2"
-divan = "0.1.21"
-inventory = "0.3"
-tracing = { version = "0.1", features = ["attributes"] }
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-cc = "1"
-
+bytemuck = "1"
 pollster = "0.4"
 wgpu = "29"
-wedeo-core = { path = "crates/wedeo-core", version = "0.2.0" }
-wedeo-codec = { path = "crates/wedeo-codec", version = "0.2.0" }
-wedeo-format = { path = "crates/wedeo-format", version = "0.2.0" }
-wedeo-filter = { path = "crates/wedeo-filter", version = "0.2.0" }
-wedeo-resample = { path = "crates/wedeo-resample", version = "0.2.0" }
-wedeo-scale = { path = "crates/wedeo-scale", version = "0.2.0" }
-wedeo-codec-pcm = { path = "codecs/wedeo-codec-pcm", version = "0.2.0" }
-wedeo-format-wav = { path = "formats/wedeo-format-wav", version = "0.2.0" }
-wedeo-codec-h264 = { path = "codecs/wedeo-codec-h264", version = "0.2.0" }
-wedeo-format-h264 = { path = "formats/wedeo-format-h264", version = "0.2.0" }
-wedeo-format-mp4 = { path = "formats/wedeo-format-mp4", version = "0.2.0" }
-wedeo-symphonia = { path = "adapters/wedeo-symphonia", version = "0.2.0" }
-wedeo-rav1d = { path = "adapters/wedeo-rav1d", version = "0.2.0" }
-wedeo-rav1e = { path = "adapters/wedeo-rav1e", version = "0.2.0" }
-wedeo-codec-vp9 = { path = "codecs/wedeo-codec-vp9", version = "0.2.0" }
-wedeo-format-ivf = { path = "formats/wedeo-format-ivf", version = "0.2.0" }
-wedeo-format-webm = { path = "formats/wedeo-format-webm", version = "0.2.0" }
+
+wedeo-core = { path = "crates/wedeo-core", version = "0.3.0" }
+wedeo-syntax = { path = "crates/wedeo-syntax", version = "0.3.0" }
+wedeo-video-ops = { path = "crates/wedeo-video-ops", version = "0.3.0" }
+wedeo-audio-ops = { path = "crates/wedeo-audio-ops", version = "0.3.0" }
+wedeo-graph = { path = "crates/wedeo-graph", version = "0.3.0" }
+wedeo-gpu-wgpu = { path = "crates/wedeo-gpu-wgpu", version = "0.3.0" }
