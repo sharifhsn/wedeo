@@ -551,3 +551,25 @@ fn checkasm_public_dispatch_idct() {
         );
     }
 }
+
+#[test]
+fn dispatched_square_average_matches_scalar_with_padding_and_overlap() {
+    for size in [8usize, 16] {
+        for stride in [1, size, size + 3, 32] {
+            for seed in 0..128usize {
+                let len = (size - 1) * stride + size + 13;
+                let src: Vec<u8> = (0..len)
+                    .map(|i| (i.wrapping_mul(71).wrapping_add(seed * 37)) as u8)
+                    .collect();
+                let initial: Vec<u8> = (0..len)
+                    .map(|i| (i.wrapping_mul(113).wrapping_add(seed * 23)) as u8)
+                    .collect();
+                let mut expected = initial.clone();
+                let mut actual = initial;
+                scalar::avg_pixels_inplace(&mut expected, stride, &src, stride, size, size);
+                simd::avg_pixels_inplace(&mut actual, stride, &src, stride, size, size);
+                assert_eq!(actual, expected, "size={size} stride={stride} seed={seed}");
+            }
+        }
+    }
+}

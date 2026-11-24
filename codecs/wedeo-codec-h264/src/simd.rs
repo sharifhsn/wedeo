@@ -512,7 +512,7 @@ pub fn avg_pixels_with_backend(
 }
 
 /// In-place pixel averaging `dst = (dst + src + 1) >> 1` for width 4, 8, or 16.
-#[inline]
+#[inline(always)]
 pub fn avg_pixels_inplace(
     dst: &mut [u8],
     dst_stride: usize,
@@ -521,6 +521,14 @@ pub fn avg_pixels_inplace(
     block_w: usize,
     block_h: usize,
 ) {
+    #[cfg(target_arch = "x86_64")]
+    if block_h == block_w && dst_stride >= block_w && src_stride >= block_w {
+        match block_w {
+            8 => return x86_sse2::avg_square::<8>(dst, dst_stride, src, src_stride),
+            16 => return x86_sse2::avg_square::<16>(dst, dst_stride, src, src_stride),
+            _ => {}
+        }
+    }
     avg_pixels_inplace_with_backend(
         dst,
         dst_stride,
@@ -546,10 +554,31 @@ pub fn avg_pixels_inplace_with_backend(
     if block_h == 0 || block_w == 0 {
         return;
     }
-    assert!((block_h - 1) * dst_stride + block_w <= dst.len());
-    assert!((block_h - 1) * src_stride + block_w <= src.len());
+    assert!(
+        (block_h - 1)
+            .checked_mul(dst_stride)
+            .and_then(|n| n.checked_add(block_w))
+            .is_some_and(|n| n <= dst.len())
+    );
+    assert!(
+        (block_h - 1)
+            .checked_mul(src_stride)
+            .and_then(|n| n.checked_add(block_w))
+            .is_some_and(|n| n <= src.len())
+    );
     if dst_stride < block_w || src_stride < block_w {
         scalar::avg_pixels_inplace(dst, dst_stride, src, src_stride, block_w, block_h);
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if matches!(backend, SimdBackend::Sse2 | SimdBackend::Avx2)
+        && ((block_w == 8 && block_h == 8) || (block_w == 16 && block_h == 16))
+    {
+        if block_w == 8 {
+            x86_sse2::avg_square::<8>(dst, dst_stride, src, src_stride);
+        } else {
+            x86_sse2::avg_square::<16>(dst, dst_stride, src, src_stride);
+        }
         return;
     }
     match (backend, block_w) {
@@ -1773,6 +1802,46 @@ mod x86_sse2 {
                 }
             }
             _ => {}
+        }
+    }
+
+    // SSE2 is part of the x86-64 baseline, so this can be inlined into the
+    // checked dispatch path. Rows are independent and need no AVX lane packing.
+    #[inline(always)]
+    pub(super) fn avg_square<const W: usize>(dst: &mut [u8], ds: usize, src: &[u8], ss: usize) {
+        // Saturation is safe here: a Rust slice cannot reach usize::MAX bytes.
+        assert!((W - 1).saturating_mul(ds).saturating_add(W) <= dst.len());
+        assert!((W - 1).saturating_mul(ss).saturating_add(W) <= src.len());
+        let dp = dst.as_mut_ptr();
+        let sp = src.as_ptr();
+        if ds == W && ss == W {
+            // The active bytes form one contiguous 64- or 256-byte block.
+            let chunks = if W == 8 { 4 } else { 16 };
+            for i in 0..chunks {
+                unsafe {
+                    let d = dp.add(16 * i).cast();
+                    let s = sp.add(16 * i).cast();
+                    _mm_storeu_si128(d, _mm_avg_epu8(_mm_loadu_si128(d), _mm_loadu_si128(s)));
+                }
+            }
+        } else if W == 8 {
+            for j in 0..8 {
+                unsafe {
+                    let d = dp.add(j * ds);
+                    store_u64_xmm(
+                        d,
+                        _mm_avg_epu8(load_u64_xmm(d), load_u64_xmm(sp.add(j * ss))),
+                    );
+                }
+            }
+        } else {
+            for j in 0..16 {
+                unsafe {
+                    let d = dp.add(j * ds).cast();
+                    let s = sp.add(j * ss).cast();
+                    _mm_storeu_si128(d, _mm_avg_epu8(_mm_loadu_si128(d), _mm_loadu_si128(s)));
+                }
+            }
         }
     }
 
