@@ -802,91 +802,12 @@ impl PolyphaseResampler {
                 ),
             ));
         }
-        let n = self.available_out_samples(max_out);
-        if n == 0 {
-            return Ok(0);
-        }
-
-        let phase_count = self.phase_count as i64;
-        let filter_length = self.filter_length;
-        let filter_alloc = self.filter_alloc;
-        let src_incr = self.src_incr;
-        let dst_incr_div = self.dst_incr_div;
-        let dst_incr_mod = self.dst_incr_mod;
-        let use_linear = self.linear_interp && (self.frac != 0 || dst_incr_mod != 0);
-
-        let mut consumed = 0usize;
-        let mut final_index = self.index;
-        let mut final_frac = self.frac;
-
-        match &self.storage {
-            ResampleStorage::F32 {
-                filter_bank,
-                in_planes,
-            } => {
-                for ch in 0..self.channels {
-                    let src = &in_planes[ch][self.in_offset..self.in_offset + self.in_len];
-                    let dst = &mut out_planes[ch][..n];
-                    let (si, idx, fr) = resample_channel_f32(
-                        src,
-                        dst,
-                        filter_bank,
-                        filter_length,
-                        filter_alloc,
-                        phase_count,
-                        src_incr,
-                        dst_incr_div,
-                        dst_incr_mod,
-                        self.index,
-                        self.frac,
-                        use_linear,
-                    );
-                    if ch + 1 == self.channels {
-                        consumed = si;
-                        final_index = idx;
-                        final_frac = fr;
-                    }
-                }
-            }
-            ResampleStorage::F64 {
-                filter_bank,
-                in_planes,
-            } => {
-                for ch in 0..self.channels {
-                    let src = &in_planes[ch][self.in_offset..self.in_offset + self.in_len];
-                    let dst = &mut out_planes[ch][..n];
-                    let (si, idx, fr) = resample_channel_f64_to_f32(
-                        src,
-                        dst,
-                        filter_bank,
-                        filter_length,
-                        filter_alloc,
-                        phase_count,
-                        src_incr,
-                        dst_incr_div,
-                        dst_incr_mod,
-                        self.index,
-                        self.frac,
-                        use_linear,
-                    );
-                    if ch + 1 == self.channels {
-                        consumed = si;
-                        final_index = idx;
-                        final_frac = fr;
-                    }
-                }
-            }
-        }
-
-        self.index = final_index;
-        self.frac = final_frac;
-        self.in_offset += consumed;
-        self.in_len -= consumed;
-        if self.in_len == 0 && self.started {
-            self.in_offset = 0;
-        }
-        self.advance_compensation(n);
-        Ok(n)
+        Ok(self.drain_channels(
+            max_out,
+            out_planes.iter_mut().map(|plane| &mut **plane),
+            resample_channel_f32,
+            resample_channel_f64_to_f32,
+        ))
     }
 
     /// Drain up to `max_out` resampled planar `f64` samples. Returns the number of samples written.
@@ -901,91 +822,12 @@ impl PolyphaseResampler {
                 ),
             ));
         }
-        let n = self.available_out_samples(max_out);
-        if n == 0 {
-            return Ok(0);
-        }
-
-        let phase_count = self.phase_count as i64;
-        let filter_length = self.filter_length;
-        let filter_alloc = self.filter_alloc;
-        let src_incr = self.src_incr;
-        let dst_incr_div = self.dst_incr_div;
-        let dst_incr_mod = self.dst_incr_mod;
-        let use_linear = self.linear_interp && (self.frac != 0 || dst_incr_mod != 0);
-
-        let mut consumed = 0usize;
-        let mut final_index = self.index;
-        let mut final_frac = self.frac;
-
-        match &self.storage {
-            ResampleStorage::F64 {
-                filter_bank,
-                in_planes,
-            } => {
-                for ch in 0..self.channels {
-                    let src = &in_planes[ch][self.in_offset..self.in_offset + self.in_len];
-                    let dst = &mut out_planes[ch][..n];
-                    let (si, idx, fr) = resample_channel_f64(
-                        src,
-                        dst,
-                        filter_bank,
-                        filter_length,
-                        filter_alloc,
-                        phase_count,
-                        src_incr,
-                        dst_incr_div,
-                        dst_incr_mod,
-                        self.index,
-                        self.frac,
-                        use_linear,
-                    );
-                    if ch + 1 == self.channels {
-                        consumed = si;
-                        final_index = idx;
-                        final_frac = fr;
-                    }
-                }
-            }
-            ResampleStorage::F32 {
-                filter_bank,
-                in_planes,
-            } => {
-                for ch in 0..self.channels {
-                    let src = &in_planes[ch][self.in_offset..self.in_offset + self.in_len];
-                    let dst = &mut out_planes[ch][..n];
-                    let (si, idx, fr) = resample_channel_f32_to_f64(
-                        src,
-                        dst,
-                        filter_bank,
-                        filter_length,
-                        filter_alloc,
-                        phase_count,
-                        src_incr,
-                        dst_incr_div,
-                        dst_incr_mod,
-                        self.index,
-                        self.frac,
-                        use_linear,
-                    );
-                    if ch + 1 == self.channels {
-                        consumed = si;
-                        final_index = idx;
-                        final_frac = fr;
-                    }
-                }
-            }
-        }
-
-        self.index = final_index;
-        self.frac = final_frac;
-        self.in_offset += consumed;
-        self.in_len -= consumed;
-        if self.in_len == 0 && self.started {
-            self.in_offset = 0;
-        }
-        self.advance_compensation(n);
-        Ok(n)
+        Ok(self.drain_channels(
+            max_out,
+            out_planes.iter_mut().map(|plane| &mut **plane),
+            resample_channel_f32_to_f64,
+            resample_channel_f64,
+        ))
     }
 
     /// Drain up to `max_out` resampled samples into a flat planar `f32` slab (`ch * stride .. ch * stride + n`).
@@ -1001,91 +843,12 @@ impl PolyphaseResampler {
                 "slab dimensions too small",
             ));
         }
-        let n = self.available_out_samples(max_out);
-        if n == 0 {
-            return Ok(0);
-        }
-
-        let phase_count = self.phase_count as i64;
-        let filter_length = self.filter_length;
-        let filter_alloc = self.filter_alloc;
-        let src_incr = self.src_incr;
-        let dst_incr_div = self.dst_incr_div;
-        let dst_incr_mod = self.dst_incr_mod;
-        let use_linear = self.linear_interp && (self.frac != 0 || dst_incr_mod != 0);
-
-        let mut consumed = 0usize;
-        let mut final_index = self.index;
-        let mut final_frac = self.frac;
-
-        match &self.storage {
-            ResampleStorage::F32 {
-                filter_bank,
-                in_planes,
-            } => {
-                for (ch, in_plane) in in_planes.iter().enumerate() {
-                    let src = &in_plane[self.in_offset..self.in_offset + self.in_len];
-                    let dst = &mut slab[ch * stride..ch * stride + n];
-                    let (si, idx, fr) = resample_channel_f32(
-                        src,
-                        dst,
-                        filter_bank,
-                        filter_length,
-                        filter_alloc,
-                        phase_count,
-                        src_incr,
-                        dst_incr_div,
-                        dst_incr_mod,
-                        self.index,
-                        self.frac,
-                        use_linear,
-                    );
-                    if ch + 1 == self.channels {
-                        consumed = si;
-                        final_index = idx;
-                        final_frac = fr;
-                    }
-                }
-            }
-            ResampleStorage::F64 {
-                filter_bank,
-                in_planes,
-            } => {
-                for (ch, in_plane) in in_planes.iter().enumerate() {
-                    let src = &in_plane[self.in_offset..self.in_offset + self.in_len];
-                    let dst = &mut slab[ch * stride..ch * stride + n];
-                    let (si, idx, fr) = resample_channel_f64_to_f32(
-                        src,
-                        dst,
-                        filter_bank,
-                        filter_length,
-                        filter_alloc,
-                        phase_count,
-                        src_incr,
-                        dst_incr_div,
-                        dst_incr_mod,
-                        self.index,
-                        self.frac,
-                        use_linear,
-                    );
-                    if ch + 1 == self.channels {
-                        consumed = si;
-                        final_index = idx;
-                        final_frac = fr;
-                    }
-                }
-            }
-        }
-
-        self.index = final_index;
-        self.frac = final_frac;
-        self.in_offset += consumed;
-        self.in_len -= consumed;
-        if self.in_len == 0 && self.started {
-            self.in_offset = 0;
-        }
-        self.advance_compensation(n);
-        Ok(n)
+        Ok(self.drain_channels(
+            max_out,
+            slab.chunks_mut(stride.max(1)),
+            resample_channel_f32,
+            resample_channel_f64_to_f32,
+        ))
     }
 
     /// Drain up to `max_out` resampled samples into a flat planar `f64` slab (`ch * stride .. ch * stride + n`).
@@ -1101,109 +864,90 @@ impl PolyphaseResampler {
                 "slab dimensions too small",
             ));
         }
+        Ok(self.drain_channels(
+            max_out,
+            slab.chunks_mut(stride.max(1)),
+            resample_channel_f32_to_f64,
+            resample_channel_f64,
+        ))
+    }
+    fn drain_channels<'a, T: 'a>(
+        &mut self,
+        max_out: usize,
+        output: impl Iterator<Item = &'a mut [T]>,
+        from_f32: impl Fn(&[f32], &mut [T], &[f32], FilterStep) -> (usize, i64, i64),
+        from_f64: impl Fn(&[f64], &mut [T], &[f64], FilterStep) -> (usize, i64, i64),
+    ) -> usize {
         let n = self.available_out_samples(max_out);
         if n == 0 {
-            return Ok(0);
+            return 0;
         }
-
-        let phase_count = self.phase_count as i64;
-        let filter_length = self.filter_length;
-        let filter_alloc = self.filter_alloc;
-        let src_incr = self.src_incr;
-        let dst_incr_div = self.dst_incr_div;
-        let dst_incr_mod = self.dst_incr_mod;
-        let use_linear = self.linear_interp && (self.frac != 0 || dst_incr_mod != 0);
-
-        let mut consumed = 0usize;
-        let mut final_index = self.index;
-        let mut final_frac = self.frac;
-
-        match &self.storage {
-            ResampleStorage::F64 {
-                filter_bank,
-                in_planes,
-            } => {
-                for (ch, in_plane) in in_planes.iter().enumerate() {
-                    let src = &in_plane[self.in_offset..self.in_offset + self.in_len];
-                    let dst = &mut slab[ch * stride..ch * stride + n];
-                    let (si, idx, fr) = resample_channel_f64(
-                        src,
-                        dst,
-                        filter_bank,
-                        filter_length,
-                        filter_alloc,
-                        phase_count,
-                        src_incr,
-                        dst_incr_div,
-                        dst_incr_mod,
-                        self.index,
-                        self.frac,
-                        use_linear,
-                    );
-                    if ch + 1 == self.channels {
-                        consumed = si;
-                        final_index = idx;
-                        final_frac = fr;
-                    }
-                }
-            }
-            ResampleStorage::F32 {
-                filter_bank,
-                in_planes,
-            } => {
-                for (ch, in_plane) in in_planes.iter().enumerate() {
-                    let src = &in_plane[self.in_offset..self.in_offset + self.in_len];
-                    let dst = &mut slab[ch * stride..ch * stride + n];
-                    let (si, idx, fr) = resample_channel_f32_to_f64(
-                        src,
-                        dst,
-                        filter_bank,
-                        filter_length,
-                        filter_alloc,
-                        phase_count,
-                        src_incr,
-                        dst_incr_div,
-                        dst_incr_mod,
-                        self.index,
-                        self.frac,
-                        use_linear,
-                    );
-                    if ch + 1 == self.channels {
-                        consumed = si;
-                        final_index = idx;
-                        final_frac = fr;
-                    }
-                }
-            }
+        let step = FilterStep {
+            filter_length: self.filter_length,
+            filter_alloc: self.filter_alloc,
+            phase_count: self.phase_count as i64,
+            src_incr: self.src_incr,
+            dst_incr_div: self.dst_incr_div,
+            dst_incr_mod: self.dst_incr_mod,
+            index: self.index,
+            frac: self.frac,
+            use_linear: self.linear_interp && (self.frac != 0 || self.dst_incr_mod != 0),
+        };
+        let input = self.in_offset..self.in_offset + self.in_len;
+        let mut consumed = 0;
+        for (ch, plane) in output.take(self.channels).enumerate() {
+            let dst = &mut plane[..n];
+            (consumed, self.index, self.frac) = match &self.storage {
+                ResampleStorage::F32 {
+                    filter_bank,
+                    in_planes,
+                } => from_f32(&in_planes[ch][input.clone()], dst, filter_bank, step),
+                ResampleStorage::F64 {
+                    filter_bank,
+                    in_planes,
+                } => from_f64(&in_planes[ch][input.clone()], dst, filter_bank, step),
+            };
         }
-
-        self.index = final_index;
-        self.frac = final_frac;
         self.in_offset += consumed;
         self.in_len -= consumed;
         if self.in_len == 0 && self.started {
             self.in_offset = 0;
         }
         self.advance_compensation(n);
-        Ok(n)
+        n
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn resample_channel_f32(
-    src: &[f32],
-    dst: &mut [f32],
-    filter_bank: &[f32],
+#[derive(Clone, Copy)]
+struct FilterStep {
     filter_length: usize,
     filter_alloc: usize,
     phase_count: i64,
     src_incr: i64,
     dst_incr_div: i64,
     dst_incr_mod: i64,
-    mut index: i64,
-    mut frac: i64,
+    index: i64,
+    frac: i64,
     use_linear: bool,
+}
+
+fn resample_channel_f32(
+    src: &[f32],
+    dst: &mut [f32],
+    filter_bank: &[f32],
+    step: FilterStep,
 ) -> (usize, i64, i64) {
+    let FilterStep {
+        filter_length,
+        filter_alloc,
+        phase_count,
+        src_incr,
+        dst_incr_div,
+        dst_incr_mod,
+        mut index,
+        mut frac,
+        use_linear,
+    } = step;
     let mut sample_index = 0usize;
     while index >= phase_count {
         sample_index += 1;
@@ -1255,21 +999,23 @@ fn resample_channel_f32(
     (sample_index, index, frac)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn resample_channel_f64(
     src: &[f64],
     dst: &mut [f64],
     filter_bank: &[f64],
-    filter_length: usize,
-    filter_alloc: usize,
-    phase_count: i64,
-    src_incr: i64,
-    dst_incr_div: i64,
-    dst_incr_mod: i64,
-    mut index: i64,
-    mut frac: i64,
-    use_linear: bool,
+    step: FilterStep,
 ) -> (usize, i64, i64) {
+    let FilterStep {
+        filter_length,
+        filter_alloc,
+        phase_count,
+        src_incr,
+        dst_incr_div,
+        dst_incr_mod,
+        mut index,
+        mut frac,
+        use_linear,
+    } = step;
     let mut sample_index = 0usize;
     while index >= phase_count {
         sample_index += 1;
@@ -1321,21 +1067,23 @@ fn resample_channel_f64(
     (sample_index, index, frac)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn resample_channel_f64_to_f32(
     src: &[f64],
     dst: &mut [f32],
     filter_bank: &[f64],
-    filter_length: usize,
-    filter_alloc: usize,
-    phase_count: i64,
-    src_incr: i64,
-    dst_incr_div: i64,
-    dst_incr_mod: i64,
-    mut index: i64,
-    mut frac: i64,
-    use_linear: bool,
+    step: FilterStep,
 ) -> (usize, i64, i64) {
+    let FilterStep {
+        filter_length,
+        filter_alloc,
+        phase_count,
+        src_incr,
+        dst_incr_div,
+        dst_incr_mod,
+        mut index,
+        mut frac,
+        use_linear,
+    } = step;
     let mut sample_index = 0usize;
     while index >= phase_count {
         sample_index += 1;
@@ -1379,21 +1127,23 @@ fn resample_channel_f64_to_f32(
     (sample_index, index, frac)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn resample_channel_f32_to_f64(
     src: &[f32],
     dst: &mut [f64],
     filter_bank: &[f32],
-    filter_length: usize,
-    filter_alloc: usize,
-    phase_count: i64,
-    src_incr: i64,
-    dst_incr_div: i64,
-    dst_incr_mod: i64,
-    mut index: i64,
-    mut frac: i64,
-    use_linear: bool,
+    step: FilterStep,
 ) -> (usize, i64, i64) {
+    let FilterStep {
+        filter_length,
+        filter_alloc,
+        phase_count,
+        src_incr,
+        dst_incr_div,
+        dst_incr_mod,
+        mut index,
+        mut frac,
+        use_linear,
+    } = step;
     let mut sample_index = 0usize;
     while index >= phase_count {
         sample_index += 1;

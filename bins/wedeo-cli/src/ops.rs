@@ -1807,6 +1807,28 @@ fn build_transcode_graph(
     let copy_audio = req.audio_codec.as_deref() == Some("copy");
 
     let mut builder = GraphBuilder::new();
+    // Decoder and encoder ports hold CPU frames. The wgpu backend performs the
+    // upload, compute pass and readback at the conversion boundary.
+    let mut gpu_warning = None;
+    if req.prefer_gpu && !compile_only && !req.no_video && !copy_video {
+        #[cfg(feature = "gpu-wgpu")]
+        match wedeo::gpu_wgpu::WgpuContext::new_headless() {
+            Ok(ctx) => {
+                let info = ctx.device().adapter_info();
+                eprintln!(
+                    "wedeo video conversion adapter: {} ({:?}, {:?})",
+                    info.name, info.backend, info.device_type
+                );
+                builder.set_sws_backend(Box::new(ctx.sws_backend()));
+            }
+            Err(err) => gpu_warning = Some(format!("GPU unavailable; using CPU: {err}")),
+        }
+        #[cfg(not(feature = "gpu-wgpu"))]
+        {
+            gpu_warning =
+                Some("using CPU; build with --features gpu-wgpu for GPU video conversion".into());
+        }
+    }
     let n_demux = builder.add_demuxer(demuxer);
 
     let mut out_header = ContainerHeader::new(muxer_desc.name);
@@ -2190,11 +2212,12 @@ fn build_transcode_graph(
     let mut compile_opts = CompileOpts::default()
         .with_strict(req.strict)
         .with_preserve_all(req.preserve_all);
-    if req.prefer_gpu {
+    if compile_only && req.prefer_gpu {
         compile_opts = compile_opts.with_prefer_gpu(Some(wedeo::GpuDeviceId(0)));
     }
 
-    let (graph, plan) = builder.compile(compile_opts)?;
+    let (graph, mut plan) = builder.compile(compile_opts)?;
+    plan.gpu_warnings.extend(gpu_warning);
     Ok((graph, plan, out_fmt, track_count))
 }
 

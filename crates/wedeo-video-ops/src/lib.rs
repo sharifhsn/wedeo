@@ -84,6 +84,39 @@ mod tests {
     }
 
     #[test]
+    fn vertical_downscale_retains_the_first_rows_of_each_band() {
+        let pool = BufferPool::new();
+        let mut plane = BorderedPlane::new(&pool, 4, 96, BorderPadding::NONE);
+        for y in 0..96 {
+            plane
+                .row_mut(y)
+                .unwrap()
+                .copy_from_slice(&[y as u8, 0, 0, 255]);
+        }
+        let mut src = VideoFrame::from_planes(1, 96, PixelLayout::RGBA8, vec![plane]);
+        src.color = ColorDesc::SRGB;
+        let from = VideoContract::from_frame(&src);
+        let to = VideoContract::new(1, 32, PixelLayout::RGBA8).with_color(src.color);
+        let options = SwsOptions {
+            scaler: SwsScaler::Point,
+            dither: DitherMode::None,
+            ..Default::default()
+        };
+        let ops = SwsOpList::build(&from, &to, options).unwrap();
+        let result = CpuSwsBackend::new()
+            .compile(&ops)
+            .unwrap()
+            .execute(&src, &pool)
+            .unwrap();
+        for y in 0..32 {
+            assert_eq!(
+                result.planes().unwrap()[0].row(y).unwrap()[0],
+                (3 * y + 1) as u8
+            );
+        }
+    }
+
+    #[test]
     fn noop_zero_copy_passthrough_preserves_buffer_and_vfr() {
         let pool = BufferPool::new();
         let mut frame = make_solid_yuv420p(&pool, 64, 48, 120, 128, 128, ColorDesc::BT709_LIMITED);

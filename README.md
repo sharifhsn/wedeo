@@ -40,6 +40,20 @@ cargo run --offline -p wedeo-cli -- inspect input.mp4
 cargo run --offline -p wedeo-cli -- transcode input.mp4 output.mkv
 ```
 
+### Hardware video conversion
+
+Build the CLI with the optional wgpu backend and request it for scaling or color conversion:
+
+```bash
+cargo build --release -p wedeo-cli --features gpu-wgpu
+target/release/wedeo transcode -i input.ivf --video av1 --size 640x360 --gpu -o output.ivf
+```
+
+The conversion backend uploads decoded frames, runs the conversion shader, and reads the
+result back for the encoder. The CLI reports the adapter name and device type on stderr.
+A CPU adapter indicates software rendering. Decode and encode use their usual codecs.
+If no backend is available, the transcode report includes the CPU fallback reason.
+
 ### Audio-Only Library Build (Zero Video / Zero GPU)
 
 ```toml

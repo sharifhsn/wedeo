@@ -109,6 +109,29 @@ pub fn record_clipping(health: &mut StreamHealth, pts: Timestamp, clipped: u64) 
     }
 }
 
+trait UnpackSample: Sized {
+    fn from_f64(sample: f64) -> Self;
+    fn unpack_contiguous(src: &[u8], fmt: SampleFormat, dst: &mut [Self]);
+}
+
+impl UnpackSample for f32 {
+    fn from_f64(sample: f64) -> Self {
+        sample as f32
+    }
+    fn unpack_contiguous(src: &[u8], fmt: SampleFormat, dst: &mut [Self]) {
+        unpack_contiguous_f32(src, fmt, dst);
+    }
+}
+
+impl UnpackSample for f64 {
+    fn from_f64(sample: f64) -> Self {
+        sample
+    }
+    fn unpack_contiguous(src: &[u8], fmt: SampleFormat, dst: &mut [Self]) {
+        unpack_contiguous_f64(src, fmt, dst);
+    }
+}
+
 /// Unpack `count` samples starting at `sample_offset` from `planes` (in `fmt`) into planar `f32` slabs.
 pub fn unpack_to_f32(
     planes: &[Buffer],
@@ -118,66 +141,7 @@ pub fn unpack_to_f32(
     count: usize,
     dst: &mut [&mut [f32]],
 ) -> Result<()> {
-    if count == 0 {
-        return Ok(());
-    }
-    if dst.len() != channels {
-        return Err(Error::invalid_argument(
-            "audio_unpack",
-            "destination plane count mismatch",
-        ));
-    }
-
-    if fmt.is_planar() {
-        if planes.len() != channels {
-            return Err(Error::invalid_argument(
-                "audio_unpack",
-                "planar AudioBlock plane count mismatch",
-            ));
-        }
-        let bps = fmt.bytes_per_sample();
-        let start_byte = sample_offset * bps;
-        let end_byte = (sample_offset + count) * bps;
-        for (ch, plane) in planes.iter().enumerate() {
-            let bytes = plane.data();
-            if bytes.len() < end_byte {
-                return Err(Error::invalid_data(
-                    "audio_unpack",
-                    "planar audio buffer smaller than declared nb_samples",
-                ));
-            }
-            let src = &bytes[start_byte..end_byte];
-            let out = &mut dst[ch][..count];
-            unpack_contiguous_f32(src, fmt, out);
-        }
-    } else {
-        if planes.len() != 1 {
-            return Err(Error::invalid_argument(
-                "audio_unpack",
-                "interleaved AudioBlock must have exactly 1 plane",
-            ));
-        }
-        let bps = fmt.bytes_per_sample();
-        let stride = bps * channels;
-        let start_byte = sample_offset * stride;
-        let end_byte = (sample_offset + count) * stride;
-        let bytes = planes[0].data();
-        if bytes.len() < end_byte {
-            return Err(Error::invalid_data(
-                "audio_unpack",
-                "interleaved audio buffer smaller than declared nb_samples",
-            ));
-        }
-        let src = &bytes[start_byte..end_byte];
-        for i in 0..count {
-            let frame = &src[i * stride..(i + 1) * stride];
-            for (ch, plane_out) in dst.iter_mut().enumerate() {
-                let b = &frame[ch * bps..(ch + 1) * bps];
-                plane_out[i] = decode_sample_f64(b, fmt) as f32;
-            }
-        }
-    }
-    Ok(())
+    unpack_planes(planes, fmt, channels, sample_offset, count, dst)
 }
 
 /// Unpack `count` samples starting at `sample_offset` from `planes` (in `fmt`) into planar `f64` slabs.
@@ -189,6 +153,17 @@ pub fn unpack_to_f64(
     count: usize,
     dst: &mut [&mut [f64]],
 ) -> Result<()> {
+    unpack_planes(planes, fmt, channels, sample_offset, count, dst)
+}
+
+fn unpack_planes<T: UnpackSample>(
+    planes: &[Buffer],
+    fmt: SampleFormat,
+    channels: usize,
+    sample_offset: usize,
+    count: usize,
+    dst: &mut [&mut [T]],
+) -> Result<()> {
     if count == 0 {
         return Ok(());
     }
@@ -219,7 +194,7 @@ pub fn unpack_to_f64(
             }
             let src = &bytes[start_byte..end_byte];
             let out = &mut dst[ch][..count];
-            unpack_contiguous_f64(src, fmt, out);
+            T::unpack_contiguous(src, fmt, out);
         }
     } else {
         if planes.len() != 1 {
@@ -244,7 +219,7 @@ pub fn unpack_to_f64(
             let frame = &src[i * stride..(i + 1) * stride];
             for (ch, plane_out) in dst.iter_mut().enumerate() {
                 let b = &frame[ch * bps..(ch + 1) * bps];
-                plane_out[i] = decode_sample_f64(b, fmt);
+                plane_out[i] = T::from_f64(decode_sample_f64(b, fmt));
             }
         }
     }
@@ -439,40 +414,23 @@ pub fn pack_from_f32(
     dither: &mut DitherState,
     dst_planes: &mut [&mut [u8]],
 ) -> u64 {
-    if count == 0 {
-        return 0;
-    }
-    let scale = DitherState::scale_for_format(fmt);
-    let bps = fmt.bytes_per_sample();
-    let mut clipped = 0u64;
-
-    if fmt.is_planar() {
-        for (ch, plane_src) in src.iter().enumerate() {
-            let out = &mut dst_planes[ch][..count * bps];
-            for i in 0..count {
-                let v = plane_src[i] as f64 + dither.next_noise(ch, scale);
-                encode_sample_f64(v, fmt, &mut out[i * bps..(i + 1) * bps], &mut clipped);
-            }
-        }
-    } else {
-        let channels = src.len();
-        let stride = bps * channels;
-        let out = &mut dst_planes[0][..count * stride];
-        for i in 0..count {
-            let frame = &mut out[i * stride..(i + 1) * stride];
-            for (ch, plane_src) in src.iter().enumerate() {
-                let v = plane_src[i] as f64 + dither.next_noise(ch, scale);
-                encode_sample_f64(v, fmt, &mut frame[ch * bps..(ch + 1) * bps], &mut clipped);
-            }
-        }
-    }
-    clipped
+    pack_planes(src, count, fmt, dither, dst_planes)
 }
 
 /// Pack `count` planar `f64` samples into `dst_planes` (planar or packed bytes) with optional dither,
 /// returning the number of clipped samples.
 pub fn pack_from_f64(
     src: &[&[f64]],
+    count: usize,
+    fmt: SampleFormat,
+    dither: &mut DitherState,
+    dst_planes: &mut [&mut [u8]],
+) -> u64 {
+    pack_planes(src, count, fmt, dither, dst_planes)
+}
+
+fn pack_planes<T: Copy + Into<f64>>(
+    src: &[&[T]],
     count: usize,
     fmt: SampleFormat,
     dither: &mut DitherState,
@@ -489,7 +447,7 @@ pub fn pack_from_f64(
         for (ch, plane_src) in src.iter().enumerate() {
             let out = &mut dst_planes[ch][..count * bps];
             for i in 0..count {
-                let v = plane_src[i] + dither.next_noise(ch, scale);
+                let v = plane_src[i].into() + dither.next_noise(ch, scale);
                 encode_sample_f64(v, fmt, &mut out[i * bps..(i + 1) * bps], &mut clipped);
             }
         }
@@ -500,7 +458,7 @@ pub fn pack_from_f64(
         for i in 0..count {
             let frame = &mut out[i * stride..(i + 1) * stride];
             for (ch, plane_src) in src.iter().enumerate() {
-                let v = plane_src[i] + dither.next_noise(ch, scale);
+                let v = plane_src[i].into() + dither.next_noise(ch, scale);
                 encode_sample_f64(v, fmt, &mut frame[ch * bps..(ch + 1) * bps], &mut clipped);
             }
         }
@@ -519,64 +477,7 @@ pub fn unpack_slab_f32(
     slab: &mut [f32],
     stride: usize,
 ) -> Result<()> {
-    if count == 0 {
-        return Ok(());
-    }
-    if slab.len() < channels * stride || count > stride {
-        return Err(Error::invalid_argument("audio_unpack", "slab too small"));
-    }
-    if fmt.is_planar() {
-        if planes.len() != channels {
-            return Err(Error::invalid_argument(
-                "audio_unpack",
-                "planar AudioBlock plane count mismatch",
-            ));
-        }
-        let bps = fmt.bytes_per_sample();
-        let start_byte = sample_offset * bps;
-        let end_byte = (sample_offset + count) * bps;
-        for (ch, plane) in planes.iter().enumerate() {
-            let bytes = plane.data();
-            if bytes.len() < end_byte {
-                return Err(Error::invalid_data(
-                    "audio_unpack",
-                    "planar audio buffer smaller than declared nb_samples",
-                ));
-            }
-            unpack_contiguous_f32(
-                &bytes[start_byte..end_byte],
-                fmt,
-                &mut slab[ch * stride..ch * stride + count],
-            );
-        }
-    } else {
-        if planes.len() != 1 {
-            return Err(Error::invalid_argument(
-                "audio_unpack",
-                "interleaved AudioBlock must have exactly 1 plane",
-            ));
-        }
-        let bps = fmt.bytes_per_sample();
-        let frame_stride = bps * channels;
-        let start_byte = sample_offset * frame_stride;
-        let end_byte = (sample_offset + count) * frame_stride;
-        let bytes = planes[0].data();
-        if bytes.len() < end_byte {
-            return Err(Error::invalid_data(
-                "audio_unpack",
-                "interleaved audio buffer smaller than declared nb_samples",
-            ));
-        }
-        let src = &bytes[start_byte..end_byte];
-        for i in 0..count {
-            let frame = &src[i * frame_stride..(i + 1) * frame_stride];
-            for ch in 0..channels {
-                let b = &frame[ch * bps..(ch + 1) * bps];
-                slab[ch * stride + i] = decode_sample_f64(b, fmt) as f32;
-            }
-        }
-    }
-    Ok(())
+    unpack_slab(planes, fmt, channels, sample_offset, count, slab, stride)
 }
 
 /// Unpack `count` samples starting at `sample_offset` from `planes` into a flat planar `f64` slab
@@ -588,6 +489,18 @@ pub fn unpack_slab_f64(
     sample_offset: usize,
     count: usize,
     slab: &mut [f64],
+    stride: usize,
+) -> Result<()> {
+    unpack_slab(planes, fmt, channels, sample_offset, count, slab, stride)
+}
+
+fn unpack_slab<T: UnpackSample>(
+    planes: &[Buffer],
+    fmt: SampleFormat,
+    channels: usize,
+    sample_offset: usize,
+    count: usize,
+    slab: &mut [T],
     stride: usize,
 ) -> Result<()> {
     if count == 0 {
@@ -614,7 +527,7 @@ pub fn unpack_slab_f64(
                     "planar audio buffer smaller than declared nb_samples",
                 ));
             }
-            unpack_contiguous_f64(
+            T::unpack_contiguous(
                 &bytes[start_byte..end_byte],
                 fmt,
                 &mut slab[ch * stride..ch * stride + count],
@@ -643,7 +556,7 @@ pub fn unpack_slab_f64(
             let frame = &src[i * frame_stride..(i + 1) * frame_stride];
             for ch in 0..channels {
                 let b = &frame[ch * bps..(ch + 1) * bps];
-                slab[ch * stride + i] = decode_sample_f64(b, fmt);
+                slab[ch * stride + i] = T::from_f64(decode_sample_f64(b, fmt));
             }
         }
     }
@@ -662,44 +575,45 @@ pub fn pack_slab_f32_to_buffers(
     dst_buffers: &mut [Buffer],
     dst_sample_offset: usize,
 ) -> u64 {
-    if count == 0 {
-        return 0;
-    }
-    let scale = DitherState::scale_for_format(fmt);
-    let bps = fmt.bytes_per_sample();
-    let mut clipped = 0u64;
-
-    if fmt.is_planar() {
-        let byte_off = dst_sample_offset * bps;
-        for (ch, buf) in dst_buffers.iter_mut().enumerate().take(channels) {
-            if let Some(out_all) = buf.try_data_mut() {
-                let out = &mut out_all[byte_off..byte_off + count * bps];
-                let src = &slab[ch * stride..ch * stride + count];
-                for i in 0..count {
-                    let v = src[i] as f64 + dither.next_noise(ch, scale);
-                    encode_sample_f64(v, fmt, &mut out[i * bps..(i + 1) * bps], &mut clipped);
-                }
-            }
-        }
-    } else if let Some(out_all) = dst_buffers[0].try_data_mut() {
-        let frame_stride = bps * channels;
-        let byte_off = dst_sample_offset * frame_stride;
-        let out = &mut out_all[byte_off..byte_off + count * frame_stride];
-        for i in 0..count {
-            let frame = &mut out[i * frame_stride..(i + 1) * frame_stride];
-            for ch in 0..channels {
-                let v = slab[ch * stride + i] as f64 + dither.next_noise(ch, scale);
-                encode_sample_f64(v, fmt, &mut frame[ch * bps..(ch + 1) * bps], &mut clipped);
-            }
-        }
-    }
-    clipped
+    pack_slab_buffers(
+        slab,
+        stride,
+        channels,
+        count,
+        fmt,
+        dither,
+        dst_buffers,
+        dst_sample_offset,
+    )
 }
 
 /// Pack `count` samples from a flat planar `f64` slab into pooled `Buffer`s at `dst_sample_offset`.
 #[allow(clippy::too_many_arguments)]
 pub fn pack_slab_f64_to_buffers(
     slab: &[f64],
+    stride: usize,
+    channels: usize,
+    count: usize,
+    fmt: SampleFormat,
+    dither: &mut DitherState,
+    dst_buffers: &mut [Buffer],
+    dst_sample_offset: usize,
+) -> u64 {
+    pack_slab_buffers(
+        slab,
+        stride,
+        channels,
+        count,
+        fmt,
+        dither,
+        dst_buffers,
+        dst_sample_offset,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pack_slab_buffers<T: Copy + Into<f64>>(
+    slab: &[T],
     stride: usize,
     channels: usize,
     count: usize,
@@ -722,7 +636,7 @@ pub fn pack_slab_f64_to_buffers(
                 let out = &mut out_all[byte_off..byte_off + count * bps];
                 let src = &slab[ch * stride..ch * stride + count];
                 for i in 0..count {
-                    let v = src[i] + dither.next_noise(ch, scale);
+                    let v = src[i].into() + dither.next_noise(ch, scale);
                     encode_sample_f64(v, fmt, &mut out[i * bps..(i + 1) * bps], &mut clipped);
                 }
             }
@@ -734,7 +648,7 @@ pub fn pack_slab_f64_to_buffers(
         for i in 0..count {
             let frame = &mut out[i * frame_stride..(i + 1) * frame_stride];
             for ch in 0..channels {
-                let v = slab[ch * stride + i] + dither.next_noise(ch, scale);
+                let v = slab[ch * stride + i].into() + dither.next_noise(ch, scale);
                 encode_sample_f64(v, fmt, &mut frame[ch * bps..(ch + 1) * bps], &mut clipped);
             }
         }
@@ -752,39 +666,24 @@ pub fn pack_slab_f32_to_vecs(
     dither: &mut DitherState,
     dst_vecs: &mut [Vec<u8>],
 ) -> u64 {
-    if count == 0 {
-        return 0;
-    }
-    let scale = DitherState::scale_for_format(fmt);
-    let bps = fmt.bytes_per_sample();
-    let mut clipped = 0u64;
-
-    if fmt.is_planar() {
-        for (ch, vec_out) in dst_vecs.iter_mut().enumerate().take(channels) {
-            let out = &mut vec_out[..count * bps];
-            let src = &slab[ch * stride..ch * stride + count];
-            for i in 0..count {
-                let v = src[i] as f64 + dither.next_noise(ch, scale);
-                encode_sample_f64(v, fmt, &mut out[i * bps..(i + 1) * bps], &mut clipped);
-            }
-        }
-    } else {
-        let frame_stride = bps * channels;
-        let out = &mut dst_vecs[0][..count * frame_stride];
-        for i in 0..count {
-            let frame = &mut out[i * frame_stride..(i + 1) * frame_stride];
-            for ch in 0..channels {
-                let v = slab[ch * stride + i] as f64 + dither.next_noise(ch, scale);
-                encode_sample_f64(v, fmt, &mut frame[ch * bps..(ch + 1) * bps], &mut clipped);
-            }
-        }
-    }
-    clipped
+    pack_slab_vecs(slab, stride, channels, count, fmt, dither, dst_vecs)
 }
 
 /// Pack `count` samples from a flat planar `f64` slab into pre-allocated `Vec<u8>` planes.
 pub fn pack_slab_f64_to_vecs(
     slab: &[f64],
+    stride: usize,
+    channels: usize,
+    count: usize,
+    fmt: SampleFormat,
+    dither: &mut DitherState,
+    dst_vecs: &mut [Vec<u8>],
+) -> u64 {
+    pack_slab_vecs(slab, stride, channels, count, fmt, dither, dst_vecs)
+}
+
+fn pack_slab_vecs<T: Copy + Into<f64>>(
+    slab: &[T],
     stride: usize,
     channels: usize,
     count: usize,
@@ -804,7 +703,7 @@ pub fn pack_slab_f64_to_vecs(
             let out = &mut vec_out[..count * bps];
             let src = &slab[ch * stride..ch * stride + count];
             for i in 0..count {
-                let v = src[i] + dither.next_noise(ch, scale);
+                let v = src[i].into() + dither.next_noise(ch, scale);
                 encode_sample_f64(v, fmt, &mut out[i * bps..(i + 1) * bps], &mut clipped);
             }
         }
@@ -814,7 +713,7 @@ pub fn pack_slab_f64_to_vecs(
         for i in 0..count {
             let frame = &mut out[i * frame_stride..(i + 1) * frame_stride];
             for ch in 0..channels {
-                let v = slab[ch * stride + i] + dither.next_noise(ch, scale);
+                let v = slab[ch * stride + i].into() + dither.next_noise(ch, scale);
                 encode_sample_f64(v, fmt, &mut frame[ch * bps..(ch + 1) * bps], &mut clipped);
             }
         }

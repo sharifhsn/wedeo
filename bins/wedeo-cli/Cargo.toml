@@ -15,5 +15,8 @@ workspace = true
 name = "wedeo"
 path = "src/main.rs"
 
+[features]
+gpu-wgpu = ["wedeo/gpu-wgpu"]
+
 [dependencies]
 wedeo = { workspace = true, features = ["rav1d"] }

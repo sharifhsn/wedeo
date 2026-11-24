@@ -330,7 +330,14 @@ impl CpuCompiledSws {
         };
 
         let (v_ring, v_ring_rows, v_ring_tags) = if let Some(ref vk) = v_kernel {
-            let rows = (vk.taps + TILE_H).max(vk.taps * 2);
+            // A band of output rows can span many more than TILE_H input
+            // rows when shrinking. Every tap must survive until the band is written.
+            let rows = vk
+                .offsets
+                .chunks(TILE_H)
+                .map(|band| band[band.len() - 1] - band[0] + vk.taps)
+                .max()
+                .unwrap_or(0);
             (vec![[0.0; 4]; rows * dst_w], rows, vec![-1i64; rows])
         } else {
             (Vec::new(), 0, Vec::new())
@@ -794,7 +801,7 @@ impl CpuCompiledSws {
         let dst_w = self.ops.dst.width as usize;
         let dst_h = self.ops.dst.height as usize;
         let ow = self.oriented_w as usize;
-        let vk = self.v_kernel.as_ref().expect("v_kernel checked").clone();
+        let vk = self.v_kernel.as_ref().expect("v_kernel checked");
         self.v_ring_tags.fill(-1);
         let has_err = !self.err_band.is_empty();
         if has_err {
