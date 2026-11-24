@@ -822,31 +822,21 @@ impl VideoFrame {
         layout: PixelLayout,
         planes: Vec<BorderedPlane>,
     ) -> Self {
-        Self {
-            storage: VideoStorage::Cpu(planes),
-            width,
-            height,
-            layout,
-            color: ColorDesc::UNSPECIFIED,
-            crop: CropRect::ZERO,
-            sar: Rational::new(1, 1),
-            picture_type: PictureType::None,
-            flags: FrameFlags::empty(),
-            repeat_pict: 0,
-            pts: Timestamp::NONE,
-            pkt_dts: Timestamp::NONE,
-            duration: 0,
-            time_base: Rational::new(0, 1),
-            side_data: Vec::new(),
-        }
+        Self::with_storage(width, height, layout, VideoStorage::Cpu(planes))
     }
 
     pub fn from_gpu(surface: Arc<dyn GpuSurface>) -> Self {
-        let width = surface.width();
-        let height = surface.height();
-        let layout = surface.layout();
+        Self::with_storage(
+            surface.width(),
+            surface.height(),
+            surface.layout(),
+            VideoStorage::Gpu(surface),
+        )
+    }
+
+    fn with_storage(width: u32, height: u32, layout: PixelLayout, storage: VideoStorage) -> Self {
         Self {
-            storage: VideoStorage::Gpu(surface),
+            storage,
             width,
             height,
             layout,

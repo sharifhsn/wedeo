@@ -6,7 +6,7 @@ use std::sync::Arc;
 use wedeo_core::{
     AlphaMode, BorderPadding, BorderedPlane, BufferPool, ChromaLocation, ColorModel, CompOrder,
     CropRect, Endian, Error, MemoryDomain, PixelLayout, PlanePacking, PositionedPlane, Result,
-    SampleDepth, SideData, Subsampling, VideoFrame,
+    SampleDepth, Subsampling, VideoFrame,
 };
 
 use crate::color;
@@ -976,35 +976,8 @@ impl CompiledSws for CpuCompiledSws {
             self.write_layout,
             dst_planes,
         );
-        out.pts = src.pts;
-        out.pkt_dts = src.pkt_dts;
-        out.duration = src.duration;
-        out.time_base = src.time_base;
-        out.picture_type = src.picture_type;
-        out.flags = src.flags;
-        out.repeat_pict = src.repeat_pict;
-        out.sar = if self.display_tx.swaps_axes() && src.sar.num > 0 && src.sar.den > 0 {
-            wedeo_core::Rational::new(src.sar.den, src.sar.num)
-        } else {
-            src.sar
-        };
-        out.crop = CropRect::ZERO;
-        out.color = color::sanitize_output_color(self.write_layout, src.color, self.ops.dst.color);
-
-        let tone_mapped = self.ops.src.color.transfer.is_hdr()
-            && !out.color.transfer.is_hdr()
-            && self.ops.options.tone_map != crate::ops::ToneMapOp::None;
-        for sd in &src.side_data {
-            match sd {
-                SideData::DisplayMatrix(_) => {}
-                SideData::MasteringDisplay(_)
-                | SideData::ContentLightLevel { .. }
-                | SideData::Hdr10Plus(_)
-                    if tone_mapped => {}
-                other => out.side_data.push(other.clone()),
-            }
-        }
-
+        self.ops
+            .populate_output_metadata(src, &mut out, self.display_tx);
         Ok(out)
     }
 

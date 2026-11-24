@@ -3,12 +3,11 @@
 use std::sync::{Arc, Mutex};
 
 use wedeo_core::{
-    BorderPadding, BorderedPlane, BufferPool, CompOrder, CropRect, Endian, Error, MemoryDomain,
-    PixelLayout, PlanePacking, PositionedPlane, Rational, Result, SampleDepth, SideData,
-    VideoFrame,
+    BorderPadding, BorderedPlane, BufferPool, CompOrder, Endian, Error, MemoryDomain, PixelLayout,
+    PlanePacking, PositionedPlane, Result, SampleDepth, VideoFrame,
 };
 use wedeo_video_ops::{
-    CompiledSws, DisplayTransform, SwsBackend, SwsOp, SwsOpList, ToneMapOp, color, cpu, optimizer,
+    CompiledSws, DisplayTransform, SwsBackend, SwsOp, SwsOpList, cpu, optimizer,
 };
 
 use crate::context::WgpuContext;
@@ -127,38 +126,6 @@ impl WgpuCompiledSws {
         &self.uniforms
     }
 
-    fn populate_output_metadata(&self, src: &VideoFrame, out: &mut VideoFrame) {
-        out.pts = src.pts;
-        out.pkt_dts = src.pkt_dts;
-        out.duration = src.duration;
-        out.time_base = src.time_base;
-        out.picture_type = src.picture_type;
-        out.flags = src.flags;
-        out.repeat_pict = src.repeat_pict;
-        out.sar = if self.display_tx.swaps_axes() && src.sar.num > 0 && src.sar.den > 0 {
-            Rational::new(src.sar.den, src.sar.num)
-        } else {
-            src.sar
-        };
-        out.crop = CropRect::ZERO;
-        out.color = color::sanitize_output_color(self.write_layout, src.color, self.ops.dst.color);
-
-        let tone_mapped = self.ops.src.color.transfer.is_hdr()
-            && !out.color.transfer.is_hdr()
-            && self.ops.options.tone_map != ToneMapOp::None;
-        out.side_data.clear();
-        for sd in &src.side_data {
-            match sd {
-                SideData::DisplayMatrix(_) => {}
-                SideData::MasteringDisplay(_)
-                | SideData::ContentLightLevel { .. }
-                | SideData::Hdr10Plus(_)
-                    if tone_mapped => {}
-                other => out.side_data.push(other.clone()),
-            }
-        }
-    }
-
     fn execute_storage_texture(
         &self,
         src_views: &[wgpu::TextureView],
@@ -229,7 +196,8 @@ impl WgpuCompiledSws {
 
         let surface = self.ctx.wrap_texture(dst_texture, self.write_layout);
         let mut gpu_out = VideoFrame::from_gpu(surface);
-        self.populate_output_metadata(src_frame, &mut gpu_out);
+        self.ops
+            .populate_output_metadata(src_frame, &mut gpu_out, self.display_tx);
 
         if self.ops.dst.domain == MemoryDomain::Cpu {
             self.ctx.download_frame_pooled(&gpu_out, dst_pool)
@@ -361,7 +329,8 @@ impl WgpuCompiledSws {
         }
 
         let mut cpu_out = VideoFrame::from_planes(dst_w, dst_h, self.write_layout, cpu_planes);
-        self.populate_output_metadata(src_frame, &mut cpu_out);
+        self.ops
+            .populate_output_metadata(src_frame, &mut cpu_out, self.display_tx);
 
         if self.ops.dst.domain == MemoryDomain::Cpu {
             Ok(cpu_out)

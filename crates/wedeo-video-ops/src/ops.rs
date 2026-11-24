@@ -326,6 +326,45 @@ pub struct SwsOpList {
 }
 
 impl SwsOpList {
+    /// Propagate frame metadata after applying this conversion, accounting for
+    /// rotation, crop, tone mapping and the destination pixel layout.
+    pub fn populate_output_metadata(
+        &self,
+        src: &VideoFrame,
+        out: &mut VideoFrame,
+        transform: DisplayTransform,
+    ) {
+        out.pts = src.pts;
+        out.pkt_dts = src.pkt_dts;
+        out.duration = src.duration;
+        out.time_base = src.time_base;
+        out.picture_type = src.picture_type;
+        out.flags = src.flags;
+        out.repeat_pict = src.repeat_pict;
+        out.sar = if transform.swaps_axes() && src.sar.num > 0 && src.sar.den > 0 {
+            wedeo_core::Rational::new(src.sar.den, src.sar.num)
+        } else {
+            src.sar
+        };
+        out.crop = CropRect::ZERO;
+        out.color = color::sanitize_output_color(out.layout, src.color, self.dst.color);
+
+        let tone_mapped = self.src.color.transfer.is_hdr()
+            && !out.color.transfer.is_hdr()
+            && self.options.tone_map != ToneMapOp::None;
+        out.side_data.clear();
+        for sd in &src.side_data {
+            match sd {
+                SideData::DisplayMatrix(_) => {}
+                SideData::MasteringDisplay(_)
+                | SideData::ContentLightLevel { .. }
+                | SideData::Hdr10Plus(_)
+                    if tone_mapped => {}
+                other => out.side_data.push(other.clone()),
+            }
+        }
+    }
+
     pub fn new(src: VideoContract, dst: VideoContract, options: SwsOptions) -> Self {
         Self {
             ops: Vec::new(),
