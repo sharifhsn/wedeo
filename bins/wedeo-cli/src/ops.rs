@@ -49,6 +49,9 @@ pub fn open_demuxer_path(
     policy: ErrorPolicy,
 ) -> Result<Box<dyn Demuxer>> {
     let ext = Path::new(path).extension().and_then(|e| e.to_str());
+    if let Some(sub) = try_open_text_subtitle_demuxer(path, ext)? {
+        return Ok(sub);
+    }
     let mut file = FileSource::open(path)?;
     let mut head = Vec::with_capacity(PROBE_BYTES);
     let mut buf = [0u8; 4096];
@@ -70,6 +73,149 @@ pub fn open_demuxer_path(
     wedeo::core::ByteSource::seek(&mut file, SeekFrom::Start(0))
         .map_err(|e| Error::io("wedeo-cli/open", &e))?;
     factory.open(Box::new(file), policy)
+}
+
+/// Lightweight in-memory WebVTT / SubRip (`.vtt` / `.srt`) demuxer so
+/// `yt-dlp --write-sub --embed-subs` and `wedeo mux` embed real subtitle tracks in MKV/WebM.
+struct TextSubtitleDemuxer {
+    header: ContainerHeader,
+    packets: VecDeque<Packet>,
+    health: StreamHealth,
+}
+
+impl Demuxer for TextSubtitleDemuxer {
+    fn header(&self) -> &ContainerHeader {
+        &self.header
+    }
+    fn health(&self) -> &StreamHealth {
+        &self.health
+    }
+    fn read_packet(&mut self) -> Result<RecvStatus<Packet>> {
+        match self.packets.pop_front() {
+            Some(p) => Ok(RecvStatus::Ready(p)),
+            None => Ok(RecvStatus::Eof),
+        }
+    }
+    fn seek(&mut self, _target: wedeo::core::SeekTarget) -> Result<()> {
+        Ok(())
+    }
+}
+
+fn parse_sub_ts_ms(tok: &str) -> Option<i64> {
+    let clean = tok.trim().replace(',', ".");
+    let parts: Vec<&str> = clean.split(':').collect();
+    let (h, m, s_str) = match parts.as_slice() {
+        [m, s] => (0i64, m.parse::<i64>().ok()?, *s),
+        [h, m, s] => (h.parse::<i64>().ok()?, m.parse::<i64>().ok()?, *s),
+        _ => return None,
+    };
+    let (sec, ms) = match s_str.split_once('.') {
+        Some((s, frac)) => {
+            let mut frac_ms = frac.chars().take(3).collect::<String>();
+            while frac_ms.len() < 3 {
+                frac_ms.push('0');
+            }
+            (s.parse::<i64>().ok()?, frac_ms.parse::<i64>().ok()?)
+        }
+        None => (s_str.parse::<i64>().ok()?, 0),
+    };
+    Some(((h * 60 + m) * 60 + sec) * 1000 + ms)
+}
+
+fn try_open_text_subtitle_demuxer(
+    path: &str,
+    ext: Option<&str>,
+) -> Result<Option<Box<dyn Demuxer>>> {
+    let is_vtt = ext.is_some_and(|e| e.eq_ignore_ascii_case("vtt"));
+    let is_srt = ext.is_some_and(|e| e.eq_ignore_ascii_case("srt"));
+    if !is_vtt && !is_srt {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(path).map_err(|e| Error::io("wedeo-cli/subtitle", &e))?;
+    let tb = Rational::new(1, 1000);
+    let mut packets = VecDeque::new();
+    let lines: Vec<&str> = text.lines().collect();
+    let mut idx = 0usize;
+    let mut max_end = 0i64;
+
+    while idx < lines.len() {
+        let line = lines[idx].trim();
+        if let Some((lhs, rhs)) = line.split_once("-->") {
+            let start = parse_sub_ts_ms(lhs);
+            let end_tok = rhs.split_whitespace().next().unwrap_or("");
+            let end = parse_sub_ts_ms(end_tok);
+            idx += 1;
+            let mut body = Vec::new();
+            while idx < lines.len() && !lines[idx].trim().is_empty() {
+                body.push(lines[idx]);
+                idx += 1;
+            }
+            if let (Some(s), Some(e)) = (start, end)
+                && !body.is_empty()
+            {
+                let payload = body.join("\n");
+                let mut pkt = Packet::new(
+                    wedeo::core::Buffer::from_slice(payload.as_bytes()),
+                    TrackId(0),
+                    tb,
+                );
+                pkt.pts = Timestamp::new(s);
+                pkt.dts = Timestamp::new(s);
+                pkt.duration = (e - s).max(1);
+                pkt.flags = PacketFlags::KEY;
+                max_end = max_end.max(e);
+                packets.push_back(pkt);
+            }
+        } else {
+            idx += 1;
+        }
+    }
+
+    let (fmt_name, codec_id, sub_fmt) = if is_vtt {
+        (
+            "webvtt",
+            CodecId::SubWebvtt,
+            wedeo::core::SubtitleFormat::WebVtt,
+        )
+    } else {
+        ("srt", CodecId::SubSrt, wedeo::core::SubtitleFormat::Srt)
+    };
+    let mut header = ContainerHeader::new(fmt_name);
+    header.time_base = tb;
+    if max_end > 0 {
+        header.duration = Some(max_end);
+    }
+    let sp = wedeo::core::SubtitleStreamParams {
+        format: sub_fmt,
+        canvas_width: 0,
+        canvas_height: 0,
+        header_script: Vec::new(),
+    };
+    let mut tr = TrackDescriptor::new(TrackId(0), codec_id, tb, StreamParams::Subtitle(sp));
+    // Infer ISO-639 language hint from yt-dlp filename convention (`video.en.vtt` -> `eng`).
+    let stem = Path::new(path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    if let Some((_, lang)) = stem.rsplit_once('.')
+        && (2..=3).contains(&lang.len())
+        && lang.chars().all(|c| c.is_ascii_alphabetic())
+    {
+        tr.language = Some(match lang.to_ascii_lowercase().as_str() {
+            "en" => "eng".to_string(),
+            "es" => "spa".to_string(),
+            "fr" => "fra".to_string(),
+            "de" => "deu".to_string(),
+            "ja" => "jpn".to_string(),
+            other => other.to_string(),
+        });
+    }
+    header.tracks.push(tr);
+    Ok(Some(Box::new(TextSubtitleDemuxer {
+        header,
+        packets,
+        health: StreamHealth::new(),
+    })))
 }
 
 pub fn resolve_muxer_name(

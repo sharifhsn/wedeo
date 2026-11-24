@@ -934,7 +934,7 @@ pub fn codec_id_from_matroska(codec_str: &str, bit_depth: u32) -> CodecId {
         // Subtitles
         "S_TEXT/UTF8" | "S_TEXT/ASCII" => CodecId::SubSrt,
         "S_TEXT/ASS" | "S_TEXT/SSA" => CodecId::SubAss,
-        "S_TEXT/WEBVTT" => CodecId::SubWebvtt,
+        "S_TEXT/WEBVTT" | "D_WEBVTT/SUBTITLES" | "D_WEBVTT/CAPTIONS" => CodecId::SubWebvtt,
         "S_HDMV/PGS" => CodecId::SubPgs,
         "S_VOBSUB" => CodecId::SubDvd,
         "S_DVBSUB" => CodecId::SubDvb,
@@ -997,7 +997,7 @@ pub fn matroska_from_codec_id(codec_id: CodecId, webm_only: bool) -> Result<(&'s
         CodecId::PcmF64le | CodecId::PcmF64be => Ok(("A_PCM/FLOAT/IEEE", 64)),
         CodecId::SubSrt | CodecId::SubText | CodecId::SubMovText => Ok(("S_TEXT/UTF8", 0)),
         CodecId::SubAss => Ok(("S_TEXT/ASS", 0)),
-        CodecId::SubWebvtt => Ok(("S_TEXT/WEBVTT", 0)),
+        CodecId::SubWebvtt => Ok(("D_WEBVTT/SUBTITLES", 0)),
         CodecId::SubPgs => Ok(("S_HDMV/PGS", 0)),
         CodecId::SubDvd => Ok(("S_VOBSUB", 0)),
         CodecId::SubDvb => Ok(("S_DVBSUB", 0)),

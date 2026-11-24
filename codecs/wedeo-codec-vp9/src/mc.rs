@@ -550,9 +550,19 @@ pub fn inter_pred(
                 emu_buf,
             );
         }
-        // Average luma.
+        // Average luma across the full 8x8-aligned block extent (sub-8x8 blocks
+        // cover 8x8 luma pixels total, whereas bw/bh is a single sub-block).
+        let luma_avg_w = (BWH_TAB[1][bs][0] as usize) * 8;
+        let luma_avg_h = (BWH_TAB[1][bs][1] as usize) * 8;
         let dst_off = row_px * fb.y_stride + col_px;
-        avg_block(&mut fb.y[dst_off..], fb.y_stride, tmp_y, TMP_STRIDE, bw, bh);
+        avg_block(
+            &mut fb.y[dst_off..],
+            fb.y_stride,
+            tmp_y,
+            TMP_STRIDE,
+            luma_avg_w,
+            luma_avg_h,
+        );
 
         // Chroma ref1 — per-sub-block averaging for sub-8x8.
         let ref1_uv_w = (ref1.width as usize).div_ceil(1 << ss_h as usize);
@@ -583,22 +593,24 @@ pub fn inter_pred(
                 emu_buf,
             );
         }
+        let uv_avg_w = luma_avg_w >> usize::from(ss_h);
+        let uv_avg_h = luma_avg_h >> usize::from(ss_v);
         let u_off = uv_row * fb.uv_stride + uv_col;
         avg_block(
             &mut fb.u[u_off..],
             fb.uv_stride,
             tmp_u,
             TMP_STRIDE,
-            uv_bw,
-            uv_bh,
+            uv_avg_w,
+            uv_avg_h,
         );
         avg_block(
             &mut fb.v[u_off..],
             fb.uv_stride,
             tmp_v,
             TMP_STRIDE,
-            uv_bw,
-            uv_bh,
+            uv_avg_w,
+            uv_avg_h,
         );
     }
 }
@@ -744,12 +756,7 @@ fn sub8x8_chroma_mc_dst(
                 call(0, 0, bw, 4, &mv);
             } else {
                 call(0, 0, bw, 4, &block.mv[0][ri]);
-                let mv2 = if !ss_h {
-                    block.mv[2][ri]
-                } else {
-                    rounded_div_mv_x2(block.mv[0][ri], block.mv[2][ri])
-                };
-                call(0, 4, bw, 4, &mv2);
+                call(0, 4, bw, 4, &block.mv[2][ri]);
             }
         }
         BlockSize::Bs4x8 => {

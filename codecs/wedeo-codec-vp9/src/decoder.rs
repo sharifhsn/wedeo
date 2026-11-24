@@ -23,7 +23,7 @@ use crate::block::{BlockInfo, TileDecodeContext, decode_sb};
 use crate::bool_decoder::BoolDecoder;
 use crate::context::{AboveContext, LeftContext};
 use crate::data::DEFAULT_COEF_PROBS;
-use crate::header::{self, ColorSpace, FrameType, decode_frame_header};
+use crate::header::{self, ColorSpace, FrameType, PersistentHeaderState, decode_frame_header};
 use crate::loopfilter::loop_filter_frame;
 use crate::mc::McScratch;
 use crate::prob::{CoefProbArray, CountContext, adapt_probs};
@@ -73,6 +73,12 @@ pub struct Vp9Decoder {
     active_color_space: ColorSpace,
     /// Active stream VP9 color range (inherited by inter frames).
     active_color_range: header::ColorRange,
+    /// Persistent cross-frame header state (ref dims, loopfilter deltas, segmentation).
+    hdr_state: PersistentHeaderState,
+    /// Persistent per-8×8 segment ID map from the most recent map-updating frame.
+    prev_seg_map: Vec<u8>,
+    prev_seg_cols8: usize,
+    prev_seg_rows8: usize,
     /// Reusable motion-compensation scratch buffers.
     mc_scratch: McScratch,
 }
@@ -104,6 +110,10 @@ impl Vp9Decoder {
             active_ss_v: true,
             active_color_space: ColorSpace::Unknown,
             active_color_range: header::ColorRange::Limited,
+            hdr_state: PersistentHeaderState::default(),
+            prev_seg_map: Vec::new(),
+            prev_seg_cols8: 0,
+            prev_seg_rows8: 0,
             mc_scratch: McScratch::new(),
         })
     }
@@ -163,9 +173,19 @@ impl Vp9Decoder {
 
     /// Decode one VP9 frame from `data` and push the result to `output_queue`.
     fn decode_frame(&mut self, data: &[u8], pkt: &Packet) -> Result<()> {
+        // Refresh reference slot dimensions snapshot for header tile-bit parsing.
+        for (dst, slot) in self
+            .hdr_state
+            .ref_dims
+            .iter_mut()
+            .zip(self.ref_store.slots.iter())
+        {
+            *dst = slot.as_ref().map(|rf| (rf.width, rf.height));
+        }
+
         // --- 1. Parse frame header ---
         let (mut header, _hdr_bytes) =
-            match decode_frame_header(data, &self.prob_ctx, &self.coef_ctx) {
+            match decode_frame_header(data, &self.prob_ctx, &self.coef_ctx, &self.hdr_state) {
                 Ok(parsed) => parsed,
                 Err(e) => {
                     self.health.record(HealthEvent {
@@ -241,12 +261,19 @@ impl Vp9Decoder {
             self.fallback_color,
         );
 
-        // On keyframe or error_resilient: reset all probability context slots to defaults.
-        if header.frame_type == FrameType::KeyFrame || header.error_resilient {
+        // Reset probability context slots per VP9 spec (keyframe, error_resilient, or intra_only reset_context).
+        if header.frame_type == FrameType::KeyFrame
+            || header.error_resilient
+            || (header.intra_only && header.reset_context == 3)
+        {
             for slot in &mut self.prob_ctx {
                 *slot = crate::header::default_prob_context();
             }
             self.coef_ctx = [DEFAULT_COEF_PROBS; 4];
+        } else if header.intra_only && header.reset_context == 2 {
+            let fctx = header.frame_ctx_id as usize;
+            self.prob_ctx[fctx] = crate::header::default_prob_context();
+            self.coef_ctx[fctx] = DEFAULT_COEF_PROBS;
         }
         if header.frame_type == FrameType::KeyFrame {
             self.ref_store.clear();
@@ -298,6 +325,27 @@ impl Vp9Decoder {
         above.reset(is_kf);
 
         let mut cur_mv_grid = vec![MvRefPair::default(); rows_4x4 * cols_4x4];
+        let cols8 = cols_4x4 >> 1;
+        let rows8 = rows_4x4 >> 1;
+        if is_kf
+            || header.error_resilient
+            || cols8 != self.prev_seg_cols8
+            || rows8 != self.prev_seg_rows8
+        {
+            self.prev_seg_map.clear();
+            self.prev_seg_cols8 = 0;
+            self.prev_seg_rows8 = 0;
+        }
+        let mut cur_seg_map = if header.segmentation.enabled && header.segmentation.update_map {
+            vec![0u8; rows8 * cols8]
+        } else {
+            Vec::new()
+        };
+        let prev_seg_opt = if self.prev_seg_map.len() == rows8 * cols8 {
+            Some(self.prev_seg_map.as_slice())
+        } else {
+            None
+        };
 
         // --- 3. Locate and decode tiles deterministically ---
         let tile_data = &data[header.tile_data_offset..];
@@ -354,6 +402,8 @@ impl Vp9Decoder {
                     &mut cur_mv_grid,
                     self.ref_store.prev_frame_mvs.as_deref(),
                     self.ref_store.prev_cols_4x4,
+                    &mut cur_seg_map,
+                    prev_seg_opt,
                 )?;
                 all_blocks.extend(blocks);
                 merged_counts.merge(&counts);
@@ -442,6 +492,14 @@ impl Vp9Decoder {
         self.ref_store.refresh(header.refresh_ref_mask, ref_frame);
         self.ref_store.rotate_mvpair(cur_mv_grid, cols_4x4);
 
+        if header.segmentation.enabled && header.segmentation.update_map {
+            self.prev_seg_map = cur_seg_map;
+            self.prev_seg_cols8 = cols8;
+            self.prev_seg_rows8 = rows8;
+        }
+        self.hdr_state.ref_deltas = header.ref_deltas;
+        self.hdr_state.mode_deltas = header.mode_deltas;
+        self.hdr_state.seg = header.segmentation.clone();
         self.last_show_frame = header.show_frame;
         self.last_width = width;
         self.last_height = height;
@@ -560,6 +618,8 @@ fn decode_tile_column(
     cur_mv_grid: &mut [MvRefPair],
     prev_mv_grid: Option<&[MvRefPair]>,
     prev_cols_4x4: usize,
+    cur_seg_map: &mut [u8],
+    prev_seg_map: Option<&[u8]>,
 ) -> Result<(Vec<BlockInfo>, CountContext)> {
     let tile_col_start_sb = tile_sb_offset(tile_col, header.tile_cols_log2, sb_cols);
     let tile_col_end_sb = tile_sb_offset(tile_col + 1, header.tile_cols_log2, sb_cols).min(sb_cols);
@@ -589,6 +649,8 @@ fn decode_tile_column(
         cur_mv_grid,
         prev_mv_grid,
         prev_cols_4x4,
+        cur_seg_map,
+        prev_seg_map,
     );
 
     for sb_row in tr_start..tr_end {
@@ -660,6 +722,10 @@ impl Decoder for Vp9Decoder {
         self.last_keyframe = false;
         self.last_width = 0;
         self.last_height = 0;
+        self.hdr_state = PersistentHeaderState::default();
+        self.prev_seg_map.clear();
+        self.prev_seg_cols8 = 0;
+        self.prev_seg_rows8 = 0;
     }
 
     fn health(&self) -> &StreamHealth {

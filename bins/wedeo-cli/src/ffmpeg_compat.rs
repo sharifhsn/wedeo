@@ -371,10 +371,9 @@ pub fn parse_ffmpeg_args(args: &[String]) -> Result<FfmpegAction> {
                         .entry(m.input_idx)
                         .or_insert((false, false, false));
                     match m.kind {
-                        MapKind::All => e.2 = true,
+                        MapKind::All | MapKind::Other => e.2 = true,
                         MapKind::Video => e.0 = true,
                         MapKind::Audio => e.1 = true,
-                        MapKind::Other => {}
                     }
                 }
             }

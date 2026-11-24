@@ -212,204 +212,86 @@ pub const fn bits_per_coded_sample(id: CodecId) -> Option<u32> {
     }
 }
 
+#[inline]
+fn map_chunks<const N: usize, const M: usize>(
+    src: &[u8],
+    dst: &mut [u8],
+    f: impl Fn([u8; N]) -> [u8; M],
+) {
+    for (&s, d) in src
+        .as_chunks::<N>()
+        .0
+        .iter()
+        .zip(dst.as_chunks_mut::<M>().0.iter_mut())
+    {
+        *d = f(s);
+    }
+}
+
+#[inline]
+fn copy_or_swap<const N: usize>(src: &[u8], dst: &mut [u8], is_le: bool) {
+    if is_le == cfg!(target_endian = "little") {
+        dst.copy_from_slice(src);
+    } else {
+        map_chunks::<N, N>(src, dst, |mut s| {
+            s.reverse();
+            s
+        });
+    }
+}
+
 /// Decode `n_samples` (total samples across all channels) from `src` into `dst`.
 ///
 /// `src` must have length `n_samples * coded_bytes_per_sample(codec_id)` and
 /// `dst` must have length `n_samples * codec_id_to_sample_format(codec_id).bytes_per_sample()`.
 fn decode_samples_into(codec_id: CodecId, src: &[u8], dst: &mut [u8]) {
     match codec_id {
-        CodecId::PcmU8 => {
-            dst.copy_from_slice(src);
-        }
-        CodecId::PcmS8 => {
-            for (s, d) in src.iter().zip(dst.iter_mut()) {
-                *d = s.wrapping_add(128);
-            }
-        }
+        CodecId::PcmU8 => dst.copy_from_slice(src),
+        CodecId::PcmS8 => map_chunks::<1, 1>(src, dst, |s| [s[0].wrapping_add(128)]),
         CodecId::PcmAlaw => {
-            for (&s, d) in src.iter().zip(dst.as_chunks_mut::<2>().0.iter_mut()) {
-                *d = ALAW_TO_LINEAR[s as usize].to_ne_bytes();
-            }
+            map_chunks::<1, 2>(src, dst, |s| ALAW_TO_LINEAR[s[0] as usize].to_ne_bytes())
         }
         CodecId::PcmMulaw => {
-            for (&s, d) in src.iter().zip(dst.as_chunks_mut::<2>().0.iter_mut()) {
-                *d = ULAW_TO_LINEAR[s as usize].to_ne_bytes();
-            }
+            map_chunks::<1, 2>(src, dst, |s| ULAW_TO_LINEAR[s[0] as usize].to_ne_bytes())
         }
-        CodecId::PcmS16le => {
-            if cfg!(target_endian = "little") {
-                dst.copy_from_slice(src);
-            } else {
-                for (&s, d) in src
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .zip(dst.as_chunks_mut::<2>().0.iter_mut())
-                {
-                    *d = i16::from_le_bytes(s).to_ne_bytes();
-                }
-            }
-        }
-        CodecId::PcmS16be => {
-            if cfg!(target_endian = "big") {
-                dst.copy_from_slice(src);
-            } else {
-                for (&s, d) in src
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .zip(dst.as_chunks_mut::<2>().0.iter_mut())
-                {
-                    *d = i16::from_be_bytes(s).to_ne_bytes();
-                }
-            }
-        }
-        CodecId::PcmU16le => {
-            for (&s, d) in src
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .zip(dst.as_chunks_mut::<2>().0.iter_mut())
-            {
-                let v = u16::from_le_bytes(s).wrapping_sub(0x8000);
-                *d = v.to_ne_bytes();
-            }
-        }
-        CodecId::PcmU16be => {
-            for (&s, d) in src
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .zip(dst.as_chunks_mut::<2>().0.iter_mut())
-            {
-                let v = u16::from_be_bytes(s).wrapping_sub(0x8000);
-                *d = v.to_ne_bytes();
-            }
-        }
-        CodecId::PcmS24le => {
-            for (&s, d) in src
-                .as_chunks::<3>()
-                .0
-                .iter()
-                .zip(dst.as_chunks_mut::<4>().0.iter_mut())
-            {
-                let v = (s[0] as u32) | ((s[1] as u32) << 8) | ((s[2] as u32) << 16);
-                *d = (v << 8).to_ne_bytes();
-            }
-        }
-        CodecId::PcmS24be => {
-            for (&s, d) in src
-                .as_chunks::<3>()
-                .0
-                .iter()
-                .zip(dst.as_chunks_mut::<4>().0.iter_mut())
-            {
-                let v = ((s[0] as u32) << 16) | ((s[1] as u32) << 8) | (s[2] as u32);
-                *d = (v << 8).to_ne_bytes();
-            }
-        }
-        CodecId::PcmU24le => {
-            for (&s, d) in src
-                .as_chunks::<3>()
-                .0
-                .iter()
-                .zip(dst.as_chunks_mut::<4>().0.iter_mut())
-            {
-                let v = (s[0] as u32) | ((s[1] as u32) << 8) | ((s[2] as u32) << 16);
-                let out = v.wrapping_sub(0x80_0000) << 8;
-                *d = out.to_ne_bytes();
-            }
-        }
-        CodecId::PcmU24be => {
-            for (&s, d) in src
-                .as_chunks::<3>()
-                .0
-                .iter()
-                .zip(dst.as_chunks_mut::<4>().0.iter_mut())
-            {
-                let v = ((s[0] as u32) << 16) | ((s[1] as u32) << 8) | (s[2] as u32);
-                let out = v.wrapping_sub(0x80_0000) << 8;
-                *d = out.to_ne_bytes();
-            }
-        }
-        CodecId::PcmS32le | CodecId::PcmF32le => {
-            if cfg!(target_endian = "little") {
-                dst.copy_from_slice(src);
-            } else {
-                for (&s, d) in src
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .zip(dst.as_chunks_mut::<4>().0.iter_mut())
-                {
-                    *d = u32::from_le_bytes(s).to_ne_bytes();
-                }
-            }
-        }
-        CodecId::PcmS32be | CodecId::PcmF32be => {
-            if cfg!(target_endian = "big") {
-                dst.copy_from_slice(src);
-            } else {
-                for (&s, d) in src
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .zip(dst.as_chunks_mut::<4>().0.iter_mut())
-                {
-                    *d = u32::from_be_bytes(s).to_ne_bytes();
-                }
-            }
-        }
-        CodecId::PcmU32le => {
-            for (&s, d) in src
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .zip(dst.as_chunks_mut::<4>().0.iter_mut())
-            {
-                let v = u32::from_le_bytes(s).wrapping_sub(0x8000_0000);
-                *d = v.to_ne_bytes();
-            }
-        }
-        CodecId::PcmU32be => {
-            for (&s, d) in src
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .zip(dst.as_chunks_mut::<4>().0.iter_mut())
-            {
-                let v = u32::from_be_bytes(s).wrapping_sub(0x8000_0000);
-                *d = v.to_ne_bytes();
-            }
-        }
-        CodecId::PcmF64le => {
-            if cfg!(target_endian = "little") {
-                dst.copy_from_slice(src);
-            } else {
-                for (&s, d) in src
-                    .as_chunks::<8>()
-                    .0
-                    .iter()
-                    .zip(dst.as_chunks_mut::<8>().0.iter_mut())
-                {
-                    *d = u64::from_le_bytes(s).to_ne_bytes();
-                }
-            }
-        }
-        CodecId::PcmF64be => {
-            if cfg!(target_endian = "big") {
-                dst.copy_from_slice(src);
-            } else {
-                for (&s, d) in src
-                    .as_chunks::<8>()
-                    .0
-                    .iter()
-                    .zip(dst.as_chunks_mut::<8>().0.iter_mut())
-                {
-                    *d = u64::from_be_bytes(s).to_ne_bytes();
-                }
-            }
-        }
+        CodecId::PcmS16le => copy_or_swap::<2>(src, dst, true),
+        CodecId::PcmS16be => copy_or_swap::<2>(src, dst, false),
+        CodecId::PcmU16le => map_chunks::<2, 2>(src, dst, |s| {
+            u16::from_le_bytes(s).wrapping_sub(0x8000).to_ne_bytes()
+        }),
+        CodecId::PcmU16be => map_chunks::<2, 2>(src, dst, |s| {
+            u16::from_be_bytes(s).wrapping_sub(0x8000).to_ne_bytes()
+        }),
+        CodecId::PcmS24le => map_chunks::<3, 4>(src, dst, |s| {
+            (((s[0] as u32) | ((s[1] as u32) << 8) | ((s[2] as u32) << 16)) << 8).to_ne_bytes()
+        }),
+        CodecId::PcmS24be => map_chunks::<3, 4>(src, dst, |s| {
+            ((((s[0] as u32) << 16) | ((s[1] as u32) << 8) | (s[2] as u32)) << 8).to_ne_bytes()
+        }),
+        CodecId::PcmU24le => map_chunks::<3, 4>(src, dst, |s| {
+            (((s[0] as u32) | ((s[1] as u32) << 8) | ((s[2] as u32) << 16)).wrapping_sub(0x80_0000)
+                << 8)
+                .to_ne_bytes()
+        }),
+        CodecId::PcmU24be => map_chunks::<3, 4>(src, dst, |s| {
+            ((((s[0] as u32) << 16) | ((s[1] as u32) << 8) | (s[2] as u32)).wrapping_sub(0x80_0000)
+                << 8)
+                .to_ne_bytes()
+        }),
+        CodecId::PcmS32le | CodecId::PcmF32le => copy_or_swap::<4>(src, dst, true),
+        CodecId::PcmS32be | CodecId::PcmF32be => copy_or_swap::<4>(src, dst, false),
+        CodecId::PcmU32le => map_chunks::<4, 4>(src, dst, |s| {
+            u32::from_le_bytes(s)
+                .wrapping_sub(0x8000_0000)
+                .to_ne_bytes()
+        }),
+        CodecId::PcmU32be => map_chunks::<4, 4>(src, dst, |s| {
+            u32::from_be_bytes(s)
+                .wrapping_sub(0x8000_0000)
+                .to_ne_bytes()
+        }),
+        CodecId::PcmF64le => copy_or_swap::<8>(src, dst, true),
+        CodecId::PcmF64be => copy_or_swap::<8>(src, dst, false),
         _ => {}
     }
 }
@@ -417,202 +299,48 @@ fn decode_samples_into(codec_id: CodecId, src: &[u8], dst: &mut [u8]) {
 /// Encode `n_samples` (interleaved native samples in `src`) into `dst` (`libavcodec/pcm.c:pcm_encode_frame`).
 fn encode_samples_into(codec_id: CodecId, src: &[u8], dst: &mut [u8]) {
     match codec_id {
-        CodecId::PcmU8 => {
-            dst.copy_from_slice(src);
-        }
-        CodecId::PcmS8 => {
-            for (s, d) in src.iter().zip(dst.iter_mut()) {
-                *d = s.wrapping_sub(128);
-            }
-        }
-        CodecId::PcmAlaw => {
-            for (&s, d) in src.as_chunks::<2>().0.iter().zip(dst.iter_mut()) {
-                let sample = i16::from_ne_bytes(s);
-                *d = linear2alaw(sample);
-            }
-        }
-        CodecId::PcmMulaw => {
-            for (&s, d) in src.as_chunks::<2>().0.iter().zip(dst.iter_mut()) {
-                let sample = i16::from_ne_bytes(s);
-                *d = linear2ulaw(sample);
-            }
-        }
-        CodecId::PcmS16le => {
-            if cfg!(target_endian = "little") {
-                dst.copy_from_slice(src);
-            } else {
-                for (&s, d) in src
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .zip(dst.as_chunks_mut::<2>().0.iter_mut())
-                {
-                    *d = i16::from_ne_bytes(s).to_le_bytes();
-                }
-            }
-        }
-        CodecId::PcmS16be => {
-            if cfg!(target_endian = "big") {
-                dst.copy_from_slice(src);
-            } else {
-                for (&s, d) in src
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .zip(dst.as_chunks_mut::<2>().0.iter_mut())
-                {
-                    *d = i16::from_ne_bytes(s).to_be_bytes();
-                }
-            }
-        }
-        CodecId::PcmU16le => {
-            for (&s, d) in src
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .zip(dst.as_chunks_mut::<2>().0.iter_mut())
-            {
-                let v = u16::from_ne_bytes(s).wrapping_add(0x8000);
-                *d = v.to_le_bytes();
-            }
-        }
-        CodecId::PcmU16be => {
-            for (&s, d) in src
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .zip(dst.as_chunks_mut::<2>().0.iter_mut())
-            {
-                let v = u16::from_ne_bytes(s).wrapping_add(0x8000);
-                *d = v.to_be_bytes();
-            }
-        }
-        CodecId::PcmS24le => {
-            for (&s, d) in src
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .zip(dst.as_chunks_mut::<3>().0.iter_mut())
-            {
-                let sample = i32::from_ne_bytes(s);
-                let v = (sample >> 8) as u32;
-                *d = [v as u8, (v >> 8) as u8, (v >> 16) as u8];
-            }
-        }
-        CodecId::PcmS24be => {
-            for (&s, d) in src
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .zip(dst.as_chunks_mut::<3>().0.iter_mut())
-            {
-                let sample = i32::from_ne_bytes(s);
-                let v = (sample >> 8) as u32;
-                *d = [(v >> 16) as u8, (v >> 8) as u8, v as u8];
-            }
-        }
-        CodecId::PcmU24le => {
-            for (&s, d) in src
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .zip(dst.as_chunks_mut::<3>().0.iter_mut())
-            {
-                let sample = u32::from_ne_bytes(s);
-                let v = (sample >> 8).wrapping_add(0x80_0000);
-                *d = [v as u8, (v >> 8) as u8, (v >> 16) as u8];
-            }
-        }
-        CodecId::PcmU24be => {
-            for (&s, d) in src
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .zip(dst.as_chunks_mut::<3>().0.iter_mut())
-            {
-                let sample = u32::from_ne_bytes(s);
-                let v = (sample >> 8).wrapping_add(0x80_0000);
-                *d = [(v >> 16) as u8, (v >> 8) as u8, v as u8];
-            }
-        }
-        CodecId::PcmS32le | CodecId::PcmF32le => {
-            if cfg!(target_endian = "little") {
-                dst.copy_from_slice(src);
-            } else {
-                for (&s, d) in src
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .zip(dst.as_chunks_mut::<4>().0.iter_mut())
-                {
-                    *d = u32::from_ne_bytes(s).to_le_bytes();
-                }
-            }
-        }
-        CodecId::PcmS32be | CodecId::PcmF32be => {
-            if cfg!(target_endian = "big") {
-                dst.copy_from_slice(src);
-            } else {
-                for (&s, d) in src
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .zip(dst.as_chunks_mut::<4>().0.iter_mut())
-                {
-                    *d = u32::from_ne_bytes(s).to_be_bytes();
-                }
-            }
-        }
-        CodecId::PcmU32le => {
-            for (&s, d) in src
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .zip(dst.as_chunks_mut::<4>().0.iter_mut())
-            {
-                let v = u32::from_ne_bytes(s).wrapping_add(0x8000_0000);
-                *d = v.to_le_bytes();
-            }
-        }
-        CodecId::PcmU32be => {
-            for (&s, d) in src
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .zip(dst.as_chunks_mut::<4>().0.iter_mut())
-            {
-                let v = u32::from_ne_bytes(s).wrapping_add(0x8000_0000);
-                *d = v.to_be_bytes();
-            }
-        }
-        CodecId::PcmF64le => {
-            if cfg!(target_endian = "little") {
-                dst.copy_from_slice(src);
-            } else {
-                for (&s, d) in src
-                    .as_chunks::<8>()
-                    .0
-                    .iter()
-                    .zip(dst.as_chunks_mut::<8>().0.iter_mut())
-                {
-                    *d = u64::from_ne_bytes(s).to_le_bytes();
-                }
-            }
-        }
-        CodecId::PcmF64be => {
-            if cfg!(target_endian = "big") {
-                dst.copy_from_slice(src);
-            } else {
-                for (&s, d) in src
-                    .as_chunks::<8>()
-                    .0
-                    .iter()
-                    .zip(dst.as_chunks_mut::<8>().0.iter_mut())
-                {
-                    *d = u64::from_ne_bytes(s).to_be_bytes();
-                }
-            }
-        }
+        CodecId::PcmU8 => dst.copy_from_slice(src),
+        CodecId::PcmS8 => map_chunks::<1, 1>(src, dst, |s| [s[0].wrapping_sub(128)]),
+        CodecId::PcmAlaw => map_chunks::<2, 1>(src, dst, |s| [linear2alaw(i16::from_ne_bytes(s))]),
+        CodecId::PcmMulaw => map_chunks::<2, 1>(src, dst, |s| [linear2ulaw(i16::from_ne_bytes(s))]),
+        CodecId::PcmS16le => copy_or_swap::<2>(src, dst, true),
+        CodecId::PcmS16be => copy_or_swap::<2>(src, dst, false),
+        CodecId::PcmU16le => map_chunks::<2, 2>(src, dst, |s| {
+            u16::from_ne_bytes(s).wrapping_add(0x8000).to_le_bytes()
+        }),
+        CodecId::PcmU16be => map_chunks::<2, 2>(src, dst, |s| {
+            u16::from_ne_bytes(s).wrapping_add(0x8000).to_be_bytes()
+        }),
+        CodecId::PcmS24le => map_chunks::<4, 3>(src, dst, |s| {
+            let v = (i32::from_ne_bytes(s) >> 8) as u32;
+            [v as u8, (v >> 8) as u8, (v >> 16) as u8]
+        }),
+        CodecId::PcmS24be => map_chunks::<4, 3>(src, dst, |s| {
+            let v = (i32::from_ne_bytes(s) >> 8) as u32;
+            [(v >> 16) as u8, (v >> 8) as u8, v as u8]
+        }),
+        CodecId::PcmU24le => map_chunks::<4, 3>(src, dst, |s| {
+            let v = (u32::from_ne_bytes(s) >> 8).wrapping_add(0x80_0000);
+            [v as u8, (v >> 8) as u8, (v >> 16) as u8]
+        }),
+        CodecId::PcmU24be => map_chunks::<4, 3>(src, dst, |s| {
+            let v = (u32::from_ne_bytes(s) >> 8).wrapping_add(0x80_0000);
+            [(v >> 16) as u8, (v >> 8) as u8, v as u8]
+        }),
+        CodecId::PcmS32le | CodecId::PcmF32le => copy_or_swap::<4>(src, dst, true),
+        CodecId::PcmS32be | CodecId::PcmF32be => copy_or_swap::<4>(src, dst, false),
+        CodecId::PcmU32le => map_chunks::<4, 4>(src, dst, |s| {
+            u32::from_ne_bytes(s)
+                .wrapping_add(0x8000_0000)
+                .to_le_bytes()
+        }),
+        CodecId::PcmU32be => map_chunks::<4, 4>(src, dst, |s| {
+            u32::from_ne_bytes(s)
+                .wrapping_add(0x8000_0000)
+                .to_be_bytes()
+        }),
+        CodecId::PcmF64le => copy_or_swap::<8>(src, dst, true),
+        CodecId::PcmF64be => copy_or_swap::<8>(src, dst, false),
         _ => {}
     }
 }

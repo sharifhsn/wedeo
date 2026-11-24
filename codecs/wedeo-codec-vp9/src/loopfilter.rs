@@ -698,7 +698,7 @@ fn filter_plane_cols(
 
         let hm1 = hmask1[0] | hmask1[1] | hmask1[2];
         let hm13 = hmask1[3];
-        let hm2 = hmask2[1] | hmask2[2];
+        let hm2 = hmask2[0] | hmask2[1] | hmask2[2];
         let hm23 = hmask2[3];
         let hm = hm1 | hm2 | hm13 | hm23;
 
@@ -706,61 +706,36 @@ fn filter_plane_cols(
         let mut ptr = dst_off;
         let mut l_idx = lvl_idx; // per-column level pointer
 
-        while hm as u32 & !(x - 1) != 0 {
-            if sb_col > 0 || x > 1 {
-                if hm1 & x as u8 != 0 {
-                    let l = level[l_idx.min(63)] as usize;
-                    let h = l >> 4;
-                    let e = mblim_lut[l] as i32;
-                    let ii = lim_lut[l] as i32;
+        let apply_col = |plane: &mut [u8], p: usize, lvl_i: usize, wd: usize| {
+            let l = level[lvl_i.min(63)] as usize;
+            let h = l >> 4;
+            let e = mblim_lut[l] as i32;
+            let ii = lim_lut[l] as i32;
+            loop_filter_edge(plane, p, stride, 1, e, ii, h as i32, wd);
+        };
 
-                    if hmask1[0] & x as u8 != 0 {
-                        if hmask2[0] & x as u8 != 0 {
-                            // 16-tap: two stacked 8-pixel edges (lf_16_fn with stridea=stride)
-                            loop_filter_edge(plane, ptr, stride, 1, e, ii, h as i32, 16);
-                            loop_filter_edge(
-                                plane,
-                                ptr + 8 * stride,
-                                stride,
-                                1,
-                                e,
-                                ii,
-                                h as i32,
-                                16,
-                            );
-                        } else {
-                            // FFmpeg: loop_filter_8[2][0] — 16-tap filter on a single 8-pixel edge.
-                            loop_filter_edge(plane, ptr, stride, 1, e, ii, h as i32, 16);
-                        }
-                    } else if hm2 & x as u8 != 0 {
-                        let wd1 = if hmask1[1] & x as u8 != 0 { 8 } else { 4 };
-                        loop_filter_edge(plane, ptr, stride, 1, e, ii, h as i32, wd1);
-                        let l2 = level[(l_idx + (8 << ss_v)).min(63)] as usize;
-                        let h2 = l2 >> 4;
-                        let e2 = mblim_lut[l2] as i32;
-                        let i2 = lim_lut[l2] as i32;
-                        let wd2 = if hmask2[1] & x as u8 != 0 { 8 } else { 4 };
-                        loop_filter_edge(
-                            plane,
-                            ptr + 8 * stride,
-                            stride,
-                            1,
-                            e2,
-                            i2,
-                            h2 as i32,
-                            wd2,
-                        );
+        while hm as u32 & !(x - 1) != 0 {
+            let xb = x as u8;
+            if sb_col > 0 || x > 1 {
+                if hm1 & xb != 0 {
+                    let wd = if hmask1[0] & xb != 0 {
+                        16
+                    } else if hmask1[1] & xb != 0 {
+                        8
                     } else {
-                        let wd = if hmask1[1] & x as u8 != 0 { 8 } else { 4 };
-                        loop_filter_edge(plane, ptr, stride, 1, e, ii, h as i32, wd);
-                    }
-                } else if hm2 & x as u8 != 0 {
-                    let l2 = level[(l_idx + (8 << ss_v)).min(63)] as usize;
-                    let h = l2 >> 4;
-                    let e = mblim_lut[l2] as i32;
-                    let ii = lim_lut[l2] as i32;
-                    let wd = if hmask2[1] & x as u8 != 0 { 8 } else { 4 };
-                    loop_filter_edge(plane, ptr + 8 * stride, stride, 1, e, ii, h as i32, wd);
+                        4
+                    };
+                    apply_col(plane, ptr, l_idx, wd);
+                }
+                if hm2 & xb != 0 {
+                    let wd = if hmask2[0] & xb != 0 {
+                        16
+                    } else if hmask2[1] & xb != 0 {
+                        8
+                    } else {
+                        4
+                    };
+                    apply_col(plane, ptr + 8 * stride, l_idx + (8 << ss_v), wd);
                 }
             }
 
@@ -772,37 +747,11 @@ fn filter_plane_cols(
             } else {
                 // Luma: process inner-4 edges (mask[3])
                 // NOTE: inner4 edges are NOT guarded by (col || x > 1) in FFmpeg.
-                if hm13 & x as u8 != 0 {
-                    let l = level[l_idx.min(63)] as usize;
-                    let h = l >> 4;
-                    let e = mblim_lut[l] as i32;
-                    let ii = lim_lut[l] as i32;
-
-                    if hm23 & x as u8 != 0 {
-                        loop_filter_edge(plane, ptr + 4, stride, 1, e, ii, h as i32, 4);
-                        let l2 = level[(l_idx + (8 << ss_v)).min(63)] as usize;
-                        let h2 = l2 >> 4;
-                        let e2 = mblim_lut[l2] as i32;
-                        let i2 = lim_lut[l2] as i32;
-                        loop_filter_edge(
-                            plane,
-                            ptr + 4 + 8 * stride,
-                            stride,
-                            1,
-                            e2,
-                            i2,
-                            h2 as i32,
-                            4,
-                        );
-                    } else {
-                        loop_filter_edge(plane, ptr + 4, stride, 1, e, ii, h as i32, 4);
-                    }
-                } else if hm23 & x as u8 != 0 {
-                    let l2 = level[(l_idx + (8 << ss_v)).min(63)] as usize;
-                    let h = l2 >> 4;
-                    let e = mblim_lut[l2] as i32;
-                    let ii = lim_lut[l2] as i32;
-                    loop_filter_edge(plane, ptr + 4 + 8 * stride, stride, 1, e, ii, h as i32, 4);
+                if hm13 & xb != 0 {
+                    apply_col(plane, ptr + 4, l_idx, 4);
+                }
+                if hm23 & xb != 0 {
+                    apply_col(plane, ptr + 4 + 8 * stride, l_idx + (8 << ss_v), 4);
                 }
                 l_idx += 1;
             }
@@ -838,143 +787,46 @@ fn filter_plane_rows(
     let mut lvl_idx: usize = 0;
     let mut dst_off = plane_off;
 
+    let apply_row = |plane: &mut [u8], p: usize, lvl_i: usize, wd: usize| {
+        let l = level[lvl_i.min(63)] as usize;
+        let h = l >> 4;
+        let e = mblim_lut[l] as i32;
+        let ii = lim_lut[l] as i32;
+        loop_filter_edge(plane, p, 1, stride as isize, e, ii, h as i32, wd);
+    };
+
     for y in 0..8usize {
         let vmask = mask[y];
         let vm = vmask[0] | vmask[1] | vmask[2];
         let vm3 = vmask[3];
+        let all_m = vm | if ss_v == 0 { vm3 } else { 0 };
 
         let mut x: u32 = 1;
         let mut ptr = dst_off;
         let mut l_idx = lvl_idx;
 
-        while vm as u32 & !(x - 1) != 0 {
-            let x_next = x << (1 + ss_h);
-
-            if sb_row > 0 || y > 0 {
-                if vm & x as u8 != 0 {
-                    let l = level[l_idx.min(63)] as usize;
-                    let h = l >> 4;
-                    let e = mblim_lut[l] as i32;
-                    let ii = lim_lut[l] as i32;
-
-                    if vmask[0] & x as u8 != 0 {
-                        if vmask[0] & x_next as u8 != 0 {
-                            // 16-tap: two side-by-side 8-pixel edges (lf_16_fn with stridea=1)
-                            loop_filter_edge(plane, ptr, 1, stride as isize, e, ii, h as i32, 16);
-                            loop_filter_edge(
-                                plane,
-                                ptr + 8,
-                                1,
-                                stride as isize,
-                                e,
-                                ii,
-                                h as i32,
-                                16,
-                            );
-                        } else {
-                            // FFmpeg: loop_filter_8[2][1] — 16-tap filter on a single 8-pixel edge.
-                            loop_filter_edge(plane, ptr, 1, stride as isize, e, ii, h as i32, 16);
-                        }
-                    } else if vm & x_next as u8 != 0 {
-                        let wd1 = if vmask[1] & x as u8 != 0 { 8 } else { 4 };
-                        loop_filter_edge(plane, ptr, 1, stride as isize, e, ii, h as i32, wd1);
-                        let l2 = level[(l_idx + 1 + ss_h).min(63)] as usize;
-                        let h2 = l2 >> 4;
-                        let e2 = mblim_lut[l2] as i32;
-                        let i2 = lim_lut[l2] as i32;
-                        let wd2 = if vmask[1] & x_next as u8 != 0 { 8 } else { 4 };
-                        loop_filter_edge(
-                            plane,
-                            ptr + 8,
-                            1,
-                            stride as isize,
-                            e2,
-                            i2,
-                            h2 as i32,
-                            wd2,
-                        );
-                    } else {
-                        let wd = if vmask[1] & x as u8 != 0 { 8 } else { 4 };
-                        loop_filter_edge(plane, ptr, 1, stride as isize, e, ii, h as i32, wd);
-                    }
-                } else if vm & x_next as u8 != 0 {
-                    let l2 = level[(l_idx + 1 + ss_h).min(63)] as usize;
-                    let h = l2 >> 4;
-                    let e = mblim_lut[l2] as i32;
-                    let ii = lim_lut[l2] as i32;
-                    let wd = if vmask[1] & x_next as u8 != 0 { 8 } else { 4 };
-                    loop_filter_edge(plane, ptr + 8, 1, stride as isize, e, ii, h as i32, wd);
-                }
+        while all_m as u32 & !(x - 1) != 0 {
+            let xb = x as u8;
+            if (sb_row > 0 || y > 0) && (vm & xb != 0) {
+                let wd = if vmask[0] & xb != 0 {
+                    16
+                } else if vmask[1] & xb != 0 {
+                    8
+                } else {
+                    4
+                };
+                apply_row(plane, ptr, l_idx, wd);
             }
 
-            // Inner 4-pixel row edges (mask[3])
-            // NOTE: inner4 edges are NOT guarded by (row || y) in FFmpeg.
-            if ss_v == 0 {
-                if vm3 & x as u8 != 0 {
-                    let l = level[l_idx.min(63)] as usize;
-                    let h = l >> 4;
-                    let e = mblim_lut[l] as i32;
-                    let ii = lim_lut[l] as i32;
-
-                    if vm3 & x_next as u8 != 0 {
-                        loop_filter_edge(
-                            plane,
-                            ptr + stride * 4,
-                            1,
-                            stride as isize,
-                            e,
-                            ii,
-                            h as i32,
-                            4,
-                        );
-                        let l2 = level[(l_idx + 1 + ss_h).min(63)] as usize;
-                        let h2 = l2 >> 4;
-                        let e2 = mblim_lut[l2] as i32;
-                        let i2 = lim_lut[l2] as i32;
-                        loop_filter_edge(
-                            plane,
-                            ptr + stride * 4 + 8,
-                            1,
-                            stride as isize,
-                            e2,
-                            i2,
-                            h2 as i32,
-                            4,
-                        );
-                    } else {
-                        loop_filter_edge(
-                            plane,
-                            ptr + stride * 4,
-                            1,
-                            stride as isize,
-                            e,
-                            ii,
-                            h as i32,
-                            4,
-                        );
-                    }
-                } else if vm3 & x_next as u8 != 0 {
-                    let l2 = level[(l_idx + 1 + ss_h).min(63)] as usize;
-                    let h = l2 >> 4;
-                    let e = mblim_lut[l2] as i32;
-                    let ii = lim_lut[l2] as i32;
-                    loop_filter_edge(
-                        plane,
-                        ptr + stride * 4 + 8,
-                        1,
-                        stride as isize,
-                        e,
-                        ii,
-                        h as i32,
-                        4,
-                    );
-                }
+            // Inner 4-pixel row edges (mask[3]); NOT guarded by (sb_row || y).
+            if ss_v == 0 && (vm3 & xb != 0) {
+                apply_row(plane, ptr + stride * 4, l_idx, 4);
             }
 
-            // Advance: step = 2 << ss_h (2 for luma, 4 for chroma)
-            l_idx += 2 << ss_h;
-            x <<= 2 << ss_h;
-            ptr += 16; // 16 pixels per step (2 8-pixel blocks)
+            // Advance one 8-pixel horizontal segment (1 bit for luma, 2 bits for 4:2:0/4:2:2 chroma).
+            l_idx += 1 << ss_h;
+            x <<= 1 << ss_h;
+            ptr += 8;
         }
 
         // Advance level row pointer
@@ -999,7 +851,7 @@ fn filter_plane_rows(
 /// 1. Build per-SB filter masks from block info
 /// 2. Apply column then row filters using the masks
 pub fn loop_filter_frame(fb: &mut FrameBuffer, blocks: &[BlockInfo], header: &FrameHeader) {
-    if header.filter_level == 0 {
+    if header.filter_level == 0 && !header.segmentation.enabled {
         return;
     }
 

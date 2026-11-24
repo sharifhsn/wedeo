@@ -170,6 +170,7 @@ impl LeftContext {
     pub fn reset(&mut self, keyframe_or_intraonly: bool) {
         self.partition = [0u8; 8];
         self.skip = [0u8; 8];
+        self.seg_id = [0u8; 8];
         if keyframe_or_intraonly {
             // FFmpeg: memset(td->left_mode_ctx, DC_PRED, 16)
             // DC_PRED = 2, 16 entries for keyframe/intra-only

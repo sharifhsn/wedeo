@@ -515,6 +515,30 @@ fn get_sbits_inv(gb: &mut GetBits<'_>, n: usize) -> Result<i8> {
 // Main entry point
 // ---------------------------------------------------------------------------
 
+/// Persistent cross-frame header state needed to parse VP9 inter frames.
+///
+/// Mirrors FFmpeg's `VP9SharedContext` fields that survive across frames:
+/// reference slot dimensions (required BEFORE reading `tile_cols_log2`!),
+/// loop-filter mode/ref deltas, and segmentation parameters.
+#[derive(Debug, Clone)]
+pub struct PersistentHeaderState {
+    pub ref_dims: [Option<(u32, u32)>; 8],
+    pub ref_deltas: [i8; 4],
+    pub mode_deltas: [i8; 2],
+    pub seg: SegmentationParams,
+}
+
+impl Default for PersistentHeaderState {
+    fn default() -> Self {
+        Self {
+            ref_dims: [None; 8],
+            ref_deltas: [1, 0, -1, -1],
+            mode_deltas: [0, 0],
+            seg: SegmentationParams::default(),
+        }
+    }
+}
+
 /// Parse a VP9 frame header from `data`.
 ///
 /// Returns the parsed `FrameHeader` and the byte offset in `data` where the
@@ -523,6 +547,7 @@ pub fn decode_frame_header(
     data: &[u8],
     prob_ctx: &[ProbContext; 4],
     coef_ctx: &[CoefProbArray; 4],
+    state: &PersistentHeaderState,
 ) -> Result<(FrameHeader, usize)> {
     let mut gb = GetBits::new(data);
 
@@ -619,10 +644,11 @@ pub fn decode_frame_header(
     let show_frame = gb.get_bit()?;
     let error_resilient = gb.get_bit()?;
 
-    // Default loop-filter delta values (reset on keyframe/errorres).
-    let mut ref_deltas: [i8; 4] = [1, 0, -1, -1];
-    let mut mode_deltas: [i8; 2] = [0, 0];
-    let mut seg = SegmentationParams::default();
+    // Carry forward persistent loop-filter deltas and segmentation from previous frames
+    // (reset to defaults below on keyframe / intra-only / error-resilient frames).
+    let mut ref_deltas: [i8; 4] = state.ref_deltas;
+    let mut mode_deltas: [i8; 2] = state.mode_deltas;
+    let mut seg = state.seg.clone();
 
     let mut bit_depth = 8u8;
     let mut color_space = ColorSpace::Unknown;
@@ -733,7 +759,8 @@ pub fn decode_frame_header(
                 false
             };
             if use_ref0 || use_ref1 || use_ref2 {
-                // Caller must fill in width/height from the referenced frame.
+                // Resolve dimensions immediately from the referenced slot so tile info
+                // (`sb_cols` / `max_log2`) reads the exact number of bits from the bitstream.
                 let which = if use_ref0 {
                     0
                 } else if use_ref1 {
@@ -742,8 +769,14 @@ pub fn decode_frame_header(
                     2
                 };
                 size_from_ref = which;
-                width = 0;
-                height = 0;
+                let slot = ref_idx[which as usize] as usize;
+                if let Some((rw, rh)) = state.ref_dims[slot] {
+                    width = rw;
+                    height = rh;
+                } else {
+                    width = 0;
+                    height = 0;
+                }
             } else {
                 width = gb.get_bits(16)? + 1;
                 height = gb.get_bits(16)? + 1;
@@ -787,12 +820,8 @@ pub fn decode_frame_header(
     };
     let parallel_mode = if error_resilient { true } else { gb.get_bit()? };
     let frame_ctx_id_raw = gb.get_bits(2)? as u8;
-    // BUG: libvpx ignores framectxid for keyframes.
-    let frame_ctx_id = if is_keyframe || intra_only {
-        0
-    } else {
-        frame_ctx_id_raw
-    };
+    // BUG: libvpx ignores framectxid for keyframes (not intra-only).
+    let frame_ctx_id = if is_keyframe { 0 } else { frame_ctx_id_raw };
 
     // Loop filter.
     if is_keyframe || error_resilient || intra_only {
@@ -864,28 +893,28 @@ pub fn decode_frame_header(
                     };
                 }
             }
+        } else {
+            seg.temporal = false;
         }
         if gb.get_bit()? {
             seg.absolute_vals = gb.get_bit()?;
             for feat in &mut seg.feat {
                 let q_en = gb.get_bit()?;
                 feat.q_enabled = q_en;
-                if q_en {
+                feat.q_val = if q_en {
                     // 8-bit magnitude + sign bit (get_sbits_inv).
                     let mag = gb.get_bits(8)? as i16;
                     let neg = gb.get_bit()?;
-                    feat.q_val = if neg { -mag } else { mag };
-                }
+                    if neg { -mag } else { mag }
+                } else {
+                    0
+                };
                 let lf_en = gb.get_bit()?;
                 feat.lf_enabled = lf_en;
-                if lf_en {
-                    feat.lf_val = get_sbits_inv(&mut gb, 6)?;
-                }
+                feat.lf_val = if lf_en { get_sbits_inv(&mut gb, 6)? } else { 0 };
                 let ref_en = gb.get_bit()?;
                 feat.ref_enabled = ref_en;
-                if ref_en {
-                    feat.ref_val = gb.get_bits(2)? as u8;
-                }
+                feat.ref_val = if ref_en { gb.get_bits(2)? as u8 } else { 0 };
                 feat.skip_enabled = gb.get_bit()?;
             }
         }
@@ -898,7 +927,6 @@ pub fn decode_frame_header(
     // Mirrors FFmpeg vp9.c:768–792.
     {
         let n_seg = if seg.enabled { 8 } else { 1 };
-        let sh = u32::from(filter_level >= 32);
         for i in 0..n_seg {
             let base = if seg.enabled && seg.feat[i].lf_enabled {
                 if seg.absolute_vals {
@@ -909,6 +937,11 @@ pub fn decode_frame_header(
             } else {
                 filter_level as i32
             };
+            if base == 0 {
+                seg.feat[i].lflvl = [[0; 2]; 4];
+                continue;
+            }
+            let sh = u32::from(base >= 32);
             if mode_ref_delta_enabled {
                 // INTRA_FRAME (ref=0): both mode slots get ref_deltas[0] only.
                 let intra_lvl = (base + ((ref_deltas[0] as i32) << sh)).clamp(0, 63) as u8;
@@ -980,16 +1013,17 @@ pub fn decode_frame_header(
     }
 
     // Initialize probability context from the selected context slot.
-    // For keyframes/intra-only, frame_ctx_id is forced to 0 and probs
-    // reset to defaults (matching FFmpeg vp9.c behavior).
-    let (mut prob, mut coef) = if is_keyframe || intra_only {
-        (default_prob_context(), DEFAULT_COEF_PROBS)
-    } else {
-        (
-            prob_ctx[frame_ctx_id as usize].clone(),
-            coef_ctx[frame_ctx_id as usize],
-        )
-    };
+    // Keyframes, error_resilient frames, and intra-only frames with reset_context >= 2
+    // start from default probabilities (matching FFmpeg vp9.c).
+    let (mut prob, mut coef) =
+        if is_keyframe || error_resilient || (intra_only && reset_context >= 2) {
+            (default_prob_context(), DEFAULT_COEF_PROBS)
+        } else {
+            (
+                prob_ctx[frame_ctx_id as usize].clone(),
+                coef_ctx[frame_ctx_id as usize],
+            )
+        };
 
     // Tx mode.
     let tx_mode = if lossless {
@@ -1299,13 +1333,23 @@ mod tests {
     fn test_invalid_frame_marker() {
         // First 2 bits must be 0b10. Provide 0b00 instead.
         let data = [0x00u8; 32];
-        let result = decode_frame_header(&data, &Default::default(), &[DEFAULT_COEF_PROBS; 4]);
+        let result = decode_frame_header(
+            &data,
+            &Default::default(),
+            &[DEFAULT_COEF_PROBS; 4],
+            &PersistentHeaderState::default(),
+        );
         assert!(result.is_err(), "Expected error for bad frame marker");
     }
 
     #[test]
     fn test_empty_data() {
-        let result = decode_frame_header(&[], &Default::default(), &[DEFAULT_COEF_PROBS; 4]);
+        let result = decode_frame_header(
+            &[],
+            &Default::default(),
+            &[DEFAULT_COEF_PROBS; 4],
+            &PersistentHeaderState::default(),
+        );
         assert!(result.is_err());
     }
 

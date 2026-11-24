@@ -120,6 +120,10 @@ pub struct TileDecodeContext<'a> {
     pub prev_cols_4x4: usize,
     /// Sign bias per reference frame (from header).
     pub sign_bias: [bool; 3],
+    /// Current frame's per-8×8 segment ID map (`rows_8x8 * cols_8x8`).
+    pub cur_seg_map: &'a mut [u8],
+    /// Previous frame's per-8×8 segment ID map (if same dimensions & not reset).
+    pub prev_seg_map: Option<&'a [u8]>,
 }
 
 impl<'a> TileDecodeContext<'a> {
@@ -134,6 +138,8 @@ impl<'a> TileDecodeContext<'a> {
         cur_mv_grid: &'a mut [MvRefPair],
         prev_mv_grid: Option<&'a [MvRefPair]>,
         prev_cols_4x4: usize,
+        cur_seg_map: &'a mut [u8],
+        prev_seg_map: Option<&'a [u8]>,
     ) -> Self {
         let width = header.width as usize;
         let height = header.height as usize;
@@ -157,6 +163,8 @@ impl<'a> TileDecodeContext<'a> {
             prev_mv_grid,
             prev_cols_4x4,
             sign_bias: header.sign_bias,
+            cur_seg_map,
+            prev_seg_map,
         }
     }
 }
@@ -312,13 +320,79 @@ fn decode_block(
     let is_kf = td.header.frame_type == FrameType::KeyFrame || td.header.intra_only;
 
     // --- Segment ID ---
-    let segment_id: u8 = if td.header.segmentation.enabled && td.header.segmentation.update_map {
-        td.bd.get_tree(
-            &crate::data::SEGMENTATION_TREE,
-            &td.header.segmentation.prob,
-        ) as u8
-    } else {
+    let segment_id: u8 = if !td.header.segmentation.enabled {
         0
+    } else {
+        let cols8 = td.cols_4x4 >> 1;
+        let rows8 = td.rows_4x4 >> 1;
+        let c8 = col >> 1;
+        let r8 = row >> 1;
+        let w8 = crate::data::BWH_TAB[1][bs as usize][0] as usize;
+        let h8 = crate::data::BWH_TAB[1][bs as usize][1] as usize;
+        let r8_end = (r8 + h8).min(rows8);
+        let c8_end = (c8 + w8).min(cols8);
+
+        let pred_seg_id = if let Some(prev) = td.prev_seg_map {
+            let mut min_id = 7u8;
+            for rr in r8..r8_end {
+                let row_off = rr * cols8;
+                for cc in c8..c8_end {
+                    let v = prev[row_off + cc];
+                    if v < min_id {
+                        min_id = v;
+                    }
+                }
+            }
+            if r8 < r8_end && c8 < c8_end {
+                min_id
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
+        let seg_id = if td.header.segmentation.update_map {
+            let use_pred = if td.header.segmentation.temporal {
+                let row7 = r8 & 7;
+                let a = td.above.seg_id.get(c8).copied().unwrap_or(0) as usize;
+                let l = td.left.seg_id[row7] as usize;
+                let ctx = (a + l).min(2);
+                let flag = td.bd.get_prob(td.header.segmentation.pred_prob[ctx]);
+                let f = u8::from(flag);
+                for cc in c8..c8_end {
+                    if cc < td.above.seg_id.len() {
+                        td.above.seg_id[cc] = f;
+                    }
+                }
+                for rr in 0..h8.min(8 - row7) {
+                    td.left.seg_id[row7 + rr] = f;
+                }
+                flag
+            } else {
+                false
+            };
+            if use_pred {
+                pred_seg_id
+            } else {
+                td.bd.get_tree(
+                    &crate::data::SEGMENTATION_TREE,
+                    &td.header.segmentation.prob,
+                ) as u8
+            }
+        } else {
+            pred_seg_id
+        };
+
+        if td.header.segmentation.update_map {
+            for rr in r8..r8_end {
+                let row_off = rr * cols8;
+                for cc in c8..c8_end {
+                    td.cur_seg_map[row_off + cc] = seg_id;
+                }
+            }
+        }
+        seg_id
     };
 
     // --- Skip flag ---
