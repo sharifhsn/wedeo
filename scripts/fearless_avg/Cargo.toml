@@ -1,0 +1,12 @@
+[package]
+name="wedeo-fearless-eval"
+version="0.1.0"
+edition="2024"
+[dependencies]
+fearless_simd="=1.2.0"
+fearless_simd_macros="=0.1.0"
+
+[workspace]
+
+[features]
+fallback = ["fearless_simd/force_support_fallback"]
