@@ -108,27 +108,9 @@ fn filter6(a: i32, b: i32, c: i32, d: i32, e: i32, f: i32) -> i32 {
 // Interior block detection — skips extract_ref_block for ~90% of MC ops
 // ---------------------------------------------------------------------------
 
-/// Fixed-width block copy from reference plane. W must be a compile-time constant
-/// so the compiler can emit optimal load/store pairs (e.g. ldp/stp for W=16 on ARM64).
+/// Copy a rectangular block. Common widths are passed as literals for specialization.
 #[inline(always)]
-fn copy_block_direct<const W: usize>(
-    dst: &mut [u8],
-    dst_stride: usize,
-    src: &[u8],
-    src_stride: usize,
-    src_offset: usize,
-    block_h: usize,
-) {
-    for j in 0..block_h {
-        let s = src_offset + j * src_stride;
-        let d = j * dst_stride;
-        dst[d..d + W].copy_from_slice(&src[s..s + W]);
-    }
-}
-
-/// Generic block copy for non-standard widths.
-#[inline]
-fn copy_block_direct_generic(
+fn copy_block_direct(
     dst: &mut [u8],
     dst_stride: usize,
     src: &[u8],
@@ -183,25 +165,26 @@ fn extract_ref_block(
     pic_w: i32,
     pic_h: i32,
 ) {
-    // Fast path: if the entire block is within picture bounds, skip clamping.
-    if rx >= 0 && ry >= 0 && rx + out_w as i32 <= pic_w && ry + out_h as i32 <= pic_h {
-        let rx = rx as usize;
-        let ry = ry as usize;
-        for j in 0..out_h {
-            let src_row = (ry + j) * ref_stride + rx;
-            let dst_row = j * out_w;
-            for i in 0..out_w {
-                out[dst_row + i] = ref_data[src_row + i] as i32;
+    if out_w == 0 || out_h == 0 {
+        return;
+    }
+    let left = (-i64::from(rx)).clamp(0, out_w as i64) as usize;
+    let start = rx.clamp(0, pic_w) as usize;
+    let middle = (out_w - left).min(pic_w as usize - start);
+    for (j, row) in out[..out_w * out_h].chunks_exact_mut(out_w).enumerate() {
+        let y = (i64::from(ry) + j as i64).clamp(0, i64::from(pic_h) - 1) as usize;
+        let offset = y * ref_stride;
+        if left > 0 {
+            row[..left].fill(i32::from(ref_data[offset]));
+        }
+        if middle > 0 {
+            let pixels = &ref_data[offset + start..offset + start + middle];
+            for (dst, &src) in row[left..left + middle].iter_mut().zip(pixels) {
+                *dst = i32::from(src);
             }
         }
-    } else {
-        for j in 0..out_h {
-            let sy = ry + j as i32;
-            for i in 0..out_w {
-                let sx = rx + i as i32;
-                out[j * out_w + i] =
-                    get_ref_pixel(ref_data, ref_stride, sx, sy, pic_w, pic_h) as i32;
-            }
+        if left + middle < out_w {
+            row[left + middle..].fill(i32::from(ref_data[offset + pic_w as usize - 1]));
         }
     }
 }
@@ -210,17 +193,18 @@ fn extract_ref_block(
 // Luma half-pel lowpass filters
 // ---------------------------------------------------------------------------
 
-/// Fixed-width horizontal lowpass on i32 extracted buffer for auto-vectorization.
+/// Horizontal lowpass on i32 extracted buffer for auto-vectorization.
 #[inline(always)]
-fn h_lowpass_w<const W: usize>(
+fn h_lowpass_rows(
     dst: &mut [u8],
     dst_stride: usize,
     src: &[i32],
     src_stride: usize,
+    block_w: usize,
     block_h: usize,
 ) {
     for j in 0..block_h {
-        for i in 0..W {
+        for i in 0..block_w {
             let s = &src[j * src_stride + i..];
             let val = filter6(s[0], s[1], s[2], s[3], s[4], s[5]);
             dst[j * dst_stride + i] = clip_u8((val + 16) >> 5);
@@ -244,32 +228,25 @@ fn h_lowpass(
     block_h: usize,
 ) {
     match block_w {
-        4 => h_lowpass_w::<4>(dst, dst_stride, src, src_stride, block_h),
-        8 => h_lowpass_w::<8>(dst, dst_stride, src, src_stride, block_h),
-        16 => h_lowpass_w::<16>(dst, dst_stride, src, src_stride, block_h),
-        _ => {
-            for j in 0..block_h {
-                for i in 0..block_w {
-                    let s = &src[j * src_stride + i..];
-                    let val = filter6(s[0], s[1], s[2], s[3], s[4], s[5]);
-                    dst[j * dst_stride + i] = clip_u8((val + 16) >> 5);
-                }
-            }
-        }
+        4 => h_lowpass_rows(dst, dst_stride, src, src_stride, 4, block_h),
+        8 => h_lowpass_rows(dst, dst_stride, src, src_stride, 8, block_h),
+        16 => h_lowpass_rows(dst, dst_stride, src, src_stride, 16, block_h),
+        _ => h_lowpass_rows(dst, dst_stride, src, src_stride, block_w, block_h),
     }
 }
 
-/// Fixed-width vertical lowpass on i32 extracted buffer for auto-vectorization.
+/// Vertical lowpass on i32 extracted buffer for auto-vectorization.
 #[inline(always)]
-fn v_lowpass_w<const W: usize>(
+fn v_lowpass_rows(
     dst: &mut [u8],
     dst_stride: usize,
     src: &[i32],
     src_stride: usize,
+    block_w: usize,
     block_h: usize,
 ) {
     for j in 0..block_h {
-        for i in 0..W {
+        for i in 0..block_w {
             let a = src[(j) * src_stride + i];
             let b = src[(j + 1) * src_stride + i];
             let c = src[(j + 2) * src_stride + i];
@@ -297,33 +274,21 @@ fn v_lowpass(
     block_h: usize,
 ) {
     match block_w {
-        4 => v_lowpass_w::<4>(dst, dst_stride, src, src_stride, block_h),
-        8 => v_lowpass_w::<8>(dst, dst_stride, src, src_stride, block_h),
-        16 => v_lowpass_w::<16>(dst, dst_stride, src, src_stride, block_h),
-        _ => {
-            for j in 0..block_h {
-                for i in 0..block_w {
-                    let a = src[(j) * src_stride + i];
-                    let b = src[(j + 1) * src_stride + i];
-                    let c = src[(j + 2) * src_stride + i];
-                    let d = src[(j + 3) * src_stride + i];
-                    let e = src[(j + 4) * src_stride + i];
-                    let f = src[(j + 5) * src_stride + i];
-                    let val = filter6(a, b, c, d, e, f);
-                    dst[j * dst_stride + i] = clip_u8((val + 16) >> 5);
-                }
-            }
-        }
+        4 => v_lowpass_rows(dst, dst_stride, src, src_stride, 4, block_h),
+        8 => v_lowpass_rows(dst, dst_stride, src, src_stride, 8, block_h),
+        16 => v_lowpass_rows(dst, dst_stride, src, src_stride, 16, block_h),
+        _ => v_lowpass_rows(dst, dst_stride, src, src_stride, block_w, block_h),
     }
 }
 
-/// Fixed-width 2D half-pel lowpass on i32 extracted buffer for auto-vectorization.
+/// 2D half-pel lowpass on i32 extracted buffer for auto-vectorization.
 #[inline(always)]
-fn hv_lowpass_w<const W: usize>(
+fn hv_lowpass_rows(
     dst: &mut [u8],
     dst_stride: usize,
     src: &[i32],
     src_stride: usize,
+    block_w: usize,
     block_h: usize,
     tmp: &mut [i32],
 ) {
@@ -331,21 +296,21 @@ fn hv_lowpass_w<const W: usize>(
 
     // First pass: horizontal filter into tmp.
     for j in 0..tmp_h {
-        for i in 0..W {
+        for i in 0..block_w {
             let s = &src[j * src_stride + i..];
-            tmp[j * W + i] = filter6(s[0], s[1], s[2], s[3], s[4], s[5]);
+            tmp[j * block_w + i] = filter6(s[0], s[1], s[2], s[3], s[4], s[5]);
         }
     }
 
     // Second pass: vertical filter on the tmp buffer.
     for j in 0..block_h {
-        for i in 0..W {
-            let a = tmp[(j) * W + i];
-            let b = tmp[(j + 1) * W + i];
-            let c = tmp[(j + 2) * W + i];
-            let d = tmp[(j + 3) * W + i];
-            let e = tmp[(j + 4) * W + i];
-            let f = tmp[(j + 5) * W + i];
+        for i in 0..block_w {
+            let a = tmp[(j) * block_w + i];
+            let b = tmp[(j + 1) * block_w + i];
+            let c = tmp[(j + 2) * block_w + i];
+            let d = tmp[(j + 3) * block_w + i];
+            let e = tmp[(j + 4) * block_w + i];
+            let f = tmp[(j + 5) * block_w + i];
             let val = filter6(a, b, c, d, e, f);
             dst[j * dst_stride + i] = clip_u8((val + 512) >> 10);
         }
@@ -369,31 +334,10 @@ fn hv_lowpass(
     tmp: &mut [i32],
 ) {
     match block_w {
-        4 => hv_lowpass_w::<4>(dst, dst_stride, src, src_stride, block_h, tmp),
-        8 => hv_lowpass_w::<8>(dst, dst_stride, src, src_stride, block_h, tmp),
-        16 => hv_lowpass_w::<16>(dst, dst_stride, src, src_stride, block_h, tmp),
-        _ => {
-            let tmp_h = block_h + 5;
-            let tmp_stride = block_w;
-            for j in 0..tmp_h {
-                for i in 0..block_w {
-                    let s = &src[j * src_stride + i..];
-                    tmp[j * tmp_stride + i] = filter6(s[0], s[1], s[2], s[3], s[4], s[5]);
-                }
-            }
-            for j in 0..block_h {
-                for i in 0..block_w {
-                    let a = tmp[(j) * tmp_stride + i];
-                    let b = tmp[(j + 1) * tmp_stride + i];
-                    let c = tmp[(j + 2) * tmp_stride + i];
-                    let d = tmp[(j + 3) * tmp_stride + i];
-                    let e = tmp[(j + 4) * tmp_stride + i];
-                    let f = tmp[(j + 5) * tmp_stride + i];
-                    let val = filter6(a, b, c, d, e, f);
-                    dst[j * dst_stride + i] = clip_u8((val + 512) >> 10);
-                }
-            }
-        }
+        4 => hv_lowpass_rows(dst, dst_stride, src, src_stride, 4, block_h, tmp),
+        8 => hv_lowpass_rows(dst, dst_stride, src, src_stride, 8, block_h, tmp),
+        16 => hv_lowpass_rows(dst, dst_stride, src, src_stride, 16, block_h, tmp),
+        _ => hv_lowpass_rows(dst, dst_stride, src, src_stride, block_w, block_h, tmp),
     }
 }
 
@@ -1105,13 +1049,13 @@ pub fn mc_luma(
                         ref_stride,
                         block_h,
                     ),
-                    8 => copy_block_direct::<8>(
-                        dst, dst_stride, ref_y, ref_stride, src_offset, block_h,
+                    8 => copy_block_direct(
+                        dst, dst_stride, ref_y, ref_stride, src_offset, 8, block_h,
                     ),
-                    4 => copy_block_direct::<4>(
-                        dst, dst_stride, ref_y, ref_stride, src_offset, block_h,
+                    4 => copy_block_direct(
+                        dst, dst_stride, ref_y, ref_stride, src_offset, 4, block_h,
                     ),
-                    _ => copy_block_direct_generic(
+                    _ => copy_block_direct(
                         dst, dst_stride, ref_y, ref_stride, src_offset, block_w, block_h,
                     ),
                 }
@@ -1473,104 +1417,6 @@ pub fn mc_chroma_avg(
     );
 }
 
-/// Fixed-width chroma bilinear MC (4-tap) for auto-vectorization.
-/// For interior blocks with d != 0 (full bilinear interpolation).
-#[inline(always)]
-#[allow(clippy::too_many_arguments)] // Bilinear filter needs 4 weights + src/dst/stride/size params
-fn chroma_mc_bilinear_w<const W: usize>(
-    dst: &mut [u8],
-    dst_stride: usize,
-    ref_uv: &[u8],
-    ref_stride: usize,
-    src_offset: usize,
-    block_h: usize,
-    a: i32,
-    b: i32,
-    c: i32,
-    d: i32,
-    avg: bool,
-) {
-    for j in 0..block_h {
-        let row_off = src_offset + j * ref_stride;
-        let dst_row = &mut dst[j * dst_stride..j * dst_stride + W];
-        for (i, dst_px) in dst_row.iter_mut().enumerate().take(W) {
-            let off = row_off + i;
-            let s00 = ref_uv[off] as i32;
-            let s10 = ref_uv[off + 1] as i32;
-            let s01 = ref_uv[off + ref_stride] as i32;
-            let s11 = ref_uv[off + ref_stride + 1] as i32;
-            let val = ((a * s00 + b * s10 + c * s01 + d * s11 + 32) >> 6) as u8;
-            if avg {
-                *dst_px = ((*dst_px as u16 + val as u16 + 1) >> 1) as u8;
-            } else {
-                *dst_px = val;
-            }
-        }
-    }
-}
-
-/// Fixed-width chroma 2-tap MC for auto-vectorization.
-/// For interior blocks with b + c != 0 but d == 0.
-#[inline(always)]
-#[allow(clippy::too_many_arguments)] // 2-tap filter needs weights + src/dst/stride/size params
-fn chroma_mc_2tap_w<const W: usize>(
-    dst: &mut [u8],
-    dst_stride: usize,
-    ref_uv: &[u8],
-    ref_stride: usize,
-    src_offset: usize,
-    block_h: usize,
-    a: i32,
-    e: i32,
-    step: usize,
-    avg: bool,
-) {
-    for j in 0..block_h {
-        let row_off = src_offset + j * ref_stride;
-        let dst_row = &mut dst[j * dst_stride..j * dst_stride + W];
-        for (i, dst_px) in dst_row.iter_mut().enumerate().take(W) {
-            let off = row_off + i;
-            let s0 = ref_uv[off] as i32;
-            let s1 = ref_uv[off + step] as i32;
-            let val = ((a * s0 + e * s1 + 32) >> 6) as u8;
-            if avg {
-                *dst_px = ((*dst_px as u16 + val as u16 + 1) >> 1) as u8;
-            } else {
-                *dst_px = val;
-            }
-        }
-    }
-}
-
-/// Fixed-width chroma full-pel copy for auto-vectorization.
-/// For interior blocks with dx == 0 && dy == 0.
-#[inline(always)]
-#[allow(clippy::too_many_arguments)] // Copy needs src/dst/stride/size + weight + avg flag
-fn chroma_mc_copy_w<const W: usize>(
-    dst: &mut [u8],
-    dst_stride: usize,
-    ref_uv: &[u8],
-    ref_stride: usize,
-    src_offset: usize,
-    block_h: usize,
-    a: i32,
-    avg: bool,
-) {
-    for j in 0..block_h {
-        let row_off = src_offset + j * ref_stride;
-        let dst_row = &mut dst[j * dst_stride..j * dst_stride + W];
-        for i in 0..W {
-            let s0 = ref_uv[row_off + i] as i32;
-            let val = ((a * s0 + 32) >> 6) as u8;
-            if avg {
-                dst_row[i] = ((dst_row[i] as u16 + val as u16 + 1) >> 1) as u8;
-            } else {
-                dst_row[i] = val;
-            }
-        }
-    }
-}
-
 /// Scalar chroma bilinear MC. When `avg` is true, averages with existing dst.
 #[allow(clippy::too_many_arguments)]
 fn chroma_mc_scalar(
@@ -1616,10 +1462,11 @@ fn chroma_mc_scalar(
                 );
             } else {
                 match block_w {
-                    2 => chroma_mc_bilinear_w::<2>(
-                        dst, dst_stride, ref_uv, ref_stride, src_offset, block_h, a, b, c, d, avg,
+                    2 => chroma_mc_bilinear(
+                        dst, dst_stride, ref_uv, ref_stride, src_offset, 2, block_h, a, b, c, d,
+                        avg,
                     ),
-                    _ => chroma_mc_bilinear_generic(
+                    _ => chroma_mc_bilinear(
                         dst, dst_stride, ref_uv, ref_stride, src_offset, block_w, block_h, a, b, c,
                         d, avg,
                     ),
@@ -1643,10 +1490,11 @@ fn chroma_mc_scalar(
                 );
             } else {
                 match block_w {
-                    2 => chroma_mc_2tap_w::<2>(
-                        dst, dst_stride, ref_uv, ref_stride, src_offset, block_h, a, e, step, avg,
+                    2 => chroma_mc_2tap(
+                        dst, dst_stride, ref_uv, ref_stride, src_offset, 2, block_h, a, e, step,
+                        avg,
                     ),
-                    _ => chroma_mc_2tap_generic(
+                    _ => chroma_mc_2tap(
                         dst, dst_stride, ref_uv, ref_stride, src_offset, block_w, block_h, a, e,
                         step, avg,
                     ),
@@ -1655,32 +1503,26 @@ fn chroma_mc_scalar(
         } else if !avg {
             // Pure full-pel copy: a==64, (64*s0+32)>>6 == s0. Use fixed-width memcpy.
             match block_w {
-                8 => {
-                    copy_block_direct::<8>(dst, dst_stride, ref_uv, ref_stride, src_offset, block_h)
-                }
-                4 => {
-                    copy_block_direct::<4>(dst, dst_stride, ref_uv, ref_stride, src_offset, block_h)
-                }
-                2 => {
-                    copy_block_direct::<2>(dst, dst_stride, ref_uv, ref_stride, src_offset, block_h)
-                }
-                _ => copy_block_direct_generic(
+                8 => copy_block_direct(dst, dst_stride, ref_uv, ref_stride, src_offset, 8, block_h),
+                4 => copy_block_direct(dst, dst_stride, ref_uv, ref_stride, src_offset, 4, block_h),
+                2 => copy_block_direct(dst, dst_stride, ref_uv, ref_stride, src_offset, 2, block_h),
+                _ => copy_block_direct(
                     dst, dst_stride, ref_uv, ref_stride, src_offset, block_w, block_h,
                 ),
             }
         } else {
             // Full-pel avg: copy + average with existing dst.
             match block_w {
-                2 => chroma_mc_copy_w::<2>(
-                    dst, dst_stride, ref_uv, ref_stride, src_offset, block_h, a, avg,
+                2 => chroma_mc_copy(
+                    dst, dst_stride, ref_uv, ref_stride, src_offset, 2, block_h, a, avg,
                 ),
-                4 => chroma_mc_copy_w::<4>(
-                    dst, dst_stride, ref_uv, ref_stride, src_offset, block_h, a, avg,
+                4 => chroma_mc_copy(
+                    dst, dst_stride, ref_uv, ref_stride, src_offset, 4, block_h, a, avg,
                 ),
-                8 => chroma_mc_copy_w::<8>(
-                    dst, dst_stride, ref_uv, ref_stride, src_offset, block_h, a, avg,
+                8 => chroma_mc_copy(
+                    dst, dst_stride, ref_uv, ref_stride, src_offset, 8, block_h, a, avg,
                 ),
-                _ => chroma_mc_copy_generic(
+                _ => chroma_mc_copy(
                     dst, dst_stride, ref_uv, ref_stride, src_offset, block_w, block_h, a, avg,
                 ),
             }
@@ -1721,10 +1563,10 @@ fn chroma_mc_scalar(
     }
 }
 
-/// Generic fallback for chroma bilinear (4-tap) with non-standard block width.
-#[inline]
+/// Scalar chroma bilinear (4-tap).
+#[inline(always)]
 #[allow(clippy::too_many_arguments)]
-fn chroma_mc_bilinear_generic(
+fn chroma_mc_bilinear(
     dst: &mut [u8],
     dst_stride: usize,
     ref_uv: &[u8],
@@ -1757,10 +1599,10 @@ fn chroma_mc_bilinear_generic(
     }
 }
 
-/// Generic fallback for chroma 2-tap with non-standard block width.
-#[inline]
+/// Scalar chroma 2-tap.
+#[inline(always)]
 #[allow(clippy::too_many_arguments)]
-fn chroma_mc_2tap_generic(
+fn chroma_mc_2tap(
     dst: &mut [u8],
     dst_stride: usize,
     ref_uv: &[u8],
@@ -1790,10 +1632,10 @@ fn chroma_mc_2tap_generic(
     }
 }
 
-/// Generic fallback for chroma full-pel copy with non-standard block width.
-#[inline]
+/// Scalar chroma full-pel copy.
+#[inline(always)]
 #[allow(clippy::too_many_arguments)]
-fn chroma_mc_copy_generic(
+fn chroma_mc_copy(
     dst: &mut [u8],
     dst_stride: usize,
     ref_uv: &[u8],
