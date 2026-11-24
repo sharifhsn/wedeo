@@ -62,23 +62,42 @@ pub fn intra_pred(
     size: usize,
     bit_depth: u8,
 ) {
+    match size {
+        4 => predict::<4>(dst, stride, above, left, top_left, mode, bit_depth),
+        8 => predict::<8>(dst, stride, above, left, top_left, mode, bit_depth),
+        16 => predict::<16>(dst, stride, above, left, top_left, mode, bit_depth),
+        32 => predict::<32>(dst, stride, above, left, top_left, mode, bit_depth),
+        _ => unreachable!("invalid VP9 transform size {size}"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn predict<const N: usize>(
+    dst: &mut [u8],
+    stride: usize,
+    above: &[u8], // above[0..size]
+    left: &[u8],  // left[0..size], bottom-to-top
+    top_left: u8, // pixel at (row-1, col-1)
+    mode: IntraMode,
+    bit_depth: u8,
+) {
     let max_val = (1_i32 << bit_depth) - 1;
     match mode {
-        IntraMode::VertPred => vert_pred(dst, stride, above, size),
-        IntraMode::HorPred => hor_pred(dst, stride, left, size),
-        IntraMode::DcPred => dc_pred(dst, stride, above, left, size),
-        IntraMode::DiagDownLeftPred => diag_downleft(dst, stride, above, size),
-        IntraMode::DiagDownRightPred => diag_downright(dst, stride, above, left, top_left, size),
-        IntraMode::VertRightPred => vert_right(dst, stride, above, left, top_left, size),
-        IntraMode::HorDownPred => hor_down(dst, stride, above, left, top_left, size),
-        IntraMode::VertLeftPred => vert_left(dst, stride, above, size),
-        IntraMode::HorUpPred => hor_up(dst, stride, left, size),
-        IntraMode::TmVp8Pred => tm_pred(dst, stride, above, left, top_left, size, max_val),
-        IntraMode::LeftDcPred => dc_left_pred(dst, stride, left, size),
-        IntraMode::TopDcPred => dc_top_pred(dst, stride, above, size),
-        IntraMode::Dc128Pred => dc_128_pred(dst, stride, size, bit_depth),
-        IntraMode::Dc127Pred => dc_127_pred(dst, stride, size, bit_depth),
-        IntraMode::Dc129Pred => dc_129_pred(dst, stride, size, bit_depth),
+        IntraMode::VertPred => vert_pred(dst, stride, above, N),
+        IntraMode::HorPred => hor_pred(dst, stride, left, N),
+        IntraMode::DcPred => dc_pred(dst, stride, above, left, N),
+        IntraMode::DiagDownLeftPred => diag_downleft(dst, stride, above, N),
+        IntraMode::DiagDownRightPred => diag_downright(dst, stride, above, left, top_left, N),
+        IntraMode::VertRightPred => vert_right(dst, stride, above, left, top_left, N),
+        IntraMode::HorDownPred => hor_down(dst, stride, above, left, top_left, N),
+        IntraMode::VertLeftPred => vert_left(dst, stride, above, N),
+        IntraMode::HorUpPred => hor_up(dst, stride, left, N),
+        IntraMode::TmVp8Pred => tm_pred(dst, stride, above, left, top_left, N, max_val),
+        IntraMode::LeftDcPred => dc_left_pred(dst, stride, left, N),
+        IntraMode::TopDcPred => dc_top_pred(dst, stride, above, N),
+        IntraMode::Dc128Pred => dc_128_pred(dst, stride, N, bit_depth),
+        IntraMode::Dc127Pred => dc_127_pred(dst, stride, N, bit_depth),
+        IntraMode::Dc129Pred => dc_129_pred(dst, stride, N, bit_depth),
     }
 }
 
@@ -175,409 +194,145 @@ fn tm_pred(
     }
 }
 
-// ---------------------------------------------------------------------------
-// D45_PRED (DIAG_DOWN_LEFT) — projects down and to the left at 45 degrees
-// The C reference reads 2*size pixels from `top` (above[0..2*size]).
-// We treat above[size-1] as the repeated-last value when beyond the block.
-// ---------------------------------------------------------------------------
+// Each directional predictor filters a short strip of boundary pixels once.
+// A block row is then a contiguous window into that strip. VP9 blocks
+// are at most 32 pixels wide.
+#[inline]
+fn avg2(a: u8, b: u8) -> u8 {
+    (a as u16 + b as u16).div_ceil(2) as u8
+}
+
+#[inline]
+fn avg3(a: u8, b: u8, c: u8) -> u8 {
+    ((a as u16 + 2 * b as u16 + c as u16 + 2) >> 2) as u8
+}
+
+#[inline]
+fn put_row(dst: &mut [u8], stride: usize, y: usize, strip: &[u8], offset: usize, size: usize) {
+    dst[y * stride..y * stride + size].copy_from_slice(&strip[offset..offset + size]);
+}
+
+#[inline]
 fn diag_downleft(dst: &mut [u8], stride: usize, above: &[u8], size: usize) {
-    // Helper: read from `above`, clamping at the last pixel.
-    let a = |k: usize| -> i32 { above[k.min(2 * size - 1)] as i32 };
-
-    if size == 4 {
-        // Verbatim 4×4 case from vp9dsp_template.c.
-        let (a0, a1, a2, a3, a4, a5, a6, a7) = (a(0), a(1), a(2), a(3), a(4), a(5), a(6), a(7));
-        let dst_set = |x: usize, y: usize, v: i32, d: &mut [u8]| {
-            d[dst_idx(x, y, stride)] = v as u8;
-        };
-        let f = |p: i32, q: i32, r: i32| (p + q * 2 + r + 2) >> 2;
-        dst_set(0, 0, f(a0, a1, a2), dst);
-        let v01 = f(a1, a2, a3);
-        dst[dst_idx(1, 0, stride)] = v01 as u8;
-        dst[dst_idx(0, 1, stride)] = v01 as u8;
-        let v02 = f(a2, a3, a4);
-        dst[dst_idx(2, 0, stride)] = v02 as u8;
-        dst[dst_idx(1, 1, stride)] = v02 as u8;
-        dst[dst_idx(0, 2, stride)] = v02 as u8;
-        let v03 = f(a3, a4, a5);
-        dst[dst_idx(3, 0, stride)] = v03 as u8;
-        dst[dst_idx(2, 1, stride)] = v03 as u8;
-        dst[dst_idx(1, 2, stride)] = v03 as u8;
-        dst[dst_idx(0, 3, stride)] = v03 as u8;
-        let v11 = f(a4, a5, a6);
-        dst[dst_idx(3, 1, stride)] = v11 as u8;
-        dst[dst_idx(2, 2, stride)] = v11 as u8;
-        dst[dst_idx(1, 3, stride)] = v11 as u8;
-        let v22 = f(a5, a6, a7);
-        dst[dst_idx(3, 2, stride)] = v22 as u8;
-        dst[dst_idx(2, 3, stride)] = v22 as u8;
-        dst[dst_idx(3, 3, stride)] = a7 as u8;
-    } else {
-        // Generic case matching `def_diag_downleft(size)`.
-        // We need the index k to read a(k), a(k+1), a(k+2).
-        #[allow(clippy::needless_range_loop)]
-        let v: Vec<i32> = (0..size - 1)
-            .map(|k| {
-                if k < size - 2 {
-                    (a(k) + a(k + 1) * 2 + a(k + 2) + 2) >> 2
-                } else {
-                    (a(size - 2) + a(size - 1) * 3 + 2) >> 2
-                }
-            })
-            .collect();
-
-        for j in 0..size {
-            for x in 0..(size - 1 - j) {
-                dst[dst_idx(x, j, stride)] = v[j + x] as u8;
-            }
-            // Fill the remaining positions with the last above pixel.
-            let last = above[size - 1];
-            for x in (size - 1 - j)..size {
-                dst[dst_idx(x, j, stride)] = last;
-            }
-        }
+    // Only the 4x4 predictor has real top-right neighbors.
+    let len = if size == 4 { 8 } else { size };
+    let last = above[len - 1];
+    let mut strip = [last; 64];
+    for i in 0..len - 2 {
+        strip[i] = avg3(above[i], above[i + 1], above[i + 2]);
+    }
+    if size != 4 {
+        strip[len - 2] = avg3(above[len - 2], last, last);
+    }
+    for y in 0..size {
+        put_row(dst, stride, y, &strip, y, size);
     }
 }
 
-// ---------------------------------------------------------------------------
-// D135_PRED (DIAG_DOWN_RIGHT)
-// ---------------------------------------------------------------------------
-fn diag_downright(
-    dst: &mut [u8],
-    stride: usize,
-    above: &[u8],
-    left: &[u8],
-    top_left: u8,
-    size: usize,
-) {
-    let tl = top_left as i32;
-
-    if size == 4 {
-        let a = |k: usize| above[k] as i32;
-        let l = |k: usize| left[k] as i32; // left[0]=bottom, left[3]=top-left-adjacent
-        let (a0, a1, a2, a3) = (a(0), a(1), a(2), a(3));
-        let (l0, l1, l2, l3) = (l(3), l(2), l(1), l(0));
-
-        let f = |p: i32, q: i32, r: i32| (p + q * 2 + r + 2) >> 2;
-        dst[dst_idx(0, 3, stride)] = f(l1, l2, l3) as u8;
-        let v = f(l0, l1, l2);
-        dst[dst_idx(0, 2, stride)] = v as u8;
-        dst[dst_idx(1, 3, stride)] = v as u8;
-        let v = f(tl, l0, l1);
-        dst[dst_idx(0, 1, stride)] = v as u8;
-        dst[dst_idx(1, 2, stride)] = v as u8;
-        dst[dst_idx(2, 3, stride)] = v as u8;
-        let v = f(l0, tl, a0);
-        dst[dst_idx(0, 0, stride)] = v as u8;
-        dst[dst_idx(1, 1, stride)] = v as u8;
-        dst[dst_idx(2, 2, stride)] = v as u8;
-        dst[dst_idx(3, 3, stride)] = v as u8;
-        let v = f(tl, a0, a1);
-        dst[dst_idx(1, 0, stride)] = v as u8;
-        dst[dst_idx(2, 1, stride)] = v as u8;
-        dst[dst_idx(3, 2, stride)] = v as u8;
-        let v = f(a0, a1, a2);
-        dst[dst_idx(2, 0, stride)] = v as u8;
-        dst[dst_idx(3, 1, stride)] = v as u8;
-        dst[dst_idx(3, 0, stride)] = f(a1, a2, a3) as u8;
-    } else {
-        // Generic case matching `def_diag_downright(size)`.
-        let mut v = vec![0i32; 2 * size - 1];
-        let f3 = |p: i32, q: i32, r: i32| (p + q * 2 + r + 2) >> 2;
-
-        for k in 0..(size - 2) {
-            v[k] = f3(left[k] as i32, left[k + 1] as i32, left[k + 2] as i32);
-            v[size + 1 + k] = f3(above[k] as i32, above[k + 1] as i32, above[k + 2] as i32);
-        }
-        // left indices in C are reversed (left[0]=bottom=farthest from corner).
-        v[size - 2] = f3(left[size - 2] as i32, left[size - 1] as i32, tl);
-        v[size - 1] = f3(left[size - 1] as i32, tl, above[0] as i32);
-        v[size] = f3(tl, above[0] as i32, above[1] as i32);
-
-        for j in 0..size {
-            for x in 0..size {
-                dst[dst_idx(x, j, stride)] = v[size - 1 - j + x] as u8;
-            }
-        }
+#[inline]
+fn diag_downright(dst: &mut [u8], stride: usize, above: &[u8], left: &[u8], tl: u8, size: usize) {
+    let mut edge = [0; 65];
+    edge[..size].copy_from_slice(&left[..size]);
+    edge[size] = tl;
+    edge[size + 1..2 * size + 1].copy_from_slice(&above[..size]);
+    let mut strip = [0; 63];
+    for i in 0..2 * size - 1 {
+        strip[i] = avg3(edge[i], edge[i + 1], edge[i + 2]);
+    }
+    for y in 0..size {
+        put_row(dst, stride, y, &strip, size - 1 - y, size);
     }
 }
 
-// ---------------------------------------------------------------------------
-// D117_PRED (VERT_RIGHT)
-// ---------------------------------------------------------------------------
+#[inline]
 fn vert_right(dst: &mut [u8], stride: usize, above: &[u8], left: &[u8], top_left: u8, size: usize) {
-    let tl = top_left as i32;
+    let tl = top_left;
 
-    if size == 4 {
-        let a = |k: usize| above[k] as i32;
-        let l = |k: usize| left[k] as i32;
-        // In FFmpeg, l0=left[3] (row just below TL), l2=left[1].
-        let (l0, l1, l2) = (l(3), l(2), l(1));
-        let (a0, a1, a2, a3) = (a(0), a(1), a(2), a(3));
+    let h = size / 2;
+    let mut ve = [0u8; 47];
+    let mut vo = [0u8; 47];
 
-        let f2 = |p: i32, q: i32| (p + q + 1) >> 1;
-        let f3 = |p: i32, q: i32, r: i32| (p + q * 2 + r + 2) >> 2;
-
-        dst[dst_idx(0, 3, stride)] = f3(l0, l1, l2) as u8;
-        dst[dst_idx(0, 2, stride)] = f3(tl, l0, l1) as u8;
-        let v = f2(tl, a0);
-        dst[dst_idx(0, 0, stride)] = v as u8;
-        dst[dst_idx(1, 2, stride)] = v as u8;
-        let v = f3(l0, tl, a0);
-        dst[dst_idx(0, 1, stride)] = v as u8;
-        dst[dst_idx(1, 3, stride)] = v as u8;
-        let v = f2(a0, a1);
-        dst[dst_idx(1, 0, stride)] = v as u8;
-        dst[dst_idx(2, 2, stride)] = v as u8;
-        let v = f3(tl, a0, a1);
-        dst[dst_idx(1, 1, stride)] = v as u8;
-        dst[dst_idx(2, 3, stride)] = v as u8;
-        let v = f2(a1, a2);
-        dst[dst_idx(2, 0, stride)] = v as u8;
-        dst[dst_idx(3, 2, stride)] = v as u8;
-        let v = f3(a0, a1, a2);
-        dst[dst_idx(2, 1, stride)] = v as u8;
-        dst[dst_idx(3, 3, stride)] = v as u8;
-        dst[dst_idx(3, 0, stride)] = f2(a2, a3) as u8;
-        dst[dst_idx(3, 1, stride)] = f3(a1, a2, a3) as u8;
-    } else {
-        // Generic case matching `def_vert_right(size)`.
-        let h = size / 2;
-        let mut ve = vec![0i32; size + h - 1];
-        let mut vo = vec![0i32; size + h - 1];
-        let f2 = |p: i32, q: i32| (p + q + 1) >> 1;
-        let f3 = |p: i32, q: i32, r: i32| (p + q * 2 + r + 2) >> 2;
-
-        for k in 0..(h - 2) {
-            // In C: left[0]=bottom, left[size-1]=top-adjacent.
-            // Rows counted from top: vo[k] uses left at positions 2k+3, 2k+2, 2k+1.
-            vo[k] = f3(
-                left[2 * k + 3] as i32,
-                left[2 * k + 2] as i32,
-                left[2 * k + 1] as i32,
-            );
-            ve[k] = f3(
-                left[2 * k + 4] as i32,
-                left[2 * k + 3] as i32,
-                left[2 * k + 2] as i32,
-            );
-        }
-        vo[h - 2] = f3(
-            left[size - 1] as i32,
-            left[size - 2] as i32,
-            left[size - 3] as i32,
+    for k in 0..(h - 2) {
+        // In C: left[0]=bottom, left[size-1]=top-adjacent.
+        // Rows counted from top: vo[k] uses left at positions 2k+3, 2k+2, 2k+1.
+        vo[k] = avg3(left[2 * k + 3], left[2 * k + 2], left[2 * k + 1]);
+        ve[k] = avg3(left[2 * k + 4], left[2 * k + 3], left[2 * k + 2]);
+    }
+    vo[h - 2] = avg3(left[size - 1], left[size - 2], left[size - 3]);
+    ve[h - 2] = avg3(tl, left[size - 1], left[size - 2]);
+    ve[h - 1] = avg2(tl, above[0]);
+    vo[h - 1] = avg3(left[size - 1], tl, above[0]);
+    for k in 0..(size - 1) {
+        ve[h + k] = avg2(above[k], above[k + 1]);
+        vo[h + k] = avg3(
+            if k > 0 { above[k - 1] } else { tl },
+            above[k],
+            above[k + 1],
         );
-        ve[h - 2] = f3(tl, left[size - 1] as i32, left[size - 2] as i32);
-        ve[h - 1] = f2(tl, above[0] as i32);
-        vo[h - 1] = f3(left[size - 1] as i32, tl, above[0] as i32);
-        for k in 0..(size - 1) {
-            ve[h + k] = f2(above[k] as i32, above[k + 1] as i32);
-            vo[h + k] = f3(
-                if k > 0 { above[k - 1] as i32 } else { tl },
-                above[k] as i32,
-                above[k + 1] as i32,
-            );
-        }
-        for j in 0..h {
-            let base_e = h - 1 - j;
-            let base_o = h - 1 - j;
-            for x in 0..size {
-                dst[dst_idx(x, j * 2, stride)] = ve[base_e + x] as u8;
-                dst[dst_idx(x, j * 2 + 1, stride)] = vo[base_o + x] as u8;
-            }
-        }
+    }
+    for j in 0..h {
+        let offset = h - 1 - j;
+        put_row(dst, stride, j * 2, &ve, offset, size);
+        put_row(dst, stride, j * 2 + 1, &vo, offset, size);
     }
 }
 
 // ---------------------------------------------------------------------------
 // D153_PRED (HOR_DOWN)
 // ---------------------------------------------------------------------------
+#[inline]
 fn hor_down(dst: &mut [u8], stride: usize, above: &[u8], left: &[u8], top_left: u8, size: usize) {
-    let tl = top_left as i32;
+    let tl = top_left;
 
-    if size == 4 {
-        let a = |k: usize| above[k] as i32;
-        // In FFmpeg: l0=left[3], l1=left[2], l2=left[1], l3=left[0].
-        let (l0, l1, l2, l3) = (
-            left[3] as i32,
-            left[2] as i32,
-            left[1] as i32,
-            left[0] as i32,
+    let mut v = [0u8; 94];
+
+    for k in 0..(size - 2) {
+        v[k * 2] = avg2(left[k + 1], left[k]);
+        v[k * 2 + 1] = avg3(left[k + 2], left[k + 1], left[k]);
+        v[size * 2 + k] = avg3(
+            if k > 0 { above[k - 1] } else { tl },
+            above[k],
+            above[k + 1],
         );
-        let (a0, a1, a2) = (a(0), a(1), a(2));
-        let f2 = |p: i32, q: i32| (p + q + 1) >> 1;
-        let f3 = |p: i32, q: i32, r: i32| (p + q * 2 + r + 2) >> 2;
+    }
+    v[size * 2 - 2] = avg2(tl, left[size - 1]);
+    v[size * 2 - 4] = avg2(left[size - 1], left[size - 2]);
+    v[size * 2 - 1] = avg3(above[0], tl, left[size - 1]);
+    v[size * 2 - 3] = avg3(tl, left[size - 1], left[size - 2]);
 
-        dst[dst_idx(2, 0, stride)] = f3(tl, a0, a1) as u8;
-        dst[dst_idx(3, 0, stride)] = f3(a0, a1, a2) as u8;
-        let v = f2(tl, l0);
-        dst[dst_idx(0, 0, stride)] = v as u8;
-        dst[dst_idx(2, 1, stride)] = v as u8;
-        let v = f3(a0, tl, l0);
-        dst[dst_idx(1, 0, stride)] = v as u8;
-        dst[dst_idx(3, 1, stride)] = v as u8;
-        let v = f2(l0, l1);
-        dst[dst_idx(0, 1, stride)] = v as u8;
-        dst[dst_idx(2, 2, stride)] = v as u8;
-        let v = f3(tl, l0, l1);
-        dst[dst_idx(1, 1, stride)] = v as u8;
-        dst[dst_idx(3, 2, stride)] = v as u8;
-        let v = f2(l1, l2);
-        dst[dst_idx(0, 2, stride)] = v as u8;
-        dst[dst_idx(2, 3, stride)] = v as u8;
-        let v = f3(l0, l1, l2);
-        dst[dst_idx(1, 2, stride)] = v as u8;
-        dst[dst_idx(3, 3, stride)] = v as u8;
-        dst[dst_idx(0, 3, stride)] = f2(l2, l3) as u8;
-        dst[dst_idx(1, 3, stride)] = f3(l1, l2, l3) as u8;
-    } else {
-        // Generic case matching `def_hor_down(size)`.
-        let mut v = vec![0i32; 3 * size - 2];
-        let f2 = |p: i32, q: i32| (p + q + 1) >> 1;
-        let f3 = |p: i32, q: i32, r: i32| (p + q * 2 + r + 2) >> 2;
-
-        for k in 0..(size - 2) {
-            v[k * 2] = f2(left[k + 1] as i32, left[k] as i32);
-            v[k * 2 + 1] = f3(left[k + 2] as i32, left[k + 1] as i32, left[k] as i32);
-            v[size * 2 + k] = f3(
-                if k > 0 { above[k - 1] as i32 } else { tl },
-                above[k] as i32,
-                above[k + 1] as i32,
-            );
-        }
-        v[size * 2 - 2] = f2(tl, left[size - 1] as i32);
-        v[size * 2 - 4] = f2(left[size - 1] as i32, left[size - 2] as i32);
-        v[size * 2 - 1] = f3(above[0] as i32, tl, left[size - 1] as i32);
-        v[size * 2 - 3] = f3(tl, left[size - 1] as i32, left[size - 2] as i32);
-
-        for j in 0..size {
-            for x in 0..size {
-                let idx = size * 2 - 2 - j * 2 + x;
-                dst[dst_idx(x, j, stride)] = v[idx] as u8;
-            }
-        }
+    for j in 0..size {
+        put_row(dst, stride, j, &v, size * 2 - 2 - j * 2, size);
     }
 }
 
 // ---------------------------------------------------------------------------
 // D207_PRED (VERT_LEFT)
 // ---------------------------------------------------------------------------
+#[inline]
 fn vert_left(dst: &mut [u8], stride: usize, above: &[u8], size: usize) {
-    let a = |k: usize| above[k.min(2 * size - 1)] as i32;
-
-    if size == 4 {
-        let f2 = |p: i32, q: i32| (p + q + 1) >> 1;
-        let f3 = |p: i32, q: i32, r: i32| (p + q * 2 + r + 2) >> 2;
-        let (a0, a1, a2, a3, a4, a5, a6) = (a(0), a(1), a(2), a(3), a(4), a(5), a(6));
-
-        dst[dst_idx(0, 0, stride)] = f2(a0, a1) as u8;
-        dst[dst_idx(0, 1, stride)] = f3(a0, a1, a2) as u8;
-        let v = f2(a1, a2);
-        dst[dst_idx(1, 0, stride)] = v as u8;
-        dst[dst_idx(0, 2, stride)] = v as u8;
-        let v = f3(a1, a2, a3);
-        dst[dst_idx(1, 1, stride)] = v as u8;
-        dst[dst_idx(0, 3, stride)] = v as u8;
-        let v = f2(a2, a3);
-        dst[dst_idx(2, 0, stride)] = v as u8;
-        dst[dst_idx(1, 2, stride)] = v as u8;
-        let v = f3(a2, a3, a4);
-        dst[dst_idx(2, 1, stride)] = v as u8;
-        dst[dst_idx(1, 3, stride)] = v as u8;
-        let v = f2(a3, a4);
-        dst[dst_idx(3, 0, stride)] = v as u8;
-        dst[dst_idx(2, 2, stride)] = v as u8;
-        let v = f3(a3, a4, a5);
-        dst[dst_idx(3, 1, stride)] = v as u8;
-        dst[dst_idx(2, 3, stride)] = v as u8;
-        dst[dst_idx(3, 2, stride)] = f2(a4, a5) as u8;
-        dst[dst_idx(3, 3, stride)] = f3(a4, a5, a6) as u8;
-    } else {
-        // Generic case matching `def_vert_left(size)`.
-        let mut ve = vec![0i32; size - 1];
-        let mut vo = vec![0i32; size - 1];
-        let f2 = |p: i32, q: i32| (p + q + 1) >> 1;
-        let f3 = |p: i32, q: i32, r: i32| (p + q * 2 + r + 2) >> 2;
-
-        for k in 0..(size - 2) {
-            ve[k] = f2(a(k), a(k + 1));
-            vo[k] = f3(a(k), a(k + 1), a(k + 2));
-        }
-        ve[size - 2] = f2(a(size - 2), a(size - 1));
-        vo[size - 2] = f3(a(size - 2), a(size - 1), a(size - 1)); // clamp last
-
-        for j in 0..(size / 2) {
-            for x in 0..(size - j - 1) {
-                dst[dst_idx(x, j * 2, stride)] = ve[j + x] as u8;
-                dst[dst_idx(x, j * 2 + 1, stride)] = vo[j + x] as u8;
-            }
-            let last = above[size - 1];
-            for x in (size - j - 1)..size {
-                dst[dst_idx(x, j * 2, stride)] = last;
-                dst[dst_idx(x, j * 2 + 1, stride)] = last;
-            }
-        }
+    let len = if size == 4 { 7 } else { size };
+    let last = above[len - 1];
+    let mut even = [last; 48];
+    let mut odd = [last; 48];
+    for i in 0..len - 1 {
+        even[i] = avg2(above[i], above[i + 1]);
+        odd[i] = avg3(above[i], above[i + 1], above[(i + 2).min(len - 1)]);
+    }
+    for j in 0..size / 2 {
+        put_row(dst, stride, j * 2, &even, j, size);
+        put_row(dst, stride, j * 2 + 1, &odd, j, size);
     }
 }
 
-// ---------------------------------------------------------------------------
-// D63_PRED (HOR_UP)
-// left[0]=bottom-left, left[size-1]=top-left-adjacent.
-// The C function uses left[0..size] with left[0]=top of left column.
-// ---------------------------------------------------------------------------
+#[inline]
 fn hor_up(dst: &mut [u8], stride: usize, left: &[u8], size: usize) {
-    if size == 4 {
-        let l = |k: usize| left[k] as i32;
-        let (l0, l1, l2, l3) = (l(0), l(1), l(2), l(3));
-        let f2 = |p: i32, q: i32| (p + q + 1) >> 1;
-        let f3 = |p: i32, q: i32, r: i32| (p + q * 2 + r + 2) >> 2;
-
-        dst[dst_idx(0, 0, stride)] = f2(l0, l1) as u8;
-        dst[dst_idx(1, 0, stride)] = f3(l0, l1, l2) as u8;
-        let v = f2(l1, l2);
-        dst[dst_idx(0, 1, stride)] = v as u8;
-        dst[dst_idx(2, 0, stride)] = v as u8;
-        let v = f3(l1, l2, l3);
-        dst[dst_idx(1, 1, stride)] = v as u8;
-        dst[dst_idx(3, 0, stride)] = v as u8;
-        let v = f2(l2, l3);
-        dst[dst_idx(0, 2, stride)] = v as u8;
-        dst[dst_idx(2, 1, stride)] = v as u8;
-        let v = (l2 + l3 * 3 + 2) >> 2; // f3-like with 3*l3
-        dst[dst_idx(1, 2, stride)] = v as u8;
-        dst[dst_idx(3, 1, stride)] = v as u8;
-        // Bottom-right quadrant filled with l3.
-        for &(x, y) in &[(0, 3), (1, 3), (2, 2), (2, 3), (3, 2), (3, 3)] {
-            dst[dst_idx(x, y, stride)] = l3 as u8;
-        }
-    } else {
-        // Generic case matching `def_hor_up(size)`.
-        let mut v = vec![0i32; 2 * size - 2];
-        let f2 = |p: i32, q: i32| (p + q + 1) >> 1;
-        let f3 = |p: i32, q: i32, r: i32| (p + q * 2 + r + 2) >> 2;
-
-        for k in 0..(size - 2) {
-            v[k * 2] = f2(left[k] as i32, left[k + 1] as i32);
-            v[k * 2 + 1] = f3(left[k] as i32, left[k + 1] as i32, left[k + 2] as i32);
-        }
-        v[2 * size - 4] = f2(left[size - 2] as i32, left[size - 1] as i32);
-        v[2 * size - 3] = (left[size - 2] as i32 + left[size - 1] as i32 * 3 + 2) >> 2;
-
-        let last = left[size - 1];
-        for j in 0..(size / 2) {
-            for x in 0..size {
-                dst[dst_idx(x, j, stride)] = v[j * 2 + x] as u8;
-            }
-        }
-        for j in (size / 2)..size {
-            let avail = 2 * size - 2 - j * 2;
-            for x in 0..avail {
-                dst[dst_idx(x, j, stride)] = v[j * 2 + x] as u8;
-            }
-            for x in avail..size {
-                dst[dst_idx(x, j, stride)] = last;
-            }
-        }
+    let mut strip = [left[size - 1]; 94];
+    for i in 0..size - 1 {
+        strip[2 * i] = avg2(left[i], left[i + 1]);
+        strip[2 * i + 1] = avg3(left[i], left[i + 1], left[(i + 2).min(size - 1)]);
+    }
+    for y in 0..size {
+        put_row(dst, stride, y, &strip, 2 * y, size);
     }
 }
 
