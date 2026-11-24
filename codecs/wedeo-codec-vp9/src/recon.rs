@@ -565,30 +565,17 @@ pub fn reconstruct_intra_block(
                 // Inverse transform + add.
                 if !block.skip {
                     let coefs = &block.coefs_y[coef_idx..coef_idx + coef_per_tx];
-                    // Determine EOB (last non-zero coefficient + 1).
-                    let eob = coefs.iter().rposition(|&c| c != 0).map_or(0, |p| p + 1);
-                    if eob > 0 {
-                        if header.lossless {
-                            itxfm_add_lossless(
-                                &mut fb.y[dst_offset..],
-                                fb.y_stride,
-                                coefs,
-                                bit_depth,
-                            );
-                        } else {
-                            let tx_type_raw = INTRA_TXFM_TYPE[mode as usize];
-                            let tx_type = TxType::try_from(tx_type_raw).unwrap_or(TxType::DctDct);
-                            itxfm_add(
-                                &mut fb.y[dst_offset..],
-                                fb.y_stride,
-                                coefs,
-                                block.tx_size,
-                                tx_type,
-                                bit_depth,
-                                eob,
-                            );
-                        }
-                    }
+                    let kind =
+                        TxType::try_from(INTRA_TXFM_TYPE[mode as usize]).unwrap_or(TxType::DctDct);
+                    add_residual(
+                        &mut fb.y,
+                        dst_offset,
+                        fb.y_stride,
+                        coefs,
+                        block.tx_size,
+                        kind,
+                        header,
+                    );
                 }
 
                 coef_idx += coef_per_tx;
@@ -620,8 +607,9 @@ pub fn reconstruct_intra_block(
     let uv_mode = block.uv_mode;
     let coef_per_uv_tx = uv_tx_px * uv_tx_px;
 
-    // Process U (Cb) plane.
-    {
+    // Preserve the joint U/V bounds check for padded frame edges.
+    let common_len = fb.u.len().min(fb.v.len());
+    for (plane, coefficients) in [(&mut fb.u, &block.coefs_u), (&mut fb.v, &block.coefs_v)] {
         let mut coef_idx = 0usize;
         for ty in (0..uv_end_y).step_by(uv_tx_step) {
             for tx in (0..uv_end_x).step_by(uv_tx_step) {
@@ -634,8 +622,7 @@ pub fn reconstruct_intra_block(
                     .saturating_mul(uv_stride)
                     .saturating_add(px)
                     .saturating_add(uv_tx_px);
-                let uv_buf_ok = |buf: &[u8]| dst_end <= buf.len();
-                if !uv_buf_ok(&fb.u) || !uv_buf_ok(&fb.v) {
+                if dst_end > common_len {
                     coef_idx += coef_per_uv_tx;
                     continue;
                 }
@@ -643,7 +630,7 @@ pub fn reconstruct_intra_block(
                 let uv_have_right = tx + uv_tx_step < uv_w4;
 
                 let resolved = prepare_intra_edges(
-                    &fb.u,
+                    plane,
                     uv_stride,
                     px,
                     py,
@@ -662,7 +649,7 @@ pub fn reconstruct_intra_block(
                 let top_left = uv_above_scratch[0];
 
                 intra_pred(
-                    &mut fb.u[dst_offset..],
+                    &mut plane[dst_offset..],
                     uv_stride,
                     above_slice,
                     &uv_left_scratch,
@@ -673,111 +660,16 @@ pub fn reconstruct_intra_block(
                 );
 
                 if !block.skip {
-                    let coefs = &block.coefs_u[coef_idx..coef_idx + coef_per_uv_tx];
-                    let eob = coefs.iter().rposition(|&c| c != 0).map_or(0, |p| p + 1);
-                    if eob > 0 {
-                        if header.lossless {
-                            itxfm_add_lossless(
-                                &mut fb.u[dst_offset..],
-                                uv_stride,
-                                coefs,
-                                bit_depth,
-                            );
-                        } else {
-                            itxfm_add(
-                                &mut fb.u[dst_offset..],
-                                uv_stride,
-                                coefs,
-                                block.uv_tx_size,
-                                TxType::DctDct,
-                                bit_depth,
-                                eob,
-                            );
-                        }
-                    }
-                }
-
-                coef_idx += coef_per_uv_tx;
-            }
-        }
-    }
-
-    // Process V (Cr) plane.
-    {
-        let mut coef_idx = 0usize;
-        for ty in (0..uv_end_y).step_by(uv_tx_step) {
-            for tx in (0..uv_end_x).step_by(uv_tx_step) {
-                let px = ((block.col >> ss_h) + tx) * 4;
-                let py = ((block.row >> ss_v) + ty) * 4;
-
-                let dst_end = py
-                    .saturating_add(uv_tx_px)
-                    .saturating_sub(1)
-                    .saturating_mul(uv_stride)
-                    .saturating_add(px)
-                    .saturating_add(uv_tx_px);
-                let uv_buf_ok = |buf: &[u8]| dst_end <= buf.len();
-                if !uv_buf_ok(&fb.u) || !uv_buf_ok(&fb.v) {
-                    coef_idx += coef_per_uv_tx;
-                    continue;
-                }
-
-                let uv_have_right = tx + uv_tx_step < uv_w4;
-
-                let resolved = prepare_intra_edges(
-                    &fb.v,
-                    uv_stride,
-                    px,
-                    py,
-                    uv_frame_w,
-                    uv_frame_h,
-                    uv_tile_col_px,
-                    uv_tx_px,
-                    &mut uv_above_scratch,
-                    &mut uv_left_scratch,
-                    uv_mode,
-                    uv_have_right,
-                );
-
-                let dst_offset = py * uv_stride + px;
-                let above_slice = &uv_above_scratch[1..];
-                let top_left = uv_above_scratch[0];
-
-                intra_pred(
-                    &mut fb.v[dst_offset..],
-                    uv_stride,
-                    above_slice,
-                    &uv_left_scratch,
-                    top_left,
-                    resolved,
-                    uv_tx_px,
-                    bit_depth,
-                );
-
-                if !block.skip {
-                    let coefs = &block.coefs_v[coef_idx..coef_idx + coef_per_uv_tx];
-                    let eob = coefs.iter().rposition(|&c| c != 0).map_or(0, |p| p + 1);
-                    if eob > 0 {
-                        if header.lossless {
-                            itxfm_add_lossless(
-                                &mut fb.v[dst_offset..],
-                                uv_stride,
-                                coefs,
-                                bit_depth,
-                            );
-                        } else {
-                            // UV always uses DCT_DCT (vp9recon.c line 280).
-                            itxfm_add(
-                                &mut fb.v[dst_offset..],
-                                uv_stride,
-                                coefs,
-                                block.uv_tx_size,
-                                TxType::DctDct,
-                                bit_depth,
-                                eob,
-                            );
-                        }
-                    }
+                    let coefs = &coefficients[coef_idx..coef_idx + coef_per_uv_tx];
+                    add_residual(
+                        plane,
+                        dst_offset,
+                        uv_stride,
+                        coefs,
+                        block.uv_tx_size,
+                        TxType::DctDct,
+                        header,
+                    );
                 }
 
                 coef_idx += coef_per_uv_tx;
@@ -803,8 +695,6 @@ pub fn reconstruct_inter_block(
     ref_slots: &[Option<Arc<RefFrame>>; 8],
     mc_scratch: &mut mc::McScratch,
 ) -> Result<()> {
-    let bit_depth = header.bit_depth;
-
     // 1. Motion compensation: write prediction into fb.
     mc::inter_pred(
         fb,
@@ -831,114 +721,79 @@ pub fn reconstruct_inter_block(
     let h4 = (BWH_TAB[1][bs][1] as usize) * 2;
     let end_x = w4.min(2 * cols_8x8.saturating_sub(block.col / 2));
     let end_y = h4.min(2 * rows_8x8.saturating_sub(block.row / 2));
-    {
-        let tx_step = 1usize << (block.tx_size as usize);
-        let tx_px = tx_step * 4;
-        let coef_per_tx = tx_px * tx_px;
-        let mut coef_idx = 0usize;
-
-        for ty in (0..end_y).step_by(tx_step) {
-            for tx in (0..end_x).step_by(tx_step) {
-                let px = (block.col + tx) * 4;
-                let py = (block.row + ty) * 4;
-
-                let coefs = &block.coefs_y[coef_idx..coef_idx + coef_per_tx];
-                let eob = coefs.iter().rposition(|&c| c != 0).map_or(0, |p| p + 1);
-                if eob > 0 {
-                    let dst_offset = py * fb.y_stride + px;
-                    if header.lossless {
-                        itxfm_add_lossless(&mut fb.y[dst_offset..], fb.y_stride, coefs, bit_depth);
-                    } else {
-                        itxfm_add(
-                            &mut fb.y[dst_offset..],
-                            fb.y_stride,
-                            coefs,
-                            block.tx_size,
-                            TxType::DctDct, // Inter always uses DCT_DCT.
-                            bit_depth,
-                            eob,
-                        );
-                    }
-                }
-
-                coef_idx += coef_per_tx;
-            }
-        }
-    }
-
-    // Chroma residual (U and V).
-    let ss_h = usize::from(header.subsampling_x);
-    let ss_v = usize::from(header.subsampling_y);
-    let uv_end_x = end_x >> ss_h;
-    let uv_end_y = end_y >> ss_v;
-    let uv_tx_step = 1usize << (block.uv_tx_size as usize);
-    let uv_tx_px = uv_tx_step * 4;
-    let coef_per_uv_tx = uv_tx_px * uv_tx_px;
-    let uv_stride = fb.uv_stride;
-
-    // U plane.
-    {
-        let mut coef_idx = 0usize;
-        for ty in (0..uv_end_y).step_by(uv_tx_step) {
-            for tx in (0..uv_end_x).step_by(uv_tx_step) {
-                let px = ((block.col >> ss_h) + tx) * 4;
-                let py = ((block.row >> ss_v) + ty) * 4;
-
-                let coefs = &block.coefs_u[coef_idx..coef_idx + coef_per_uv_tx];
-                let eob = coefs.iter().rposition(|&c| c != 0).map_or(0, |p| p + 1);
-                if eob > 0 {
-                    let dst_offset = py * uv_stride + px;
-                    if header.lossless {
-                        itxfm_add_lossless(&mut fb.u[dst_offset..], uv_stride, coefs, bit_depth);
-                    } else {
-                        itxfm_add(
-                            &mut fb.u[dst_offset..],
-                            uv_stride,
-                            coefs,
-                            block.uv_tx_size,
-                            TxType::DctDct,
-                            bit_depth,
-                            eob,
-                        );
-                    }
-                }
-
-                coef_idx += coef_per_uv_tx;
-            }
-        }
-    }
-
-    // V plane.
-    {
-        let mut coef_idx = 0usize;
-        for ty in (0..uv_end_y).step_by(uv_tx_step) {
-            for tx in (0..uv_end_x).step_by(uv_tx_step) {
-                let px = ((block.col >> ss_h) + tx) * 4;
-                let py = ((block.row >> ss_v) + ty) * 4;
-
-                let coefs = &block.coefs_v[coef_idx..coef_idx + coef_per_uv_tx];
-                let eob = coefs.iter().rposition(|&c| c != 0).map_or(0, |p| p + 1);
-                if eob > 0 {
-                    let dst_offset = py * uv_stride + px;
-                    if header.lossless {
-                        itxfm_add_lossless(&mut fb.v[dst_offset..], uv_stride, coefs, bit_depth);
-                    } else {
-                        itxfm_add(
-                            &mut fb.v[dst_offset..],
-                            uv_stride,
-                            coefs,
-                            block.uv_tx_size,
-                            TxType::DctDct,
-                            bit_depth,
-                            eob,
-                        );
-                    }
-                }
-
-                coef_idx += coef_per_uv_tx;
+    // Luma and chroma use identical DCT residuals with per-plane origins,
+    // subsampling and transform sizes. Traverse coefficients in bitstream order.
+    let sx = usize::from(header.subsampling_x);
+    let sy = usize::from(header.subsampling_y);
+    for (plane, stride, coefficients, size, xs, ys) in [
+        (&mut fb.y, fb.y_stride, &block.coefs_y, block.tx_size, 0, 0),
+        (
+            &mut fb.u,
+            fb.uv_stride,
+            &block.coefs_u,
+            block.uv_tx_size,
+            sx,
+            sy,
+        ),
+        (
+            &mut fb.v,
+            fb.uv_stride,
+            &block.coefs_v,
+            block.uv_tx_size,
+            sx,
+            sy,
+        ),
+    ] {
+        let step = 1usize << size as usize;
+        let count = (step * 4).pow(2);
+        let mut start = 0;
+        for ty in (0..end_y >> ys).step_by(step) {
+            for tx in (0..end_x >> xs).step_by(step) {
+                let x = ((block.col >> xs) + tx) * 4;
+                let y = ((block.row >> ys) + ty) * 4;
+                add_residual(
+                    plane,
+                    y * stride + x,
+                    stride,
+                    &coefficients[start..start + count],
+                    size,
+                    TxType::DctDct,
+                    header,
+                );
+                start += count;
             }
         }
     }
 
     Ok(())
+}
+
+/// Empty residuals leave the prediction alone. Both luma and chroma use
+/// the lossless Walsh-Hadamard path when signaled by the frame header.
+#[inline]
+fn add_residual(
+    plane: &mut [u8],
+    offset: usize,
+    stride: usize,
+    coefs: &[i32],
+    size: TxSize,
+    kind: TxType,
+    header: &FrameHeader,
+) {
+    let Some(last) = coefs.iter().rposition(|&v| v != 0) else {
+        return;
+    };
+    if header.lossless {
+        itxfm_add_lossless(&mut plane[offset..], stride, coefs, header.bit_depth);
+    } else {
+        itxfm_add(
+            &mut plane[offset..],
+            stride,
+            coefs,
+            size,
+            kind,
+            header.bit_depth,
+            last + 1,
+        );
+    }
 }
