@@ -7,10 +7,16 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Default path to the pinned FFmpeg `n9.1` oracle binary built in-tree.
-pub const PINNED_FFMPEG_ORACLE: &str = "/home/sharif/wedeo/target/ffmpeg-oracle/ffmpeg";
+pub const PINNED_FFMPEG_ORACLE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../target/ffmpeg-oracle/ffmpeg"
+);
 
 /// Default path to the pinned FFmpeg `n9.1` `ffprobe` oracle binary built in-tree.
-pub const PINNED_FFPROBE_ORACLE: &str = "/home/sharif/wedeo/target/ffmpeg-oracle/ffprobe";
+pub const PINNED_FFPROBE_ORACLE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../target/ffmpeg-oracle/ffprobe"
+);
 
 // ---------------------------------------------------------------------------
 // CountingAlloc: thread-local + reentrancy-safe DOD allocation tracker
@@ -136,38 +142,25 @@ pub fn assert_zero_allocs<F: FnOnce() -> R, R>(label: &str, f: F) -> R {
 // Pinned FFmpeg n9.1 oracle binary resolution
 // ---------------------------------------------------------------------------
 
-/// Resolve the FFmpeg `n9.1` oracle binary:
-/// 1. `/home/sharif/wedeo/target/ffmpeg-oracle/ffmpeg`
-/// 2. `WEDEO_FFMPEG_BIN` environment variable
-/// 3. `"ffmpeg"` on `PATH`
-pub fn ffmpeg_oracle_bin() -> PathBuf {
-    let pinned = Path::new(PINNED_FFMPEG_ORACLE);
+fn resolve_oracle(pinned: &str, override_var: &str, fallback: &str) -> PathBuf {
+    let pinned = Path::new(pinned);
     if pinned.is_file() {
         return pinned.to_path_buf();
     }
-    if let Ok(env_bin) = std::env::var("WEDEO_FFMPEG_BIN")
-        && !env_bin.trim().is_empty()
-    {
-        return PathBuf::from(env_bin);
-    }
-    PathBuf::from("ffmpeg")
+    std::env::var(override_var)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map_or_else(|| PathBuf::from(fallback), PathBuf::from)
 }
 
-/// Resolve the FFmpeg `n9.1` `ffprobe` oracle binary:
-/// 1. `/home/sharif/wedeo/target/ffmpeg-oracle/ffprobe`
-/// 2. `WEDEO_FFPROBE_BIN` environment variable
-/// 3. `"ffprobe"` on `PATH`
+/// Use this checkout's pinned FFmpeg, then WEDEO_FFMPEG_BIN, then PATH.
+pub fn ffmpeg_oracle_bin() -> PathBuf {
+    resolve_oracle(PINNED_FFMPEG_ORACLE, "WEDEO_FFMPEG_BIN", "ffmpeg")
+}
+
+/// Use this checkout's pinned ffprobe, then WEDEO_FFPROBE_BIN, then PATH.
 pub fn ffprobe_oracle_bin() -> PathBuf {
-    let pinned = Path::new(PINNED_FFPROBE_ORACLE);
-    if pinned.is_file() {
-        return pinned.to_path_buf();
-    }
-    if let Ok(env_bin) = std::env::var("WEDEO_FFPROBE_BIN")
-        && !env_bin.trim().is_empty()
-    {
-        return PathBuf::from(env_bin);
-    }
-    PathBuf::from("ffprobe")
+    resolve_oracle(PINNED_FFPROBE_ORACLE, "WEDEO_FFPROBE_BIN", "ffprobe")
 }
 
 /// Resolve a system FFmpeg binary with external encoders (`libx264`, `libsvtav1`,
