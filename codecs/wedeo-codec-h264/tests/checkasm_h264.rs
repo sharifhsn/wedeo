@@ -573,3 +573,97 @@ fn dispatched_square_average_matches_scalar_with_padding_and_overlap() {
         }
     }
 }
+
+/// None selects the real decoder entry point. Some selects a checkasm backend.
+fn run_avg(
+    backend: Option<SimdBackend>,
+    dst: &mut [u8],
+    src: &[u8],
+    (ds, ss): (usize, usize),
+    (w, h): (usize, usize),
+) {
+    match backend {
+        None => simd::avg_pixels_inplace(dst, ds, src, ss, w, h),
+        Some(b) => simd::avg_pixels_inplace_with_backend(dst, ds, src, ss, w, h, b),
+    }
+}
+
+#[test]
+fn average_exact_extents_and_independent_strides() {
+    let mut rng = Rng::new(0xabc123);
+    let backends: Vec<_> = std::iter::once(None)
+        .chain(simd::available_backends().into_iter().map(Some))
+        .collect();
+    for w in [1usize, 4, 7, 8, 9, 15, 16, 17] {
+        for h in [1, w - 1, w, w + 1].into_iter().filter(|&h| h > 0) {
+            for (ds, ss) in [
+                (w, w),
+                (w, w + 3),
+                (w + 5, w),
+                (w - 1, w + 7),
+                (0, w),
+                (w, 0),
+            ] {
+                let dn = (h - 1) * ds + w;
+                let sn = (h - 1) * ss + w;
+                for offset in 0..16 {
+                    let mut src = vec![0; 15 - offset + sn];
+                    let mut input = vec![CANARY; offset + dn + GUARD];
+                    fill_pixels(&mut rng, &mut src);
+                    fill_pixels(&mut rng, &mut input[offset..offset + dn]);
+                    let src = &src[15 - offset..];
+                    let mut expected = input.clone();
+                    for y in 0..h {
+                        for x in 0..w {
+                            let d = &mut expected[offset + y * ds + x];
+                            *d = (u16::from(*d) + u16::from(src[y * ss + x])).div_ceil(2) as u8;
+                        }
+                    }
+                    for &b in &backends {
+                        let mut actual = input.clone();
+                        run_avg(b, &mut actual[offset..offset + dn], src, (ds, ss), (w, h));
+                        assert_eq!(
+                            actual, expected,
+                            "{b:?} {w}x{h} ds={ds} ss={ss} offset={offset}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn average_zero_and_invalid_extents() {
+    for b in std::iter::once(None).chain(simd::available_backends().into_iter().map(Some)) {
+        for dims in [(0, usize::MAX), (usize::MAX, 0), (0, 0)] {
+            run_avg(b, &mut [], &[], (usize::MAX, usize::MAX), dims);
+        }
+        // A single row never advances either pointer, even at maximum pitch.
+        let mut row = [0; 16];
+        run_avg(b, &mut row, &[255; 16], (usize::MAX, usize::MAX), (16, 1));
+        assert_eq!(row, [128; 16]);
+        for w in [8, 16] {
+            for h in [w, w - 1] {
+                let len = w * h;
+                // Multiplication fits for this pitch; adding the last row does not.
+                let add_overflow_pitch = usize::MAX / (h - 1);
+                for (dn, sn, ds, ss) in [
+                    (len - 1, len, w, w),
+                    (len, len - 1, w, w),
+                    (len, len, usize::MAX, w),
+                    (len, len, w, usize::MAX),
+                    (len, len, add_overflow_pitch, w),
+                    (len, len, w, add_overflow_pitch),
+                ] {
+                    let mut dst = vec![1; dn];
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        run_avg(b, &mut dst, &vec![255; sn], (ds, ss), (w, h));
+                    }));
+                    assert!(result.is_err(), "{b:?} {w}x{h} accepted invalid extent");
+                    assert!(dst.iter().all(|&v| v == 1), "partial write on rejection");
+                }
+            }
+        }
+    }
+}

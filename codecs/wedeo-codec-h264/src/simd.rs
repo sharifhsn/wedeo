@@ -1809,6 +1809,8 @@ mod x86_sse2 {
     // checked dispatch path. Rows are independent and need no AVX lane packing.
     #[inline(always)]
     pub(super) fn avg_square<const W: usize>(dst: &mut [u8], ds: usize, src: &[u8], ss: usize) {
+        // The packed and row kernels below have fixed access widths.
+        const { assert!(W == 8 || W == 16) };
         // Saturation is safe here: a Rust slice cannot reach usize::MAX bytes.
         assert!((W - 1).saturating_mul(ds).saturating_add(W) <= dst.len());
         assert!((W - 1).saturating_mul(ss).saturating_add(W) <= src.len());
