@@ -52,12 +52,6 @@ fn clip(val: i32) -> u8 {
     val.clamp(0, 255) as u8
 }
 
-/// Compute dst index from (x, y) coordinates and stride.
-#[inline(always)]
-fn at(x: usize, y: usize, stride: usize) -> usize {
-    x + y * stride
-}
-
 // ============================================================================
 // Intra 4x4 prediction (9 modes)
 // ============================================================================
@@ -79,244 +73,10 @@ pub fn predict_4x4(
     top_left: u8,
     has_top: bool,
     has_left: bool,
-    has_top_right: bool,
+    _has_top_right: bool,
 ) {
-    match mode {
-        INTRA_4X4_VERTICAL => pred_4x4_vertical(dst, stride, top),
-        INTRA_4X4_HORIZONTAL => pred_4x4_horizontal(dst, stride, left),
-        INTRA_4X4_DC => pred_4x4_dc(dst, stride, top, left, has_top, has_left),
-        INTRA_4X4_DIAG_DOWN_LEFT => pred_4x4_diag_down_left(dst, stride, top, has_top_right),
-        INTRA_4X4_DIAG_DOWN_RIGHT => pred_4x4_diag_down_right(dst, stride, top, left, top_left),
-        INTRA_4X4_VERT_RIGHT => pred_4x4_vertical_right(dst, stride, top, left, top_left),
-        INTRA_4X4_HOR_DOWN => pred_4x4_horizontal_down(dst, stride, top, left, top_left),
-        INTRA_4X4_VERT_LEFT => pred_4x4_vertical_left(dst, stride, top),
-        INTRA_4X4_HOR_UP => pred_4x4_horizontal_up(dst, stride, left),
-        _ => {} // Unknown mode, leave dst unchanged
-    }
-}
-
-/// Mode 0: Vertical -- each row copies top[0..3].
-fn pred_4x4_vertical(dst: &mut [u8], stride: usize, top: &[u8]) {
-    fill_vertical::<4>(dst, stride, top);
-}
-
-/// Mode 1: Horizontal -- each row is filled with left[y].
-fn pred_4x4_horizontal(dst: &mut [u8], stride: usize, left: &[u8]) {
-    fill_horizontal::<4>(dst, stride, left);
-}
-
-/// Mode 2: DC -- average of available neighbors, or 128 if none available.
-fn pred_4x4_dc(
-    dst: &mut [u8],
-    stride: usize,
-    top: &[u8],
-    left: &[u8],
-    has_top: bool,
-    has_left: bool,
-) {
-    let dc = compute_dc_value::<4>(has_top, has_left, top, left);
-    fill_block::<4>(dst, stride, dc);
-}
-
-/// Mode 3: Diagonal Down-Left.
-///
-/// Predicts toward the bottom-right using top samples.
-/// Uses top[0..7] (top-right samples top[4..7] are needed).
-/// When has_top_right is false, top[4..7] should already be filled with top[3]
-/// by the caller (as per H.264 spec 8.3.1.2.3).
-fn pred_4x4_diag_down_left(dst: &mut [u8], stride: usize, top: &[u8], _has_top_right: bool) {
-    let t0 = top[0] as u16;
-    let t1 = top[1] as u16;
-    let t2 = top[2] as u16;
-    let t3 = top[3] as u16;
-    let t4 = top[4] as u16;
-    let t5 = top[5] as u16;
-    let t6 = top[6] as u16;
-    let t7 = top[7] as u16;
-
-    let s = stride;
-
-    // Matches FFmpeg pred4x4_down_left exactly.
-    // Each anti-diagonal (x+y = const) shares the same value.
-    dst[at(0, 0, s)] = ((t0 + 2 * t1 + t2 + 2) >> 2) as u8;
-    dst[at(1, 0, s)] = ((t1 + 2 * t2 + t3 + 2) >> 2) as u8;
-    dst[at(0, 1, s)] = dst[at(1, 0, s)];
-    dst[at(2, 0, s)] = ((t2 + 2 * t3 + t4 + 2) >> 2) as u8;
-    dst[at(1, 1, s)] = dst[at(2, 0, s)];
-    dst[at(0, 2, s)] = dst[at(2, 0, s)];
-    dst[at(3, 0, s)] = ((t3 + 2 * t4 + t5 + 2) >> 2) as u8;
-    dst[at(2, 1, s)] = dst[at(3, 0, s)];
-    dst[at(1, 2, s)] = dst[at(3, 0, s)];
-    dst[at(0, 3, s)] = dst[at(3, 0, s)];
-    dst[at(3, 1, s)] = ((t4 + 2 * t5 + t6 + 2) >> 2) as u8;
-    dst[at(2, 2, s)] = dst[at(3, 1, s)];
-    dst[at(1, 3, s)] = dst[at(3, 1, s)];
-    dst[at(3, 2, s)] = ((t5 + 2 * t6 + t7 + 2) >> 2) as u8;
-    dst[at(2, 3, s)] = dst[at(3, 2, s)];
-    dst[at(3, 3, s)] = ((t6 + 3 * t7 + 2) >> 2) as u8;
-}
-
-/// Mode 4: Diagonal Down-Right.
-///
-/// Predicts toward the bottom-left using top, left, and top-left samples.
-fn pred_4x4_diag_down_right(dst: &mut [u8], stride: usize, top: &[u8], left: &[u8], top_left: u8) {
-    let lt = top_left;
-    let t0 = top[0];
-    let t1 = top[1];
-    let t2 = top[2];
-    let t3 = top[3];
-    let l0 = left[0];
-    let l1 = left[1];
-    let l2 = left[2];
-    let l3 = left[3];
-    let s = stride;
-
-    // Matches FFmpeg pred4x4_down_right exactly.
-    // Each diagonal (x-y = const) shares the same value.
-    dst[at(0, 3, s)] = avg3(l3, l2, l1);
-    dst[at(0, 2, s)] = avg3(l2, l1, l0);
-    dst[at(1, 3, s)] = dst[at(0, 2, s)];
-    dst[at(0, 1, s)] = avg3(l1, l0, lt);
-    dst[at(1, 2, s)] = dst[at(0, 1, s)];
-    dst[at(2, 3, s)] = dst[at(0, 1, s)];
-    dst[at(0, 0, s)] = avg3(l0, lt, t0);
-    dst[at(1, 1, s)] = dst[at(0, 0, s)];
-    dst[at(2, 2, s)] = dst[at(0, 0, s)];
-    dst[at(3, 3, s)] = dst[at(0, 0, s)];
-    dst[at(1, 0, s)] = avg3(lt, t0, t1);
-    dst[at(2, 1, s)] = dst[at(1, 0, s)];
-    dst[at(3, 2, s)] = dst[at(1, 0, s)];
-    dst[at(2, 0, s)] = avg3(t0, t1, t2);
-    dst[at(3, 1, s)] = dst[at(2, 0, s)];
-    dst[at(3, 0, s)] = avg3(t1, t2, t3);
-}
-
-/// Mode 5: Vertical-Right.
-///
-/// Approximately 26.6 degrees from vertical.
-fn pred_4x4_vertical_right(dst: &mut [u8], stride: usize, top: &[u8], left: &[u8], top_left: u8) {
-    let lt = top_left;
-    let t0 = top[0];
-    let t1 = top[1];
-    let t2 = top[2];
-    let t3 = top[3];
-    let l0 = left[0];
-    let l1 = left[1];
-    let l2 = left[2];
-    let s = stride;
-
-    // Matches FFmpeg pred4x4_vertical_right exactly
-    dst[at(0, 0, s)] = avg2(lt, t0);
-    dst[at(1, 2, s)] = dst[at(0, 0, s)];
-    dst[at(1, 0, s)] = avg2(t0, t1);
-    dst[at(2, 2, s)] = dst[at(1, 0, s)];
-    dst[at(2, 0, s)] = avg2(t1, t2);
-    dst[at(3, 2, s)] = dst[at(2, 0, s)];
-    dst[at(3, 0, s)] = avg2(t2, t3);
-    dst[at(0, 1, s)] = avg3(l0, lt, t0);
-    dst[at(1, 3, s)] = dst[at(0, 1, s)];
-    dst[at(1, 1, s)] = avg3(lt, t0, t1);
-    dst[at(2, 3, s)] = dst[at(1, 1, s)];
-    dst[at(2, 1, s)] = avg3(t0, t1, t2);
-    dst[at(3, 3, s)] = dst[at(2, 1, s)];
-    dst[at(3, 1, s)] = avg3(t1, t2, t3);
-    dst[at(0, 2, s)] = avg3(lt, l0, l1);
-    dst[at(0, 3, s)] = avg3(l0, l1, l2);
-}
-
-/// Mode 6: Horizontal-Down.
-///
-/// Approximately 26.6 degrees from horizontal.
-fn pred_4x4_horizontal_down(dst: &mut [u8], stride: usize, top: &[u8], left: &[u8], top_left: u8) {
-    let lt = top_left;
-    let t0 = top[0];
-    let t1 = top[1];
-    let t2 = top[2];
-    let l0 = left[0];
-    let l1 = left[1];
-    let l2 = left[2];
-    let l3 = left[3];
-    let s = stride;
-
-    // Matches FFmpeg pred4x4_horizontal_down exactly
-    dst[at(0, 0, s)] = avg2(lt, l0);
-    dst[at(2, 1, s)] = dst[at(0, 0, s)];
-    dst[at(1, 0, s)] = avg3(l0, lt, t0);
-    dst[at(3, 1, s)] = dst[at(1, 0, s)];
-    dst[at(2, 0, s)] = avg3(lt, t0, t1);
-    dst[at(3, 0, s)] = avg3(t0, t1, t2);
-    dst[at(0, 1, s)] = avg2(l0, l1);
-    dst[at(2, 2, s)] = dst[at(0, 1, s)];
-    dst[at(1, 1, s)] = avg3(lt, l0, l1);
-    dst[at(3, 2, s)] = dst[at(1, 1, s)];
-    dst[at(0, 2, s)] = avg2(l1, l2);
-    dst[at(2, 3, s)] = dst[at(0, 2, s)];
-    dst[at(1, 2, s)] = avg3(l0, l1, l2);
-    dst[at(3, 3, s)] = dst[at(1, 2, s)];
-    dst[at(0, 3, s)] = avg2(l2, l3);
-    dst[at(1, 3, s)] = avg3(l1, l2, l3);
-}
-
-/// Mode 7: Vertical-Left.
-///
-/// Mirror of diagonal down-left, uses top[0..7].
-fn pred_4x4_vertical_left(dst: &mut [u8], stride: usize, top: &[u8]) {
-    let t0 = top[0];
-    let t1 = top[1];
-    let t2 = top[2];
-    let t3 = top[3];
-    let t4 = top[4];
-    let t5 = top[5];
-    let t6 = top[6];
-    let s = stride;
-
-    // Matches FFmpeg pred4x4_vertical_left exactly
-    dst[at(0, 0, s)] = avg2(t0, t1);
-    dst[at(1, 0, s)] = avg2(t1, t2);
-    dst[at(0, 2, s)] = dst[at(1, 0, s)];
-    dst[at(2, 0, s)] = avg2(t2, t3);
-    dst[at(1, 2, s)] = dst[at(2, 0, s)];
-    dst[at(3, 0, s)] = avg2(t3, t4);
-    dst[at(2, 2, s)] = dst[at(3, 0, s)];
-    dst[at(3, 2, s)] = avg2(t4, t5);
-    dst[at(0, 1, s)] = avg3(t0, t1, t2);
-    dst[at(1, 1, s)] = avg3(t1, t2, t3);
-    dst[at(0, 3, s)] = dst[at(1, 1, s)];
-    dst[at(2, 1, s)] = avg3(t2, t3, t4);
-    dst[at(1, 3, s)] = dst[at(2, 1, s)];
-    dst[at(3, 1, s)] = avg3(t3, t4, t5);
-    dst[at(2, 3, s)] = dst[at(3, 1, s)];
-    dst[at(3, 3, s)] = avg3(t4, t5, t6);
-}
-
-/// Mode 8: Horizontal-Up.
-///
-/// Uses left[0..3] only.
-fn pred_4x4_horizontal_up(dst: &mut [u8], stride: usize, left: &[u8]) {
-    let l0 = left[0];
-    let l1 = left[1];
-    let l2 = left[2];
-    let l3 = left[3];
-    let s = stride;
-
-    // Matches FFmpeg pred4x4_horizontal_up exactly
-    dst[at(0, 0, s)] = avg2(l0, l1);
-    dst[at(1, 0, s)] = avg3(l0, l1, l2);
-    dst[at(2, 0, s)] = avg2(l1, l2);
-    dst[at(0, 1, s)] = dst[at(2, 0, s)];
-    dst[at(3, 0, s)] = avg3(l1, l2, l3);
-    dst[at(1, 1, s)] = dst[at(3, 0, s)];
-    dst[at(2, 1, s)] = avg2(l2, l3);
-    dst[at(0, 2, s)] = dst[at(2, 1, s)];
-    dst[at(3, 1, s)] = avg3(l2, l3, l3);
-    dst[at(1, 2, s)] = dst[at(3, 1, s)];
-    // Bottom-right region is all l3
-    dst[at(3, 2, s)] = l3;
-    dst[at(1, 3, s)] = l3;
-    dst[at(0, 3, s)] = l3;
-    dst[at(2, 2, s)] = l3;
-    dst[at(2, 3, s)] = l3;
-    dst[at(3, 3, s)] = l3;
+    // The caller extends top with its last sample when top-right is unavailable.
+    predict_luma::<4>(dst, stride, mode, top, left, top_left, has_top, has_left);
 }
 
 // ============================================================================
@@ -395,207 +155,125 @@ pub fn predict_8x8l(
         }
     }
 
+    predict_luma::<8>(dst, stride, mode, &ft, &fl, flt, has_top, has_left);
+}
+
+/// Intra_4x4 and Intra_8x8 use the same directions. The 8x8 caller supplies
+/// filtered neighbors. The two block sizes share the same interpolation and boundary rules.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn predict_luma<const N: usize>(
+    dst: &mut [u8],
+    stride: usize,
+    mode: u8,
+    top: &[u8],
+    left: &[u8],
+    corner: u8,
+    has_top: bool,
+    has_left: bool,
+) {
     match mode {
-        INTRA_4X4_VERTICAL => pred_8x8l_vertical(dst, stride, &ft),
-        INTRA_4X4_HORIZONTAL => pred_8x8l_horizontal(dst, stride, &fl),
-        INTRA_4X4_DC => pred_8x8l_dc(dst, stride, &ft, &fl, has_top, has_left),
-        INTRA_4X4_DIAG_DOWN_LEFT => pred_8x8l_diag_down_left(dst, stride, &ft),
-        INTRA_4X4_DIAG_DOWN_RIGHT => pred_8x8l_diag_down_right(dst, stride, &ft, &fl, flt),
-        INTRA_4X4_VERT_RIGHT => pred_8x8l_vert_right(dst, stride, &ft, &fl, flt),
-        INTRA_4X4_HOR_DOWN => pred_8x8l_hor_down(dst, stride, &ft, &fl, flt),
-        INTRA_4X4_VERT_LEFT => pred_8x8l_vert_left(dst, stride, &ft),
-        INTRA_4X4_HOR_UP => pred_8x8l_hor_up(dst, stride, &fl),
+        INTRA_4X4_VERTICAL => fill_vertical::<N>(dst, stride, top),
+        INTRA_4X4_HORIZONTAL => fill_horizontal::<N>(dst, stride, left),
+        INTRA_4X4_DC => fill_block::<N>(
+            dst,
+            stride,
+            compute_dc_value::<N>(has_top, has_left, top, left),
+        ),
+        INTRA_4X4_DIAG_DOWN_LEFT => {
+            let top = &top[..2 * N];
+            let mut diagonal = [0; 15];
+            for i in 0..2 * N - 1 {
+                diagonal[i] = avg3(top[i], top[i + 1], top[(i + 2).min(2 * N - 1)]);
+            }
+            for y in 0..N {
+                dst[y * stride..y * stride + N].copy_from_slice(&diagonal[y..y + N]);
+            }
+        }
+        INTRA_4X4_DIAG_DOWN_RIGHT => {
+            let (top, left) = (&top[..N], &left[..N]);
+            let mut diagonal = [0; 15];
+            diagonal[N - 1] = avg3(left[0], corner, top[0]);
+            for i in 0..N - 1 {
+                diagonal[N + i] =
+                    avg3(if i == 0 { corner } else { top[i - 1] }, top[i], top[i + 1]);
+                diagonal[N - 2 - i] = avg3(
+                    if i == 0 { corner } else { left[i - 1] },
+                    left[i],
+                    left[i + 1],
+                );
+            }
+            for y in 0..N {
+                let start = N - 1 - y;
+                dst[y * stride..y * stride + N].copy_from_slice(&diagonal[start..start + N]);
+            }
+        }
+        INTRA_4X4_VERT_RIGHT => predict_toward_corner::<N, false>(dst, stride, top, left, corner),
+        INTRA_4X4_HOR_DOWN => predict_toward_corner::<N, true>(dst, stride, left, top, corner),
+        INTRA_4X4_VERT_LEFT => {
+            let top = &top[..N + N / 2 + 1];
+            for y in 0..N {
+                let row = &mut dst[y * stride..y * stride + N];
+                let i = y / 2;
+                for x in 0..N {
+                    row[x] = if y % 2 == 0 {
+                        avg2(top[x + i], top[x + i + 1])
+                    } else {
+                        avg3(top[x + i], top[x + i + 1], top[x + i + 2])
+                    };
+                }
+            }
+        }
+        INTRA_4X4_HOR_UP => {
+            let mut edge = [left[N - 1]; 22];
+            for i in 0..N - 1 {
+                edge[2 * i] = avg2(left[i], left[i + 1]);
+                edge[2 * i + 1] = avg3(left[i], left[i + 1], left[(i + 2).min(N - 1)]);
+            }
+            for y in 0..N {
+                dst[y * stride..y * stride + N].copy_from_slice(&edge[2 * y..2 * y + N]);
+            }
+        }
         _ => {}
     }
 }
 
-/// 8x8 mode 0: Vertical — each row copies filtered top[0..7].
-fn pred_8x8l_vertical(dst: &mut [u8], stride: usize, t: &[u8]) {
-    for y in 0..8 {
-        dst[y * stride..y * stride + 8].copy_from_slice(&t[..8]);
-    }
-}
-
-/// 8x8 mode 1: Horizontal — each column copies filtered left[y].
-fn pred_8x8l_horizontal(dst: &mut [u8], stride: usize, l: &[u8]) {
-    for (y, &lv) in l[..8].iter().enumerate() {
-        let row = y * stride;
-        dst[row..row + 8].fill(lv);
-    }
-}
-
-/// 8x8 mode 2: DC — average of available filtered neighbors.
-fn pred_8x8l_dc(dst: &mut [u8], stride: usize, t: &[u8], l: &[u8], has_top: bool, has_left: bool) {
-    let dc = match (has_top, has_left) {
-        (true, true) => {
-            let sum: u32 = t[..8].iter().map(|&v| v as u32).sum::<u32>()
-                + l[..8].iter().map(|&v| v as u32).sum::<u32>();
-            ((sum + 8) >> 4) as u8
+/// Vertical-right predicts from the top edge at half-pixel intervals. Past the
+/// corner the prediction follows the left edge. Horizontal-down is its transpose.
+#[inline]
+fn predict_toward_corner<const N: usize, const TRANSPOSE: bool>(
+    dst: &mut [u8],
+    stride: usize,
+    primary: &[u8],
+    secondary: &[u8],
+    corner: u8,
+) {
+    let (primary, secondary) = (&primary[..N], &secondary[..N - 1]);
+    let mut edge = [0; 22];
+    for i in 0..N {
+        let prev = if i == 0 { corner } else { primary[i - 1] };
+        edge[N - 1 + 2 * i] = avg2(prev, primary[i]);
+        if i + 1 < N {
+            edge[N + 2 * i] = avg3(prev, primary[i], primary[i + 1]);
         }
-        (true, false) => {
-            let sum: u32 = t[..8].iter().map(|&v| v as u32).sum();
-            ((sum + 4) >> 3) as u8
-        }
-        (false, true) => {
-            let sum: u32 = l[..8].iter().map(|&v| v as u32).sum();
-            ((sum + 4) >> 3) as u8
-        }
-        (false, false) => 128,
-    };
-    for y in 0..8 {
-        let row = y * stride;
-        dst[row..row + 8].fill(dc);
     }
-}
-
-/// 8x8 mode 3: Diagonal down-left.
-/// Uses t[0..15] (needs top-right extension).
-fn pred_8x8l_diag_down_left(dst: &mut [u8], stride: usize, t: &[u8]) {
-    let s = stride;
-    for y in 0..8 {
-        for x in 0..8 {
-            let i = x + y;
-            if i < 14 {
-                dst[at(x, y, s)] = avg3(t[i], t[i + 1], t[i + 2]);
+    edge[N - 2] = avg3(secondary[0], corner, primary[0]);
+    for i in 0..N - 2 {
+        edge[N - 3 - i] = avg3(
+            if i == 0 { corner } else { secondary[i - 1] },
+            secondary[i],
+            secondary[i + 1],
+        );
+    }
+    for y in 0..N {
+        let row = &mut dst[y * stride..y * stride + N];
+        for (x, pixel) in row.iter_mut().enumerate() {
+            let idx = if TRANSPOSE {
+                N - 1 + 2 * y - x
             } else {
-                // i == 14: last position uses edge-biased formula
-                dst[at(x, y, s)] = ((t[14] as u16 + 3 * t[15] as u16 + 2) >> 2) as u8;
-            }
-        }
-    }
-}
-
-/// 8x8 mode 4: Diagonal down-right.
-/// Uses t[0..7], l[0..7], and lt (filtered top-left).
-fn pred_8x8l_diag_down_right(dst: &mut [u8], stride: usize, t: &[u8], l: &[u8], lt: u8) {
-    let s = stride;
-    for y in 0..8 {
-        for x in 0..8 {
-            let d = x as i32 - y as i32;
-            dst[at(x, y, s)] = if d > 1 {
-                // Upper-right: uses top samples
-                let i = (d - 2) as usize;
-                avg3(t[i], t[i + 1], t[i + 2])
-            } else if d == 1 {
-                avg3(lt, t[0], t[1])
-            } else if d == 0 {
-                // Main diagonal
-                avg3(l[0], lt, t[0])
-            } else if d == -1 {
-                avg3(lt, l[0], l[1])
-            } else {
-                // Lower-left: uses left samples
-                let i = (-d - 2) as usize;
-                avg3(l[i], l[i + 1], l[i + 2])
+                N - 1 + 2 * x - y
             };
-        }
-    }
-}
-
-/// 8x8 mode 5: Vertical-right (~26.6° from vertical).
-/// Uses t[0..7], l[0..6], and lt.
-/// Reference: FFmpeg h264pred_template.c pred8x8l_vertical_right.
-fn pred_8x8l_vert_right(dst: &mut [u8], stride: usize, t: &[u8], l: &[u8], lt: u8) {
-    let s = stride;
-    for y in 0..8 {
-        for x in 0..8 {
-            // zVR = 2*x - y
-            let zvr = 2 * x as i32 - y as i32;
-            dst[at(x, y, s)] = if zvr >= 2 {
-                let i = (zvr / 2 - 1) as usize;
-                if zvr & 1 == 0 {
-                    avg2(t[i], t[i + 1])
-                } else {
-                    avg3(t[i], t[i + 1], t[i + 2])
-                }
-            } else if zvr == 1 {
-                avg3(lt, t[0], t[1])
-            } else if zvr == 0 {
-                avg2(lt, t[0])
-            } else if zvr == -1 {
-                avg3(l[0], lt, t[0])
-            } else {
-                // zvr < -1: uses left samples.
-                // Pattern: avg3(l[d-3], l[d-2], l[d-1]) where d = y-2*x, l[-1] = lt
-                let li = (y as i32 - 2 * x as i32 - 2) as usize;
-                if li == 0 {
-                    avg3(lt, l[0], l[1])
-                } else {
-                    avg3(l[li - 1], l[li], l[li + 1])
-                }
-            };
-        }
-    }
-}
-
-/// 8x8 mode 6: Horizontal-down (~26.6° from horizontal).
-/// Uses t[0..6], l[0..7], and lt.
-/// Reference: FFmpeg h264pred_template.c pred8x8l_horizontal_down.
-fn pred_8x8l_hor_down(dst: &mut [u8], stride: usize, t: &[u8], l: &[u8], lt: u8) {
-    let s = stride;
-    for y in 0..8 {
-        for x in 0..8 {
-            // zHD = 2*y - x
-            let zhd = 2 * y as i32 - x as i32;
-            dst[at(x, y, s)] = if zhd >= 2 {
-                let i = (zhd / 2 - 1) as usize;
-                if zhd & 1 == 0 {
-                    avg2(l[i], l[i + 1])
-                } else {
-                    avg3(l[i], l[i + 1], l[i + 2])
-                }
-            } else if zhd == 1 {
-                avg3(lt, l[0], l[1])
-            } else if zhd == 0 {
-                avg2(lt, l[0])
-            } else if zhd == -1 {
-                avg3(t[0], lt, l[0])
-            } else {
-                // zhd < -1: uses top samples.
-                // Pattern: avg3(t[d-3], t[d-2], t[d-1]) where d = x-2*y, t[-1] = lt
-                let ti = (x as i32 - 2 * y as i32 - 2) as usize;
-                if ti == 0 {
-                    avg3(lt, t[0], t[1])
-                } else {
-                    avg3(t[ti - 1], t[ti], t[ti + 1])
-                }
-            };
-        }
-    }
-}
-
-/// 8x8 mode 7: Vertical-left (mirror of diag down-left from top).
-/// Uses t[0..14].
-fn pred_8x8l_vert_left(dst: &mut [u8], stride: usize, t: &[u8]) {
-    let s = stride;
-    for y in 0..8 {
-        for x in 0..8 {
-            let i = x + y / 2;
-            if y & 1 == 0 {
-                dst[at(x, y, s)] = avg2(t[i], t[i + 1]);
-            } else {
-                dst[at(x, y, s)] = avg3(t[i], t[i + 1], t[i + 2]);
-            }
-        }
-    }
-}
-
-/// 8x8 mode 8: Horizontal-up (mirror of diag down-left from left).
-/// Uses l[0..7]. Replicates l[7] at the bottom boundary.
-/// Reference: FFmpeg h264pred_template.c pred8x8l_horizontal_up.
-fn pred_8x8l_hor_up(dst: &mut [u8], stride: usize, l: &[u8]) {
-    let s = stride;
-    for y in 0..8 {
-        for x in 0..8 {
-            let i = y + x / 2;
-            if i >= 7 {
-                dst[at(x, y, s)] = l[7];
-            } else if x & 1 == 0 {
-                dst[at(x, y, s)] = avg2(l[i], l[i + 1]);
-            } else {
-                let c = if i + 2 >= 8 { l[7] } else { l[i + 2] };
-                dst[at(x, y, s)] = avg3(l[i], l[i + 1], c);
-            }
+            *pixel = edge[idx];
         }
     }
 }
