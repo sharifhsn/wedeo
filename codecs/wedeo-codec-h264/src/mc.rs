@@ -20,15 +20,13 @@ use crate::deblock::PictureBuffer;
 /// Replaces ~15k-20k short-lived `vec![]` allocations per 1080p frame with
 /// 4 persistent buffers totaling ~4 KB.
 pub struct McScratch {
-    /// i32 buffer for extract_ref_block output.
-    /// Worst case: (16+5) × (16+5) = 441 i32s (for hv_lowpass src).
+    /// Legacy integer reference workspace retained for callers that reuse it.
     pub ref_buf: Vec<i32>,
-    /// Second i32 buffer for functions needing two extract_ref_block calls
-    /// or hv_lowpass tmp.
+    /// Intermediate horizontal sums for two-dimensional half-pixel filtering.
     pub ref_buf2: Vec<i32>,
     /// u8 buffer for first half-pel filter output. Worst case: 16×16 = 256.
     pub half_a: Vec<u8>,
-    /// u8 buffer for second half-pel output (avg_pixels needs two live).
+    /// Second predictor followed by space for a clamped reference tile.
     pub half_b: Vec<u8>,
 }
 
@@ -47,7 +45,7 @@ impl McScratch {
             ref_buf: vec![0i32; max_ref],
             ref_buf2: vec![0i32; max_ref],
             half_a: vec![0u8; max_pix],
-            half_b: vec![0u8; max_pix],
+            half_b: vec![0u8; max_pix + max_ref],
         }
     }
 
@@ -76,12 +74,6 @@ impl McScratch {
 // Pixel helpers
 // ---------------------------------------------------------------------------
 
-/// Clamp a value to [0, 255].
-#[inline(always)]
-fn clip_u8(x: i32) -> u8 {
-    x.clamp(0, 255) as u8
-}
-
 /// Read a reference pixel with edge clamping.
 #[inline(always)]
 fn get_ref_pixel(ref_data: &[u8], stride: usize, x: i32, y: i32, width: i32, height: i32) -> u8 {
@@ -89,24 +81,6 @@ fn get_ref_pixel(ref_data: &[u8], stride: usize, x: i32, y: i32, width: i32, hei
     let cy = y.clamp(0, height - 1) as usize;
     ref_data[cy * stride + cx]
 }
-
-// ---------------------------------------------------------------------------
-// 6-tap FIR half-pel filter (H.264 spec coefficients: 1, -5, 20, 20, -5, 1)
-// ---------------------------------------------------------------------------
-
-/// Apply the 6-tap FIR filter to six samples.
-///
-/// Returns the unshifted, unclipped filter output. The caller must add the
-/// rounding offset and shift right by 5 (for direct half-pel) or 10 (for the
-/// second pass of the 2D HV filter).
-#[inline(always)]
-fn filter6(a: i32, b: i32, c: i32, d: i32, e: i32, f: i32) -> i32 {
-    a - 5 * b + 20 * c + 20 * d - 5 * e + f
-}
-
-// ---------------------------------------------------------------------------
-// Interior block detection — skips extract_ref_block for ~90% of MC ops
-// ---------------------------------------------------------------------------
 
 /// Copy a rectangular block. Common widths are passed as literals for specialization.
 #[inline(always)]
@@ -144,847 +118,36 @@ fn is_interior(
         && ref_y + block_h as i32 + tap_margin <= pic_h
 }
 
-// ---------------------------------------------------------------------------
-// Edge-clamped reference block extraction
-// ---------------------------------------------------------------------------
-
-/// Copy a reference block with edge clamping into a contiguous temporary
-/// buffer. The output has `out_w` columns and `out_h` rows, stride = `out_w`.
-///
-/// `rx`, `ry` are the top-left position (may be negative for edge cases).
-#[inline]
-#[allow(clippy::too_many_arguments)] // MC primitives inherently need position + dimension + picture size params
-fn extract_ref_block(
-    out: &mut [i32],
-    ref_data: &[u8],
-    ref_stride: usize,
-    rx: i32,
-    ry: i32,
-    out_w: usize,
-    out_h: usize,
-    pic_w: i32,
-    pic_h: i32,
-) {
-    if out_w == 0 || out_h == 0 {
-        return;
-    }
-    let left = (-i64::from(rx)).clamp(0, out_w as i64) as usize;
-    let start = rx.clamp(0, pic_w) as usize;
-    let middle = (out_w - left).min(pic_w as usize - start);
-    for (j, row) in out[..out_w * out_h].chunks_exact_mut(out_w).enumerate() {
-        let y = (i64::from(ry) + j as i64).clamp(0, i64::from(pic_h) - 1) as usize;
-        let offset = y * ref_stride;
-        if left > 0 {
-            row[..left].fill(i32::from(ref_data[offset]));
-        }
-        if middle > 0 {
-            let pixels = &ref_data[offset + start..offset + start + middle];
-            for (dst, &src) in row[left..left + middle].iter_mut().zip(pixels) {
-                *dst = i32::from(src);
-            }
-        }
-        if left + middle < out_w {
-            row[left + middle..].fill(i32::from(ref_data[offset + pic_w as usize - 1]));
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Luma half-pel lowpass filters
-// ---------------------------------------------------------------------------
-
-/// Horizontal lowpass on i32 extracted buffer for auto-vectorization.
-#[inline(always)]
-fn h_lowpass_rows(
-    dst: &mut [u8],
-    dst_stride: usize,
-    src: &[i32],
-    src_stride: usize,
-    block_w: usize,
-    block_h: usize,
-) {
-    for j in 0..block_h {
-        for i in 0..block_w {
-            let s = &src[j * src_stride + i..];
-            let val = filter6(s[0], s[1], s[2], s[3], s[4], s[5]);
-            dst[j * dst_stride + i] = clip_u8((val + 16) >> 5);
-        }
-    }
-}
-
-/// Horizontal half-pel lowpass: apply the 6-tap filter across each row.
-///
-/// Input: `src` is an edge-clamped block of size `(block_w + 5) x block_h`,
-/// stride = `src_stride`.
-/// Output: `dst` is `block_w x block_h`, stride = `dst_stride`.
-/// Each output sample is `clip((filter6(...) + 16) >> 5)`.
-#[inline]
-fn h_lowpass(
-    dst: &mut [u8],
-    dst_stride: usize,
-    src: &[i32],
-    src_stride: usize,
-    block_w: usize,
-    block_h: usize,
-) {
-    match block_w {
-        4 => h_lowpass_rows(dst, dst_stride, src, src_stride, 4, block_h),
-        8 => h_lowpass_rows(dst, dst_stride, src, src_stride, 8, block_h),
-        16 => h_lowpass_rows(dst, dst_stride, src, src_stride, 16, block_h),
-        _ => h_lowpass_rows(dst, dst_stride, src, src_stride, block_w, block_h),
-    }
-}
-
-/// Vertical lowpass on i32 extracted buffer for auto-vectorization.
-#[inline(always)]
-fn v_lowpass_rows(
-    dst: &mut [u8],
-    dst_stride: usize,
-    src: &[i32],
-    src_stride: usize,
-    block_w: usize,
-    block_h: usize,
-) {
-    for j in 0..block_h {
-        for i in 0..block_w {
-            let a = src[(j) * src_stride + i];
-            let b = src[(j + 1) * src_stride + i];
-            let c = src[(j + 2) * src_stride + i];
-            let d = src[(j + 3) * src_stride + i];
-            let e = src[(j + 4) * src_stride + i];
-            let f = src[(j + 5) * src_stride + i];
-            let val = filter6(a, b, c, d, e, f);
-            dst[j * dst_stride + i] = clip_u8((val + 16) >> 5);
-        }
-    }
-}
-
-/// Vertical half-pel lowpass: apply the 6-tap filter down each column.
-///
-/// Input: `src` is an edge-clamped block of size `block_w x (block_h + 5)`,
-/// stride = `src_stride`.
-/// Output: `dst` is `block_w x block_h`, stride = `dst_stride`.
-#[inline]
-fn v_lowpass(
-    dst: &mut [u8],
-    dst_stride: usize,
-    src: &[i32],
-    src_stride: usize,
-    block_w: usize,
-    block_h: usize,
-) {
-    match block_w {
-        4 => v_lowpass_rows(dst, dst_stride, src, src_stride, 4, block_h),
-        8 => v_lowpass_rows(dst, dst_stride, src, src_stride, 8, block_h),
-        16 => v_lowpass_rows(dst, dst_stride, src, src_stride, 16, block_h),
-        _ => v_lowpass_rows(dst, dst_stride, src, src_stride, block_w, block_h),
-    }
-}
-
-/// 2D half-pel lowpass on i32 extracted buffer for auto-vectorization.
-#[inline(always)]
-fn hv_lowpass_rows(
-    dst: &mut [u8],
-    dst_stride: usize,
-    src: &[i32],
-    src_stride: usize,
-    block_w: usize,
-    block_h: usize,
-    tmp: &mut [i32],
-) {
-    let tmp_h = block_h + 5;
-
-    // First pass: horizontal filter into tmp.
-    for j in 0..tmp_h {
-        for i in 0..block_w {
-            let s = &src[j * src_stride + i..];
-            tmp[j * block_w + i] = filter6(s[0], s[1], s[2], s[3], s[4], s[5]);
-        }
-    }
-
-    // Second pass: vertical filter on the tmp buffer.
-    for j in 0..block_h {
-        for i in 0..block_w {
-            let a = tmp[(j) * block_w + i];
-            let b = tmp[(j + 1) * block_w + i];
-            let c = tmp[(j + 2) * block_w + i];
-            let d = tmp[(j + 3) * block_w + i];
-            let e = tmp[(j + 4) * block_w + i];
-            let f = tmp[(j + 5) * block_w + i];
-            let val = filter6(a, b, c, d, e, f);
-            dst[j * dst_stride + i] = clip_u8((val + 512) >> 10);
-        }
-    }
-}
-
-/// 2D half-pel lowpass (the "j" position in the spec): horizontal first pass
-/// into a temporary i16 buffer, then vertical second pass.
-///
-/// Input: `src` is an edge-clamped block of size `(block_w + 5) x (block_h + 5)`,
-/// stride = `src_stride`.
-/// Output: `dst` is `block_w x block_h`, stride = `dst_stride`.
-#[inline]
-fn hv_lowpass(
-    dst: &mut [u8],
-    dst_stride: usize,
-    src: &[i32],
-    src_stride: usize,
-    block_w: usize,
-    block_h: usize,
-    tmp: &mut [i32],
-) {
-    match block_w {
-        4 => hv_lowpass_rows(dst, dst_stride, src, src_stride, 4, block_h, tmp),
-        8 => hv_lowpass_rows(dst, dst_stride, src, src_stride, 8, block_h, tmp),
-        16 => hv_lowpass_rows(dst, dst_stride, src, src_stride, 16, block_h, tmp),
-        _ => hv_lowpass_rows(dst, dst_stride, src, src_stride, block_w, block_h, tmp),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Direct-from-reference filter functions (interior blocks only)
-// ---------------------------------------------------------------------------
-// These read directly from &[u8] reference data, skipping the intermediate
-// i32 extraction buffer. For interior blocks (~90% of all MC operations),
-// this eliminates the biggest bottleneck: the u8→i32 copy in extract_ref_block.
-
-/// Horizontal lowpass reading directly from u8 reference data.
-/// For interior blocks only — caller must ensure all reads are in-bounds.
-#[inline]
+/// Materialize only the taps the requested phase needs. Extend each edge
+/// with its closest reference sample, as in FFmpeg's emulated-edge path.
 #[allow(clippy::too_many_arguments)]
-fn h_lowpass_direct(
+fn extend_luma_edge(
     dst: &mut [u8],
-    dst_stride: usize,
+    width: usize,
     src: &[u8],
-    src_stride: usize,
-    src_offset: usize,
-    block_w: usize,
-    block_h: usize,
+    stride: usize,
+    x: i64,
+    y: i64,
+    pic_width: i64,
+    pic_height: i64,
 ) {
-    crate::simd::luma_6tap_h(
-        dst,
-        dst_stride,
-        &src[src_offset..],
-        src_stride,
-        block_w,
-        block_h,
-    );
-}
-
-/// Vertical lowpass reading directly from u8 reference data.
-/// For interior blocks only — caller must ensure all reads are in-bounds.
-#[inline]
-#[allow(clippy::too_many_arguments)]
-fn v_lowpass_direct(
-    dst: &mut [u8],
-    dst_stride: usize,
-    src: &[u8],
-    src_stride: usize,
-    src_offset: usize,
-    block_w: usize,
-    block_h: usize,
-) {
-    crate::simd::luma_6tap_v(
-        dst,
-        dst_stride,
-        &src[src_offset..],
-        src_stride,
-        block_w,
-        block_h,
-    );
-}
-
-/// 2D half-pel lowpass reading directly from u8 reference data.
-/// For interior blocks only — caller must ensure all reads are in-bounds.
-#[inline]
-#[allow(clippy::too_many_arguments)]
-fn hv_lowpass_direct(
-    dst: &mut [u8],
-    dst_stride: usize,
-    src: &[u8],
-    src_stride: usize,
-    src_offset: usize,
-    block_w: usize,
-    block_h: usize,
-    tmp: &mut [i32],
-) {
-    crate::simd::luma_6tap_hv(
-        dst,
-        dst_stride,
-        &src[src_offset..],
-        src_stride,
-        block_w,
-        block_h,
-        tmp,
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Pixel averaging (for quarter-pel from half-pel + integer/half-pel)
-// ---------------------------------------------------------------------------
-
-/// Average two pixel buffers: `dst[i] = (a[i] + b[i] + 1) >> 1`.
-#[inline]
-#[allow(clippy::too_many_arguments)] // Two source buffers plus destination each need data + stride
-fn avg_pixels(
-    dst: &mut [u8],
-    dst_stride: usize,
-    a: &[u8],
-    a_stride: usize,
-    b: &[u8],
-    b_stride: usize,
-    block_w: usize,
-    block_h: usize,
-) {
-    crate::simd::avg_pixels(dst, dst_stride, a, a_stride, b, b_stride, block_w, block_h);
-}
-
-/// Copy a block of pixels.
-#[allow(dead_code)] // Will be used by MC callers for direct block copies
-fn copy_block(
-    dst: &mut [u8],
-    dst_stride: usize,
-    src: &[u8],
-    src_stride: usize,
-    block_w: usize,
-    block_h: usize,
-) {
-    for j in 0..block_h {
-        dst[j * dst_stride..j * dst_stride + block_w]
-            .copy_from_slice(&src[j * src_stride..j * src_stride + block_w]);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Quarter-pel luma helper functions
-// ---------------------------------------------------------------------------
-
-/// Group B helper: compute h_lowpass, then average with a full-pel column
-/// extracted at column offset `full_pel_col_offset` within the extracted block.
-///
-/// `full_pel_col_offset` is 2 for (1,0) and 3 for (3,0).
-#[inline]
-#[allow(clippy::too_many_arguments)]
-fn qpel_h_avg(
-    dst: &mut [u8],
-    dst_stride: usize,
-    ref_y: &[u8],
-    ref_stride: usize,
-    ref_x: i32,
-    ref_y_pos: i32,
-    block_w: usize,
-    block_h: usize,
-    pw: i32,
-    ph: i32,
-    full_pel_col_offset: usize,
-    scratch: &mut McScratch,
-) {
-    let pix = block_w * block_h;
-
-    if is_interior(ref_x, ref_y_pos, block_w, block_h, pw, ph, 3) {
-        // Interior fast path — read directly from reference.
-        let src_offset = ref_y_pos as usize * ref_stride + (ref_x - 2) as usize;
-        h_lowpass_direct(
-            &mut scratch.half_a[..pix],
-            block_w,
-            ref_y,
-            ref_stride,
-            src_offset,
-            block_w,
-            block_h,
-        );
-        // Full-pel column at full_pel_col_offset within the extraction window.
-        // full_pel_col_offset is 2 for (1,0) or 3 for (3,0), relative to ref_x-2.
-        let fp_x = (ref_x - 2) as usize + full_pel_col_offset;
-        for j in 0..block_h {
-            let row_start = (ref_y_pos as usize + j) * ref_stride + fp_x;
-            for i in 0..block_w {
-                scratch.half_b[j * block_w + i] = ref_y[row_start + i];
-            }
+    let left = (-x).clamp(0, width as i64) as usize;
+    let start = x.clamp(0, pic_width) as usize;
+    let middle = (width - left).min(pic_width as usize - start);
+    for (i, row) in dst.chunks_exact_mut(width).enumerate() {
+        let offset = (y + i as i64).clamp(0, pic_height - 1) as usize * stride;
+        if left != 0 {
+            row[..left].fill(src[offset]);
         }
-    } else {
-        // Edge fallback — extract + filter.
-        let src_w = block_w + 5;
-        let src_h = block_h;
-        let needed = src_w * src_h;
-        extract_ref_block(
-            &mut scratch.ref_buf[..needed],
-            ref_y,
-            ref_stride,
-            ref_x - 2,
-            ref_y_pos,
-            src_w,
-            src_h,
-            pw,
-            ph,
-        );
-        h_lowpass(
-            &mut scratch.half_a[..pix],
-            block_w,
-            &scratch.ref_buf[..needed],
-            src_w,
-            block_w,
-            block_h,
-        );
-        for j in 0..block_h {
-            for i in 0..block_w {
-                scratch.half_b[j * block_w + i] =
-                    scratch.ref_buf[j * src_w + i + full_pel_col_offset] as u8;
-            }
+        if middle != 0 {
+            row[left..left + middle].copy_from_slice(&src[offset + start..offset + start + middle]);
+        }
+        if left + middle < width {
+            row[left + middle..].fill(src[offset + pic_width as usize - 1]);
         }
     }
-
-    avg_pixels(
-        dst,
-        dst_stride,
-        &scratch.half_b[..pix],
-        block_w,
-        &scratch.half_a[..pix],
-        block_w,
-        block_w,
-        block_h,
-    );
 }
 
-/// Group B helper: compute v_lowpass, then average with a full-pel row
-/// extracted at row offset `full_pel_row_offset` within the extracted block.
-///
-/// `full_pel_row_offset` is 2 for (0,1) and 3 for (0,3).
-#[inline]
-#[allow(clippy::too_many_arguments)]
-fn qpel_v_avg(
-    dst: &mut [u8],
-    dst_stride: usize,
-    ref_y: &[u8],
-    ref_stride: usize,
-    ref_x: i32,
-    ref_y_pos: i32,
-    block_w: usize,
-    block_h: usize,
-    pw: i32,
-    ph: i32,
-    full_pel_row_offset: usize,
-    scratch: &mut McScratch,
-) {
-    let pix = block_w * block_h;
-
-    if is_interior(ref_x, ref_y_pos, block_w, block_h, pw, ph, 3) {
-        // Interior fast path — read directly from reference.
-        let src_offset = (ref_y_pos - 2) as usize * ref_stride + ref_x as usize;
-        v_lowpass_direct(
-            &mut scratch.half_a[..pix],
-            block_w,
-            ref_y,
-            ref_stride,
-            src_offset,
-            block_w,
-            block_h,
-        );
-        // Full-pel row at full_pel_row_offset within the extraction window.
-        // full_pel_row_offset is 2 for (0,1) or 3 for (0,3), relative to ref_y-2.
-        let fp_y = (ref_y_pos - 2) as usize + full_pel_row_offset;
-        for j in 0..block_h {
-            let row_start = (fp_y + j) * ref_stride + ref_x as usize;
-            for i in 0..block_w {
-                scratch.half_b[j * block_w + i] = ref_y[row_start + i];
-            }
-        }
-    } else {
-        // Edge fallback — extract + filter.
-        let src_w = block_w;
-        let src_h = block_h + 5;
-        let needed = src_w * src_h;
-        extract_ref_block(
-            &mut scratch.ref_buf[..needed],
-            ref_y,
-            ref_stride,
-            ref_x,
-            ref_y_pos - 2,
-            src_w,
-            src_h,
-            pw,
-            ph,
-        );
-        v_lowpass(
-            &mut scratch.half_a[..pix],
-            block_w,
-            &scratch.ref_buf[..needed],
-            src_w,
-            block_w,
-            block_h,
-        );
-        for j in 0..block_h {
-            for i in 0..block_w {
-                scratch.half_b[j * block_w + i] =
-                    scratch.ref_buf[(j + full_pel_row_offset) * src_w + i] as u8;
-            }
-        }
-    }
-
-    avg_pixels(
-        dst,
-        dst_stride,
-        &scratch.half_b[..pix],
-        block_w,
-        &scratch.half_a[..pix],
-        block_w,
-        block_w,
-        block_h,
-    );
-}
-
-/// Group C helper: diagonal quarter-pel = avg(h_lowpass, v_lowpass).
-///
-/// `h_row_delta` is the vertical offset added to `ref_y_pos` for the
-/// horizontal half-pel extraction (0 for top-adjacent, +1 for below).
-/// `v_col_delta` is the horizontal offset added to `ref_x` for the
-/// vertical half-pel extraction (0 for current col, +1 for right).
-#[inline]
-#[allow(clippy::too_many_arguments)]
-fn qpel_diagonal(
-    dst: &mut [u8],
-    dst_stride: usize,
-    ref_y: &[u8],
-    ref_stride: usize,
-    ref_x: i32,
-    ref_y_pos: i32,
-    block_w: usize,
-    block_h: usize,
-    pw: i32,
-    ph: i32,
-    h_row_delta: i32,
-    v_col_delta: i32,
-    scratch: &mut McScratch,
-) {
-    let pix = block_w * block_h;
-
-    // The h_lowpass needs tap_margin=2 horizontally at row ref_y_pos+h_row_delta.
-    // The v_lowpass needs tap_margin=2 vertically at col ref_x+v_col_delta.
-    // For interior check, we need both regions to be in-bounds.
-    // h_lowpass region: x in [ref_x-2 .. ref_x+block_w+2], y in [ref_y+h_row_delta .. ref_y+h_row_delta+block_h-1]
-    // v_lowpass region: x in [ref_x+v_col_delta .. ref_x+v_col_delta+block_w-1], y in [ref_y-2 .. ref_y+block_h+2]
-    // Combined: we need ref_x-2 >= 0, ref_x+block_w+2 <= pw (h margin),
-    //           ref_y-2 >= 0, ref_y+block_h+h_row_delta <= ph (covers both),
-    //           ref_x+v_col_delta+block_w <= pw, ref_y+block_h+2 <= ph
-    // Simplify: is_interior with margin=2 on the base position covers both if h_row_delta and v_col_delta are 0 or 1.
-    let interior = is_interior(ref_x, ref_y_pos, block_w, block_h, pw, ph, 3)
-        && ref_y_pos + h_row_delta + block_h as i32 <= ph
-        && ref_x + v_col_delta + block_w as i32 <= pw;
-
-    if interior {
-        // Interior fast path — h_lowpass and v_lowpass directly from reference.
-        let h_src_offset = (ref_y_pos + h_row_delta) as usize * ref_stride + (ref_x - 2) as usize;
-        h_lowpass_direct(
-            &mut scratch.half_a[..pix],
-            block_w,
-            ref_y,
-            ref_stride,
-            h_src_offset,
-            block_w,
-            block_h,
-        );
-
-        let v_src_offset = (ref_y_pos - 2) as usize * ref_stride + (ref_x + v_col_delta) as usize;
-        v_lowpass_direct(
-            &mut scratch.half_b[..pix],
-            block_w,
-            ref_y,
-            ref_stride,
-            v_src_offset,
-            block_w,
-            block_h,
-        );
-    } else {
-        // Edge fallback — extract + filter.
-        let src_h_w = block_w + 5;
-        let src_h_h = block_h;
-        let needed_h = src_h_w * src_h_h;
-        extract_ref_block(
-            &mut scratch.ref_buf[..needed_h],
-            ref_y,
-            ref_stride,
-            ref_x - 2,
-            ref_y_pos + h_row_delta,
-            src_h_w,
-            src_h_h,
-            pw,
-            ph,
-        );
-        h_lowpass(
-            &mut scratch.half_a[..pix],
-            block_w,
-            &scratch.ref_buf[..needed_h],
-            src_h_w,
-            block_w,
-            block_h,
-        );
-
-        let src_v_w = block_w;
-        let src_v_h = block_h + 5;
-        let needed_v = src_v_w * src_v_h;
-        extract_ref_block(
-            &mut scratch.ref_buf2[..needed_v],
-            ref_y,
-            ref_stride,
-            ref_x + v_col_delta,
-            ref_y_pos - 2,
-            src_v_w,
-            src_v_h,
-            pw,
-            ph,
-        );
-        v_lowpass(
-            &mut scratch.half_b[..pix],
-            block_w,
-            &scratch.ref_buf2[..needed_v],
-            src_v_w,
-            block_w,
-            block_h,
-        );
-    }
-
-    avg_pixels(
-        dst,
-        dst_stride,
-        &scratch.half_a[..pix],
-        block_w,
-        &scratch.half_b[..pix],
-        block_w,
-        block_w,
-        block_h,
-    );
-}
-
-/// Group D helper: h_lowpass (at row `ref_y_pos + h_row_delta`) + hv_lowpass, averaged.
-///
-/// Used for (2,1) with `h_row_delta=0` and (2,3) with `h_row_delta=1`.
-#[inline]
-#[allow(clippy::too_many_arguments)]
-fn qpel_mixed_h_hv(
-    dst: &mut [u8],
-    dst_stride: usize,
-    ref_y: &[u8],
-    ref_stride: usize,
-    ref_x: i32,
-    ref_y_pos: i32,
-    block_w: usize,
-    block_h: usize,
-    pw: i32,
-    ph: i32,
-    h_row_delta: i32,
-    scratch: &mut McScratch,
-) {
-    let pix = block_w * block_h;
-
-    // Interior check: 6-tap filter needs margin=3. h_row_delta shifts the h_lowpass row by 0 or 1.
-    let interior = is_interior(ref_x, ref_y_pos, block_w, block_h, pw, ph, 3)
-        && ref_y_pos + h_row_delta + block_h as i32 <= ph;
-
-    if interior {
-        // Interior fast path — both filters read directly from reference.
-        let h_src_offset = (ref_y_pos + h_row_delta) as usize * ref_stride + (ref_x - 2) as usize;
-        h_lowpass_direct(
-            &mut scratch.half_a[..pix],
-            block_w,
-            ref_y,
-            ref_stride,
-            h_src_offset,
-            block_w,
-            block_h,
-        );
-
-        let hv_src_offset = (ref_y_pos - 2) as usize * ref_stride + (ref_x - 2) as usize;
-        hv_lowpass_direct(
-            &mut scratch.half_b[..pix],
-            block_w,
-            ref_y,
-            ref_stride,
-            hv_src_offset,
-            block_w,
-            block_h,
-            &mut scratch.ref_buf,
-        );
-    } else {
-        // Edge fallback — extract + filter.
-        let src_h_w = block_w + 5;
-        let src_h_h = block_h;
-        let needed_h = src_h_w * src_h_h;
-        extract_ref_block(
-            &mut scratch.ref_buf[..needed_h],
-            ref_y,
-            ref_stride,
-            ref_x - 2,
-            ref_y_pos + h_row_delta,
-            src_h_w,
-            src_h_h,
-            pw,
-            ph,
-        );
-        h_lowpass(
-            &mut scratch.half_a[..pix],
-            block_w,
-            &scratch.ref_buf[..needed_h],
-            src_h_w,
-            block_w,
-            block_h,
-        );
-
-        let src_hv_w = block_w + 5;
-        let src_hv_h = block_h + 5;
-        let needed_hv = src_hv_w * src_hv_h;
-        extract_ref_block(
-            &mut scratch.ref_buf2[..needed_hv],
-            ref_y,
-            ref_stride,
-            ref_x - 2,
-            ref_y_pos - 2,
-            src_hv_w,
-            src_hv_h,
-            pw,
-            ph,
-        );
-        // hv_lowpass reads from ref_buf2, uses ref_buf as tmp (ref_buf is free after h_lowpass consumed it)
-        hv_lowpass(
-            &mut scratch.half_b[..pix],
-            block_w,
-            &scratch.ref_buf2[..needed_hv],
-            src_hv_w,
-            block_w,
-            block_h,
-            &mut scratch.ref_buf,
-        );
-    }
-
-    avg_pixels(
-        dst,
-        dst_stride,
-        &scratch.half_a[..pix],
-        block_w,
-        &scratch.half_b[..pix],
-        block_w,
-        block_w,
-        block_h,
-    );
-}
-
-/// Group D helper: v_lowpass (at col `ref_x + v_col_delta`) + hv_lowpass, averaged.
-///
-/// Used for (1,2) with `v_col_delta=0` and (3,2) with `v_col_delta=1`.
-#[inline]
-#[allow(clippy::too_many_arguments)]
-fn qpel_mixed_v_hv(
-    dst: &mut [u8],
-    dst_stride: usize,
-    ref_y: &[u8],
-    ref_stride: usize,
-    ref_x: i32,
-    ref_y_pos: i32,
-    block_w: usize,
-    block_h: usize,
-    pw: i32,
-    ph: i32,
-    v_col_delta: i32,
-    scratch: &mut McScratch,
-) {
-    let pix = block_w * block_h;
-
-    // Interior check: 6-tap filter needs margin=3. v_col_delta shifts the v_lowpass column by 0 or 1.
-    let interior = is_interior(ref_x, ref_y_pos, block_w, block_h, pw, ph, 3)
-        && ref_x + v_col_delta + block_w as i32 <= pw;
-
-    if interior {
-        // Interior fast path — both filters read directly from reference.
-        let v_src_offset = (ref_y_pos - 2) as usize * ref_stride + (ref_x + v_col_delta) as usize;
-        v_lowpass_direct(
-            &mut scratch.half_a[..pix],
-            block_w,
-            ref_y,
-            ref_stride,
-            v_src_offset,
-            block_w,
-            block_h,
-        );
-
-        let hv_src_offset = (ref_y_pos - 2) as usize * ref_stride + (ref_x - 2) as usize;
-        hv_lowpass_direct(
-            &mut scratch.half_b[..pix],
-            block_w,
-            ref_y,
-            ref_stride,
-            hv_src_offset,
-            block_w,
-            block_h,
-            &mut scratch.ref_buf,
-        );
-    } else {
-        // Edge fallback — extract + filter.
-        let src_v_w = block_w;
-        let src_v_h = block_h + 5;
-        let needed_v = src_v_w * src_v_h;
-        extract_ref_block(
-            &mut scratch.ref_buf[..needed_v],
-            ref_y,
-            ref_stride,
-            ref_x + v_col_delta,
-            ref_y_pos - 2,
-            src_v_w,
-            src_v_h,
-            pw,
-            ph,
-        );
-        v_lowpass(
-            &mut scratch.half_a[..pix],
-            block_w,
-            &scratch.ref_buf[..needed_v],
-            src_v_w,
-            block_w,
-            block_h,
-        );
-
-        let src_hv_w = block_w + 5;
-        let src_hv_h = block_h + 5;
-        let needed_hv = src_hv_w * src_hv_h;
-        extract_ref_block(
-            &mut scratch.ref_buf2[..needed_hv],
-            ref_y,
-            ref_stride,
-            ref_x - 2,
-            ref_y_pos - 2,
-            src_hv_w,
-            src_hv_h,
-            pw,
-            ph,
-        );
-        // hv_lowpass reads from ref_buf2, uses ref_buf as tmp (ref_buf is free after v_lowpass consumed it)
-        hv_lowpass(
-            &mut scratch.half_b[..pix],
-            block_w,
-            &scratch.ref_buf2[..needed_hv],
-            src_hv_w,
-            block_w,
-            block_h,
-            &mut scratch.ref_buf,
-        );
-    }
-
-    avg_pixels(
-        dst,
-        dst_stride,
-        &scratch.half_a[..pix],
-        block_w,
-        &scratch.half_b[..pix],
-        block_w,
-        block_w,
-        block_h,
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Luma motion compensation (quarter-pel precision)
-// ---------------------------------------------------------------------------
-
-/// Perform luma motion compensation (quarter-pel precision).
-///
 /// Copies a block from the reference luma plane to `dst`, applying sub-pixel
 /// interpolation as determined by the fractional MV components `dx`, `dy`
 /// (each 0..3, in quarter-pel units).
@@ -1028,280 +191,131 @@ pub fn mc_luma(
     pic_height: u32,
     scratch: &mut McScratch,
 ) {
-    scratch.ensure_capacity(block_w, block_h);
-    let (pw, ph) = (pic_width as i32, pic_height as i32);
-
-    match (dx, dy) {
-        // ------------------------------------------------------------------
-        // (0,0): full-pel copy
-        // ------------------------------------------------------------------
-        (0, 0) => {
-            if is_interior(ref_x, ref_y_pos, block_w, block_h, pw, ph, 0) {
-                // Interior fast path — direct copy from reference, no intermediate buffer.
-                let src_offset = ref_y_pos as usize * ref_stride + ref_x as usize;
-                // Dispatch to fixed-width copy so the compiler can inline memcpy
-                // with a compile-time constant size (e.g. ldp/stp for 16 bytes on ARM64).
-                match block_w {
-                    16 => crate::simd::put_pixels_16x16(
-                        dst,
-                        dst_stride,
-                        &ref_y[src_offset..],
-                        ref_stride,
-                        block_h,
-                    ),
-                    8 => copy_block_direct(
-                        dst, dst_stride, ref_y, ref_stride, src_offset, 8, block_h,
-                    ),
-                    4 => copy_block_direct(
-                        dst, dst_stride, ref_y, ref_stride, src_offset, 4, block_h,
-                    ),
-                    _ => copy_block_direct(
-                        dst, dst_stride, ref_y, ref_stride, src_offset, block_w, block_h,
-                    ),
-                }
-            } else {
-                // Edge fallback — extract + copy (existing code).
-                let src_w = block_w;
-                let src_h = block_h;
-                let needed = src_w * src_h;
-                extract_ref_block(
-                    &mut scratch.ref_buf[..needed],
-                    ref_y,
-                    ref_stride,
-                    ref_x,
-                    ref_y_pos,
-                    src_w,
-                    src_h,
-                    pw,
-                    ph,
-                );
-                for j in 0..block_h {
-                    for i in 0..block_w {
-                        dst[j * dst_stride + i] = scratch.ref_buf[j * src_w + i] as u8;
-                    }
-                }
-            }
-        }
-
-        // ------------------------------------------------------------------
-        // (2,0): horizontal half-pel (the "b" position)
-        // ------------------------------------------------------------------
-        (2, 0) => {
-            if is_interior(ref_x, ref_y_pos, block_w, block_h, pw, ph, 3) {
-                // Interior fast path — filter directly from reference.
-                // The 6-tap filter needs 2 pixels before and 3 after, tap_margin=3 covers both.
-                let src_offset = ref_y_pos as usize * ref_stride + (ref_x - 2) as usize;
-                h_lowpass_direct(
-                    dst, dst_stride, ref_y, ref_stride, src_offset, block_w, block_h,
-                );
-            } else {
-                // Edge fallback — extract + filter.
-                let src_w = block_w + 5;
-                let src_h = block_h;
-                let needed = src_w * src_h;
-                extract_ref_block(
-                    &mut scratch.ref_buf[..needed],
-                    ref_y,
-                    ref_stride,
-                    ref_x - 2,
-                    ref_y_pos,
-                    src_w,
-                    src_h,
-                    pw,
-                    ph,
-                );
-                h_lowpass(
-                    dst,
-                    dst_stride,
-                    &scratch.ref_buf[..needed],
-                    src_w,
-                    block_w,
-                    block_h,
-                );
-            }
-        }
-
-        // ------------------------------------------------------------------
-        // (0,2): vertical half-pel (the "h" position)
-        // ------------------------------------------------------------------
-        (0, 2) => {
-            if is_interior(ref_x, ref_y_pos, block_w, block_h, pw, ph, 3) {
-                // Interior fast path — filter directly from reference.
-                let src_offset = (ref_y_pos - 2) as usize * ref_stride + ref_x as usize;
-                v_lowpass_direct(
-                    dst, dst_stride, ref_y, ref_stride, src_offset, block_w, block_h,
-                );
-            } else {
-                // Edge fallback — extract + filter.
-                let src_w = block_w;
-                let src_h = block_h + 5;
-                let needed = src_w * src_h;
-                extract_ref_block(
-                    &mut scratch.ref_buf[..needed],
-                    ref_y,
-                    ref_stride,
-                    ref_x,
-                    ref_y_pos - 2,
-                    src_w,
-                    src_h,
-                    pw,
-                    ph,
-                );
-                v_lowpass(
-                    dst,
-                    dst_stride,
-                    &scratch.ref_buf[..needed],
-                    src_w,
-                    block_w,
-                    block_h,
-                );
-            }
-        }
-
-        // ------------------------------------------------------------------
-        // (2,2): 2D half-pel (the "j" position)
-        // ------------------------------------------------------------------
-        (2, 2) => {
-            if is_interior(ref_x, ref_y_pos, block_w, block_h, pw, ph, 3) {
-                // Interior fast path — 2D filter directly from reference.
-                // The HV filter needs (block_w+5) x (block_h+5) pixels starting at (ref_x-2, ref_y-2).
-                let src_offset = (ref_y_pos - 2) as usize * ref_stride + (ref_x - 2) as usize;
-                hv_lowpass_direct(
-                    dst,
-                    dst_stride,
-                    ref_y,
-                    ref_stride,
-                    src_offset,
-                    block_w,
-                    block_h,
-                    &mut scratch.ref_buf2,
-                );
-            } else {
-                // Edge fallback — extract + filter.
-                let src_w = block_w + 5;
-                let src_h = block_h + 5;
-                let needed = src_w * src_h;
-                extract_ref_block(
-                    &mut scratch.ref_buf[..needed],
-                    ref_y,
-                    ref_stride,
-                    ref_x - 2,
-                    ref_y_pos - 2,
-                    src_w,
-                    src_h,
-                    pw,
-                    ph,
-                );
-                hv_lowpass(
-                    dst,
-                    dst_stride,
-                    &scratch.ref_buf[..needed],
-                    src_w,
-                    block_w,
-                    block_h,
-                    &mut scratch.ref_buf2,
-                );
-            }
-        }
-
-        // ------------------------------------------------------------------
-        // (1,0): quarter-pel = avg(G, b) — avg of full-pel and horizontal half
-        // ------------------------------------------------------------------
-        (1, 0) => qpel_h_avg(
-            dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos, block_w, block_h, pw, ph, 2,
-            scratch,
-        ),
-
-        // ------------------------------------------------------------------
-        // (3,0): quarter-pel = avg(G+1, b) — avg of full-pel+1 and horizontal half
-        // ------------------------------------------------------------------
-        (3, 0) => qpel_h_avg(
-            dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos, block_w, block_h, pw, ph, 3,
-            scratch,
-        ),
-
-        // ------------------------------------------------------------------
-        // (0,1): quarter-pel = avg(G, h) — avg of full-pel and vertical half
-        // ------------------------------------------------------------------
-        (0, 1) => qpel_v_avg(
-            dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos, block_w, block_h, pw, ph, 2,
-            scratch,
-        ),
-
-        // ------------------------------------------------------------------
-        // (0,3): quarter-pel = avg(G_below, h) — avg of full-pel+1row and vertical half
-        // ------------------------------------------------------------------
-        (0, 3) => qpel_v_avg(
-            dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos, block_w, block_h, pw, ph, 3,
-            scratch,
-        ),
-
-        // ------------------------------------------------------------------
-        // (1,1): avg(halfH, halfV) — diagonal quarter-pel "e"
-        // ------------------------------------------------------------------
-        (1, 1) => qpel_diagonal(
-            dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos, block_w, block_h, pw, ph, 0, 0,
-            scratch,
-        ),
-
-        // ------------------------------------------------------------------
-        // (3,1): avg(halfH, halfV_right) — "g" position
-        // ------------------------------------------------------------------
-        (3, 1) => qpel_diagonal(
-            dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos, block_w, block_h, pw, ph, 0, 1,
-            scratch,
-        ),
-
-        // ------------------------------------------------------------------
-        // (1,3): avg(halfH_below, halfV) — "m" position
-        // ------------------------------------------------------------------
-        (1, 3) => qpel_diagonal(
-            dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos, block_w, block_h, pw, ph, 1, 0,
-            scratch,
-        ),
-
-        // ------------------------------------------------------------------
-        // (3,3): avg(halfH_below, halfV_right) — "o" position
-        // ------------------------------------------------------------------
-        (3, 3) => qpel_diagonal(
-            dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos, block_w, block_h, pw, ph, 1, 1,
-            scratch,
-        ),
-
-        // ------------------------------------------------------------------
-        // (2,1): avg(halfH, halfHV) — "f" position
-        // ------------------------------------------------------------------
-        (2, 1) => qpel_mixed_h_hv(
-            dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos, block_w, block_h, pw, ph, 0,
-            scratch,
-        ),
-
-        // ------------------------------------------------------------------
-        // (2,3): avg(halfH_below, halfHV) — "n" position
-        // ------------------------------------------------------------------
-        (2, 3) => qpel_mixed_h_hv(
-            dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos, block_w, block_h, pw, ph, 1,
-            scratch,
-        ),
-
-        // ------------------------------------------------------------------
-        // (1,2): avg(halfV, halfHV) — "i" position
-        // ------------------------------------------------------------------
-        (1, 2) => qpel_mixed_v_hv(
-            dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos, block_w, block_h, pw, ph, 0,
-            scratch,
-        ),
-
-        // ------------------------------------------------------------------
-        // (3,2): avg(halfV_right, halfHV) — "k" position
-        // ------------------------------------------------------------------
-        (3, 2) => qpel_mixed_v_hv(
-            dst, dst_stride, ref_y, ref_stride, ref_x, ref_y_pos, block_w, block_h, pw, ph, 1,
-            scratch,
-        ),
-
-        _ => unreachable!("dx and dy must be in 0..4, got ({}, {})", dx, dy),
+    assert!(dx < 4 && dy < 4, "invalid luma quarter-pixel position");
+    if block_w == 0 || block_h == 0 {
+        return;
     }
+    scratch.ensure_capacity(block_w, block_h);
+    let horizontal = usize::from(dx != 0);
+    let vertical = usize::from(dy != 0);
+    let x = i64::from(ref_x) - 2 * horizontal as i64;
+    let y = i64::from(ref_y_pos) - 2 * vertical as i64;
+    let width = block_w + 5 * horizontal;
+    let height = block_h + 5 * vertical;
+    let pixels = block_w * block_h;
+
+    // Interior samples borrow the picture directly. Border samples get the
+    // same filter kernel on a small padded tile in the reusable scratch.
+    let inside = x >= 0
+        && y >= 0
+        && x + width as i64 <= i64::from(pic_width)
+        && y + height as i64 <= i64::from(pic_height);
+    if !inside && scratch.half_b.len() < pixels + width * height {
+        scratch.half_b.resize(pixels + width * height, 0);
+    }
+    let (b, edge) = scratch.half_b.split_at_mut(pixels);
+    let (src, stride) = if inside {
+        (&ref_y[y as usize * ref_stride + x as usize..], ref_stride)
+    } else {
+        let tile = &mut edge[..width * height];
+        extend_luma_edge(
+            tile,
+            width,
+            ref_y,
+            ref_stride,
+            x,
+            y,
+            pic_width.into(),
+            pic_height.into(),
+        );
+        (&*tile, width)
+    };
+
+    let center = 2 * vertical * stride + 2 * horizontal;
+    let full = |x: usize, y: usize| &src[center + y * stride + x..];
+    let h = |out: &mut [u8], pitch, row| {
+        crate::simd::luma_6tap_h(
+            out,
+            pitch,
+            &src[center - 2 + row * stride..],
+            stride,
+            block_w,
+            block_h,
+        )
+    };
+    let v = |out: &mut [u8], pitch, col| {
+        crate::simd::luma_6tap_v(
+            out,
+            pitch,
+            &src[center - 2 * stride + col..],
+            stride,
+            block_w,
+            block_h,
+        )
+    };
+    let mut hv = |out: &mut [u8], pitch| {
+        crate::simd::luma_6tap_hv(
+            out,
+            pitch,
+            src,
+            stride,
+            block_w,
+            block_h,
+            &mut scratch.ref_buf2,
+        )
+    };
+    let a = &mut scratch.half_a[..pixels];
+
+    // Integer and half-pixel positions need just one prediction. The remaining
+    // phases average a pair of neighboring integer/half-pixel predictions.
+    let (second, second_stride): (&[u8], usize) = match (dx, dy) {
+        (0, 0) => {
+            match block_w {
+                16 => crate::simd::put_pixels_16x16(dst, dst_stride, src, stride, block_h),
+                8 => copy_block_direct(dst, dst_stride, src, stride, 0, 8, block_h),
+                4 => copy_block_direct(dst, dst_stride, src, stride, 0, 4, block_h),
+                _ => copy_block_direct(dst, dst_stride, src, stride, 0, block_w, block_h),
+            }
+            return;
+        }
+        (2, 0) => return h(dst, dst_stride, 0),
+        (0, 2) => return v(dst, dst_stride, 0),
+        (2, 2) => return hv(dst, dst_stride),
+        (1 | 3, 0) => {
+            h(a, block_w, 0);
+            (full(usize::from(dx == 3), 0), stride)
+        }
+        (0, 1 | 3) => {
+            v(a, block_w, 0);
+            (full(0, usize::from(dy == 3)), stride)
+        }
+        (1 | 3, 1 | 3) => {
+            h(a, block_w, usize::from(dy == 3));
+            v(b, block_w, usize::from(dx == 3));
+            (b, block_w)
+        }
+        (2, 1 | 3) => {
+            h(a, block_w, usize::from(dy == 3));
+            hv(b, block_w);
+            (b, block_w)
+        }
+        (1 | 3, 2) => {
+            v(a, block_w, usize::from(dx == 3));
+            hv(b, block_w);
+            (b, block_w)
+        }
+        _ => unreachable!(),
+    };
+    crate::simd::avg_pixels(
+        dst,
+        dst_stride,
+        a,
+        block_w,
+        second,
+        second_stride,
+        block_w,
+        block_h,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2257,12 +1271,18 @@ mod tests {
 
     #[test]
     fn test_filter6_known_values() {
-        // Direct test of filter6.
-        assert_eq!(filter6(1, 1, 1, 1, 1, 1), 32);
-        assert_eq!(filter6(0, 0, 0, 0, 0, 0), 0);
-        assert_eq!(filter6(0, 0, 1, 0, 0, 0), 20);
-        assert_eq!(filter6(0, 0, 0, 1, 0, 0), 20);
-        assert_eq!(filter6(0, 1, 0, 0, 0, 0), -5);
-        assert_eq!(filter6(1, 0, 0, 0, 0, 0), 1);
+        // A 32-level impulse cancels the filter's shift by five.
+        for (tap, weight) in [1, -5, 20, 20, -5, 1].into_iter().enumerate() {
+            let mut src = [128; 6];
+            src[tap] += 32;
+            let mut dst = [0];
+            crate::simd::luma_6tap_h(&mut dst, 1, &src, 6, 1, 1);
+            assert_eq!(i32::from(dst[0]) - 128, weight);
+        }
+        for value in [0, 1, 32] {
+            let mut dst = [255];
+            crate::simd::luma_6tap_h(&mut dst, 1, &[value; 6], 6, 1, 1);
+            assert_eq!(dst[0], value);
+        }
     }
 }
