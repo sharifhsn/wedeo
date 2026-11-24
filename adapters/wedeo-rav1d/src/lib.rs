@@ -1,8 +1,8 @@
 //! Segregated `rav1d` AV1 decoder adapter for Wedeo v2.
 //!
 //! Wraps the pure-Rust `rav1d` AV1 decoder behind `wedeo_core::Decoder`:
-//! - **Zero-copy output planes** via [`ExternalCpuBuffer`] holding a shared,
-//!   reference-counted [`Dav1dPictureGuard`] that calls `dav1d_picture_unref`
+//! - **Zero-copy output planes** via `wedeo_core::ExternalCpuBuffer` holding a shared,
+//!   reference-counted `Dav1dPictureGuard` that calls `dav1d_picture_unref`
 //!   once all plane buffers for a frame are dropped (with automatic clean
 //!   fallback to pooled copy if a non-positive or narrow stride is encountered).
 //! - **Odd-dimension chroma** computed with ceiling division (`w.div_ceil(2)`,
@@ -14,34 +14,31 @@
 //! - **8-bit, 10-bit, and 12-bit** support across `4:2:0`, `4:2:2`, `4:4:4`
 //!   (including GBR identity matrix), and `4:0:0` monochrome.
 
+#![deny(unsafe_code)]
+
+mod ffi_guard;
+
 use std::collections::VecDeque;
-use std::ffi::{c_int, c_void};
-use std::ptr::NonNull;
+use std::ffi::c_int;
 use std::sync::Arc;
 
-use rav1d::Dav1dResult;
-use rav1d::include::dav1d::data::Dav1dData;
-use rav1d::include::dav1d::dav1d::{DAV1D_MAX_THREADS, Dav1dContext, Dav1dSettings};
 use rav1d::include::dav1d::headers::{
     DAV1D_CHR_COLOCATED, DAV1D_CHR_VERTICAL, DAV1D_FRAME_TYPE_INTER, DAV1D_FRAME_TYPE_INTRA,
     DAV1D_FRAME_TYPE_KEY, DAV1D_FRAME_TYPE_SWITCH, DAV1D_PIXEL_LAYOUT_I400,
     DAV1D_PIXEL_LAYOUT_I420, DAV1D_PIXEL_LAYOUT_I422, DAV1D_PIXEL_LAYOUT_I444, Dav1dPixelLayout,
     Dav1dSequenceHeader,
 };
-use rav1d::include::dav1d::picture::Dav1dPicture;
-use rav1d::{
-    dav1d_close, dav1d_data_create, dav1d_data_unref, dav1d_default_settings, dav1d_flush,
-    dav1d_get_picture, dav1d_open, dav1d_picture_unref, dav1d_send_data,
-};
 
 use wedeo_core::{
-    BorderPadding, BorderedPlane, Buffer, BufferPool, ChromaLocation, CodecContext, CodecId,
-    ColorDesc, ColorPrimaries, ColorRange, Decoder, DecoderDescriptor, DecoderFactory, Error,
-    ErrorPolicy, ExternalCpuBuffer, FrameFlags, HealthEvent, HealthIssue, MasteringDisplayMeta,
-    MatrixCoefficients, MediaType, MediaUnit, Packet, PictureType, PixelLayout, Rational,
-    RecvStatus, Registry, Result, SampleDepth, SendStatus, SideData, StreamHealth, Timestamp,
-    TrackDescriptor, TrackId, TransferCharacteristic, VideoFrame, reduce,
+    BufferPool, ChromaLocation, CodecContext, CodecId, ColorDesc, ColorPrimaries, ColorRange,
+    Decoder, DecoderDescriptor, DecoderFactory, Error, ErrorPolicy, FrameFlags, HealthEvent,
+    HealthIssue, MasteringDisplayMeta, MatrixCoefficients, MediaType, MediaUnit, Packet,
+    PictureType, PixelLayout, Rational, RecvStatus, Registry, Result, SampleDepth, SendStatus,
+    SideData, StreamHealth, Timestamp, TrackDescriptor, TrackId, TransferCharacteristic,
+    VideoFrame, reduce,
 };
+
+use self::ffi_guard::{Dav1dContextGuard, Dav1dPictureGuard};
 
 const COMPONENT: &str = "rav1d";
 
@@ -51,18 +48,6 @@ enum RawSendOutcome {
     Accepted,
     TryAgain,
     InvalidData,
-}
-
-/// Convert a `Dav1dResult` from `dav1d_open` to a Wedeo `Result`.
-fn check_open_result(r: Dav1dResult) -> Result<()> {
-    if r.0 == 0 {
-        Ok(())
-    } else {
-        Err(Error::invalid_argument(
-            COMPONENT,
-            format!("dav1d_open failed with code {}", r.0),
-        ))
-    }
 }
 
 /// Map a `rav1d` pixel layout, bit depth (`8`, `10`, `12`), and matrix coefficients
@@ -185,141 +170,7 @@ pub fn extract_color_desc(seq_hdr: &Dav1dSequenceHeader, fallback: ColorDesc) ->
     }
 }
 
-/// Shared RAII owner for a decoded [`Dav1dPicture`].
-///
-/// Calls `dav1d_picture_unref` exactly once when the final plane buffer referencing
-/// this decoded picture is dropped.
-struct Dav1dPictureGuard(Dav1dPicture);
-
-// SAFETY: Once returned by `dav1d_get_picture`, a `Dav1dPicture`'s pixel planes and
-// reference-counted headers (`RawArc<Rav1dPictureData>`, `RawArc<DRav1d<...>>`) are
-// immutable for the lifetime of the picture. On drop, `dav1d_picture_unref` converts
-// those `RawArc` pointers back into `Arc`s and drops them, returning the backing buffer
-// to `rav1d`'s thread-safe `Arc<MemPool<u8>>`.
-unsafe impl Send for Dav1dPictureGuard {}
-
-// SAFETY: `Dav1dPictureGuard` only exposes shared immutable access to the decoded
-// plane bytes after `dav1d_get_picture` completes.
-unsafe impl Sync for Dav1dPictureGuard {}
-
-impl Drop for Dav1dPictureGuard {
-    fn drop(&mut self) {
-        // SAFETY: `self.0` was populated by a successful `dav1d_get_picture` call and
-        // is unreferenced exactly once here when the `Arc<Dav1dPictureGuard>` drops.
-        unsafe {
-            dav1d_picture_unref(NonNull::new(&mut self.0));
-        }
-    }
-}
-
-/// Zero-copy [`ExternalCpuBuffer`] view over one plane of a [`Dav1dPictureGuard`].
-struct Rav1dPlaneBuffer {
-    _guard: Arc<Dav1dPictureGuard>,
-    ptr: NonNull<u8>,
-    logical_len: usize,
-    padded_len: usize,
-}
-
-// SAFETY: `ptr` points into immutable plane memory owned by `_guard`, which stays alive
-// and free of mutable aliases until `_guard` drops.
-unsafe impl Send for Rav1dPlaneBuffer {}
-
-// SAFETY: `as_slice` and `as_padded_slice` only return shared immutable `&[u8]` views.
-unsafe impl Sync for Rav1dPlaneBuffer {}
-
-impl ExternalCpuBuffer for Rav1dPlaneBuffer {
-    #[inline]
-    fn as_slice(&self) -> &[u8] {
-        // SAFETY: `self.ptr` points to at least `self.logical_len` initialized,
-        // immutable bytes inside the decoded `Dav1dPicture` owned by `self._guard`.
-        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.logical_len) }
-    }
-
-    #[inline]
-    fn as_padded_slice(&self) -> &[u8] {
-        // SAFETY: `self.ptr` points to at least `self.padded_len` (`>= self.logical_len`)
-        // initialized, immutable bytes inside the `rav1d` picture component allocation
-        // kept alive by `self._guard`.
-        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.padded_len) }
-    }
-}
-
-/// Fallback row-by-row copy into a pooled [`BorderedPlane`] when a picture plane
-/// uses a negative (bottom-up) or unexpectedly narrow stride.
-///
-/// # Safety
-/// `plane_ptr` must point to valid pixel data for `height` rows at signed byte `stride`,
-/// with at least `width_bytes` readable bytes per row.
-unsafe fn copy_plane_fallback(
-    pool: &Arc<BufferPool>,
-    plane_ptr: NonNull<c_void>,
-    stride: isize,
-    width_bytes: usize,
-    height: usize,
-) -> BorderedPlane {
-    let mut plane = BorderedPlane::new_reused(pool, width_bytes, height, BorderPadding::NONE);
-    let base = plane_ptr.as_ptr() as *const u8;
-    for row in 0..height {
-        // SAFETY: Caller guarantees `plane_ptr` is valid for `height` rows at `stride`.
-        // For negative strides, `base + row * stride` steps backward within the allocated slab.
-        let src_row = unsafe {
-            let row_ptr = base.offset(row as isize * stride);
-            std::slice::from_raw_parts(row_ptr, width_bytes)
-        };
-        if let Some(dst_row) = plane.row_mut(row) {
-            dst_row.copy_from_slice(src_row);
-        }
-    }
-    plane
-}
-
-/// Build a [`BorderedPlane`] from a decoded `Dav1dPicture` plane, using zero-copy
-/// [`ExternalCpuBuffer`] whenever `stride > 0` and falling back cleanly to a pooled
-/// copy otherwise.
-///
-/// # Safety
-/// `plane_ptr` must come from a decoded `Dav1dPicture` kept alive by `guard`, valid for
-/// `height` rows of `width_bytes` at `stride` within `alloc_component_bytes`.
-unsafe fn build_plane(
-    guard: &Arc<Dav1dPictureGuard>,
-    pool: &Arc<BufferPool>,
-    plane_ptr: NonNull<c_void>,
-    stride: isize,
-    width_bytes: usize,
-    height: usize,
-    alloc_component_bytes: usize,
-) -> BorderedPlane {
-    if height > 0 && width_bytes > 0 && stride > 0 {
-        let stride_usize = stride as usize;
-        if stride_usize >= width_bytes {
-            let min_span = (height - 1)
-                .saturating_mul(stride_usize)
-                .saturating_add(width_bytes);
-            let full_span = height.saturating_mul(stride_usize);
-            let logical_len = if full_span <= alloc_component_bytes {
-                full_span
-            } else {
-                min_span
-            };
-            if logical_len <= alloc_component_bytes {
-                let padded_len = alloc_component_bytes.max(logical_len);
-                let ext = Rav1dPlaneBuffer {
-                    _guard: Arc::clone(guard),
-                    ptr: plane_ptr.cast::<u8>(),
-                    logical_len,
-                    padded_len,
-                };
-                let buffer = Buffer::from_external(Box::new(ext));
-                return BorderedPlane::from_buffer(buffer, 0, stride, width_bytes, height);
-            }
-        }
-    }
-
-    // SAFETY: Caller guarantees `plane_ptr` is valid for `height` rows of `width_bytes` at `stride`.
-    unsafe { copy_plane_fallback(pool, plane_ptr, stride, width_bytes, height) }
-}
-
-/// Convert a decoded [`Dav1dPictureGuard`] into a Wedeo [`VideoFrame`].
+/// Convert a decoded `Dav1dPictureGuard` into a Wedeo [`VideoFrame`].
 fn picture_to_video_frame(
     guard: Arc<Dav1dPictureGuard>,
     pool: &Arc<BufferPool>,
@@ -327,7 +178,7 @@ fn picture_to_video_frame(
     fallback_sar: Rational,
     time_base: Rational,
 ) -> Result<VideoFrame> {
-    let pic = &guard.0;
+    let pic = guard.picture();
     if pic.p.w <= 0 || pic.p.h <= 0 {
         return Err(Error::invalid_data(
             COMPONENT,
@@ -341,9 +192,7 @@ fn picture_to_video_frame(
 
     // Extract sequence header CICP colorimetry before choosing pixel layout
     // (since 4:4:4 + Identity matrix maps to GBRP).
-    let color = if let Some(seq_ptr) = pic.seq_hdr {
-        // SAFETY: `seq_ptr` is valid for the lifetime of `pic` (`guard`).
-        let seq_hdr = unsafe { seq_ptr.as_ref() };
+    let color = if let Some(seq_hdr) = guard.seq_hdr() {
         extract_color_desc(seq_hdr, fallback_color)
     } else {
         fallback_color
@@ -358,58 +207,33 @@ fn picture_to_video_frame(
     let ss_ver = usize::from(layout == DAV1D_PIXEL_LAYOUT_I420);
     let y_stride = pic.stride[0];
     let uv_stride = pic.stride[1];
-    let y_alloc_bytes = y_stride.unsigned_abs().saturating_mul(aligned_h);
-    let uv_alloc_bytes = uv_stride.unsigned_abs().saturating_mul(aligned_h >> ss_ver);
+    let y_alloc_bytes = y_stride
+        .unsigned_abs()
+        .checked_mul(aligned_h)
+        .ok_or_else(|| Error::invalid_data(COMPONENT, "rav1d luma plane byte size overflow"))?;
+    let uv_alloc_bytes = uv_stride
+        .unsigned_abs()
+        .checked_mul(aligned_h >> ss_ver)
+        .ok_or_else(|| Error::invalid_data(COMPONENT, "rav1d chroma plane byte size overflow"))?;
 
-    let y_ptr =
-        pic.data[0].ok_or_else(|| Error::invalid_data(COMPONENT, "missing luma plane pointer"))?;
-    let y_width_bytes = w * bytes_per_sample;
-    // SAFETY: `y_ptr` is valid for `h` rows of `y_width_bytes` at `y_stride` inside `y_alloc_bytes`.
-    let y_plane = unsafe {
-        build_plane(
-            &guard,
-            pool,
-            y_ptr,
-            y_stride,
-            y_width_bytes,
-            h,
-            y_alloc_bytes,
-        )
-    };
+    let y_width_bytes = w
+        .checked_mul(bytes_per_sample)
+        .ok_or_else(|| Error::invalid_data(COMPONENT, "rav1d luma row byte width overflow"))?;
+    let y_plane = Dav1dPictureGuard::build_plane(&guard, pool, 0, y_width_bytes, h, y_alloc_bytes)
+        .ok_or_else(|| Error::invalid_data(COMPONENT, "missing luma plane pointer"))?;
 
     let (cw, ch) = chroma_dims(layout, w, h);
     let planes = if cw > 0 && ch > 0 {
-        let u_ptr = pic.data[1]
-            .ok_or_else(|| Error::invalid_data(COMPONENT, "missing U chroma plane pointer"))?;
-        let v_ptr = pic.data[2]
-            .ok_or_else(|| Error::invalid_data(COMPONENT, "missing V chroma plane pointer"))?;
-        let c_width_bytes = cw * bytes_per_sample;
+        let c_width_bytes = cw.checked_mul(bytes_per_sample).ok_or_else(|| {
+            Error::invalid_data(COMPONENT, "rav1d chroma row byte width overflow")
+        })?;
 
-        // SAFETY: `u_ptr` and `v_ptr` are valid for `ch` rows of `c_width_bytes` at `uv_stride`
-        // inside `uv_alloc_bytes`.
-        let u_plane = unsafe {
-            build_plane(
-                &guard,
-                pool,
-                u_ptr,
-                uv_stride,
-                c_width_bytes,
-                ch,
-                uv_alloc_bytes,
-            )
-        };
-        // SAFETY: Same as `u_plane` for the V plane component.
-        let v_plane = unsafe {
-            build_plane(
-                &guard,
-                pool,
-                v_ptr,
-                uv_stride,
-                c_width_bytes,
-                ch,
-                uv_alloc_bytes,
-            )
-        };
+        let u_plane =
+            Dav1dPictureGuard::build_plane(&guard, pool, 1, c_width_bytes, ch, uv_alloc_bytes)
+                .ok_or_else(|| Error::invalid_data(COMPONENT, "missing U chroma plane pointer"))?;
+        let v_plane =
+            Dav1dPictureGuard::build_plane(&guard, pool, 2, c_width_bytes, ch, uv_alloc_bytes)
+                .ok_or_else(|| Error::invalid_data(COMPONENT, "missing V chroma plane pointer"))?;
         vec![y_plane, u_plane, v_plane]
     } else {
         vec![y_plane]
@@ -423,9 +247,7 @@ fn picture_to_video_frame(
     frame.time_base = time_base;
     frame.sar = fallback_sar;
 
-    if let Some(frame_hdr_ptr) = pic.frame_hdr {
-        // SAFETY: `frame_hdr_ptr` is valid while `pic` (`guard`) is alive.
-        let hdr = unsafe { frame_hdr_ptr.as_ref() };
+    if let Some(hdr) = guard.frame_hdr() {
         frame.picture_type = match hdr.frame_type {
             DAV1D_FRAME_TYPE_KEY | DAV1D_FRAME_TYPE_INTRA => PictureType::I,
             DAV1D_FRAME_TYPE_INTER => PictureType::P,
@@ -447,9 +269,7 @@ fn picture_to_video_frame(
         }
     }
 
-    if let Some(md_ptr) = pic.mastering_display {
-        // SAFETY: `md_ptr` is valid while `pic` (`guard`) is alive.
-        let md = unsafe { md_ptr.as_ref() };
+    if let Some(md) = guard.mastering_display() {
         frame
             .side_data
             .push(SideData::MasteringDisplay(MasteringDisplayMeta {
@@ -468,9 +288,7 @@ fn picture_to_video_frame(
             }));
     }
 
-    if let Some(cll_ptr) = pic.content_light {
-        // SAFETY: `cll_ptr` is valid while `pic` (`guard`) is alive.
-        let cll = unsafe { cll_ptr.as_ref() };
+    if let Some(cll) = guard.content_light() {
         frame.side_data.push(SideData::ContentLightLevel {
             max_cll: u32::from(cll.max_content_light_level),
             max_fall: u32::from(cll.max_frame_average_light_level),
@@ -501,7 +319,7 @@ fn extract_config_obus(extradata: &[u8], policy: ErrorPolicy) -> Result<&[u8]> {
 
 /// `rav1d` AV1 decoder implementing [`wedeo_core::Decoder`].
 pub struct Rav1dDecoder {
-    ctx: Option<Dav1dContext>,
+    ctx: Dav1dContextGuard,
     codec_ctx: CodecContext,
     track_id: TrackId,
     time_base: Rational,
@@ -513,11 +331,6 @@ pub struct Rav1dDecoder {
     health: StreamHealth,
 }
 
-// SAFETY: `Dav1dContext` is `RawArc<Rav1dContext>`, a raw pointer to an `Arc<Rav1dContext>`.
-// `Rav1dContext` is thread-safe internally (`Mutex` + atomics), and `Rav1dDecoder`
-// holds unique ownership of its `Dav1dContext` handle, freeing it once in `Drop` via `dav1d_close`.
-unsafe impl Send for Rav1dDecoder {}
-
 impl Rav1dDecoder {
     pub fn open(track: &TrackDescriptor, codec_ctx: CodecContext) -> Result<Self> {
         if track.codec_id != CodecId::Av1 {
@@ -527,35 +340,10 @@ impl Rav1dDecoder {
             ));
         }
 
-        let mut settings = std::mem::MaybeUninit::<Dav1dSettings>::uninit();
-        // SAFETY: `dav1d_default_settings` initializes the `Dav1dSettings` struct.
-        unsafe {
-            dav1d_default_settings(NonNull::new(settings.as_mut_ptr()).unwrap());
-        }
-        // SAFETY: `settings` was initialized by `dav1d_default_settings`.
-        let mut settings = unsafe { settings.assume_init() };
-
-        if codec_ctx.threads > 0 {
-            settings.n_threads = (codec_ctx.threads as c_int).min(DAV1D_MAX_THREADS);
-            if codec_ctx.threads == 1 {
-                settings.max_frame_delay = 1;
-            }
-        }
-        settings.apply_grain = 1;
-        settings.strict_std_compliance = c_int::from(codec_ctx.error_policy == ErrorPolicy::Strict);
-
-        let mut raw_ctx: Option<Dav1dContext> = None;
-        // SAFETY: `dav1d_open` writes a newly opened context handle into `raw_ctx`.
-        let open_res = unsafe {
-            dav1d_open(
-                Some(NonNull::new(&mut raw_ctx).unwrap()),
-                Some(NonNull::new(&mut settings).unwrap()),
-            )
-        };
-        check_open_result(open_res)?;
-
-        let ctx = raw_ctx
-            .ok_or_else(|| Error::internal(COMPONENT, "dav1d_open returned null context"))?;
+        let ctx = Dav1dContextGuard::open(
+            codec_ctx.threads,
+            codec_ctx.error_policy == ErrorPolicy::Strict,
+        )?;
 
         let (fallback_color, fallback_sar, extradata) = match track.params.video() {
             Some(vp) => {
@@ -572,7 +360,7 @@ impl Rav1dDecoder {
         let config_obus = extract_config_obus(extradata, codec_ctx.error_policy)?;
 
         let mut decoder = Self {
-            ctx: Some(ctx),
+            ctx,
             codec_ctx,
             track_id: track.id,
             time_base: track.time_base,
@@ -631,49 +419,8 @@ impl Rav1dDecoder {
         if data.is_empty() {
             return Ok(RawSendOutcome::Accepted);
         }
-        let ctx = self
-            .ctx
-            .ok_or_else(|| Error::internal(COMPONENT, "rav1d context already closed"))?;
 
-        let mut dav1d_data = std::mem::MaybeUninit::<Dav1dData>::zeroed();
-        let dav1d_data_ptr = NonNull::new(dav1d_data.as_mut_ptr()).unwrap();
-
-        // SAFETY: `dav1d_data_create` initializes `dav1d_data` and returns a pointer to an
-        // internal buffer of `data.len()` bytes (or null on allocation failure).
-        let buf_ptr = unsafe { dav1d_data_create(Some(dav1d_data_ptr), data.len()) };
-        if buf_ptr.is_null() {
-            return Err(Error::internal(
-                COMPONENT,
-                "dav1d_data_create failed to allocate buffer",
-            ));
-        }
-
-        // SAFETY: `dav1d_data_create` succeeded, so `dav1d_data` is initialized.
-        let mut dav1d_data = unsafe { dav1d_data.assume_init() };
-
-        if let Some(ptr) = dav1d_data.data {
-            // SAFETY: `dav1d_data_create` allocated exactly `data.len()` bytes at `ptr`.
-            unsafe {
-                std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.as_ptr(), data.len());
-            }
-        }
-
-        dav1d_data.m.timestamp = timestamp;
-        dav1d_data.m.duration = duration;
-
-        // SAFETY: `ctx` is an open `Dav1dContext` and `dav1d_data` is initialized.
-        let result =
-            unsafe { dav1d_send_data(Some(ctx), Some(NonNull::new(&mut dav1d_data).unwrap())) };
-
-        // Free any unconsumed buffer when `dav1d_send_data` returns EAGAIN or an error.
-        if dav1d_data.sz > 0 {
-            // SAFETY: `dav1d_data` still owns its allocation because `sz > 0`.
-            unsafe {
-                dav1d_data_unref(Some(NonNull::new(&mut dav1d_data).unwrap()));
-            }
-        }
-
-        let code = result.0;
+        let code = self.ctx.send_data(data, timestamp, duration)?;
         if code == 0 {
             Ok(RawSendOutcome::Accepted)
         } else if code == -(libc::EAGAIN as c_int) {
@@ -685,33 +432,19 @@ impl Rav1dDecoder {
 
     /// Pull all ready pictures from `rav1d` into `self.pending_frames`.
     fn drain_pictures(&mut self) -> Result<()> {
-        let Some(ctx) = self.ctx else {
-            return Ok(());
-        };
-
         loop {
-            let mut pic = std::mem::MaybeUninit::<Dav1dPicture>::zeroed();
-            let pic_ptr = NonNull::new(pic.as_mut_ptr()).unwrap();
-
-            // SAFETY: `dav1d_get_picture` writes a decoded picture into `pic` on success (`0`).
-            let result = unsafe { dav1d_get_picture(Some(ctx), Some(pic_ptr)) };
-            let code = result.0;
-            if code < 0 {
-                if code == -(libc::EAGAIN as c_int) {
+            let guard = match self.ctx.get_picture() {
+                Ok(Some(guard)) => guard,
+                Ok(None) => break,
+                Err(_) => {
+                    self.record_corrupt(
+                        Timestamp::NONE,
+                        None,
+                        "rav1d reported corrupt picture during decode",
+                    )?;
                     break;
                 }
-                self.record_corrupt(
-                    Timestamp::NONE,
-                    None,
-                    "rav1d reported corrupt picture during decode",
-                )?;
-                break;
-            }
-
-            // SAFETY: `dav1d_get_picture` returned 0, so `pic` is a valid `Dav1dPicture`.
-            // Wrap immediately in `Arc<Dav1dPictureGuard>` so `dav1d_picture_unref` is
-            // guaranteed to run when all zero-copy plane buffers drop.
-            let guard = Arc::new(Dav1dPictureGuard(unsafe { pic.assume_init() }));
+            };
 
             match picture_to_video_frame(
                 guard,
@@ -866,12 +599,7 @@ impl Decoder for Rav1dDecoder {
     }
 
     fn flush(&mut self) {
-        if let Some(ctx) = self.ctx {
-            // SAFETY: `ctx` is a valid open `Dav1dContext`; `dav1d_flush` resets decoder state.
-            unsafe {
-                dav1d_flush(ctx);
-            }
-        }
+        self.ctx.flush();
         self.pending_packets.clear();
         self.pending_frames.clear();
         self.draining = false;
@@ -879,19 +607,6 @@ impl Decoder for Rav1dDecoder {
 
     fn health(&self) -> &StreamHealth {
         &self.health
-    }
-}
-
-impl Drop for Rav1dDecoder {
-    fn drop(&mut self) {
-        if let Some(ctx) = self.ctx.take() {
-            let mut ctx_opt: Option<Dav1dContext> = Some(ctx);
-            // SAFETY: `dav1d_close` takes the context from `ctx_opt`, stops worker threads,
-            // frees the context, and writes `None` back.
-            unsafe {
-                dav1d_close(NonNull::new(&mut ctx_opt));
-            }
-        }
     }
 }
 
