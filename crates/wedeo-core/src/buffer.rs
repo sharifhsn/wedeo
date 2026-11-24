@@ -179,6 +179,13 @@ pub trait GpuSurface: Send + Sync + 'static {
     fn height(&self) -> u32;
     /// Downcast escape hatch so `wedeo-gpu-wgpu` and Tessera extract `wgpu::Texture` zero-copy.
     fn as_any(&self) -> &dyn Any;
+    /// Read the surface's pixels on its owning device, in logical plane order.
+    fn readback_planes(&self) -> crate::Result<Vec<BorderedPlane>> {
+        Err(crate::Error::unsupported(
+            "gpu_surface",
+            "this surface has no CPU readback provider",
+        ))
+    }
     /// Optional OS zero-copy interop handle.
     fn export_native(&self) -> Option<NativeGpuHandle> {
         None

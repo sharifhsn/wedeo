@@ -29,6 +29,7 @@ pub struct WgpuTextureSurface {
     width: u32,
     height: u32,
     device_id: GpuDeviceId,
+    owner: Option<Arc<ReadbackDevice>>,
 }
 
 impl WgpuTextureSurface {
@@ -42,6 +43,7 @@ impl WgpuTextureSurface {
             width,
             height,
             device_id,
+            owner: None,
         }
     }
 
@@ -76,6 +78,7 @@ impl WgpuTextureSurface {
             width,
             height,
             device_id,
+            owner: None,
         })
     }
 
@@ -93,6 +96,7 @@ impl WgpuTextureSurface {
             width,
             height,
             device_id,
+            owner: None,
         }
     }
 
@@ -136,18 +140,35 @@ impl GpuSurface for WgpuTextureSurface {
         self.height
     }
 
+    fn readback_planes(&self) -> Result<Vec<BorderedPlane>> {
+        self.owner
+            .as_ref()
+            .ok_or_else(|| {
+                Error::unsupported(
+                    "wedeo-gpu-wgpu",
+                    "wrap the texture with its WgpuContext to enable readback",
+                )
+            })?
+            .read_planes(self, None)
+    }
+
     #[inline]
     fn as_any(&self) -> &dyn Any {
         self
     }
 }
 
+#[derive(Debug)]
+struct ReadbackDevice {
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
+}
+
 /// Shared `wgpu` execution context holding a device, command queue, unique [`GpuDeviceId`],
 /// and a thread-safe structural WGSL compute pipeline cache.
 #[derive(Debug, Clone)]
 pub struct WgpuContext {
-    device: Arc<wgpu::Device>,
-    queue: Arc<wgpu::Queue>,
+    owner: Arc<ReadbackDevice>,
     device_id: GpuDeviceId,
     pipeline_cache: Arc<RwLock<HashMap<u64, CachedPipeline>>>,
 }
@@ -158,8 +179,7 @@ impl WgpuContext {
     pub fn from_external(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>) -> Self {
         let id = NEXT_DEVICE_ID.fetch_add(1, Ordering::Relaxed);
         Self {
-            device,
-            queue,
+            owner: Arc::new(ReadbackDevice { device, queue }),
             device_id: GpuDeviceId(id),
             pipeline_cache: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -251,13 +271,13 @@ impl WgpuContext {
     /// Reference to the underlying `Arc<wgpu::Device>`.
     #[inline]
     pub fn device(&self) -> &Arc<wgpu::Device> {
-        &self.device
+        &self.owner.device
     }
 
     /// Reference to the underlying `Arc<wgpu::Queue>`.
     #[inline]
     pub fn queue(&self) -> &Arc<wgpu::Queue> {
-        &self.queue
+        &self.owner.queue
     }
 
     /// Build a [`WgpuSwsBackend`] sharing this context and its WGSL pipeline cache.
@@ -293,7 +313,7 @@ impl WgpuContext {
             }
         }
 
-        let compiled = compile_cached_pipeline(&self.device, ops)?;
+        let compiled = compile_cached_pipeline(&self.owner.device, ops)?;
         let mut cache = self
             .pipeline_cache
             .write()
@@ -304,7 +324,9 @@ impl WgpuContext {
 
     /// Wrap a single `wgpu::Texture` into a [`GpuSurface`] associated with this context's device.
     pub fn wrap_texture(&self, texture: wgpu::Texture, layout: PixelLayout) -> Arc<dyn GpuSurface> {
-        Arc::new(WgpuTextureSurface::new(texture, layout, self.device_id))
+        let mut surface = WgpuTextureSurface::new(texture, layout, self.device_id);
+        surface.owner = Some(self.owner.clone());
+        Arc::new(surface)
     }
 
     /// Wrap multiple planar/semi-planar `wgpu::Texture`s into a [`GpuSurface`] associated with this context's device.
@@ -315,7 +337,9 @@ impl WgpuContext {
         height: u32,
         layout: PixelLayout,
     ) -> Result<Arc<dyn GpuSurface>> {
-        let surf = WgpuTextureSurface::from_planes(planes, width, height, layout, self.device_id)?;
+        let mut surf =
+            WgpuTextureSurface::from_planes(planes, width, height, layout, self.device_id)?;
+        surf.owner = Some(self.owner.clone());
         Ok(Arc::new(surf))
     }
 
@@ -378,11 +402,11 @@ impl WgpuContext {
             let mut usage = wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_DST
                 | wgpu::TextureUsages::COPY_SRC;
-            if supports_storage_binding(format, self.device.features()) {
+            if supports_storage_binding(format, self.owner.device.features()) {
                 usage |= wgpu::TextureUsages::STORAGE_BINDING;
             }
 
-            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            let texture = self.owner.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("wedeo-video-plane"),
                 size: wgpu::Extent3d {
                     width: tex_w,
@@ -406,7 +430,7 @@ impl WgpuContext {
                 tight.extend_from_slice(&row[..row_bytes]);
             }
 
-            self.queue.write_texture(
+            self.owner.queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &texture,
                     mip_level: 0,
@@ -429,7 +453,7 @@ impl WgpuContext {
             textures.push(texture);
         }
 
-        self.queue.submit([]);
+        self.owner.queue.submit([]);
 
         let surface = self.wrap_planes(textures, frame.width, frame.height, frame.layout)?;
         let mut out = VideoFrame::from_gpu(surface);
@@ -474,14 +498,26 @@ impl WgpuContext {
         let wgpu_surf = Self::unwrap_surface(surf.as_ref()).ok_or_else(|| {
             Error::invalid_argument("wedeo-gpu-wgpu", "GpuSurface is not a WgpuTextureSurface")
         })?;
-        if wgpu_surf.planes().is_empty() {
+        let planes = self.owner.read_planes(wgpu_surf, pool)?;
+        let mut out = frame.clone();
+        out.storage = wedeo_core::VideoStorage::Cpu(planes);
+        Ok(out)
+    }
+}
+
+impl ReadbackDevice {
+    fn read_planes(
+        &self,
+        surface: &WgpuTextureSurface,
+        pool: Option<&Arc<BufferPool>>,
+    ) -> Result<Vec<BorderedPlane>> {
+        if surface.planes().len() != surface.layout.plane_count() {
             return Err(Error::invalid_argument(
                 "wedeo-gpu-wgpu",
-                "cannot download a virtual WgpuTextureSurface with no backing wgpu::Texture",
+                "missing texture planes for readback",
             ));
         }
-
-        let plane_count = wgpu_surf.planes().len();
+        let plane_count = surface.planes().len();
         let mut staging_buffers = Vec::with_capacity(plane_count);
         let mut encoder = self
             .device
@@ -489,9 +525,20 @@ impl WgpuContext {
                 label: Some("wedeo-download-frame"),
             });
 
-        for (p, tex) in wgpu_surf.planes().iter().enumerate() {
+        for (p, tex) in surface.planes().iter().enumerate() {
             let (tex_w, tex_h, bpt) =
-                plane_texel_geometry(frame.layout, frame.width, frame.height, p)?;
+                plane_texel_geometry(surface.layout, surface.width, surface.height, p)?;
+            if !tex.usage().contains(wgpu::TextureUsages::COPY_SRC)
+                || tex.sample_count() != 1
+                || tex.width() < tex_w
+                || tex.height() < tex_h
+                || tex.format() != plane_texture_format(surface.layout, p)?
+            {
+                return Err(Error::invalid_argument(
+                    "wedeo-gpu-wgpu",
+                    "texture plane does not support readback with the declared layout",
+                ));
+            }
             let row_bytes = tex_w * bpt;
             let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
             let padded_row_bytes = row_bytes.div_ceil(align) * align;
@@ -587,9 +634,7 @@ impl WgpuContext {
             cpu_planes.push(plane);
         }
 
-        let mut out = VideoFrame::from_planes(frame.width, frame.height, frame.layout, cpu_planes);
-        copy_frame_metadata(frame, &mut out);
-        Ok(out)
+        Ok(cpu_planes)
     }
 }
 

@@ -171,91 +171,45 @@ impl GpuSurface for CpuBackedGpuSurface {
         self.height
     }
 
+    fn readback_planes(&self) -> Result<Vec<BorderedPlane>> {
+        Ok(self.planes.clone())
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
 }
 
-fn clone_video_metadata(src: &VideoFrame, dst: &mut VideoFrame) {
-    dst.color = src.color;
-    dst.crop = src.crop;
-    dst.sar = src.sar;
-    dst.picture_type = src.picture_type;
-    dst.flags = src.flags;
-    dst.repeat_pict = src.repeat_pict;
-    dst.pts = src.pts;
-    dst.pkt_dts = src.pkt_dts;
-    dst.duration = src.duration;
-    dst.time_base = src.time_base;
-    dst.side_data = src.side_data.clone();
+/// Place CPU pixels in a CPU-backed GPU domain for graph emulation. An external
+/// surface without readable pixels retains its original device and contents.
+/// Graph execution uses the fallible transfer below to report that case.
+pub fn upload_frame_to_gpu(mut frame: VideoFrame, device_id: GpuDeviceId) -> VideoFrame {
+    let _ = place_in_gpu_domain(&mut frame, device_id);
+    frame
 }
 
-/// Upload a CPU [`VideoFrame`] into a [`MemoryDomain::Gpu`] frame (preserving all planes and VFR metadata).
-pub fn upload_frame_to_gpu(frame: VideoFrame, device_id: GpuDeviceId) -> VideoFrame {
-    match &frame.storage {
-        VideoStorage::Gpu(surf) if surf.device_id() == device_id => frame,
-        VideoStorage::Gpu(surf) => {
-            let planes = surf
-                .as_any()
-                .downcast_ref::<CpuBackedGpuSurface>()
-                .map(|s| s.planes.clone())
-                .unwrap_or_default();
-            let new_surf = Arc::new(CpuBackedGpuSurface {
-                device_id,
-                width: frame.width,
-                height: frame.height,
-                layout: frame.layout,
-                planes,
-            });
-            let mut out = VideoFrame::from_gpu(new_surf);
-            clone_video_metadata(&frame, &mut out);
-            out
-        }
-        VideoStorage::Cpu(planes) => {
-            let new_surf = Arc::new(CpuBackedGpuSurface {
-                device_id,
-                width: frame.width,
-                height: frame.height,
-                layout: frame.layout,
-                planes: planes.clone(),
-            });
-            let mut out = VideoFrame::from_gpu(new_surf);
-            clone_video_metadata(&frame, &mut out);
-            out
-        }
-    }
+fn place_in_gpu_domain(frame: &mut VideoFrame, device_id: GpuDeviceId) -> Result<()> {
+    let planes = match &mut frame.storage {
+        VideoStorage::Gpu(surface) if surface.device_id() == device_id => return Ok(()),
+        VideoStorage::Gpu(surface) => surface.readback_planes()?,
+        VideoStorage::Cpu(planes) => std::mem::take(planes),
+    };
+    frame.storage = VideoStorage::Gpu(Arc::new(CpuBackedGpuSurface {
+        device_id,
+        width: frame.width,
+        height: frame.height,
+        layout: frame.layout,
+        planes,
+    }));
+    Ok(())
 }
 
-/// Download a [`MemoryDomain::Gpu`] [`VideoFrame`] back to [`MemoryDomain::Cpu`].
-pub fn download_frame_to_cpu(frame: VideoFrame) -> Result<VideoFrame> {
-    match &frame.storage {
-        VideoStorage::Cpu(_) => Ok(frame),
-        VideoStorage::Gpu(surf) => {
-            let planes = if let Some(backed) = surf.as_any().downcast_ref::<CpuBackedGpuSurface>() {
-                backed.planes.clone()
-            } else {
-                // Allocate blank planes matching layout dimensions if an external surface is downloaded without custom hook
-                let mut allocs = Vec::with_capacity(frame.layout.plane_count());
-                for p_idx in 0..frame.layout.plane_count() {
-                    let (wb, h) = frame
-                        .layout
-                        .plane_dims(frame.width, frame.height, p_idx)
-                        .ok_or_else(|| {
-                            Error::invalid_data("domain_transfer", "invalid GPU surface layout")
-                        })?;
-                    allocs.push(crate::filter::alloc_plane(
-                        wb,
-                        h,
-                        wedeo_core::BorderPadding::NONE,
-                    ));
-                }
-                allocs
-            };
-            let mut out = VideoFrame::from_planes(frame.width, frame.height, frame.layout, planes);
-            clone_video_metadata(&frame, &mut out);
-            Ok(out)
-        }
+/// Download pixels using the GPU surface's readback provider.
+pub fn download_frame_to_cpu(mut frame: VideoFrame) -> Result<VideoFrame> {
+    if let VideoStorage::Gpu(surface) = &frame.storage {
+        frame.storage = VideoStorage::Cpu(surface.readback_planes()?);
     }
+    Ok(frame)
 }
 
 // ============================================================================
@@ -739,11 +693,10 @@ impl GraphNode for SwsNode {
             frame
         };
 
-        let cpu_out = self.compiled.execute(&cpu_in, &self.internal_pool)?;
-        let out_frame = match self.assigned_domain {
-            MemoryDomain::Cpu => cpu_out,
-            MemoryDomain::Gpu(dev_id) => upload_frame_to_gpu(cpu_out, dev_id),
-        };
+        let mut out_frame = self.compiled.execute(&cpu_in, &self.internal_pool)?;
+        if let MemoryDomain::Gpu(dev_id) = self.assigned_domain {
+            place_in_gpu_domain(&mut out_frame, dev_id)?;
+        }
 
         Ok(vec![(0, GraphItem::Unit(MediaUnit::Video(out_frame)))])
     }
@@ -1239,7 +1192,8 @@ impl<F: WgslFilter + 'static> GraphNode for WgslFilterNode<F> {
             .filter
             .uniforms(pts_sec, frame.width, frame.height)
             .to_vec();
-        let gpu_frame = upload_frame_to_gpu(frame, self.device_id);
+        let mut gpu_frame = frame;
+        place_in_gpu_domain(&mut gpu_frame, self.device_id)?;
         Ok(vec![(0, GraphItem::Unit(MediaUnit::Video(gpu_frame)))])
     }
 
@@ -1320,7 +1274,11 @@ impl GraphNode for DomainTransferNode {
         };
         let transferred = match self.dst_domain {
             MemoryDomain::Cpu => download_frame_to_cpu(frame)?,
-            MemoryDomain::Gpu(dev_id) => upload_frame_to_gpu(frame, dev_id),
+            MemoryDomain::Gpu(dev_id) => {
+                let mut frame = frame;
+                place_in_gpu_domain(&mut frame, dev_id)?;
+                frame
+            }
         };
         Ok(vec![(0, GraphItem::Unit(MediaUnit::Video(transferred)))])
     }

@@ -19,6 +19,9 @@ path = "src/audiogen.rs"
 name = "wedeo-framecrc"
 path = "src/framecrc.rs"
 
+[features]
+gpu-readback = ["wedeo/gpu-wgpu"]
+
 [dependencies]
 wedeo = { workspace = true, features = ["rav1d"] }
 adler2 = "2.0.1"
