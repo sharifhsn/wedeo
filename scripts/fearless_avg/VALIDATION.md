@@ -22,6 +22,26 @@ RUSTFLAGS="-A dead_code -C link-arg=$PWD/FFmpeg/libavcodec/x86/fpel.o" \
 
 To repeat the secondary compiler check, put the installed Rust 1.98 toolchain on PATH and run the last command with a separate target directory. All timings printed by these test commands describe test execution only.
 
+## Recorded kernel timings
+
+The earlier comparison on this host measured nanoseconds per block with the pinned Rust compiler and FFmpeg object identified above. Each median covers seven batches of 500,000 calls. The process was pinned to logical CPU 9 after compilation. Each trial ran FFmpeg, Wedeo intrinsics and fearless_simd in that order. The shared host and fixed order limit conclusions about small differences, particularly for padded 16×16.
+
+| Block | Pitch | SSE2 intrinsics | fearless_simd | FFmpeg |
+|---|---:|---:|---:|---:|
+| 8×8 | 8 | 2.484 | 6.329 | 4.093 |
+| 8×8 | 32 | 6.214 | 13.073 | 6.451 |
+| 16×16 | 16 | 7.938 | 9.521 | 8.422 |
+| 16×16 | 32 | 9.077 | 25.598 | 9.183 |
+
+[All 84 timing samples](timings-2026-11-24.txt) include the implementation, dimensions, pitch and trial number. To repeat the comparison after building the object, run the following commands from the repository root. Select an available quiet CPU for the timing run.
+
+```sh
+export CARGO_TARGET_DIR=/tmp/wedeo-avg-bench
+RUSTFLAGS="-A dead_code -C link-arg=$PWD/FFmpeg/libavcodec/x86/fpel.o" \
+  cargo build --locked --offline -j1 --release --manifest-path scripts/fearless_avg/Cargo.toml
+taskset -c 9 "$CARGO_TARGET_DIR/release/wedeo-fearless-eval"
+```
+
 ## Recorded test runs
 
 **Rust 1.100.0 checkasm**
