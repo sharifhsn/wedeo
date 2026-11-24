@@ -1,8 +1,8 @@
 # wedeo
 
-**100% Pure-Rust Universal A/V Adapter** — a deterministic, VFR-native, data-oriented media compiler and runtime combining exact algorithmic ports of **FFmpeg `n9.1` ("Gauss")** with optional `wgpu` WGSL GPU compute acceleration.
+**Rust Universal A/V Adapter** — a deterministic, VFR-native, data-oriented media compiler and runtime combining exact algorithmic ports of **FFmpeg `n9.1` ("Gauss")** with optional `wgpu` WGSL GPU compute acceleration.
 
-- **Zero FFI / Zero Vendored ASM:** No `.S` files, no `cc` `build.rs`, no `bindgen`, no `c2rust`, no `inventory` link-time globals.
+- **Codec implementations:** Wedeo implements H.264 and VP9 in Rust with architecture-specific intrinsics. The optional rav1d AV1 adapter uses a dav1d-compatible FFI boundary and enables rav1d’s assembly optimizations.
 - **Strong Audio / Video Separation:** Audio-only builds (`wedeo` with `--no-default-features --features "audio-ops,pcm,wav,symphonia"`) pull zero video decoders, zero `SwsOpList`, and zero `wgpu`.
 - **VFR-Native Everywhere:** Exact rational `(pts, dts, duration, time_base)` on every `Packet`, `AudioBlock`, and `VideoFrame`.
 - **Data-Oriented Design (DOD):** `256×16` L1/L2 strip-fused `SwsOpList`, `1024`-sample planar `AudioOpList` slabs, warm `BufferPool`, `BorderedPlane` edge extension, and flat-indexed `CompiledGraph`.
