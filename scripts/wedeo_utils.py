@@ -24,9 +24,9 @@ from pathlib import Path
 _RUST_SRC_DIRS = [
     Path("codecs/wedeo-codec-h264/src"),
     Path("crates/wedeo-core/src"),
-    Path("crates/wedeo-codec/src"),
-    Path("formats/wedeo-format-h264/src"),
-    Path("tests/fate/src"),
+    Path("codecs/wedeo-codec-vp9/src"),
+    Path("crates/wedeo-syntax/src"),
+    Path("tests/wedeo-oracle/src"),
 ]
 
 
@@ -100,7 +100,7 @@ def find_wedeo_binary(
                 cmd = ["cargo", "build"]
                 if profile == "release":
                     cmd.append("--release")
-                cmd += ["--bin", "wedeo-framecrc", "-p", "wedeo-fate"]
+                cmd += ["--bin", "wedeo-framecrc", "-p", "wedeo-oracle"]
                 if features:
                     cmd += ["--features", ",".join(features)]
                 result = subprocess.run(cmd, capture_output=True, text=True)
@@ -115,14 +115,14 @@ def find_wedeo_binary(
     cmd = ["cargo", "build"]
     if profile == "release":
         cmd.append("--release")
-    cmd += ["--bin", "wedeo-framecrc", "-p", "wedeo-fate"]
+    cmd += ["--bin", "wedeo-framecrc", "-p", "wedeo-oracle"]
     if features:
         cmd += ["--features", ",".join(features)]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         print(
             f"Error: wedeo-framecrc not found and build failed.\n"
-            f"Run: cargo build --bin wedeo-framecrc -p wedeo-fate\n"
+            f"Run: cargo build --bin wedeo-framecrc -p wedeo-oracle\n"
             f"{result.stderr[-500:]}",
             file=sys.stderr,
         )

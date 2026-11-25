@@ -200,17 +200,18 @@ def run_suite(
     snapshot_passing: set[str] | None = None
     if check_snapshot:
         snap_path = _snapshot_path(suite.name, snapshot_dir)
-        if snap_path.exists():
-            snap_data = json.loads(snap_path.read_text())
-            snapshot_passing = set(snap_data.get("passing", []))
-            if not snapshot_passing:
-                print(f"  No baseline tests for {suite.name} (empty snapshot) — skipping")
-                return []
-        else:
-            print(f"  No baseline for {suite.name} (no snapshot at {snap_path.name}) — skipping")
-            return []
+        if not snap_path.exists():
+            return [RunResult(suite.name, "ERROR", f"missing baseline: {snap_path}")]
+        snap_data = json.loads(snap_path.read_text())
+        snapshot_passing = set(snap_data.get("passing", []))
+        if not snapshot_passing:
+            return [RunResult(suite.name, "ERROR", "baseline contains no passing vectors")]
 
     results: list[RunResult] = []
+    if snapshot_passing is not None:
+        for name in sorted(snapshot_passing.difference(v.name for v in suite.vectors)):
+            results.append(RunResult(name, "ERROR", "baseline vector absent from suite"))
+    unavailable = "ERROR" if check_snapshot else "SKIP"
     for vec in suite.vectors:
         # Filter by format
         if format_filter and vec.output_format not in format_filter:
@@ -229,7 +230,7 @@ def run_suite(
 
         # Check file exists
         if not vec.input_path.exists():
-            results.append(RunResult(vec.name, "SKIP", "file not found"))
+            results.append(RunResult(vec.name, unavailable, "file not found"))
             continue
 
         # Run comparison
@@ -237,7 +238,7 @@ def run_suite(
             status, detail = compare_one_md5(vec.input_path, wedeo_bin, vec.expected_md5)
         elif vec.comparison == "framecrc":
             if ffmpeg_bin is None:
-                results.append(RunResult(vec.name, "SKIP", "FFmpeg not available"))
+                results.append(RunResult(vec.name, unavailable, "FFmpeg not available"))
                 continue
             status, detail = compare_one_framecrc(vec.input_path, wedeo_bin, ffmpeg_bin)
         else:
@@ -375,9 +376,7 @@ def main():
 
         # Regression detection: compare tested results against baseline
         if args.check_snapshot and results:
-            tested_names = {r.name for r in results if r.status != "SKIP"}
-            now_passing = {r.name for r in results if r.status == "MATCH"}
-            baseline = tested_names - now_passing  # vectors that were in baseline but didn't pass
+            baseline = {r.name for r in results if r.status in {"ERROR", "FAIL"}}
             if baseline:
                 any_regression = True
                 print(f"\n  REGRESSIONS in {suite.name}:")
