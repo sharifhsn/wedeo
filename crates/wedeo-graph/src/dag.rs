@@ -1129,21 +1129,45 @@ pub struct WgslFilterNode<F: WgslFilter> {
     inputs: [PortContract; 1],
     outputs: [PortContract; 1],
     last_uniforms: Vec<u8>,
+    pass: Option<Box<dyn wedeo_video_ops::CompiledWgsl>>,
 }
 
 impl<F: WgslFilter + 'static> WgslFilterNode<F> {
-    pub fn new(name: impl Into<String>, mut input: VideoContract, filter: F) -> Result<Self> {
+    pub fn new(name: impl Into<String>, input: VideoContract, filter: F) -> Result<Self> {
+        Self::with_backend(name, input, filter, &CpuSwsBackend::new())
+    }
+
+    pub fn with_backend(
+        name: impl Into<String>,
+        mut input: VideoContract,
+        filter: F,
+        backend: &dyn SwsBackend,
+    ) -> Result<Self> {
+        let pass = backend.compile_wgsl(
+            filter.wgsl_source(),
+            filter.entry_point(),
+            filter.workgroup_size(),
+        )?;
         let device_id = match input.domain {
             MemoryDomain::Gpu(id) => id,
             MemoryDomain::Cpu => {
-                let id = GpuDeviceId(0);
+                let id = pass.as_ref().map_or(GpuDeviceId(0), |p| p.device_id());
                 input.domain = MemoryDomain::Gpu(id);
                 id
             }
         };
         let mut output = filter.output_contract(&input)?;
         output.domain = MemoryDomain::Gpu(device_id);
+        if let Some(p) = &pass
+            && (p.device_id() != device_id || input.layout != PixelLayout::RGBA8 || output != input)
+        {
+            return Err(Error::unsupported(
+                "wgsl filter",
+                "requires a matching device and unchanged RGBA8 contract",
+            ));
+        }
         Ok(Self {
+            pass,
             name: name.into(),
             filter,
             device_id,
@@ -1183,7 +1207,7 @@ impl<F: WgslFilter + 'static> GraphNode for WgslFilterNode<F> {
         &mut self,
         _input_port: usize,
         item: GraphItem,
-        _pool: &BufferPool,
+        pool: &BufferPool,
     ) -> Result<Vec<(usize, GraphItem)>> {
         let GraphItem::Unit(MediaUnit::Video(frame)) = item else {
             return Err(Error::invalid_argument(
@@ -1192,12 +1216,27 @@ impl<F: WgslFilter + 'static> GraphNode for WgslFilterNode<F> {
             ));
         };
         let pts_sec = frame.pts.to_seconds(frame.time_base).unwrap_or(0.0);
-        self.last_uniforms = self
-            .filter
-            .uniforms(pts_sec, frame.width, frame.height)
-            .to_vec();
-        let mut gpu_frame = frame;
-        place_in_gpu_domain(&mut gpu_frame, self.device_id)?;
+        let pass = self.pass.as_ref().ok_or_else(|| {
+            Error::unsupported(
+                "wgsl filter",
+                "configure a GPU backend before adding a shader",
+            )
+        })?;
+        self.last_uniforms.clear();
+        self.last_uniforms.extend_from_slice(self.filter.uniforms(
+            pts_sec,
+            frame.width,
+            frame.height,
+        ));
+        let frame = if frame
+            .gpu_surface()
+            .is_some_and(|s| s.as_any().is::<CpuBackedGpuSurface>())
+        {
+            download_frame_to_cpu(frame)?
+        } else {
+            frame
+        };
+        let gpu_frame = pass.execute(&frame, &self.last_uniforms, pool)?;
         Ok(vec![(0, GraphItem::Unit(MediaUnit::Video(gpu_frame)))])
     }
 
@@ -1606,13 +1645,16 @@ impl GraphBuilder {
         Ok(self.add_node(Box::new(node)))
     }
 
+    /// Register a custom compute filter. Install the device's scaling backend with
+    /// `set_sws_backend` before adding filters to compile executable GPU passes.
+    /// Without one, placement is available and execution reports an unsupported operation.
     pub fn add_wgsl_filter<F: WgslFilter + 'static>(
         &mut self,
         name: impl Into<String>,
         input: VideoContract,
         filter: F,
     ) -> Result<NodeId> {
-        let node = WgslFilterNode::new(name, input, filter)?;
+        let node = WgslFilterNode::with_backend(name, input, filter, self.sws_backend.as_ref())?;
         Ok(self.add_node(Box::new(node)))
     }
 

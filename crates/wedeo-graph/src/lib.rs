@@ -417,7 +417,7 @@ mod tests {
         let pool = BufferPool::new();
         let tb = Rational::new(1, 1000);
 
-        // Execute custom VideoFilter + WgslFilter in one graph
+        // Execute a CPU filter and verify that an unconfigured WGSL node reports an error.
         let vc =
             VideoContract::new(8, 8, PixelLayout::YUV420P).with_color(ColorDesc::BT709_LIMITED);
         let f_in = make_yuv420p_frame(&pool, 8, 8, 55, 128, 128, 500, 33, tb);
@@ -427,19 +427,27 @@ mod tests {
         let vf = vb
             .add_video_filter("invert", vc.clone(), InvertLuma)
             .unwrap();
-        let vw = vb
-            .add_wgsl_filter(
-                "vignette",
-                vc.clone().with_domain(MemoryDomain::Gpu(GpuDeviceId(1))),
-                Vignette {
-                    strength_bytes: 0.4_f32.to_le_bytes(),
-                },
-            )
-            .unwrap();
+        let mut shader = WgslFilterNode::new(
+            "vignette",
+            vc.clone(),
+            Vignette {
+                strength_bytes: 0.4_f32.to_le_bytes(),
+            },
+        )
+        .unwrap();
+        let probe = make_yuv420p_frame(&pool, 8, 8, 55, 128, 128, 500, 33, tb);
+        assert!(
+            shader
+                .process(
+                    0,
+                    GraphItem::Unit(wedeo_core::MediaUnit::Video(probe)),
+                    &pool
+                )
+                .is_err()
+        );
         let vk = vb.add_sink("v_sink", PortContract::Video(vc));
         vb.connect(vs, 0, vf, 0).unwrap();
-        vb.connect(vf, 0, vw, 0).unwrap();
-        vb.connect(vw, 0, vk, 0).unwrap();
+        vb.connect(vf, 0, vk, 0).unwrap();
 
         let (mut vg, _vplan) = vb.compile(CompileOpts::default()).unwrap();
         vg.run(&pool).unwrap();
