@@ -22,6 +22,22 @@ const SLAB_PIXELS: usize = TILE_W * TILE_H;
 /// Execution backend compiling an `SwsOpList` into a reusable `CompiledSws` pipeline.
 pub trait SwsBackend: Send + Sync {
     fn compile(&self, ops: &SwsOpList) -> Result<Box<dyn CompiledSws>>;
+
+    /// Optional custom RGBA8 compute shader support. CPU backends can still plan GPU graphs.
+    fn compile_wgsl(
+        &self,
+        _source: &str,
+        _entry: &str,
+        _group: [u32; 3],
+    ) -> Result<Option<Box<dyn CompiledWgsl>>> {
+        Ok(None)
+    }
+}
+
+/// Device-bound compute pass that returns a resident frame for downstream filters.
+pub trait CompiledWgsl: Send {
+    fn device_id(&self) -> wedeo_core::GpuDeviceId;
+    fn execute(&self, src: &VideoFrame, uniforms: &[u8], pool: &BufferPool) -> Result<VideoFrame>;
 }
 
 /// Compiled, zero-steady-state-scratch-alloc video scaling/color/overlay pipeline.
