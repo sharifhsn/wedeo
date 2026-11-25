@@ -72,7 +72,7 @@
   async function initWasm() {
     const t0 = performance.now();
     try {
-      const resp = await fetch("wedeo.wasm?release=clip2");
+      const resp = await fetch("wedeo.wasm?release=audition1");
       if (!resp.ok) throw new Error(`HTTP ${resp.status} loading wedeo.wasm`);
       let instance;
       if (WebAssembly.instantiateStreaming) {
@@ -239,12 +239,17 @@
     audioBuffer = null;
     $("btn-audio-play").disabled = true;
     const at0 = performance.now();
-    if (wasm.wedeo_audition(ptr, len, nptr, nlen, Number($("audition").value)) !== 0) {
+    const id = Number($("audition").value);
+    const rc = !$("clip-panel").hidden
+      ? wasm.wedeo_audition_window(ptr, len, nptr, nlen, id, Number($("clip-in").value), Number($("clip-out").value))
+      : wasm.wedeo_audition(ptr, len, nptr, nlen, id);
+    if (rc !== 0) {
       throw new Error(readError());
     }
     const aInfo = readJson();
     audioStart = aInfo.start_sec;
     const raw = readBytesCopy();
+    wasm.wedeo_release_output_bytes();
     const f32 = new Float32Array(raw.buffer, raw.byteOffset, Math.floor(raw.byteLength / 4));
     const aMs = Math.round(performance.now() - at0);
 
@@ -295,7 +300,7 @@
     const position = monitor.currentTime;
     const mark = start ? options.filter(o => Number(o.value) <= position).pop()
                        : options.find(o => !o.disabled && Number(o.value) >= position);
-    if (mark) { selector.value = mark.value; updateClip(); }
+    if (mark) { selector.value = mark.value; changeSelection(); }
   }
   $("mark-in").onclick = () => markAtPlayhead(true);
   $("mark-out").onclick = () => markAtPlayhead(false);
@@ -307,7 +312,20 @@
     }
     $("clip-result").textContent = "";
   }
-  $("clip-in").onchange = $("clip-out").onchange = updateClip;
+  function changeSelection() {
+    updateClip();
+    monitor.pause();
+    monitor.currentTime = Number($("clip-in").value);
+    if ($("audition").options.length) withFile(decodeSelectedAudio);
+  }
+  $("clip-in").onchange = $("clip-out").onchange = changeSelection;
+  monitor.ontimeupdate = () => {
+    if (!monitor.paused && monitor.currentTime >= Number($("clip-out").value)) monitor.pause();
+  };
+  monitor.onplay = () => {
+    const start = Number($("clip-in").value), end = Number($("clip-out").value);
+    if (monitor.currentTime < start || monitor.currentTime >= end) monitor.currentTime = start;
+  };
   $("clip-save").onclick = () => withFile((p, l, n, k) => {
     const start = Number($("clip-in").value), end = Number($("clip-out").value);
     if (wasm.wedeo_clip(p, l, n, k, start, end) !== 0) throw new Error(readError());
@@ -363,7 +381,9 @@
         const options = times => times.map(t => new Option(`${t.toFixed(3)} s`, String(t)));
         $("clip-in").replaceChildren(...options(marks.slice(0, -1)));
         $("clip-out").replaceChildren(...options(marks.slice(1)));
-        $("clip-out").selectedIndex = marks.length - 2;
+        // Start with a short audition on long recordings; export can still span the whole file.
+        const firstWindow = marks.slice(1).findIndex(t => t >= marks[0] + 10);
+        $("clip-out").selectedIndex = firstWindow >= 0 ? firstWindow : marks.length - 2;
         updateClip();
         previewUrl = URL.createObjectURL(new Blob([bytes]));
         monitor.src = previewUrl;
