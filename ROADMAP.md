@@ -1,6 +1,16 @@
 # Wedeo roadmap
 
-The next milestone is a faster native GPU scaler, a more usable audio preview for long recordings, and broader H.264 coverage. The starting point is main at `69d7eb3`. Complete the three items in order, with GPU performance first.
+This milestone started at `69d7eb3` with GPU performance first. The results below cover planar scaling, long-recording audio preview, and H.264 conformance.
+
+## Results
+
+| Milestone | Verified outcome |
+|---|---|
+| [Planar GPU conversion](https://github.com/sharifhsn/wedeo/pull/20) | Six buffers on the first YUV420P conversion, zero new storage or staging buffers on subsequent frames. Two interleaved converters kept their outputs independent. In the final RTX 2070 SUPER release runs, 720p → 360p conversion plus readback fell from 3.00 to 2.39 ms; 1080p → 540p fell from 6.39 to 4.74 ms. Even- and odd-size outputs matched byte for byte. Whole-CLI medians were 1.87 and 1.88 s with identical decoded output. [Raw timings](benchmarks/planar-timings.csv) · [Setup times, inputs and output hashes](benchmarks/planar-results.json) |
+| [Interval audition](https://github.com/sharifhsn/wedeo/pull/21) | A 60–70 s preview of either track in a two-minute AAC recording retained 480,000 mono samples (1.92 MB at 48 kHz). Each audition decoded 517 packets including preroll. Both tones aligned with an independent FFmpeg decode, and the exported video and both audio streams preserved packet payloads and relative timestamps. [Runtime regression](tests/e2e/check_web_clip.mjs) |
+| [H.264 MBAFF](https://github.com/sharifhsn/wedeo/pull/22) | Wedeo now finishes the deferred deblocking row when a CABAC slice terminates at the right edge. CAMA1_Sony_C matched the published MD5 `c234cc1b862b5b2ef958622fce77b7f5` in serial and multithread decoding. The required JVT-AVC snapshot grew from 78 to 79 vectors. |
+
+**Remaining codec differences.** On `cabac_mot_mbaff0_full`, the first filtered picture went from 11,374 differing samples to an exact match. The next picture still diverges. On `cabac_mot_fld0_full`, Wedeo emits 60 full-height pictures where the reference emits 30 paired frames. Both Motorola streams remain outside the passing snapshot.
 
 ## 1. Reuse GPU buffers between video frames
 
