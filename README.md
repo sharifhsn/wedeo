@@ -6,6 +6,30 @@ Wedeo is a Rust media toolkit that lets you look inside a video file, decode its
 
 [Open the studio](https://wedeo.sharifhsn.dev/) · [Download the standalone studio](https://wedeo.sharifhsn.dev/downloads/Wedeo.zip)
 
+## Try the command line
+
+Run Wedeo directly from [PyPI](https://pypi.org/project/wedeo/) with [uv](https://docs.astral.sh/uv/). Start with a familiar FFmpeg command. This one changes the container from MP4 to Matroska and copies the encoded tracks:
+
+```sh
+uvx wedeo ffmpeg -i input.mp4 -c copy output.mkv
+uvx wedeo ffprobe -show_streams -of json output.mkv
+```
+
+For transformations, choose whichever spelling you prefer. These commands both convert a WAV file to 16 kHz mono:
+
+```sh
+uvx wedeo ffmpeg -i input.wav -ar 16000 -ac 1 ffmpeg-style.wav
+uvx wedeo transcode -i input.wav --sample-rate 16000 --channels 1 -o native-style.wav
+```
+
+Use `uvx wedeo --help` to explore the native commands or `uvx wedeo studio` to open the browser studio. The FFmpeg interface supports a subset of FFmpeg options. The prebuilt wheel runs on x86-64 Linux with glibc 2.39 or later. Source installs require Rust and NASM.
+
+### What happens to the second audio track?
+
+In a two-second test clip with one H.264 video track and two distinct AAC audio tracks, FFmpeg 7.1.5 selected one video and one audio track for `-c copy`. Wedeo 0.3.1 copied all three to Matroska. FFmpeg also copied all three with `-map 0 -c copy`. We compared the SHA-256 of every encoded packet in stream order: 48 video packets and 95 packets per audio track. This example checks track selection and payloads; timestamps and container metadata have separate semantics.
+
+To reproduce from this checkout with FFmpeg, FFprobe, Python 3, and uv installed, run `python3 scripts/check_multitrack_remux.py`. [User report](https://ffmpeg.org/pipermail/ffmpeg-user/2012-May/006470.html) · [FFmpeg stream selection](https://ffmpeg.org/ffmpeg.html#Automatic-stream-selection)
+
 ## Run the studio locally
 
 With Rust installed through rustup, run these commands from the repository root. The build uses the toolchain pinned in `rust-toolchain.toml`. Python 3 serves the demo locally.
@@ -17,27 +41,6 @@ python3 -m http.server 8000 --bind 127.0.0.1 --directory web
 ```
 
 Open [the local studio](http://127.0.0.1:8000/). It starts with a two-second H.264 clip. Click **Step +1** to see the next decoded frame, play its audio, or inspect the MP4 box tree. You can also drop in a file of your own. The browser processes it locally.
-
-## Try the command line
-
-With [uv](https://docs.astral.sh/uv/), run the native CLI from the Wedeo package index:
-
-```sh
-uvx --index https://wedeo.sharifhsn.dev/simple wedeo studio
-uvx --index https://wedeo.sharifhsn.dev/simple wedeo ffprobe -v quiet -print_format json -show_streams clip.mp4
-```
-
-The prebuilt wheel targets x86-64 Linux with glibc 2.39 or later. On other platforms, uv can build the source distribution using Rust and NASM. Use `wedeo ffmpeg` and `wedeo ffprobe` for the supported FFmpeg-style commands.
-
-The repository includes the same media samples used in the studio. The native build needs Rust and NASM for the AV1 dependencies.
-
-```sh
-cargo build --locked -p wedeo-cli
-target/debug/wedeo inspect web/samples/h264_aac_320x240.mp4
-target/debug/wedeo transcode -i web/samples/chord_48k.wav --sample-rate 16000 --channels 1 -o chord-16k.wav
-```
-
-The first command after the build prints the MP4 tracks and box tree. The second writes a 16 kHz mono WAV. Run `target/debug/wedeo --help` for cutting, muxing, and other commands.
 
 ## Inside the project
 
