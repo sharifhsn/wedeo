@@ -401,8 +401,10 @@ impl WgslFilter for Vignette {
     fn wgsl_source(&self) -> &str { include_str!("vignette.wgsl") }
     fn uniforms(&self, _pts: f64, _w: u32, _h: u32) -> &[u8] { bytemuck::bytes_of(&self.strength) }
 }
-// Graph automatically keeps frames GPU-resident, preserves VFR timestamps & HDR, and caches the pipeline!
-graph.add_wgsl_filter(Vignette { strength: 0.4 });
+let ctx = WgpuContext::new_headless()?;
+graph.set_sws_backend(Box::new(ctx.sws_backend()));
+let input = VideoContract::new(width, height, PixelLayout::RGBA8);
+graph.add_wgsl_filter("vignette", input, Vignette { strength: 0.4 })?;
 ```
 
 - **Built-In Essential Filters (~10 beyond `SwsOpList` & `AudioOpList`):** `pad`, `overlay` (shared with bitmap `PGS`/`DVD` subs), `fps` (explicit VFR→CFR), `setpts`, `trim`/`concat` (via `Timeline` algebra + GOP smart-cut), `bwdif` deinterlace, `amix`, `fade`, `silencedetect`/`blackdetect`, `drawbox`.
