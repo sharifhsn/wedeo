@@ -620,6 +620,7 @@ fn decode_audio_internal(
     target_rate: u32,
     target_channels: u16,
     to_wav_s16: bool,
+    selected: Option<u32>,
 ) -> Result<(String, Vec<u8>)> {
     let reg = wedeo::default_registry();
     let ext = ext_from_name(name);
@@ -629,7 +630,9 @@ fn decode_audio_internal(
     let track = hdr
         .tracks
         .iter()
-        .find(|t| t.params.media_type() == MediaType::Audio)
+        .find(|t| {
+            t.params.media_type() == MediaType::Audio && selected.is_none_or(|id| t.id.0 == id)
+        })
         .ok_or_else(|| Error::unsupported("wasm/audio", "no audio track found in input"))?
         .clone();
 
@@ -678,6 +681,8 @@ fn decode_audio_internal(
     }
 
     let first = &raw_blocks[0];
+    let start_sec = first.pts.to_seconds(first.time_base).unwrap_or_default()
+        + clip_shift(&hdr, track.id).unwrap_or_default();
     let src_rate = first.sample_rate;
     let src_channels = first.channel_layout.nb_channels;
     let out_rate = if target_rate > 0 {
@@ -820,7 +825,7 @@ fn decode_audio_internal(
         }
 
         let json = format!(
-            "{{\"codec\":{},\"src_rate\":{src_rate},\"src_channels\":{src_channels},\"sample_rate\":{out_rate},\"channels\":{out_ch},\"frames_per_channel\":{total_frames},\"duration_sec\":{duration_sec:.4},\"bytes\":{}}}",
+            "{{\"start_sec\":{start_sec},\"codec\":{},\"src_rate\":{src_rate},\"src_channels\":{src_channels},\"sample_rate\":{out_rate},\"channels\":{out_ch},\"frames_per_channel\":{total_frames},\"duration_sec\":{duration_sec:.4},\"bytes\":{}}}",
             json_str(track.codec_id.name()),
             flat.len()
         );
@@ -829,6 +834,15 @@ fn decode_audio_internal(
 }
 
 pub fn remux_bytes(data: Vec<u8>, name: &str, target_fmt: &str) -> Result<(String, Vec<u8>)> {
+    write_container(data, name, target_fmt, None)
+}
+
+fn write_container(
+    data: Vec<u8>,
+    name: &str,
+    target_fmt: &str,
+    range: Option<(f64, f64)>,
+) -> Result<(String, Vec<u8>)> {
     let reg = wedeo::default_registry();
     let ext = ext_from_name(name);
     let mut demuxer = open_demuxer_bytes(&reg, data, ext)?;
@@ -848,10 +862,36 @@ pub fn remux_bytes(data: Vec<u8>, name: &str, target_fmt: &str) -> Result<(Strin
     let mut muxer = mux_factory.create(Box::new(SharedMemorySink(Arc::clone(&shared))))?;
     let mut out_hdr = hdr.clone();
     out_hdr.format_name = mux_factory.descriptor().name;
+    if range.is_some() {
+        out_hdr.duration = None;
+        out_hdr.chapters.clear();
+        out_hdr.start_time = wedeo::Timestamp::new(0);
+    }
     muxer.write_header(&out_hdr)?;
 
     let mut packet_count = 0usize;
-    while let RecvStatus::Ready(pkt) = demuxer.read_packet()? {
+    while let RecvStatus::Ready(mut pkt) = demuxer.read_packet()? {
+        if let Some((start, end)) = range {
+            let pts = pkt
+                .pts
+                .to_seconds(pkt.time_base)
+                .ok_or_else(|| Error::unsupported("clip", "missing packet timestamp"))?;
+            let shift = clip_shift(&hdr, pkt.track_id)?;
+            if pts + shift < start || pts + shift >= end {
+                continue;
+            }
+            let offset = ((start - shift) * f64::from(pkt.time_base.den)
+                / f64::from(pkt.time_base.num))
+            .round() as i64;
+            pkt.pts = pkt
+                .pts
+                .checked_sub(offset)
+                .unwrap_or(wedeo::Timestamp::NONE);
+            pkt.dts = pkt
+                .dts
+                .checked_sub(offset)
+                .unwrap_or(wedeo::Timestamp::NONE);
+        }
         muxer.write_packet(&pkt)?;
         packet_count += 1;
     }
@@ -1038,7 +1078,7 @@ pub extern "C" fn wedeo_decode_audio(
 ) -> i32 {
     let data = read_input_bytes(ptr, len);
     let name = read_input_str(name_ptr, name_len);
-    match decode_audio_internal(data, &name, target_rate, target_channels, false) {
+    match decode_audio_internal(data, &name, target_rate, target_channels, false, None) {
         Ok((json, bytes)) => {
             set_outputs(json, bytes);
             0
@@ -1061,7 +1101,7 @@ pub extern "C" fn wedeo_export_wav(
 ) -> i32 {
     let data = read_input_bytes(ptr, len);
     let name = read_input_str(name_ptr, name_len);
-    match decode_audio_internal(data, &name, target_rate, target_channels, true) {
+    match decode_audio_internal(data, &name, target_rate, target_channels, true, None) {
         Ok((json, bytes)) => {
             set_outputs(json, bytes);
             0
@@ -1095,6 +1135,136 @@ pub extern "C" fn wedeo_remux(
             -1
         }
     }
+}
+
+fn clip_result(result: Result<(String, Vec<u8>)>) -> i32 {
+    match result {
+        Ok((json, bytes)) => {
+            set_outputs(json, bytes);
+            0
+        }
+        Err(e) => {
+            set_error(e.to_string());
+            -1
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wedeo_audition(
+    ptr: *const u8,
+    len: usize,
+    np: *const u8,
+    nl: usize,
+    id: u32,
+) -> i32 {
+    clip_result(decode_audio_internal(
+        read_input_bytes(ptr, len),
+        &read_input_str(np, nl),
+        0,
+        0,
+        false,
+        Some(id),
+    ))
+}
+
+// Map coded packet timestamps to the movie timeline before comparing tracks.
+fn clip_shift(header: &ContainerHeader, id: TrackId) -> Result<f64> {
+    let track = header
+        .track(id)
+        .ok_or_else(|| Error::unsupported("clip", "unknown track"))?;
+    let mut shift = 0.0;
+    for (index, edit) in track.edit_list.iter().enumerate() {
+        if edit.rate != Rational::new(1, 1) {
+            return Err(Error::unsupported("clip", "variable-rate edit lists"));
+        }
+        if let Some(start) = edit.media_time.to_seconds(edit.time_base) {
+            if index + 1 != track.edit_list.len() {
+                return Err(Error::unsupported("clip", "multiple media edits"));
+            }
+            shift -= start;
+        } else {
+            shift += wedeo::Timestamp::new(edit.duration)
+                .to_seconds(edit.time_base)
+                .unwrap_or_default();
+        }
+    }
+    Ok(shift)
+}
+
+fn clip_boundaries(data: Vec<u8>, name: &str) -> Result<Vec<f64>> {
+    let mut demux = open_demuxer_bytes(&wedeo::default_registry(), data, ext_from_name(name))?;
+    let mut videos = demux
+        .header()
+        .tracks
+        .iter()
+        .filter(|t| t.params.media_type() == MediaType::Video);
+    let id = videos
+        .next()
+        .ok_or_else(|| Error::unsupported("clip", "requires a video track"))?
+        .id;
+    if videos.next().is_some() {
+        return Err(Error::unsupported(
+            "clip",
+            "select a recording with one video track",
+        ));
+    }
+    let mut cuts = Vec::new();
+    let mut end = f64::NEG_INFINITY;
+    while let RecvStatus::Ready(pkt) = demux.read_packet()? {
+        let ts = pkt
+            .pts
+            .to_seconds(pkt.time_base)
+            .ok_or_else(|| Error::unsupported("clip", "missing packet timestamp"))?;
+        let ts = ts + clip_shift(demux.header(), pkt.track_id)?;
+        if pkt.track_id == id && pkt.flags.contains(wedeo::core::PacketFlags::KEY) {
+            cuts.push(ts);
+        }
+        let duration = wedeo::Timestamp::new(pkt.duration.max(1))
+            .to_seconds(pkt.time_base)
+            .unwrap_or_default();
+        end = end.max(ts + duration);
+    }
+    if cuts.is_empty() {
+        return Err(Error::unsupported("clip", "no indexed video keyframes"));
+    }
+    cuts.push(end);
+    if cuts.windows(2).any(|p| p[0] >= p[1]) {
+        return Err(Error::unsupported(
+            "clip",
+            "non-monotonic keyframe timestamps",
+        ));
+    }
+    Ok(cuts)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wedeo_clip_marks(ptr: *const u8, len: usize, np: *const u8, nl: usize) -> i32 {
+    clip_result(
+        clip_boundaries(read_input_bytes(ptr, len), &read_input_str(np, nl))
+            .map(|v| (format!("{v:?}"), Vec::new())),
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wedeo_clip(
+    ptr: *const u8,
+    len: usize,
+    np: *const u8,
+    nl: usize,
+    start: f64,
+    end: f64,
+) -> i32 {
+    if !(start.is_finite() && end.is_finite() && start < end) {
+        set_error("Invalid clip bounds");
+        return -1;
+    }
+    clip_result(write_container(
+        read_input_bytes(ptr, len),
+        &read_input_str(np, nl),
+        "mkv",
+        Some((start, end)),
+    ))
 }
 
 #[cfg(test)]
