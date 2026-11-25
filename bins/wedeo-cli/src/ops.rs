@@ -1702,6 +1702,7 @@ pub struct RunReport {
     pub format: String,
     pub tracks: usize,
     pub packets_processed: u64,
+    pub packets_written: u64,
     pub units_processed: u64,
     pub conversion_notes: Vec<String>,
     pub gpu_warnings: Vec<String>,
@@ -1720,7 +1721,7 @@ impl RunReport {
             self.output,
             self.format,
             self.tracks,
-            self.packets_processed,
+            self.packets_written,
             self.units_processed
         );
         for note in &self.conversion_notes {
@@ -1745,6 +1746,7 @@ impl RunReport {
             ("output", self.output.clone().into()),
             ("format", self.format.clone().into()),
             ("tracks", self.tracks.into()),
+            ("packets_written", self.packets_written.into()),
             ("packets_processed", self.packets_processed.into()),
             ("units_processed", self.units_processed.into()),
             ("conversion_notes", self.conversion_notes.clone().into()),
@@ -1773,6 +1775,7 @@ pub fn run_transcode(reg: &Registry, req: &TranscodeReq) -> Result<RunReport> {
         format: out_fmt,
         tracks: track_count,
         packets_processed: report.packets_processed,
+        packets_written: graph.packets_written(),
         units_processed: report.units_processed,
         conversion_notes: plan
             .conversion_notes
@@ -2689,6 +2692,7 @@ fn run_mixed_smart_cut(
         format: out_fmt,
         tracks: track_count,
         packets_processed: report.packets_processed,
+        packets_written: graph.packets_written(),
         units_processed: report.units_processed,
         conversion_notes: plan
             .conversion_notes
@@ -2931,6 +2935,7 @@ pub fn run_mux(reg: &Registry, req: &MuxReq) -> Result<RunReport> {
         format: out_fmt,
         tracks: track_count,
         packets_processed: report.packets_processed,
+        packets_written: graph.packets_written(),
         units_processed: report.units_processed,
         conversion_notes: plan
             .conversion_notes

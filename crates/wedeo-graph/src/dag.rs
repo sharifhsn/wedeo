@@ -63,6 +63,7 @@ impl GraphItem {
 /// Summary report returned by [`CompiledGraph::run`].
 #[derive(Debug, Clone)]
 pub struct RunReport {
+    /// Packet emissions from all graph stages, including intermediate conversions.
     pub packets_processed: u64,
     pub units_processed: u64,
     pub health: StreamHealth,
@@ -345,6 +346,7 @@ pub struct MuxerNode {
     muxer: Option<Box<dyn Muxer>>,
     header: ContainerHeader,
     header_written: bool,
+    packets_written: u64,
     inputs: Vec<PortContract>,
 }
 
@@ -356,6 +358,7 @@ impl MuxerNode {
             muxer: Some(muxer),
             header,
             header_written: false,
+            packets_written: 0,
             inputs,
         }
     }
@@ -394,6 +397,7 @@ impl GraphNode for MuxerNode {
             self.header_written = true;
         }
         muxer.write_packet(&pkt)?;
+        self.packets_written += 1;
         Ok(Vec::new())
     }
 
@@ -2172,6 +2176,15 @@ pub struct CompiledGraph {
 }
 
 impl CompiledGraph {
+    /// Total successful writes across the graph's container muxers.
+    pub fn packets_written(&self) -> u64 {
+        self.nodes
+            .iter()
+            .filter_map(|node| node.as_any().downcast_ref::<MuxerNode>())
+            .map(|muxer| muxer.packets_written)
+            .sum()
+    }
+
     pub fn plan(&self) -> &ExecutionPlan {
         &self.plan
     }
