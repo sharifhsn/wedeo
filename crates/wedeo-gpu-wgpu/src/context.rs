@@ -391,6 +391,12 @@ impl WgpuContext {
             let format = plane_texture_format(frame.layout, p)?;
             let (tex_w, tex_h, bpt) =
                 plane_texel_geometry(frame.layout, frame.width, frame.height, p)?;
+            if tex_w == 0 || tex_h == 0 {
+                return Err(Error::invalid_data(
+                    "wedeo-gpu-wgpu",
+                    "empty texture extent",
+                ));
+            }
             let row_bytes = (tex_w as usize) * (bpt as usize);
             if plane.width_bytes < row_bytes || plane.height < tex_h as usize {
                 return Err(Error::invalid_data(
@@ -421,14 +427,32 @@ impl WgpuContext {
                 view_formats: &[],
             });
 
-            // Pack active rows tightly for Queue::write_texture
-            let mut tight = Vec::with_capacity(row_bytes * (tex_h as usize));
-            for y in 0..(tex_h as usize) {
-                let row = plane.row(y).ok_or_else(|| {
+            // Queue writes accept a source stride; only inverted or incompatible rows need packing.
+            let pitch = u32::try_from(plane.stride)
+                .ok()
+                .filter(|&n| n as usize >= row_bytes && n % bpt == 0);
+            let (bytes, pitch) = if let Some(pitch) = pitch {
+                let last = plane.row_offset(tex_h as usize - 1).ok_or_else(|| {
                     Error::invalid_data("wedeo-gpu-wgpu", "CPU plane row out of bounds")
                 })?;
-                tight.extend_from_slice(&row[..row_bytes]);
-            }
+                let data = plane
+                    .buffer
+                    .as_slice()
+                    .and_then(|s| s.get(plane.origin_offset..last.checked_add(row_bytes)?))
+                    .ok_or_else(|| {
+                        Error::invalid_data("wedeo-gpu-wgpu", "CPU plane is inaccessible")
+                    })?;
+                (std::borrow::Cow::Borrowed(data), pitch)
+            } else {
+                let mut packed = Vec::with_capacity(row_bytes * tex_h as usize);
+                for y in 0..tex_h as usize {
+                    let row = plane.row(y).ok_or_else(|| {
+                        Error::invalid_data("wedeo-gpu-wgpu", "CPU plane row out of bounds")
+                    })?;
+                    packed.extend_from_slice(&row[..row_bytes]);
+                }
+                (std::borrow::Cow::Owned(packed), row_bytes as u32)
+            };
 
             self.owner.queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
@@ -437,10 +461,10 @@ impl WgpuContext {
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
                 },
-                &tight,
+                &bytes,
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(row_bytes as u32),
+                    bytes_per_row: Some(pitch),
                     rows_per_image: Some(tex_h),
                 },
                 wgpu::Extent3d {

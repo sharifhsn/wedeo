@@ -61,6 +61,37 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires an available GPU or software Vulkan adapter"]
+    fn padded_and_inverted_rows_survive_gpu_upload() {
+        let ctx = WgpuContext::new_headless().expect("requires a GPU or software Vulkan adapter");
+        let pool = BufferPool::new();
+        for inverted in [false, true] {
+            let (w, h) = (19usize, 7usize);
+            let mut plane = BorderedPlane::new(&pool, 4 * w, h, BorderPadding::uniform(5));
+            if inverted {
+                plane.origin_offset = plane.row_offset(h - 1).unwrap();
+                plane.stride = -plane.stride;
+            }
+            for y in 0..h {
+                for (x, byte) in plane.row_mut(y).unwrap().iter_mut().enumerate() {
+                    *byte = (y * 23 + x) as u8;
+                }
+            }
+            let frame =
+                VideoFrame::from_planes(w as u32, h as u32, PixelLayout::RGBA8, vec![plane]);
+            let result = ctx
+                .download_frame(&ctx.upload_frame(&frame).unwrap(), &pool)
+                .unwrap();
+            for y in 0..h {
+                assert_eq!(
+                    result.planes().unwrap()[0].row(y),
+                    frame.planes().unwrap()[0].row(y)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn wgsl_codegen_structural_invariance_across_color_matrices_and_crops() {
         // Two YUV420P -> RGBA8 conversions differing in ColorMatrix (BT.709 vs BT.601),
         // crop rectangle, display_matrix rotation (0 vs 90 deg), and dimensions:

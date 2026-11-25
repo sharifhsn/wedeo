@@ -1226,7 +1226,10 @@ mod tests {
 
     #[test]
     fn wav_ffmpeg_oracle_compatibility() {
-        let ffmpeg = std::path::Path::new("/home/sharif/wedeo/target/ffmpeg-oracle/ffmpeg");
+        let ffmpeg = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../target/ffmpeg-oracle/ffmpeg"
+        ));
         if !ffmpeg.exists() {
             return;
         }
