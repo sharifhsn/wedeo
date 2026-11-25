@@ -4,7 +4,9 @@ Wedeo is a Rust media toolkit that lets you look inside a video file, decode its
 
 ![Wedeo decoding the bundled MP4 in Firefox, with video, audio, and container information visible](web/studio.png)
 
-## Try the browser studio
+[Open the studio](https://wedeo.pages.dev/) · [Download the standalone studio](https://wedeo.pages.dev/downloads/Wedeo.zip)
+
+## Run the studio locally
 
 With Rust installed through rustup, run these commands from the repository root. The build uses the toolchain pinned in `rust-toolchain.toml`. Python 3 serves the demo locally.
 
@@ -17,6 +19,15 @@ python3 -m http.server 8000 --bind 127.0.0.1 --directory web
 Open [the local studio](http://127.0.0.1:8000/). It starts with a two-second H.264 clip. Click **Step +1** to see the next decoded frame, play its audio, or inspect the MP4 box tree. You can also drop in a file of your own. The browser processes it locally.
 
 ## Try the command line
+
+With [uv](https://docs.astral.sh/uv/), run the native CLI from the Wedeo package index:
+
+```sh
+uvx --index https://wedeo.pages.dev/simple wedeo studio
+uvx --index https://wedeo.pages.dev/simple wedeo ffprobe -v quiet -print_format json -show_streams clip.mp4
+```
+
+The prebuilt wheel targets x86-64 Linux with glibc 2.39 or later. On other platforms, uv can build the source distribution using Rust and NASM. Use `wedeo ffmpeg` and `wedeo ffprobe` for the supported FFmpeg-style commands.
 
 The repository includes the same media samples used in the studio. The native build needs Rust and NASM for the AV1 dependencies.
 

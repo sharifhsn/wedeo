@@ -65,6 +65,7 @@ fn dispatch(args: &[String]) -> Result<()> {
             println!("wedeo {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
+        "studio" => cmd_studio(rest),
         "inspect" => cmd_inspect(&reg, rest),
         "explain" => cmd_explain(&reg, rest),
         "transcode" => cmd_transcode(&reg, rest),
@@ -100,6 +101,7 @@ Usage:
   wedeo <command> [options]
 
 Commands:
+  studio        Open the browser studio (use --url to print the link)
   inspect       Inspect container AST, tracks, colorimetry, packets/GOP/NALs, and StreamHealth
   explain       Compile pipeline via wedeo-graph without running (nodes, bridges, GPU notes)
   transcode     Transcode or remux media preserving tracks, metadata, chapters, and rotation
@@ -112,6 +114,47 @@ Commands:
   codecs        List registered decoders and encoders
   formats       List registered demuxers and muxers
 "
+}
+
+fn cmd_studio(args: &[String]) -> Result<()> {
+    const URL: &str = "https://wedeo.pages.dev/";
+    match args {
+        [arg] if arg == "--url" => {
+            println!("{URL}");
+            return Ok(());
+        }
+        [arg] if matches!(arg.as_str(), "-h" | "--help") => {
+            println!("Usage: wedeo studio [--url]");
+            return Ok(());
+        }
+        [] => {}
+        _ => {
+            return Err(Error::invalid_argument(
+                "studio",
+                "Usage: wedeo studio [--url]",
+            ));
+        }
+    }
+    #[cfg(target_os = "windows")]
+    let (program, prefix) = ("rundll32.exe", &["url.dll,FileProtocolHandler"][..]);
+    #[cfg(target_os = "macos")]
+    let (program, prefix) = ("open", &[] as &[&str]);
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let (program, prefix) = ("xdg-open", &[] as &[&str]);
+
+    println!("{URL}");
+    let status = process::Command::new(program)
+        .args(prefix)
+        .arg(URL)
+        .status()
+        .map_err(|err| Error::io("studio", &err))?;
+    if !status.success() {
+        return Err(Error::invalid_argument(
+            "studio",
+            "open the printed URL in a browser",
+        ));
+    }
+    Ok(())
 }
 
 fn next_val(args: &[String], idx: &mut usize, flag: &str) -> Result<String> {

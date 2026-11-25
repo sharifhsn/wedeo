@@ -1,0 +1,18 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "wedeo"
+dynamic = ["version"]
+description = "Wedeo media toolkit and FFmpeg-compatible command-line tools"
+requires-python = ">=3.8"
+license = "LGPL-2.1-or-later"
+
+[tool.maturin]
+bindings = "bin"
+manifest-path = "bins/wedeo-cli/Cargo.toml"
+locked = true
+strip = true
+sdist-generator = "git"
+exclude = [{ path = "FFmpeg", format = "sdist" }]
