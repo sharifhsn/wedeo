@@ -421,3 +421,58 @@ fn cli_multicall_ffmpeg_and_ffprobe_ytdlp_shim() {
     let _ = std::fs::remove_file(&merged);
     let _ = std::fs::remove_file(&extracted);
 }
+
+#[test]
+fn remux_report_counts_written_packets_across_tracks() {
+    let input = workspace_root().join("web/samples/multitrack.mp4");
+    let output = temp_path("reported.mkv");
+    for json in [false, true] {
+        let mut cmd = Command::new(wedeo_bin());
+        cmd.args(["transcode", "-i"])
+            .arg(&input)
+            .args(["--video", "copy", "--audio", "copy", "-y", "-o"])
+            .arg(&output);
+        if json {
+            cmd.arg("--json");
+        }
+        let result = cmd.output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let probe = Command::new(ffprobe_bin())
+            .args([
+                "-v",
+                "error",
+                "-count_packets",
+                "-show_entries",
+                "stream=nb_read_packets",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(&output)
+            .output()
+            .unwrap();
+        assert!(
+            probe.status.success(),
+            "{}",
+            String::from_utf8_lossy(&probe.stderr)
+        );
+        let counts = String::from_utf8(probe.stdout).unwrap();
+        assert_eq!(counts.lines().count(), 3);
+        let written: u64 = counts.lines().map(|n| n.parse::<u64>().unwrap()).sum();
+        assert!(written > 0);
+        let text = String::from_utf8(result.stdout).unwrap();
+        if json {
+            assert!(
+                text.contains(&format!("\"packets_written\": {written},")),
+                "{text}"
+            );
+            assert!(text.contains("\"packets_processed\""));
+        } else {
+            assert!(text.contains(&format!("packets={written},")), "{text}");
+        }
+    }
+    std::fs::remove_file(output).unwrap();
+}
