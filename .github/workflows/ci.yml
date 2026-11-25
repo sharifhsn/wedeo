@@ -179,6 +179,8 @@ jobs:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers nasm libasound2-dev
       - uses: Swatinem/rust-cache@v2
+      - name: Verify device uploads and conversions on Vulkan
+        run: cargo test --locked -p wedeo-gpu-wgpu -- --include-ignored
       - name: Dispatch shaders and read back pixels
         run: cargo test --locked -p wedeo-oracle --features gpu-readback --test gpu_readback -- --nocapture
 
