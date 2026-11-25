@@ -119,6 +119,14 @@ pub struct WgpuCompiledSws {
     uniforms: SwsUniforms,
     uniform_buffer: wgpu::Buffer,
     cached_pipeline: CachedPipeline,
+    planar_scratch: Vec<PlaneScratch>,
+    #[cfg(test)]
+    planar_buffer_allocations: usize,
+}
+
+struct PlaneScratch {
+    storage: wgpu::Buffer,
+    staging: wgpu::Buffer,
 }
 
 impl WgpuCompiledSws {
@@ -175,7 +183,15 @@ impl WgpuCompiledSws {
             uniforms,
             uniform_buffer,
             cached_pipeline,
+            planar_scratch: Vec::new(),
+            #[cfg(test)]
+            planar_buffer_allocations: 0,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn planar_buffer_allocations(&self) -> usize {
+        self.planar_buffer_allocations
     }
 
     /// Structural cache key of the compiled WGSL compute pipeline.
@@ -277,7 +293,7 @@ impl WgpuCompiledSws {
     }
 
     fn execute_planar_storage(
-        &self,
+        &mut self,
         src_views: &[wgpu::TextureView],
         plane_count: usize,
         src_frame: &VideoFrame,
@@ -287,28 +303,34 @@ impl WgpuCompiledSws {
         let dst_h = self.ops.dst.height;
         let device = self.ctx.device();
 
-        let mut storage_bufs = Vec::with_capacity(plane_count);
-        let mut staging_bufs = Vec::with_capacity(plane_count);
-        let mut elem_counts = Vec::with_capacity(plane_count);
-
-        for p in 0..plane_count {
-            let elems = plane_u32_element_count(self.write_layout, dst_w, dst_h, p);
-            let byte_size = ((elems as u64) * 4).max(4);
-            let sbuf = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("wedeo-sws-plane-storage"),
-                size: byte_size,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
-            });
-            let rbuf = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("wedeo-sws-plane-staging"),
-                size: byte_size,
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            });
-            storage_bufs.push(sbuf);
-            staging_bufs.push(rbuf);
-            elem_counts.push(elems);
+        // Only recycle scratch after all readbacks have finished and been unmapped.
+        // A failed map or poll drops this invocation's buffers instead.
+        let mut scratch = std::mem::take(&mut self.planar_scratch);
+        if scratch.is_empty() {
+            for p in 0..plane_count {
+                let elems = plane_u32_element_count(self.write_layout, dst_w, dst_h, p);
+                let byte_size = ((elems as u64) * 4).max(4);
+                let sbuf = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("wedeo-sws-plane-storage"),
+                    size: byte_size,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                });
+                let rbuf = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("wedeo-sws-plane-staging"),
+                    size: byte_size,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                });
+                scratch.push(PlaneScratch {
+                    storage: sbuf,
+                    staging: rbuf,
+                });
+                #[cfg(test)]
+                {
+                    self.planar_buffer_allocations += 2;
+                }
+            }
         }
 
         let mut bg_entries = Vec::with_capacity(1 + src_views.len() + plane_count);
@@ -323,10 +345,10 @@ impl WgpuCompiledSws {
             });
         }
         let dst_base = (src_views.len() + 1) as u32;
-        for (p, sbuf) in storage_bufs.iter().enumerate() {
+        for (p, plane) in scratch.iter().enumerate() {
             bg_entries.push(wgpu::BindGroupEntry {
                 binding: dst_base + (p as u32),
-                resource: sbuf.as_entire_binding(),
+                resource: plane.storage.as_entire_binding(),
             });
         }
 
@@ -350,15 +372,21 @@ impl WgpuCompiledSws {
             let wg_y = dst_h.div_ceil(WORKGROUP_SIZE[1]);
             cpass.dispatch_workgroups(wg_x, wg_y, 1);
         }
-        for p in 0..plane_count {
-            let byte_size = ((elem_counts[p] as u64) * 4).max(4);
-            encoder.copy_buffer_to_buffer(&storage_bufs[p], 0, &staging_bufs[p], 0, byte_size);
+        for plane in &scratch {
+            encoder.copy_buffer_to_buffer(
+                &plane.storage,
+                0,
+                &plane.staging,
+                0,
+                plane.storage.size(),
+            );
         }
         self.ctx.queue().submit(Some(encoder.finish()));
 
         let map_results: Arc<Mutex<Vec<std::result::Result<(), wgpu::BufferAsyncError>>>> =
             Arc::new(Mutex::new(Vec::with_capacity(plane_count)));
-        for rbuf in &staging_bufs {
+        for plane in &scratch {
+            let rbuf = &plane.staging;
             let res_clone = Arc::clone(&map_results);
             rbuf.slice(..).map_async(wgpu::MapMode::Read, move |res| {
                 res_clone
@@ -384,7 +412,8 @@ impl WgpuCompiledSws {
         }
 
         let mut cpu_planes = Vec::with_capacity(plane_count);
-        for (p, rbuf) in staging_bufs.into_iter().enumerate() {
+        for (p, scratch_plane) in scratch.iter().enumerate() {
+            let rbuf = &scratch_plane.staging;
             let (width_bytes, height_rows) = self
                 .write_layout
                 .plane_dims(dst_w, dst_h, p)
@@ -398,6 +427,7 @@ impl WgpuCompiledSws {
             cpu_planes.push(plane);
         }
 
+        self.planar_scratch = scratch;
         let mut cpu_out = VideoFrame::from_planes(dst_w, dst_h, self.write_layout, cpu_planes);
         self.ops
             .populate_output_metadata(src_frame, &mut cpu_out, self.display_tx);
@@ -558,37 +588,30 @@ fn unpack_u32_storage_into_plane(
     for y in 0..plane.height {
         let dst_row = plane.row_mut(y).expect("row in bounds");
         let row_word_base = y * samples_per_row;
-        for s in 0..samples_per_row {
-            let byte_off = (row_word_base + s) * 4;
-            let word = u32::from_le_bytes([
-                raw_u32_bytes[byte_off],
-                raw_u32_bytes[byte_off + 1],
-                raw_u32_bytes[byte_off + 2],
-                raw_u32_bytes[byte_off + 3],
-            ]);
-            match layout.depth {
-                SampleDepth::U8 => {
-                    dst_row[s] = (word.min(255)) as u8;
+        let raw = &raw_u32_bytes[row_word_base * 4..(row_word_base + samples_per_row) * 4];
+        let (words, _) = raw.as_chunks::<4>();
+        match layout.depth {
+            SampleDepth::U8 => {
+                for (dst, word) in dst_row.iter_mut().zip(words) {
+                    *dst = u32::from_le_bytes(*word).min(255) as u8;
                 }
-                SampleDepth::U10 | SampleDepth::U12 | SampleDepth::U14 | SampleDepth::U16 => {
-                    let v = (word.min(65535)) as u16;
-                    let b = match layout.endian {
-                        Endian::Little => v.to_le_bytes(),
-                        Endian::Big => v.to_be_bytes(),
-                    };
-                    dst_row[s * 2] = b[0];
-                    dst_row[s * 2 + 1] = b[1];
-                }
-                SampleDepth::F32 => {
-                    let f = f32::from_bits(word);
-                    let b = match layout.endian {
-                        Endian::Little => f.to_le_bytes(),
-                        Endian::Big => f.to_be_bytes(),
-                    };
-                    dst_row[s * 4..s * 4 + 4].copy_from_slice(&b);
-                }
-                SampleDepth::F16 => {}
             }
+            SampleDepth::U10 | SampleDepth::U12 | SampleDepth::U14 | SampleDepth::U16 => {
+                for (dst, word) in dst_row.as_chunks_mut::<2>().0.iter_mut().zip(words) {
+                    let value = u32::from_le_bytes(*word).min(65535) as u16;
+                    dst.copy_from_slice(&match layout.endian {
+                        Endian::Little => value.to_le_bytes(),
+                        Endian::Big => value.to_be_bytes(),
+                    });
+                }
+            }
+            SampleDepth::F32 if layout.endian == Endian::Little => dst_row.copy_from_slice(raw),
+            SampleDepth::F32 => {
+                for (dst, word) in dst_row.as_chunks_mut::<4>().0.iter_mut().zip(words) {
+                    dst.copy_from_slice(&u32::from_le_bytes(*word).to_be_bytes());
+                }
+            }
+            SampleDepth::F16 => {}
         }
     }
 }

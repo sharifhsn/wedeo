@@ -61,6 +61,36 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a GPU or software Vulkan adapter"]
+    fn planar_scratch_is_private_and_reused_after_readback() {
+        use wedeo_video_ops::CompiledSws;
+        let ctx = WgpuContext::new_headless().unwrap();
+        let pool = BufferPool::new();
+        let dark = make_solid_yuv420p(&pool, 38, 22, 40, 128, 128, ColorDesc::BT709_LIMITED);
+        let bright = make_solid_yuv420p(&pool, 38, 22, 200, 128, 128, ColorDesc::BT709_LIMITED);
+        let dst = VideoContract::new(19, 11, PixelLayout::YUV420P).with_color(dark.color);
+        let ops = SwsOpList::build(
+            &VideoContract::from_frame(&dark),
+            &dst,
+            SwsOptions::default(),
+        )
+        .unwrap();
+        let mut a = WgpuCompiledSws::compile(ctx.clone(), &ops).unwrap();
+        let mut b = WgpuCompiledSws::compile(ctx, &ops).unwrap();
+        assert_eq!(a.planar_buffer_allocations(), 0);
+        for (src, other) in [(&dark, &bright), (&bright, &dark), (&dark, &bright)] {
+            let first = a.execute(src, &pool).unwrap();
+            let second = b.execute(other, &pool).unwrap();
+            for (frame, expected) in [(first, src), (second, other)] {
+                let got = frame.planes().unwrap()[0].row(0).unwrap()[0];
+                assert!(got.abs_diff(expected.planes().unwrap()[0].row(0).unwrap()[0]) <= 1);
+            }
+            assert_eq!(a.planar_buffer_allocations(), 6);
+            assert_eq!(b.planar_buffer_allocations(), 6);
+        }
+    }
+
+    #[test]
     #[ignore = "requires an available GPU or software Vulkan adapter"]
     fn padded_and_inverted_rows_survive_gpu_upload() {
         let ctx = WgpuContext::new_headless().expect("requires a GPU or software Vulkan adapter");
