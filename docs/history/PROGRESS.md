@@ -1,4 +1,4 @@
-# Wedeo Progress (v2 — FFmpeg `n9.1` "Gauss" Target)
+# Wedeo Progress (FFmpeg `n9.1` "Gauss" Target)
 
 > Historical development notes. For the current build and examples, see the [project README](../../README.md).
 

@@ -208,7 +208,7 @@ class TestF14ReleasePackaging(unittest.TestCase):
 
         ci_text = ci_yml.read_text(encoding="utf-8")
         for token in (
-            "v2",
+            "branches: [main]",
             "clippy",
             "fmt",
             "oracle_arch_lint",
@@ -226,7 +226,7 @@ class TestF14ReleasePackaging(unittest.TestCase):
         self.assertIn("wasm", rel_text)
 
     @e2e_test(feature="F14", tier=1, milestone="M6")
-    def test_t1_changelog_and_readme_v2_alignment(self) -> None:
+    def test_t1_changelog_and_readme_alignment(self) -> None:
         ver = self.ws_pkg["version"]
         changelog = self.root / "CHANGELOG.md"
         self.assertTrue(changelog.is_file(), f"Missing {changelog}")

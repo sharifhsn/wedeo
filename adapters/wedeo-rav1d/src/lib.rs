@@ -1,4 +1,4 @@
-//! Segregated `rav1d` AV1 decoder adapter for Wedeo v2.
+//! Segregated `rav1d` AV1 decoder adapter for Wedeo.
 //!
 //! Wraps the pure-Rust `rav1d` AV1 decoder behind `wedeo_core::Decoder`:
 //! - **Zero-copy output planes** via `wedeo_core::ExternalCpuBuffer` holding a shared,

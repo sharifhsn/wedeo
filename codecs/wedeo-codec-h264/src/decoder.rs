@@ -282,7 +282,7 @@ fn mb_intra4x4_modes_i8(mb: &crate::cavlc::Macroblock, constrained_intra: bool) 
 }
 
 impl H264Decoder {
-    /// Open a new `H264Decoder` from a v2 `TrackDescriptor` and `CodecContext`.
+    /// Open a new `H264Decoder` from a `TrackDescriptor` and `CodecContext`.
     pub fn open(track: &TrackDescriptor, ctx: CodecContext) -> Result<Self> {
         let video = track.params.video();
         let (init_w, init_h, init_color, init_sar, init_crop, extradata) = match video {
@@ -2253,7 +2253,7 @@ impl H264Decoder {
         Ok(mbs_decoded)
     }
 
-    /// Convert a deblocked `InFlightDecode` to a v2 `VideoFrame`.
+    /// Convert a deblocked `InFlightDecode` to a `VideoFrame`.
     fn fdc_to_frame(&self, in_flight: &InFlightDecode, is_corrupt: bool) -> VideoFrame {
         let fdc = &in_flight.fdc;
         let hdr = &in_flight.last_hdr;

@@ -130,7 +130,7 @@ fn guess_sample_format(codec_id: CodecId, bits_per_sample: u32) -> SampleFormat 
     }
 }
 
-/// Convert a symphonia `Track` into a v2 `TrackDescriptor` with sequential `TrackId(index)`.
+/// Convert a symphonia `Track` into a `TrackDescriptor` with sequential `TrackId(index)`.
 fn track_to_descriptor(
     track: &Track,
     index: usize,

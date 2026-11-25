@@ -1,4 +1,4 @@
-//! ISOBMFF / MP4 / MOV / M4A demuxer implementation (Wedeo v2).
+//! ISOBMFF / MP4 / MOV / M4A demuxer implementation (Wedeo).
 //!
 //! Supports classic (`moov` + `mdat`) and fragmented (`moov` [`mvex`] + `moof`/`mdat`)
 //! MP4 files, VFR `stts` + `ctts` v1 signed composition offsets, `elst` edit lists,

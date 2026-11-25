@@ -195,7 +195,7 @@ fn seekable_faststart_roundtrip_and_box_ast() {
     // Write to a temp file via FileSink so we can inspect & demux!
     drop(muxer);
 
-    let path = "/tmp/wedeo_test_faststart_v2.mp4";
+    let path = "/tmp/wedeo_test_faststart.mp4";
     let file_sink = wedeo_core::FileSink::create(path).unwrap();
     let mut muxer = reg
         .find_muxer_by_name("mp4")

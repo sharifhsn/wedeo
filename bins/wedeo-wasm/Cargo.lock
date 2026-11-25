@@ -370,7 +370,7 @@ dependencies = [
 
 [[package]]
 name = "wedeo"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "wedeo-audio-ops",
  "wedeo-codec-h264",
@@ -389,14 +389,14 @@ dependencies = [
 
 [[package]]
 name = "wedeo-audio-ops"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "wedeo-core",
 ]
 
 [[package]]
 name = "wedeo-codec-h264"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "wedeo-core",
  "wedeo-syntax",
@@ -404,14 +404,14 @@ dependencies = [
 
 [[package]]
 name = "wedeo-codec-pcm"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "wedeo-core",
 ]
 
 [[package]]
 name = "wedeo-codec-vp9"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "wedeo-core",
  "wedeo-syntax",
@@ -419,21 +419,21 @@ dependencies = [
 
 [[package]]
 name = "wedeo-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "bitflags 2.13.2",
 ]
 
 [[package]]
 name = "wedeo-format-ivf"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "wedeo-core",
 ]
 
 [[package]]
 name = "wedeo-format-mkv"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "wedeo-core",
  "wedeo-syntax",
@@ -441,21 +441,21 @@ dependencies = [
 
 [[package]]
 name = "wedeo-format-mp4"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "wedeo-core",
 ]
 
 [[package]]
 name = "wedeo-format-wav"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "wedeo-core",
 ]
 
 [[package]]
 name = "wedeo-graph"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "wedeo-audio-ops",
  "wedeo-core",
@@ -465,7 +465,7 @@ dependencies = [
 
 [[package]]
 name = "wedeo-symphonia"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "opus1",
  "symphonia",
@@ -474,14 +474,14 @@ dependencies = [
 
 [[package]]
 name = "wedeo-syntax"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "wedeo-core",
 ]
 
 [[package]]
 name = "wedeo-video-ops"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "wedeo-core",
 ]

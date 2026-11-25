@@ -4,7 +4,7 @@ Wedeo is a Rust media toolkit that lets you look inside a video file, decode its
 
 ![Wedeo decoding the bundled MP4 in Firefox, with video, audio, and container information visible](web/studio.png)
 
-[Open the studio](https://wedeo.pages.dev/) · [Download the standalone studio](https://wedeo.pages.dev/downloads/Wedeo.zip)
+[Open the studio](https://wedeo.sharifhsn.dev/) · [Download the standalone studio](https://wedeo.sharifhsn.dev/downloads/Wedeo.zip)
 
 ## Run the studio locally
 
@@ -23,8 +23,8 @@ Open [the local studio](http://127.0.0.1:8000/). It starts with a two-second H.2
 With [uv](https://docs.astral.sh/uv/), run the native CLI from the Wedeo package index:
 
 ```sh
-uvx --index https://wedeo.pages.dev/simple wedeo studio
-uvx --index https://wedeo.pages.dev/simple wedeo ffprobe -v quiet -print_format json -show_streams clip.mp4
+uvx --index https://wedeo.sharifhsn.dev/simple wedeo studio
+uvx --index https://wedeo.sharifhsn.dev/simple wedeo ffprobe -v quiet -print_format json -show_streams clip.mp4
 ```
 
 The prebuilt wheel targets x86-64 Linux with glibc 2.39 or later. On other platforms, uv can build the source distribution using Rust and NASM. Use `wedeo ffmpeg` and `wedeo ffprobe` for the supported FFmpeg-style commands.

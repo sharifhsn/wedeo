@@ -346,7 +346,7 @@ fn encode_samples_into(codec_id: CodecId, src: &[u8], dst: &mut [u8]) {
 }
 
 // =============================================================================
-// PCM Decoder (v2 wedeo_core::Decoder)
+// PCM Decoder (wedeo_core::Decoder)
 // =============================================================================
 
 /// Native FFmpeg `n9.1` PCM decoder.
@@ -552,7 +552,7 @@ impl Decoder for PcmDecoder {
 }
 
 // =============================================================================
-// PCM Encoder (v2 wedeo_core::Encoder)
+// PCM Encoder (wedeo_core::Encoder)
 // =============================================================================
 
 /// Native FFmpeg `n9.1` PCM encoder.

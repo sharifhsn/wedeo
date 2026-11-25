@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-//! Native bit-exact FFmpeg RIFF/RIFX/RF64/BW64 WAV demuxer and muxer for Wedeo v2.
+//! Native bit-exact FFmpeg RIFF/RIFX/RF64/BW64 WAV demuxer and muxer for Wedeo.
 
 use std::io::{self, Read, SeekFrom};
 use std::sync::Arc;

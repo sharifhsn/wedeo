@@ -31,7 +31,7 @@ strip = true
 panic = "abort"
 
 [workspace.package]
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 rust-version = "1.89"
 license = "LGPL-2.1-or-later"
@@ -48,23 +48,23 @@ divan = "0.1.21"
 pollster = "0.4"
 wgpu = "29"
 
-wedeo-core = { path = "crates/wedeo-core", version = "0.3.0" }
-wedeo-syntax = { path = "crates/wedeo-syntax", version = "0.3.0" }
-wedeo-video-ops = { path = "crates/wedeo-video-ops", version = "0.3.0" }
-wedeo-audio-ops = { path = "crates/wedeo-audio-ops", version = "0.3.0" }
-wedeo-graph = { path = "crates/wedeo-graph", version = "0.3.0" }
-wedeo-gpu-wgpu = { path = "crates/wedeo-gpu-wgpu", version = "0.3.0" }
-wedeo = { path = "crates/wedeo", version = "0.3.0" }
+wedeo-core = { path = "crates/wedeo-core", version = "0.3.1" }
+wedeo-syntax = { path = "crates/wedeo-syntax", version = "0.3.1" }
+wedeo-video-ops = { path = "crates/wedeo-video-ops", version = "0.3.1" }
+wedeo-audio-ops = { path = "crates/wedeo-audio-ops", version = "0.3.1" }
+wedeo-graph = { path = "crates/wedeo-graph", version = "0.3.1" }
+wedeo-gpu-wgpu = { path = "crates/wedeo-gpu-wgpu", version = "0.3.1" }
+wedeo = { path = "crates/wedeo", version = "0.3.1" }
 
-wedeo-codec-pcm = { path = "codecs/wedeo-codec-pcm", version = "0.3.0" }
-wedeo-codec-h264 = { path = "codecs/wedeo-codec-h264", version = "0.3.0" }
-wedeo-codec-vp9 = { path = "codecs/wedeo-codec-vp9", version = "0.3.0" }
+wedeo-codec-pcm = { path = "codecs/wedeo-codec-pcm", version = "0.3.1" }
+wedeo-codec-h264 = { path = "codecs/wedeo-codec-h264", version = "0.3.1" }
+wedeo-codec-vp9 = { path = "codecs/wedeo-codec-vp9", version = "0.3.1" }
 
-wedeo-format-wav = { path = "formats/wedeo-format-wav", version = "0.3.0" }
-wedeo-format-mp4 = { path = "formats/wedeo-format-mp4", version = "0.3.0" }
-wedeo-format-mkv = { path = "formats/wedeo-format-mkv", version = "0.3.0" }
-wedeo-format-ivf = { path = "formats/wedeo-format-ivf", version = "0.3.0" }
+wedeo-format-wav = { path = "formats/wedeo-format-wav", version = "0.3.1" }
+wedeo-format-mp4 = { path = "formats/wedeo-format-mp4", version = "0.3.1" }
+wedeo-format-mkv = { path = "formats/wedeo-format-mkv", version = "0.3.1" }
+wedeo-format-ivf = { path = "formats/wedeo-format-ivf", version = "0.3.1" }
 
-wedeo-rav1d = { path = "adapters/wedeo-rav1d", version = "0.3.0" }
-wedeo-rav1e = { path = "adapters/wedeo-rav1e", version = "0.3.0" }
-wedeo-symphonia = { path = "adapters/wedeo-symphonia", version = "0.3.0" }
+wedeo-rav1d = { path = "adapters/wedeo-rav1d", version = "0.3.1" }
+wedeo-rav1e = { path = "adapters/wedeo-rav1e", version = "0.3.1" }
+wedeo-symphonia = { path = "adapters/wedeo-symphonia", version = "0.3.1" }

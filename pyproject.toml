@@ -16,3 +16,7 @@ locked = true
 strip = true
 sdist-generator = "git"
 exclude = [{ path = "FFmpeg", format = "sdist" }]
+
+[project.urls]
+Homepage = "https://wedeo.sharifhsn.dev/"
+Repository = "https://github.com/sharifhsn/wedeo"

@@ -79,7 +79,7 @@ flowchart TB
 | **L3** | `bins/wedeo-cli` | Unified `wedeo` binary: 5 typed `serde` ops driving primary CLI (`inspect`/`transcode`/`cut`/`mux`/`explain`), lean `wedeo ffmpeg` (`lexopt`), and `wedeo mcp`. |
 | **Dev** | `tests/wedeo-oracle` | Non-published dev harness: FFmpeg `n9.1` oracle, all-pixfmt/all-column `framecrc`, `audiogen`, `checkasm`, `dhat` 0-alloc gate, Miri tests, DAG lint, `dev-trace` bisector. |
 
-*Explicitly deferred until Core v2 is green:* `wedeo-metrics` (SSIMULACRA2/PSNR/SSIM/scene-cut/chunked encode), `wedeo-package` (HLS/DASH manifests), `wedeo-net` (HTTP/RTMP/SRT/WebRTC), `wedeo-hw` (VA-API/VideoToolbox/NVDEC/Vulkan Video), `bindings/wedeo-{py,capi,wasm}`.
+*Explicitly deferred until the core passes its tests:* `wedeo-metrics` (SSIMULACRA2/PSNR/SSIM/scene-cut/chunked encode), `wedeo-package` (HLS/DASH manifests), `wedeo-net` (HTTP/RTMP/SRT/WebRTC), `wedeo-hw` (VA-API/VideoToolbox/NVDEC/Vulkan Video), `bindings/wedeo-{py,capi,wasm}`.
 
 ---
 

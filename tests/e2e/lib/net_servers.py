@@ -224,7 +224,7 @@ def assert_binary_cli_error(
     expected_code: int = 1,
     allow_stdout: bool = False,
 ) -> None:
-    """Assert a binary CLI invocation failed cleanly without v2 file-source false passes."""
+    """Assert a binary CLI invocation failed cleanly without file-source false passes."""
     if res.returncode != expected_code:
         raise AssertionError(
             f"Expected exit code {expected_code}, got {res.returncode} "

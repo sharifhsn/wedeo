@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Standalone opaque-box E2E test runner for wedeo v2."""
+"""Standalone opaque-box E2E test runner for wedeo."""
 
 from __future__ import annotations
 
@@ -161,7 +161,7 @@ def discover_tests() -> list[tuple[unittest.TestCase, TestMeta]]:
 def build_parser() -> E2EArgumentParser:
     parser = E2EArgumentParser(
         prog="run.py",
-        description="Standalone opaque-box E2E test runner for wedeo v2.",
+        description="Standalone opaque-box E2E test runner for wedeo.",
     )
     parser.add_argument(
         "--baseline",

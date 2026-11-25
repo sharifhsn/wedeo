@@ -1,4 +1,4 @@
-//! ISOBMFF / MP4 / M4A muxer implementation (Wedeo v2).
+//! ISOBMFF / MP4 / M4A muxer implementation (Wedeo).
 //!
 //! Automatically selects output layout based on `sink.is_seekable()`:
 //! - **Seekable sinks**: classic faststart `moov`-first MP4 (`ftyp` + `moov` + `mdat`).

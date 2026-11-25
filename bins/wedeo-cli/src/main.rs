@@ -117,7 +117,7 @@ Commands:
 }
 
 fn cmd_studio(args: &[String]) -> Result<()> {
-    const URL: &str = "https://wedeo.pages.dev/";
+    const URL: &str = "https://wedeo.sharifhsn.dev/";
     match args {
         [arg] if arg == "--url" => {
             println!("{URL}");

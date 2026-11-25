@@ -1,4 +1,4 @@
-//! FFmpeg-compatible `framecrc` generator for Wedeo v2.
+//! FFmpeg-compatible `framecrc` generator for Wedeo.
 //!
 //! Uses `wedeo::default_registry()` (zero `inventory` globals) and
 //! `wedeo_core::bitstream::adler32_ffmpeg` (init `s1=0, s2=0`):

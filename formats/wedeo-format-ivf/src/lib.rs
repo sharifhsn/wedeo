@@ -948,7 +948,7 @@ mod tests {
         muxer.write_header(&hdr).unwrap();
 
         // To inspect bytes after finalize, let's test over a Temporary file or shared buffer sink.
-        let tmp_path = "/tmp/wedeo_test_ivf_v2_roundtrip.ivf";
+        let tmp_path = "/tmp/wedeo_test_ivf_roundtrip.ivf";
         let file_sink = wedeo_core::FileSink::create(tmp_path).unwrap();
         let mux_factory = reg.find_muxer_by_name("ivf").unwrap();
         let mut muxer = mux_factory.create(Box::new(file_sink)).unwrap();

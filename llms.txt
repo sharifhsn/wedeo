@@ -1,4 +1,4 @@
-# Wedeo v2
+# Wedeo
 
 Rust media toolkit with native and WebAssembly entry points.
 

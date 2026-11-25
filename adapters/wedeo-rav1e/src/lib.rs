@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-//! Segregated `rav1e` AV1 encoder adapter for Wedeo v2.
+//! Segregated `rav1e` AV1 encoder adapter for Wedeo.
 //!
 //! Wraps the pure-Rust `rav1e` AV1 encoder behind `wedeo_core::Encoder`:
 //! - Exposes the `av1C` codec configuration record immediately after `open()` via
