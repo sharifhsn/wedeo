@@ -168,6 +168,9 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y nasm libasound2-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Fetch host dependencies for the offline architecture check
+        run: |
+          cargo fetch --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
       - name: Architecture DAG & unsafe lint (oracle_arch_lint)
         run: cargo test -p wedeo-oracle --test oracle_arch_lint
       - name: DOD allocation gate (oracle_dod_alloc)
