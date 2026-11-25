@@ -22,6 +22,7 @@
     "CABAST3_Sony_E",
     "CABASTBR3_Sony_B",
     "CACQP3_Sony_D",
+    "CAMA1_Sony_C",
     "CANL1_SVA_B",
     "CANL1_Sony_E",
     "CANL1_TOSHIBA_G",
@@ -80,6 +81,6 @@
     "cabac_mot_frm0_full",
     "cavlc_mot_frm0_full_B"
   ],
-  "count": 78,
+  "count": 79,
   "total": 135
 }

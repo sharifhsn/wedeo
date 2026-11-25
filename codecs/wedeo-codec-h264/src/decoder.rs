@@ -2235,11 +2235,6 @@ impl H264Decoder {
             bot_left_modes = fdc.neighbor_ctx.left_intra4x4_mode;
             bot_left_avail = fdc.neighbor_ctx.left_available;
 
-            // Check terminate after both MBs of pair
-            if reader.get_cabac_terminate() {
-                break;
-            }
-
             // Advance to next pair
             mb_x += 1;
             if mb_x >= mb_width {
@@ -2247,6 +2242,11 @@ impl H264Decoder {
                 inline_deblock_pair_row(fdc, mb_y / 2, mb_width, deblock_enabled);
                 mb_x = 0;
                 mb_y += 2; // Skip to next pair row
+            }
+
+            // A slice that terminates at a pair-row boundary still completes that row.
+            if reader.get_cabac_terminate() {
+                break;
             }
         }
 
