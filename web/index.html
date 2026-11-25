@@ -86,7 +86,7 @@
         <section class="export-box" id="clip-panel" hidden>
           <h3>Lossless clip</h3>
           <video id="clip-monitor" controls muted playsinline preload="metadata" style="width:100%;max-height:42vh;background:#090b10"></video>
-          <p>Choose keyframe boundaries. The export keeps every audio track, including tracks you haven’t auditioned.</p>
+          <p>Choose an independent video boundary. H.264 recordings with only one IDR frame can be exported in full. The export keeps every audio track, including tracks you haven’t auditioned.</p>
           <div class="export-row">
             <label>In <select class="select" id="clip-in"></select></label>
             <label>Out <select class="select" id="clip-out"></select></label>
@@ -147,6 +147,6 @@
     </section>
   </main>
 
-  <script src="app.js?release=clip1"></script>
+  <script src="app.js?release=clip2"></script>
 </body>
 </html>

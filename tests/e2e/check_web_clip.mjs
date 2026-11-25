@@ -42,6 +42,36 @@ function packets(path) {
   return JSON.parse(execFileSync("ffprobe", ["-v","error","-show_packets","-show_data_hash","sha256",
     "-show_entries","packet=stream_index,pts_time,data_hash","-of","json",path])).packets;
 }
+// Compare decoded pictures as well as compressed payloads: open GOPs can
+// depend on pictures across a nominal keyframe even when packet hashes match.
+function pictureHashes(path) {
+  const text = execFileSync("ffmpeg", ["-nostdin", "-v", "error", "-xerror", "-i", path,
+    "-map", "0:v:0", "-fps_mode", "passthrough", "-threads", "1", "-f", "framemd5", "-"], {encoding:"utf8"});
+  return text.trim().split("\n").filter(line => !line.startsWith("#")).map(line => line.split(",").at(-1).trim());
+}
+function verifyReorderedVideo(openGop) {
+  const source = join(dir, `reordered-${openGop}.mp4`);
+  const output = join(dir, `reordered-${openGop}.mkv`);
+  execFileSync("ffmpeg", ["-nostdin", "-v","error","-i", file,"-map","0","-c:a","copy",
+    "-c:v","libx264","-crf","17","-g","24","-bf","3","-x264-params",
+    `open-gop=${openGop}:scenecut=0:b-adapt=0`,"-threads","1",source]);
+  const params = [...input(readFileSync(source)), ...input(Buffer.from("source.mp4"))];
+  check(w.wedeo_clip_marks(...params));
+  const bounds = json();
+  let expected = pictureHashes(source);
+  if (openGop) {
+    assert.equal(bounds.length, 2, "only the initial IDR and end are independent");
+    assert.notEqual(w.wedeo_clip(...params, 2, 12), 0, "reject unsafe boundaries from direct callers");
+    check(w.wedeo_clip(...params, bounds[0], bounds[1]));
+  } else {
+    check(w.wedeo_clip(...params, bounds[1], bounds[6]));
+    expected = expected.slice(24, 144);
+  }
+  writeFileSync(output, bytes(w.wedeo_bytes_ptr(), w.wedeo_bytes_len()));
+  assert.deepEqual(pictureHashes(output), expected);
+  w.wedeo_free(params[0], params[1]);
+  w.wedeo_free(params[2], params[3]);
+}
 try {
   const output = join(dir, "clip.mkv");
   writeFileSync(output, bytes(w.wedeo_bytes_ptr(), w.wedeo_bytes_len()));
@@ -59,5 +89,7 @@ try {
       assert.ok(Math.abs(Number(packet.pts_time) - (Number(source[offset+i].pts_time) - start)) <= 0.0011);
     });
   }
-  console.log("Two audition tones verified; ten-second export independently decoded and packet-checked.");
+  verifyReorderedVideo(0);
+  verifyReorderedVideo(1);
+  console.log("Closed/open GOP decoded pictures match. Two audition tones verified; ten-second export independently decoded and packet-checked.");
 } finally { rmSync(dir, { recursive: true }); }

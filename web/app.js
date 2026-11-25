@@ -72,7 +72,7 @@
   async function initWasm() {
     const t0 = performance.now();
     try {
-      const resp = await fetch("wedeo.wasm?release=clip1");
+      const resp = await fetch("wedeo.wasm?release=clip2");
       if (!resp.ok) throw new Error(`HTTP ${resp.status} loading wedeo.wasm`);
       let instance;
       if (WebAssembly.instantiateStreaming) {

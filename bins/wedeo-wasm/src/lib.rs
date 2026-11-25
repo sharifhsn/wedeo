@@ -869,14 +869,16 @@ fn write_container(
     }
     muxer.write_header(&out_hdr)?;
 
+    let mut clip_index = range.map(|_| ClipIndex::new(&hdr)).transpose()?;
     let mut packet_count = 0usize;
     while let RecvStatus::Ready(mut pkt) = demuxer.read_packet()? {
-        if let Some((start, end)) = range {
+        if let (Some((start, end)), Some(index)) = (range, &mut clip_index) {
             let pts = pkt
                 .pts
                 .to_seconds(pkt.time_base)
                 .ok_or_else(|| Error::unsupported("clip", "missing packet timestamp"))?;
             let shift = clip_shift(&hdr, pkt.track_id)?;
+            index.observe(&pkt, pts + shift)?;
             if pts + shift < start || pts + shift >= end {
                 continue;
             }
@@ -894,6 +896,15 @@ fn write_container(
         }
         muxer.write_packet(&pkt)?;
         packet_count += 1;
+    }
+    if let (Some((start, end)), Some(index)) = (range, clip_index) {
+        let marks = index.finish()?;
+        if !marks.contains(&start) || !marks.contains(&end) {
+            return Err(Error::unsupported(
+                "clip",
+                "choose independently decodable clip boundaries",
+            ));
+        }
     }
     muxer.finalize()?;
 
@@ -1192,50 +1203,104 @@ fn clip_shift(header: &ContainerHeader, id: TrackId) -> Result<f64> {
     Ok(shift)
 }
 
-fn clip_boundaries(data: Vec<u8>, name: &str) -> Result<Vec<f64>> {
-    let mut demux = open_demuxer_bytes(&wedeo::default_registry(), data, ext_from_name(name))?;
-    let mut videos = demux
-        .header()
-        .tracks
-        .iter()
-        .filter(|t| t.params.media_type() == MediaType::Video);
-    let id = videos
-        .next()
-        .ok_or_else(|| Error::unsupported("clip", "requires a video track"))?
-        .id;
-    if videos.next().is_some() {
-        return Err(Error::unsupported(
-            "clip",
-            "select a recording with one video track",
-        ));
-    }
-    let mut cuts = Vec::new();
-    let mut end = f64::NEG_INFINITY;
-    while let RecvStatus::Ready(pkt) = demux.read_packet()? {
-        let ts = pkt
-            .pts
-            .to_seconds(pkt.time_base)
-            .ok_or_else(|| Error::unsupported("clip", "missing packet timestamp"))?;
-        let ts = ts + clip_shift(demux.header(), pkt.track_id)?;
-        if pkt.track_id == id && pkt.flags.contains(wedeo::core::PacketFlags::KEY) {
-            cuts.push(ts);
+struct ClipIndex {
+    video: TrackId,
+    h264: bool,
+    nal_size: Option<u8>,
+    marks: Vec<f64>,
+    end: f64,
+}
+
+impl ClipIndex {
+    fn new(header: &ContainerHeader) -> Result<Self> {
+        let mut videos = header
+            .tracks
+            .iter()
+            .filter(|t| t.params.media_type() == MediaType::Video);
+        let track = videos
+            .next()
+            .ok_or_else(|| Error::unsupported("clip", "requires a video track"))?;
+        if videos.next().is_some() {
+            return Err(Error::unsupported(
+                "clip",
+                "select a recording with one video track",
+            ));
         }
+        let StreamParams::Video(v) = &track.params else {
+            unreachable!()
+        };
+        let nal_size = if v.extradata.first() == Some(&1) {
+            v.extradata.get(4).map(|b| (b & 3) + 1)
+        } else {
+            None
+        };
+        Ok(Self {
+            video: track.id,
+            h264: track.codec_id == CodecId::H264,
+            nal_size,
+            marks: Vec::new(),
+            end: f64::NEG_INFINITY,
+        })
+    }
+
+    fn observe(&mut self, pkt: &wedeo::Packet, ts: f64) -> Result<()> {
         let duration = wedeo::Timestamp::new(pkt.duration.max(1))
             .to_seconds(pkt.time_base)
             .unwrap_or_default();
-        end = end.max(ts + duration);
+        self.end = self.end.max(ts + duration);
+        if pkt.track_id != self.video || !pkt.flags.contains(wedeo::core::PacketFlags::KEY) {
+            return Ok(());
+        }
+        if self.h264 {
+            let data = pkt.data.as_slice().unwrap_or_default();
+            let annexb;
+            let payload = if let Some(size) = self.nal_size {
+                annexb = wedeo::syntax::h264::avcc_to_annexb(data, size)?;
+                &annexb[..]
+            } else {
+                data
+            };
+            if !wedeo::syntax::h264::iter_annexb_nals(payload).any(|n| {
+                n.is_ok_and(|nal| {
+                    nal.header.nal_unit_type == wedeo::syntax::h264::NalUnitType::IdrSlice
+                })
+            }) {
+                return Ok(());
+            }
+        }
+        self.marks.push(ts);
+        Ok(())
     }
-    if cuts.is_empty() {
-        return Err(Error::unsupported("clip", "no indexed video keyframes"));
+
+    fn finish(mut self) -> Result<Vec<f64>> {
+        if self.marks.is_empty() {
+            return Err(Error::unsupported(
+                "clip",
+                "no independently decodable video boundary",
+            ));
+        }
+        self.marks.push(self.end);
+        if self.marks.windows(2).any(|p| p[0] >= p[1]) {
+            return Err(Error::unsupported(
+                "clip",
+                "non-monotonic keyframe timestamps",
+            ));
+        }
+        Ok(self.marks)
     }
-    cuts.push(end);
-    if cuts.windows(2).any(|p| p[0] >= p[1]) {
-        return Err(Error::unsupported(
-            "clip",
-            "non-monotonic keyframe timestamps",
-        ));
+}
+
+fn clip_boundaries(data: Vec<u8>, name: &str) -> Result<Vec<f64>> {
+    let mut demux = open_demuxer_bytes(&wedeo::default_registry(), data, ext_from_name(name))?;
+    let mut index = ClipIndex::new(demux.header())?;
+    while let RecvStatus::Ready(pkt) = demux.read_packet()? {
+        let pts = pkt
+            .pts
+            .to_seconds(pkt.time_base)
+            .ok_or_else(|| Error::unsupported("clip", "missing packet timestamp"))?;
+        index.observe(&pkt, pts + clip_shift(demux.header(), pkt.track_id)?)?;
     }
-    Ok(cuts)
+    index.finish()
 }
 
 #[unsafe(no_mangle)]
