@@ -48,6 +48,7 @@ struct MuxTrackState {
     codec_id: CodecId,
     media_type: MediaType,
     sample_rate: u32,
+    nal_length_size: Option<u8>,
 }
 
 struct PendingCluster {
@@ -481,6 +482,17 @@ impl Muxer for MkvMuxer {
                 codec_id: track.codec_id,
                 media_type,
                 sample_rate,
+                nal_length_size: match &track.params {
+                    StreamParams::Video(v) if v.extradata.first() == Some(&1) => {
+                        match track.codec_id {
+                            CodecId::H264 => v.extradata.get(4),
+                            CodecId::Hevc => v.extradata.get(21),
+                            _ => None,
+                        }
+                        .map(|b| (b & 3) + 1)
+                    }
+                    _ => None,
+                },
             });
         }
 
@@ -642,7 +654,11 @@ impl Muxer for MkvMuxer {
             });
         }
 
-        let payload_cow = normalize_packet_payload(codec_id, pkt.data.as_slice().unwrap_or(&[]))?;
+        let payload_cow = normalize_packet_payload(
+            codec_id,
+            self.tracks[track_idx].nal_length_size,
+            pkt.data.as_slice().unwrap_or(&[]),
+        )?;
         let payload = payload_cow.as_ref();
 
         let cluster = self.pending_cluster.as_mut().unwrap();
@@ -787,28 +803,38 @@ fn normalize_video_extradata(codec_id: CodecId, extradata: &[u8]) -> Result<Vec<
     }
 }
 
-fn normalize_packet_payload(codec_id: CodecId, data: &[u8]) -> Result<std::borrow::Cow<'_, [u8]>> {
-    match codec_id {
-        CodecId::H264 => {
-            if is_annexb_start_code(data) {
-                Ok(std::borrow::Cow::Owned(wedeo_syntax::h264::annexb_to_avcc(
-                    data, 4,
-                )?))
-            } else {
-                Ok(std::borrow::Cow::Borrowed(data))
-            }
-        }
-        CodecId::Hevc => {
-            if is_annexb_start_code(data) {
-                Ok(std::borrow::Cow::Owned(wedeo_syntax::hevc::annexb_to_hvcc(
-                    data, 4,
-                )?))
-            } else {
-                Ok(std::borrow::Cow::Borrowed(data))
-            }
-        }
-        _ => Ok(std::borrow::Cow::Borrowed(data)),
+fn normalize_packet_payload(
+    codec_id: CodecId,
+    length_size: Option<u8>,
+    data: &[u8],
+) -> Result<std::borrow::Cow<'_, [u8]>> {
+    if !matches!(codec_id, CodecId::H264 | CodecId::Hevc) || !is_annexb_start_code(data) {
+        return Ok(std::borrow::Cow::Borrowed(data));
     }
+    // A four-byte length in 256..512 starts with the three-byte Annex B delimiter.
+    // Prefer valid packet framing from the track configuration when both are possible.
+    if let Some(size) = length_size {
+        let mut rest = data;
+        while let Some((prefix, tail)) = rest.split_at_checked(usize::from(size)) {
+            let len = prefix
+                .iter()
+                .fold(0usize, |n, &b| (n << 8) | usize::from(b));
+            if len == 0 {
+                break;
+            }
+            let Some(next) = tail.get(len..) else { break };
+            if next.is_empty() {
+                return Ok(std::borrow::Cow::Borrowed(data));
+            }
+            rest = next;
+        }
+    }
+    let bytes = match codec_id {
+        CodecId::H264 => wedeo_syntax::h264::annexb_to_avcc(data, length_size.unwrap_or(4))?,
+        CodecId::Hevc => wedeo_syntax::hevc::annexb_to_hvcc(data, length_size.unwrap_or(4))?,
+        _ => unreachable!(),
+    };
+    Ok(std::borrow::Cow::Owned(bytes))
 }
 
 fn is_annexb_start_code(data: &[u8]) -> bool {

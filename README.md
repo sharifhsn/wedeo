@@ -6,6 +6,10 @@ Wedeo is a Rust media toolkit that lets you look inside a video file, decode its
 
 [Open the studio](https://wedeo.sharifhsn.dev/) · [Download the standalone studio](https://wedeo.sharifhsn.dev/downloads/Wedeo.zip)
 
+## Clip a multitrack recording
+
+[Open the multitrack clipper](https://wedeo.sharifhsn.dev/?clip). The demo has a low tone on Audio 1 and a high tone on Audio 2. Play the recording and switch tracks to audition them. Choose **2.000 s** for In and **12.000 s** for Out, then export a ten-second Matroska file with both tracks. The clipper copies encoded packets at keyframe boundaries. Browser video playback depends on the input container and codec. The current studio loads the file and selected audio into memory.
+
 ## Try the command line
 
 Run Wedeo directly from [PyPI](https://pypi.org/project/wedeo/) with [uv](https://docs.astral.sh/uv/). Start with a familiar FFmpeg command. This one changes the container from MP4 to Matroska and copies the encoded tracks:

@@ -16,7 +16,10 @@ use wedeo_core::{
 use wedeo_syntax::h264::{NalUnitType, find_annexb_start_code};
 
 const SYSTEM_FFMPEG: &str = "/usr/bin/ffmpeg";
-const ORACLE_FFMPEG: &str = "/home/sharif/wedeo/target/ffmpeg-oracle/ffmpeg";
+const ORACLE_FFMPEG: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../target/ffmpeg-oracle/ffmpeg"
+);
 
 struct TempDir(PathBuf);
 

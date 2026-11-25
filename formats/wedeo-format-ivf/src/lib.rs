@@ -1095,7 +1095,10 @@ mod tests {
         }
         muxer.finalize().unwrap();
 
-        let ffprobe = "/home/sharif/wedeo/target/ffmpeg-oracle/ffprobe";
+        let ffprobe = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../target/ffmpeg-oracle/ffprobe"
+        );
         if std::path::Path::new(ffprobe).exists() {
             let out = std::process::Command::new(ffprobe)
                 .args([

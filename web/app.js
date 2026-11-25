@@ -3,6 +3,15 @@
   const enc = new TextEncoder();
   const dec = new TextDecoder();
 
+  const clipMode = new URLSearchParams(location.search).has("clip");
+  if (clipMode) {
+    document.title = "Multitrack clipper | Wedeo";
+    for (const selector of [".player-panel > .panel-head", ".stage", "#video-controls", "#video-telemetry"]) {
+      document.querySelector(selector).style.display = "none";
+    }
+  }
+  let previewUrl = null;
+  let audioStart = 0;
   let wasm = null;
   let currentFile = null; // { name, bytes: Uint8Array, inspect }
   let decodedFrames = []; // [{ imageData, meta, decodeMs }]
@@ -63,7 +72,7 @@
   async function initWasm() {
     const t0 = performance.now();
     try {
-      const resp = await fetch("wedeo.wasm");
+      const resp = await fetch("wedeo.wasm?release=clip2");
       if (!resp.ok) throw new Error(`HTTP ${resp.status} loading wedeo.wasm`);
       let instance;
       if (WebAssembly.instantiateStreaming) {
@@ -81,7 +90,7 @@
       const ms = Math.round(performance.now() - t0);
       $("wasm-status").textContent = `wasm ready (${ms} ms)`;
       // Auto-load the vivid H.264 + AAC MP4 sample so visitors see it working immediately.
-      loadSample("samples/h264_aac_320x240.mp4");
+      loadSample(clipMode ? "samples/multitrack.mp4" : "samples/h264_aac_320x240.mp4");
     } catch (e) {
       $("wasm-status").textContent = "wasm failed";
       showError(`Failed to initialize wedeo.wasm: ${e.message}`);
@@ -225,10 +234,101 @@
     ctx.stroke();
   }
 
+  function decodeSelectedAudio(ptr, len, nptr, nlen) {
+    stopAudio();
+    audioBuffer = null;
+    $("btn-audio-play").disabled = true;
+    const at0 = performance.now();
+    if (wasm.wedeo_audition(ptr, len, nptr, nlen, Number($("audition").value)) !== 0) {
+      throw new Error(readError());
+    }
+    const aInfo = readJson();
+    audioStart = aInfo.start_sec;
+    const raw = readBytesCopy();
+    const f32 = new Float32Array(raw.buffer, raw.byteOffset, Math.floor(raw.byteLength / 4));
+    const aMs = Math.round(performance.now() - at0);
+
+    drawWaveform(f32, aInfo.channels, aInfo.frames_per_channel);
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    audioBuffer = audioCtx.createBuffer(aInfo.channels, aInfo.frames_per_channel, aInfo.sample_rate);
+    for (let c = 0; c < aInfo.channels; c++) {
+      const offset = c * aInfo.frames_per_channel;
+      audioBuffer.copyToChannel(f32.subarray(offset, offset + aInfo.frames_per_channel), c);
+    }
+    $("btn-audio-play").disabled = false;
+    $("audio-telemetry").textContent =
+      `${aInfo.codec} → F32Planar · ${aInfo.sample_rate} Hz · ${aInfo.channels} ch · ${aInfo.duration_sec.toFixed(2)}s (${aInfo.frames_per_channel.toLocaleString()} samples decoded in ${aMs} ms)`;
+  }
+
+  function withFile(operation) {
+    if (!currentFile) return;
+    const [p, l] = allocBytes(currentFile.bytes);
+    const [n, k] = allocBytes(enc.encode(currentFile.name));
+    try { operation(p, l, n, k); }
+    catch (e) { showError(e.message); }
+    finally { freeBytes(n, k); freeBytes(p, l); }
+  }
+
+  const monitor = $("clip-monitor");
+  function syncMonitorAudio() {
+    stopAudio();
+    if (!audioBuffer || !audioCtx || monitor.paused || monitor.seeking) return;
+    const offset = monitor.currentTime - audioStart;
+    if (offset >= audioBuffer.duration) return;
+    audioCtx.resume().catch(e => showError(e.message));
+    audioSource = audioCtx.createBufferSource();
+    audioSource.buffer = audioBuffer;
+    audioSource.playbackRate.value = monitor.playbackRate;
+    audioSource.connect(audioCtx.destination);
+    audioSource.start(audioCtx.currentTime + Math.max(0, -offset) / monitor.playbackRate, Math.max(0, offset));
+  }
+  monitor.onplaying = monitor.onseeked = monitor.onratechange = syncMonitorAudio;
+  monitor.onpause = monitor.onwaiting = monitor.onseeking = stopAudio;
+  monitor.onvolumechange = () => { monitor.muted = true; };
+  $("audition").onchange = () => {
+    withFile(decodeSelectedAudio);
+    syncMonitorAudio();
+  };
+  function markAtPlayhead(start) {
+    const selector = $(start ? "clip-in" : "clip-out");
+    const options = Array.from(selector.options);
+    const position = monitor.currentTime;
+    const mark = start ? options.filter(o => Number(o.value) <= position).pop()
+                       : options.find(o => !o.disabled && Number(o.value) >= position);
+    if (mark) { selector.value = mark.value; updateClip(); }
+  }
+  $("mark-in").onclick = () => markAtPlayhead(true);
+  $("mark-out").onclick = () => markAtPlayhead(false);
+  function updateClip() {
+    const start = Number($("clip-in").value);
+    for (const option of $("clip-out").options) option.disabled = Number(option.value) <= start;
+    if (Number($("clip-out").value) <= start) {
+      $("clip-out").value = Array.from($("clip-out").options).find(o => !o.disabled).value;
+    }
+    $("clip-result").textContent = "";
+  }
+  $("clip-in").onchange = $("clip-out").onchange = updateClip;
+  $("clip-save").onclick = () => withFile((p, l, n, k) => {
+    const start = Number($("clip-in").value), end = Number($("clip-out").value);
+    if (wasm.wedeo_clip(p, l, n, k, start, end) !== 0) throw new Error(readError());
+    const bytes = readBytesCopy();
+    triggerDownload(bytes, currentFile.name.replace(/\.[^.]+$/, "") + ".clip.mkv", "video/x-matroska");
+    $("clip-result").textContent = `Exported ${(end - start).toFixed(2)} seconds · ${formatBytes(bytes.length)}`;
+  });
+
   async function loadMediaBytes(name, bytes) {
     showError(null);
     stopPlayback();
     stopAudio();
+    const monitor = $("clip-monitor");
+    monitor.pause();
+    monitor.removeAttribute("src");
+    monitor.load();
+    if (previewUrl) URL.revokeObjectURL(previewUrl);
+    previewUrl = null;
+    currentFile = null;
+    $("clip-panel").hidden = true;
+    $("audition").replaceChildren();
     decodedFrames = [];
     audioBuffer = null;
     $("video-canvas").style.display = "none";
@@ -256,8 +356,23 @@
       const hasAudio = info.tracks.some((t) => t.media_type === "audio" && t.decodable);
       $("btn-export-wav").disabled = !hasAudio;
 
+      const audioTracks = info.tracks.filter(t => t.media_type === "audio" && t.decodable);
+      $("audition").replaceChildren(...audioTracks.map((t, i) => new Option(`Audio ${i + 1} · ${t.codec}`, t.id)));
+      if (hasVideo && wasm.wedeo_clip_marks(ptr, len, nptr, nlen) === 0) {
+        const marks = readJson();
+        const options = times => times.map(t => new Option(`${t.toFixed(3)} s`, String(t)));
+        $("clip-in").replaceChildren(...options(marks.slice(0, -1)));
+        $("clip-out").replaceChildren(...options(marks.slice(1)));
+        $("clip-out").selectedIndex = marks.length - 2;
+        updateClip();
+        previewUrl = URL.createObjectURL(new Blob([bytes]));
+        monitor.src = previewUrl;
+        $("clip-panel").hidden = false;
+        if (clipMode) $("video-controls").closest(".player-panel").prepend($("clip-panel"));
+      }
+
       // 1. Decode video frames (capped at 120 frames for instant snappy interactive scrubbing)
-      if (hasVideo) {
+      if (hasVideo && !clipMode) {
         if (wasm.wedeo_video_open(ptr, len, nptr, nlen) !== 0) {
           throw new Error(readError());
         }
@@ -304,25 +419,7 @@
 
       // 2. Decode audio track for waveform + Web Audio playback
       if (hasAudio) {
-        const at0 = performance.now();
-        if (wasm.wedeo_decode_audio(ptr, len, nptr, nlen, 0, 0) !== 0) {
-          throw new Error(readError());
-        }
-        const aInfo = readJson();
-        const raw = readBytesCopy();
-        const f32 = new Float32Array(raw.buffer, raw.byteOffset, Math.floor(raw.byteLength / 4));
-        const aMs = Math.round(performance.now() - at0);
-
-        drawWaveform(f32, aInfo.channels, aInfo.frames_per_channel);
-        if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-        audioBuffer = audioCtx.createBuffer(aInfo.channels, aInfo.frames_per_channel, aInfo.sample_rate);
-        for (let c = 0; c < aInfo.channels; c++) {
-          const offset = c * aInfo.frames_per_channel;
-          audioBuffer.copyToChannel(f32.subarray(offset, offset + aInfo.frames_per_channel), c);
-        }
-        $("btn-audio-play").disabled = false;
-        $("audio-telemetry").textContent =
-          `${aInfo.codec} → F32Planar · ${aInfo.sample_rate} Hz · ${aInfo.channels} ch · ${aInfo.duration_sec.toFixed(2)}s (${aInfo.frames_per_channel.toLocaleString()} samples decoded in ${aMs} ms)`;
+        decodeSelectedAudio(ptr, len, nptr, nlen);
       } else {
         $("btn-audio-play").disabled = true;
         $("btn-audio-stop").disabled = true;
@@ -461,6 +558,7 @@
 
   $("btn-audio-play").addEventListener("click", async () => {
     if (!audioBuffer || !audioCtx) return;
+    monitor.pause();
     stopAudio();
     if (audioCtx.state === "suspended") await audioCtx.resume();
     audioSource = audioCtx.createBufferSource();

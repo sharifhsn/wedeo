@@ -448,7 +448,10 @@ fn non_seekable_pipe_auto_fmp4_and_ffprobe() {
     assert_eq!(a_count, 2);
 
     // Verify with FFmpeg oracle ffprobe n9.1
-    let ffprobe_path = "/home/sharif/wedeo/target/ffmpeg-oracle/ffprobe";
+    let ffprobe_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../target/ffmpeg-oracle/ffprobe"
+    );
     if std::path::Path::new(ffprobe_path).exists() {
         let tmp_fmp4 = "/tmp/wedeo_test_auto_fmp4_oracle.mp4";
         std::fs::write(tmp_fmp4, &fmp4_bytes).unwrap();

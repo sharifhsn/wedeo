@@ -34,13 +34,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: false
-      - run: sudo apt-get update && sudo apt-get install -y nasm libasound2-dev
+          submodules: true
+      - run: sudo apt-get update && sudo apt-get install -y nasm libasound2-dev ffmpeg
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
+      - name: Build the pinned FFmpeg test oracle
+        run: ./scripts/build-ffmpeg-oracle.sh
       - name: Unit & integration tests
-        run: cargo nextest run --profile ci --exclude wedeo-oracle
+        run: cargo nextest run --workspace --profile ci --exclude wedeo-oracle
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4
@@ -106,7 +108,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: taiki-e/install-action@cargo-deny
+      - run: cargo deny check
 
   jvt-regression:
     name: JVT Regression
@@ -167,6 +170,9 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y nasm libasound2-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Fetch host dependencies for the offline architecture check
+        run: |
+          cargo fetch --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
       - name: Architecture DAG & unsafe lint (oracle_arch_lint)
         run: cargo test -p wedeo-oracle --test oracle_arch_lint
       - name: DOD allocation gate (oracle_dod_alloc)
@@ -179,10 +185,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: false
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-          targets: wasm32-unknown-unknown
+      - run: rustup target add wasm32-unknown-unknown
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: bins/wedeo-wasm
@@ -191,7 +195,9 @@ jobs:
       - name: Unit tests (wedeo-wasm)
         run: cargo test --manifest-path bins/wedeo-wasm/Cargo.toml
       - name: Build wasm32 target
-        run: cargo build --manifest-path bins/wedeo-wasm/Cargo.toml --target wasm32-unknown-unknown --profile wasm-release
+        run: ./web/build.sh
+      - name: Verify browser clip export and audio audition
+        run: node tests/e2e/check_web_clip.mjs
 
   miri:
     name: Miri
