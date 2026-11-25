@@ -107,6 +107,7 @@ scripts/.suite_*_snapshot.json
 /CONFORMANCE_STATE.md
 /docs/*
 !/docs/ARCHITECTURE.md
+!/docs/history/
 
 # Diagnostic & debug output
 diag_*.txt

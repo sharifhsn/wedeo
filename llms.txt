@@ -1,43 +1,14 @@
-# wedeo
+# Wedeo v2
 
-> AI-generated Rust rewrite of FFmpeg.
+Rust media toolkit with native and WebAssembly entry points.
 
-wedeo translates FFmpeg's C source into idiomatic Rust, verified bit-for-bit
-against FFmpeg's FATE test suite. 18 crates, ~52K lines of Rust.
-
-## Project structure
-
-- CLAUDE.md: Full project context, architecture, conventions, debugging (READ THIS FIRST)
-- H264.md: H.264 decoder internals, module map, conformance status
-- CONTRIBUTING.md: Contribution guidelines, what we accept/reject
-- DIVERGENCES.md: Known behavioral differences vs FFmpeg
-
-## Key files for AI agents
-
-- CLAUDE.md — canonical rules, build commands, debugging procedures
-- codecs/wedeo-codec-h264/src/ — H.264 decoder (30K lines, 25 modules)
-- codecs/wedeo-codec-vp9/src/ — VP9 decoder (keyframe-only, 12 modules)
-- scripts/suite_runner.py — unified conformance runner
-- scripts/conformance_full.py — FATE conformance report
-- tests/fate/ — Rust FATE test harness
-- FFmpeg/ — reference C source (git submodule, n8.1)
-
-## Build and verify
-
-- cargo clippy && cargo fmt --check — must pass before any PR
-- cargo nextest run — 462 tests
-- python3 scripts/suite_runner.py --suite all --format yuv420p — full conformance
-
-## Current focus
-
-H.264 decoder: 79/79 progressive conformance BITEXACT, expanding to MBAFF
-interlaced and FRext profiles. Performance optimization via aarch64 NEON.
-VP9 decoder: keyframe-only native Rust decoder with IVF demuxer. Inter
-prediction deferred.
-Video player (wedeo-play): GPU-accelerated via wgpu+winit, ffplay-style
-A/V sync with pts_drift audio clock, 24fps 0-drop 1080p playback.
-
-## Philosophy
-
-"Make it work, make it right, make it fast." Correctness first. Reproduce
-FFmpeg bugs when needed for behavioral parity. Copy FFmpeg comments verbatim.
+- README.md — build instructions, bundled samples, browser studio, and CLI examples
+- crates/wedeo/src/lib.rs — public API, feature-gated modules, and registry construction
+- bins/wedeo-cli/ — native CLI and MCP entry points
+- bins/wedeo-wasm/ and web/ — WebAssembly exports and browser studio
+- codecs/, formats/, adapters/ — built-in implementations and external codec adapters
+- tests/wedeo-oracle/ — differential tests and reference helpers
+- docs/ARCHITECTURE.md — architectural design
+- DIVERGENCES.md — known differences from FFmpeg
+- CONTRIBUTING.md and CLAUDE.md — contribution and implementation guidance
+- docs/history/ — earlier progress reports and design notes

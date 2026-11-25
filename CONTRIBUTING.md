@@ -6,7 +6,7 @@ Contributions are welcome from both humans and AI agents.
 
 1. Read [CLAUDE.md](CLAUDE.md) for architecture, conventions, and technical requirements
 2. Read [DIVERGENCES.md](DIVERGENCES.md) for known behavioral differences vs FFmpeg
-3. Read the FFmpeg C source for whatever you're implementing (`./FFmpeg/` submodule)
+3. For codec or format work, run `git submodule update --init FFmpeg` and read the corresponding reference implementation.
 4. Build and run tests to confirm your environment works:
    ```bash
    cargo build && cargo nextest run && cargo clippy
@@ -107,25 +107,13 @@ Every PR must include these sections:
 - If CLAUDE.md says to do it one way, do it that way
 - Run the full test suite before submitting
 
-## Adding a new codec
+## Adding a codec or container
 
-1. Create `codecs/wedeo-codec-<name>/` with `Cargo.toml` depending on
-   `wedeo-core` + `wedeo-codec` + `inventory`
-2. Implement the `Decoder` trait (`send_packet`/`receive_frame`/`flush`)
-3. Create a `DecoderFactory` impl and register with `inventory::submit!`
-4. Add the crate to `workspace.members` in root `Cargo.toml`
-5. Add `use wedeo_codec_<name> as _;` in `wedeo-cli` and `wedeo-fate` to
-   ensure linking
-6. Add FATE tests comparing framecrc output against FFmpeg
-
-## Adding a new format
-
-1. Create `formats/wedeo-format-<name>/` with `Cargo.toml` depending on
-   `wedeo-core` + `wedeo-format` + `inventory`
-2. Implement the `Demuxer` trait (`read_header`/`read_packet`/`seek`) and
-   `DemuxerFactory` with `probe()`
-3. Register with `inventory::submit!`
-4. Add FATE tests
+Add the crate to the root workspace and expose it through a feature in
+`crates/wedeo/Cargo.toml`. Register its factory in the facade registry in
+`crates/wedeo/src/lib.rs`. Existing examples include the VP9 decoder and the
+IVF container. Add a fixture that exercises the new path and compare its
+output with the pinned FFmpeg reference.
 
 ## License
 

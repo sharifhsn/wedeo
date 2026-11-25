@@ -1,49 +1,22 @@
 # wedeo
 
-AI-generated Rust rewrite of FFmpeg — a pure-Rust multimedia framework for
-decoding, encoding, demuxing, and muxing audio and video.
+Use Wedeo's registry and typed readers to decode audio blocks or video frames in Rust. This example counts frames in the MP4 bundled with the v2 checkout. Run it from the repository root with the default features enabled.
 
-No bindgen, no c2rust, no FFI. Licensed under LGPL-2.1-or-later (same as
-FFmpeg). Verification target: bit-for-bit output parity with FFmpeg's FATE
-test suite.
-
-## Quick start
-
-```rust,no_run
-use wedeo::{InputContext, CodecParameters, DecoderBuilder, Error};
+```rust
+use wedeo::{default_registry, video::VideoReader};
 
 fn main() -> wedeo::Result<()> {
-    let mut input = InputContext::open("video.mp4")?;
-    let stream = &input.streams[0];
-    let mut decoder = DecoderBuilder::new(stream.codec_params.clone()).open()?;
-
-    loop {
-        match input.read_packet() {
-            Ok(packet) => {
-                decoder.send_packet(Some(&packet))?;
-                while let Ok(frame) = decoder.receive_frame() {
-                    // Process decoded frame...
-                    let _ = frame;
-                }
-            }
-            Err(Error::Eof) => break,
-            Err(e) => return Err(e),
-        }
+    let registry = default_registry();
+    let mut reader = VideoReader::open(&registry, "web/samples/h264_aac_320x240.mp4")?;
+    let mut frames = 0;
+    while reader.next_frame()?.is_some() {
+        frames += 1;
     }
+    println!("{frames} frames");
     Ok(())
 }
 ```
 
-## Status
+For an audio-only application, disable default features and enable `audio-ops`, `pcm`, `wav`, and `symphonia`. For GPU conversion, enable `gpu-wgpu`. The optional AV1 decoder uses rav1d through a dav1d-compatible interface.
 
-- **H.264 progressive**: 79/79 FATE vectors, bit-exact
-- **H.264 FRext**: 23/55 vectors passing
-- **Audio**: PCM native + Symphonia adapter (AAC, FLAC, MP3, Vorbis, Opus)
-- **Formats**: MP4/MOV, WAV, H.264 Annex B raw bitstream
-
-See the [repository](https://github.com/sharifhsn/wedeo) for full status
-and architecture details.
-
-## License
-
-LGPL-2.1-or-later
+[CLI and browser studio](https://github.com/sharifhsn/wedeo/tree/v2) · [Feature definitions](Cargo.toml) · [License](../../LICENSE)

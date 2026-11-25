@@ -1,5 +1,7 @@
 # Wedeo TODO
 
+> Historical development notes. For the current build and examples, see the [project README](../../README.md).
+
 ## Audio gaps (short-term)
 
 - [x] **Test ALAC decode** — tested via FFmpeg-generated M4A. Symphonia decodes to S32; verified against FFmpeg.

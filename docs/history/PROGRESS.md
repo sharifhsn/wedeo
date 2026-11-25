@@ -1,5 +1,7 @@
 # Wedeo Progress (v2 — FFmpeg `n9.1` "Gauss" Target)
 
+> Historical development notes. For the current build and examples, see the [project README](../../README.md).
+
 ## Architecture & Phase 2 Status (Verified)
 
 - **19-crate workspace (`v0.3.0`, Rust 2024):** 17 product crates + optional `wedeo-gpu-wgpu` + dev-only `wedeo-oracle` (`publish = false`).

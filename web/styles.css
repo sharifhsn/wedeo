@@ -325,12 +325,3 @@ html, body {
 .ast-kind { color: #6ee7b7; font-weight: 600; }
 .ast-off { color: #64748b; }
 .ast-sum { color: #cbd5e1; }
-
-.foot {
-  max-width: 1320px;
-  margin: 0 auto;
-  padding: 8px 24px 24px;
-  color: var(--muted);
-  font-size: 12px;
-}
-.foot code { font-family: var(--mono); color: var(--text); }

@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Wedeo — Pure-Rust A/V Adapter in WebAssembly</title>
+  <title>Wedeo | Browser media studio</title>
   <meta name="description" content="Inspect containers, decode H.264/VP9/audio, run SwsOpList color conversion, resample audio, and remux MP4/MKV/WAV 100% client-side in pure Rust WebAssembly." />
   <link rel="stylesheet" href="styles.css" />
 </head>
@@ -14,7 +14,7 @@
       <span class="pill" id="wasm-status">loading wasm…</span>
     </div>
     <div class="meta-links">
-      <span class="tag">Pure Rust · Zero C/FFI · FFmpeg 9.1 Oracle</span>
+      <span class="tag">Rust + WebAssembly</span>
       <a href="https://github.com/sharifhsn/wedeo/tree/v2" target="_blank" rel="noopener">GitHub</a>
     </div>
   </header>
@@ -23,7 +23,7 @@
     <section class="drop-bar" id="dropzone">
       <div class="drop-copy">
         <strong>Drop a media file</strong>
-        <span>.mp4 · .mkv · .webm · .ivf · .wav · .h264 — processed 100% locally in your browser (zero upload)</span>
+        <span>.mp4 · .mkv · .webm · .ivf · .wav · .h264 — files stay in your browser</span>
       </div>
       <div class="drop-actions">
         <label class="btn primary">
@@ -41,7 +41,7 @@
     <section class="grid" id="workspace">
       <div class="panel player-panel">
         <div class="panel-head">
-          <h2>Live WASM Decoder &amp; Player</h2>
+          <h2>Decoder &amp; player</h2>
           <span class="mono muted" id="file-label">no file loaded</span>
         </div>
 
@@ -129,10 +129,6 @@
       </div>
     </section>
   </main>
-
-  <footer class="foot">
-    <span>Built from 14 pure-Rust crates in Wedeo v2 (H.264, VP9, PCM, Symphonia, SwsOpList, AudioOpList, MP4, MKV, WAV, IVF) compiled directly to <code>wasm32-unknown-unknown</code> without Emscripten or SharedArrayBuffer.</span>
-  </footer>
 
   <script src="app.js"></script>
 </body>
