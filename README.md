@@ -8,7 +8,7 @@ Wedeo is a Rust media toolkit that lets you look inside a video file, decode its
 
 ## Clip a multitrack recording
 
-[Open the multitrack clipper](https://wedeo.sharifhsn.dev/?clip). The demo has a low tone on Audio 1 and a high tone on Audio 2. Play the recording and switch tracks to audition them. Choose **2.000 s** for In and **12.000 s** for Out, then export a ten-second Matroska file with both tracks. The clipper copies encoded packets at keyframe boundaries. Browser video playback depends on the input container and codec. The current studio loads the file and selected audio into memory.
+[Open the multitrack clipper](https://wedeo.sharifhsn.dev/?clip). The demo has a low tone on Audio 1 and a high tone on Audio 2. Play the recording and switch tracks to audition them. Choose **2.000 s** for In and **12.000 s** for Out, then export a ten-second Matroska file with both tracks. The clipper copies encoded packets at keyframe boundaries. Browser video playback depends on the input container and codec. The clipper keeps the compressed file in memory. For audio preview it seeks up to one second before the in-point, decodes through the selection, and retains one planar float sample per channel for each selected sample time. A ten-second, 48 kHz mono selection retains 1.92 MB of PCM. The decoder and Web Audio transfer use temporary buffers; switching tracks or marks releases the previous preview.
 
 ## Try the command line
 

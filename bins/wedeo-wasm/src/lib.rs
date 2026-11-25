@@ -833,6 +833,204 @@ fn decode_audio_internal(
     }
 }
 
+/// Decode a movie-time interval directly into a zero-filled native-rate planar buffer.
+/// Gaps and delayed tracks stay silent. Only the current decoder block is unpacked.
+fn audition_window(
+    data: Vec<u8>,
+    name: &str,
+    id: u32,
+    start: f64,
+    end: f64,
+) -> Result<(String, Vec<u8>)> {
+    if !(start.is_finite() && end.is_finite() && start < end) {
+        return Err(Error::invalid_argument(
+            "audition",
+            "invalid preview interval",
+        ));
+    }
+    let reg = wedeo::default_registry();
+    let mut demux = open_demuxer_bytes(&reg, data, ext_from_name(name))?;
+    let track = demux
+        .header()
+        .track(TrackId(id))
+        .ok_or_else(|| Error::invalid_argument("audition", "unknown track"))?
+        .clone();
+    let StreamParams::Audio(params) = &track.params else {
+        return Err(Error::invalid_argument(
+            "audition",
+            "expected an audio track",
+        ));
+    };
+    let rate = params.sample_rate;
+    let channels = params.channel_layout.nb_channels as usize;
+    if rate == 0 || channels == 0 {
+        return Err(Error::unsupported("audition", "missing audio format"));
+    }
+    let shift = clip_shift(demux.header(), track.id)?;
+    let pool = BufferPool::new();
+    let mut dec = reg
+        .find_decoder(track.codec_id)
+        .ok_or_else(|| Error::unsupported("audition", "no audio decoder"))?
+        .open(&track, wasm_codec_ctx(pool))?;
+    let origin = (start * f64::from(rate)).round() as i64;
+    let frames = ((end - start) * f64::from(rate)).round() as usize;
+    if frames == 0 {
+        return Err(Error::invalid_argument(
+            "audition",
+            "selection shorter than one sample",
+        ));
+    }
+    let size = frames
+        .checked_mul(channels)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| Error::invalid_argument("audition", "preview too large"))?;
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(size)
+        .map_err(|_| Error::unsupported("audition", "interval exceeds available memory"))?;
+    output.resize(size, 0);
+
+    // One second covers AAC overlap, Opus preroll and the MP3 reservoir at common rates.
+    // Containers without a seek index can scan compressed packets to the same point.
+    let preroll = (start - shift - 1.0).max(0.0);
+    if preroll > 0.0 {
+        let target = wedeo::SeekTarget {
+            track: Some(track.id),
+            timestamp: wedeo::Timestamp::new((preroll * 1e6).floor() as i64),
+            time_base: Rational::new(1, 1_000_000),
+            backward: true,
+        };
+        if let Err(e) = demux.seek(target)
+            && !matches!(
+                e.kind,
+                wedeo::ErrorKind::NotSeekable | wedeo::ErrorKind::Unsupported
+            )
+        {
+            return Err(e);
+        }
+    }
+    let mut slab = Vec::new();
+    let mut decoded_packets = 0usize;
+    loop {
+        let packet = match demux.read_packet()? {
+            RecvStatus::Ready(pkt) => {
+                if pkt.track_id != track.id {
+                    continue;
+                }
+                let ts = pkt
+                    .pts
+                    .to_seconds(pkt.time_base)
+                    .ok_or_else(|| Error::unsupported("audition", "missing packet timestamp"))?;
+                if ts + shift >= end {
+                    None
+                } else if ts
+                    + wedeo::Timestamp::new(pkt.duration.max(0))
+                        .to_seconds(pkt.time_base)
+                        .unwrap_or_default()
+                    < preroll
+                {
+                    continue;
+                } else {
+                    Some(pkt)
+                }
+            }
+            RecvStatus::NeedMore => {
+                return Err(Error::invalid_data("audition", "incomplete input"));
+            }
+            RecvStatus::Eof => None,
+        };
+        if dec.send_packet(packet.as_ref())? != SendStatus::Accepted {
+            return Err(Error::internal(
+                "audition",
+                "audio decoder did not accept packet after draining",
+            ));
+        }
+        decoded_packets += usize::from(packet.is_some());
+        while let RecvStatus::Ready(unit) = dec.receive()? {
+            let MediaUnit::Audio(block) = unit else {
+                continue;
+            };
+            if block.sample_rate != rate || block.channel_layout.nb_channels as usize != channels {
+                return Err(Error::unsupported(
+                    "audition",
+                    "audio format changed within the selection",
+                ));
+            }
+            let ts = block
+                .pts
+                .to_seconds(block.time_base)
+                .ok_or_else(|| Error::unsupported("audition", "missing audio timestamp"))?
+                + shift;
+            let offset = ((ts * f64::from(rate)).round() as i64).saturating_sub(origin);
+            let src = offset.saturating_neg().max(0) as usize;
+            let dst = offset.max(0) as usize;
+            let take = (block.nb_samples as usize)
+                .saturating_sub(src)
+                .min(frames.saturating_sub(dst));
+            if take == 0 {
+                continue;
+            }
+            slab.resize(take * channels, 0.0);
+            wedeo::audio_ops::dither::unpack_slab_f32(
+                &block.planes,
+                block.format,
+                channels,
+                src,
+                take,
+                &mut slab,
+                take,
+            )?;
+            for (channel, samples) in slab.chunks_exact(take).enumerate() {
+                let pos = (channel * frames + dst) * 4;
+                for (slot, sample) in output[pos..pos + take * 4]
+                    .as_chunks_mut::<4>()
+                    .0
+                    .iter_mut()
+                    .zip(samples)
+                {
+                    *slot = sample.to_le_bytes();
+                }
+            }
+        }
+        if packet.is_none() {
+            break;
+        }
+    }
+    Ok((
+        format!(
+            r#"{{"codec":{},"sample_rate":{rate},"channels":{channels},"frames_per_channel":{frames},"start_sec":{start},"duration_sec":{},"decoded_packets":{decoded_packets},"bytes":{size}}}"#,
+            json_str(track.codec_id.name()),
+            frames as f64 / f64::from(rate)
+        ),
+        output,
+    ))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wedeo_audition_window(
+    ptr: *const u8,
+    len: usize,
+    np: *const u8,
+    nl: usize,
+    id: u32,
+    start: f64,
+    end: f64,
+) -> i32 {
+    wedeo_release_output_bytes();
+    clip_result(audition_window(
+        read_input_bytes(ptr, len),
+        &read_input_str(np, nl),
+        id,
+        start,
+        end,
+    ))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wedeo_release_output_bytes() {
+    STATE.with(|state| state.borrow_mut().bytes_out = Vec::new());
+}
+
 pub fn remux_bytes(data: Vec<u8>, name: &str, target_fmt: &str) -> Result<(String, Vec<u8>)> {
     write_container(data, name, target_fmt, None)
 }
