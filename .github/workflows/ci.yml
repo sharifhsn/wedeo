@@ -34,11 +34,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: false
-      - run: sudo apt-get update && sudo apt-get install -y nasm libasound2-dev
+          submodules: true
+      - run: sudo apt-get update && sudo apt-get install -y nasm libasound2-dev ffmpeg
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
+      - name: Build the pinned FFmpeg test oracle
+        run: ./scripts/build-ffmpeg-oracle.sh
       - name: Unit & integration tests
         run: cargo nextest run --workspace --profile ci --exclude wedeo-oracle
       - name: Upload test results
