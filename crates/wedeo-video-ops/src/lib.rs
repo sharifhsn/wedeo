@@ -8,7 +8,9 @@ pub mod cpu;
 pub mod ops;
 pub mod optimizer;
 
-pub use cpu::{CompiledSws, CpuCompiledSws, CpuSwsBackend, SwsBackend, TILE_H, TILE_W};
+pub use cpu::{
+    CompiledSws, CompiledWgsl, CpuCompiledSws, CpuSwsBackend, SwsBackend, TILE_H, TILE_W,
+};
 pub use ops::{
     DisplayTransform, DitherMode, IDENTITY_DISPLAY_MATRIX, SwsOp, SwsOpList, SwsOptions, SwsScaler,
     ToneMapOp, VideoContract, display_matrix,

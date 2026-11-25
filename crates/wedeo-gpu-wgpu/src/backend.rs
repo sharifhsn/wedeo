@@ -37,6 +37,76 @@ impl SwsBackend for WgpuSwsBackend {
         let compiled = WgpuCompiledSws::compile(self.ctx.clone(), ops)?;
         Ok(Box::new(compiled))
     }
+
+    fn compile_wgsl(
+        &self,
+        source: &str,
+        entry: &str,
+        group: [u32; 3],
+    ) -> Result<Option<Box<dyn wedeo_video_ops::CompiledWgsl>>> {
+        let module = wgpu::naga::front::wgsl::parse_str(source)
+            .map_err(|e| Error::invalid_data("wgsl filter", e.emit_to_string(source)))?;
+        let ep = module
+            .entry_points
+            .iter()
+            .find(|ep| ep.name == entry && ep.stage == wgpu::naga::ShaderStage::Compute)
+            .ok_or_else(|| {
+                Error::invalid_argument("wgsl filter", "compute entry point not found")
+            })?;
+        if ep.workgroup_size != group || group[2] != 1 {
+            return Err(Error::invalid_argument(
+                "wgsl filter",
+                "declared workgroup must match the 2D shader entry point",
+            ));
+        }
+        let has_uniforms = module.global_variables.iter().any(|(_, v)| {
+            v.binding
+                .as_ref()
+                .is_some_and(|b| b.group == 0 && b.binding == 2)
+        });
+        let scope = self
+            .ctx
+            .device()
+            .push_error_scope(wgpu::ErrorFilter::Validation);
+        let pass = crate::WgslComputePass::compile(&self.ctx, source, entry, group, has_uniforms);
+        if let Some(error) = pollster::block_on(scope.pop()) {
+            return Err(Error::invalid_argument("wgsl filter", error.to_string()));
+        }
+        Ok(Some(Box::new(GraphComputePass {
+            ctx: self.ctx.clone(),
+            pass: pass?,
+        })))
+    }
+}
+
+struct GraphComputePass {
+    ctx: WgpuContext,
+    pass: crate::WgslComputePass,
+}
+
+impl wedeo_video_ops::CompiledWgsl for GraphComputePass {
+    fn device_id(&self) -> wedeo_core::GpuDeviceId {
+        self.ctx.device_id()
+    }
+
+    fn execute(&self, src: &VideoFrame, uniforms: &[u8], pool: &BufferPool) -> Result<VideoFrame> {
+        if self.pass.has_uniforms() == uniforms.is_empty() {
+            return Err(Error::invalid_argument(
+                "wgsl filter",
+                "uniform bytes must match shader binding 2",
+            ));
+        }
+        let resident = self.ctx.upload_frame(src)?;
+        let scope = self
+            .ctx
+            .device()
+            .push_error_scope(wgpu::ErrorFilter::Validation);
+        let output = self.pass.execute(&self.ctx, &resident, uniforms, pool);
+        if let Some(error) = pollster::block_on(scope.pop()) {
+            return Err(Error::invalid_argument("wgsl filter", error.to_string()));
+        }
+        output
+    }
 }
 
 /// Compiled `wgpu` WGSL compute pipeline executing an [`SwsOpList`].
