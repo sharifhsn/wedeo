@@ -1,0 +1,138 @@
+{
+  "base": "69d7eb3",
+  "candidate": "c4ae045",
+  "adapter": "NVIDIA GeForce RTX 2070 SUPER / Vulkan",
+  "fixture_recipe": "Generate one raw YUV420P frame with FFmpeg testsrc at the specified size and 1 fps. Run the release conversion_timing example with <frame> <width> <height> planar-loop <dump>. Alternate binary order for six pairs, discard frames 0\u20133 from steady-state medians, compare visible bytes of frames 30 and 31.",
+  "fixtures": {
+    "1280x720": {
+      "input_sha256": "90e68dcafcc4b8641a97c83a95270004fba23662a17f37288b4df9d761654457",
+      "two_frame_sha256": "84e65a5e66ec569a88b110978de3d5730d4efb659fa890fe149a1db3c936eaa5",
+      "visible_bytes_compared": 691200,
+      "medians": {
+        "before": {
+          "steady_us": 2998.5,
+          "first_frame_us": 11199.5,
+          "setup_us": 183074.5
+        },
+        "after": {
+          "steady_us": 2390.5,
+          "first_frame_us": 10123.5,
+          "setup_us": 181478.5
+        }
+      }
+    },
+    "1920x1080": {
+      "input_sha256": "c5fbefcbfa8bde640835d9b83d53f5eb226ad05a2ac8eec2bbb227adbf5d6975",
+      "two_frame_sha256": "0f9d233f3c5a78643b7781b4a1f303ac99ebfea552eb38c6deb356bf6e01b1b3",
+      "visible_bytes_compared": 1555200,
+      "medians": {
+        "before": {
+          "steady_us": 6386.25,
+          "first_frame_us": 15233.5,
+          "setup_us": 190361.5
+        },
+        "after": {
+          "steady_us": 4739.0,
+          "first_frame_us": 12544.5,
+          "setup_us": 174356.0
+        }
+      }
+    },
+    "1279x719": {
+      "input_sha256": "a6cd32233d9cb37d9843798fa4f78a94395cf9548c06c494519f9167c66bfbac",
+      "two_frame_sha256": "e34cd3262d6ebb82edc6513cd38b41f014bb2f753122751daf6a9521eb0c4800",
+      "visible_bytes_compared": 689202,
+      "medians": {
+        "before": {
+          "steady_us": 4245.75,
+          "first_frame_us": 11386.5,
+          "setup_us": 194517.5
+        },
+        "after": {
+          "steady_us": 3720.5,
+          "first_frame_us": 11624.0,
+          "setup_us": 191715.5
+        }
+      }
+    }
+  },
+  "cli": {
+    "source": "12 frames of testsrc2 from the earlier GPU milestone, scaled to 1280x720 and encoded to VP9",
+    "input_sha256": "1c0ecc892862aa647e99f7a74b7f74ea088d437811204fd2fdbaf4d95e5a0e71",
+    "command": "wedeo transcode -i wide.ivf --video av1 --size 640x360 --gpu -y -o clip.ivf",
+    "runs": [
+      {
+        "build": "before",
+        "pair": 0,
+        "ms": 2954.492081000353,
+        "sha": "ddfe464804643bf8634db16d9c60e2ae5175e38c287babd5fb799dd866af9118"
+      },
+      {
+        "build": "after",
+        "pair": 0,
+        "ms": 1908.1176829931792,
+        "sha": "ddfe464804643bf8634db16d9c60e2ae5175e38c287babd5fb799dd866af9118"
+      },
+      {
+        "build": "after",
+        "pair": 1,
+        "ms": 1851.5599579986883,
+        "sha": "ddfe464804643bf8634db16d9c60e2ae5175e38c287babd5fb799dd866af9118"
+      },
+      {
+        "build": "before",
+        "pair": 1,
+        "ms": 1848.3893440134125,
+        "sha": "ddfe464804643bf8634db16d9c60e2ae5175e38c287babd5fb799dd866af9118"
+      },
+      {
+        "build": "before",
+        "pair": 2,
+        "ms": 1862.6327289966866,
+        "sha": "ddfe464804643bf8634db16d9c60e2ae5175e38c287babd5fb799dd866af9118"
+      },
+      {
+        "build": "after",
+        "pair": 2,
+        "ms": 1875.617087003775,
+        "sha": "ddfe464804643bf8634db16d9c60e2ae5175e38c287babd5fb799dd866af9118"
+      },
+      {
+        "build": "after",
+        "pair": 3,
+        "ms": 1893.2264269969892,
+        "sha": "ddfe464804643bf8634db16d9c60e2ae5175e38c287babd5fb799dd866af9118"
+      },
+      {
+        "build": "before",
+        "pair": 3,
+        "ms": 1868.8919379928848,
+        "sha": "ddfe464804643bf8634db16d9c60e2ae5175e38c287babd5fb799dd866af9118"
+      },
+      {
+        "build": "before",
+        "pair": 4,
+        "ms": 1865.6868530088104,
+        "sha": "ddfe464804643bf8634db16d9c60e2ae5175e38c287babd5fb799dd866af9118"
+      },
+      {
+        "build": "after",
+        "pair": 4,
+        "ms": 1902.5403790001292,
+        "sha": "ddfe464804643bf8634db16d9c60e2ae5175e38c287babd5fb799dd866af9118"
+      },
+      {
+        "build": "after",
+        "pair": 5,
+        "ms": 1864.5421449909918,
+        "sha": "ddfe464804643bf8634db16d9c60e2ae5175e38c287babd5fb799dd866af9118"
+      },
+      {
+        "build": "before",
+        "pair": 5,
+        "ms": 1878.1779480050318,
+        "sha": "ddfe464804643bf8634db16d9c60e2ae5175e38c287babd5fb799dd866af9118"
+      }
+    ]
+  }
+}
