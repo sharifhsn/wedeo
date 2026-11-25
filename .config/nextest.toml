@@ -39,13 +39,13 @@ path = "junit.xml"
 
 # FATE integration tests get more time (they do file I/O and spawn subprocesses)
 [[profile.default.overrides]]
-filter = "package(wedeo-fate) & kind(test)"
+filter = "package(wedeo-oracle) & kind(test)"
 slow-timeout = { period = "30s", terminate-after = 4 }
 leak-timeout = "2s"
 test-group = "fate-integration"
 
 [[profile.ci.overrides]]
-filter = "package(wedeo-fate) & kind(test)"
+filter = "package(wedeo-oracle) & kind(test)"
 slow-timeout = { period = "30s", terminate-after = 4 }
 leak-timeout = "2s"
 test-group = "fate-integration"
