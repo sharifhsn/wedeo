@@ -28,6 +28,7 @@ fn main() {
     assert!(data.is_empty());
     let mut frame = VideoFrame::from_planes(w, h, layout, planes);
     frame.color = ColorDesc::BT709_LIMITED;
+    let startup = Instant::now();
     let ctx = WgpuContext::new_headless().unwrap();
     let mode = args.next();
     if mode.as_deref() == Some("upload") {
@@ -53,6 +54,36 @@ fn main() {
         return;
     }
     let src = VideoContract::from_frame(&frame);
+    if mode.as_deref() == Some("planar-loop") {
+        use std::io::Write;
+        let dst = VideoContract::new(w / 2, h / 2, layout).with_color(frame.color);
+        let ops = SwsOpList::build(&src, &dst, SwsOptions::default()).unwrap();
+        let mut pass = ctx.sws_backend().compile(&ops).unwrap();
+        eprintln!(
+            "adapter and pipeline setup: {} us",
+            startup.elapsed().as_micros()
+        );
+        let mut output = std::io::BufWriter::new(
+            std::fs::File::create(args.next().expect("output frame dump")).unwrap(),
+        );
+        println!("frame,conversion_and_readback_us");
+        for i in 0..32 {
+            // Change visible input each time so stale storage is observable.
+            frame.planes_mut().unwrap()[0].row_mut(0).unwrap()[0] ^= 255;
+            let t = Instant::now();
+            let result = pass.execute(&frame, &pool).unwrap();
+            println!("{i},{}", t.elapsed().as_micros());
+            if i == 30 || i == 31 {
+                for plane in result.planes().unwrap() {
+                    for y in 0..plane.height {
+                        output.write_all(plane.row(y).unwrap()).unwrap();
+                    }
+                }
+            }
+        }
+        output.flush().unwrap();
+        return;
+    }
     if mode.as_deref() == Some("planar") {
         let dst = VideoContract::new(w / 2, h / 2, layout).with_color(frame.color);
         let ops = SwsOpList::build(&src, &dst, SwsOptions::default()).unwrap();
