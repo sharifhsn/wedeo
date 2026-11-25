@@ -53,4 +53,4 @@ Open [the local studio](http://127.0.0.1:8000/). It starts with a two-second H.2
 - [The wgpu backend](crates/wedeo-gpu-wgpu) can run scaling and color conversion on a GPU. Build the CLI with `--features gpu-wgpu` and pass `--gpu` to a transcode that requests scaling. The CLI reports the selected adapter or why it fell back to the CPU.
 - [The test harness](tests/wedeo-oracle) compares selected decoder output with a pinned FFmpeg revision. [Known differences](DIVERGENCES.md) describe where behavior varies.
 
-[Architecture](docs/ARCHITECTURE.md) · [Contributing](CONTRIBUTING.md) · [Historical development notes](docs/history) · [LGPL-2.1-or-later license](LICENSE)
+[Roadmap](ROADMAP.md) · [Architecture](docs/ARCHITECTURE.md) · [Contributing](CONTRIBUTING.md) · [Historical development notes](docs/history) · [LGPL-2.1-or-later license](LICENSE)
