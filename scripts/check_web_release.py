@@ -83,9 +83,22 @@ for link in parsed.links:
             metadata = BytesParser().parsebytes(archive.extractfile(entries[0]).read())
     else:
         raise SystemExit('Unsupported package artifact; review verifier: ' + href)
+    project = re.sub(r'[-_.]+', '-', str(metadata.get('Name', ''))).lower()
+    version = str(metadata.get('Version', '')).strip()
+    if project != 'wedeo' or not version:
+        raise SystemExit('Unexpected package name or version in metadata: ' + href)
+    # Deliberately conservative: unusual but valid version spellings require review.
+    if artifact.name.endswith('.whl'):
+        components = artifact.name[:-4].split('-')
+        filename_matches = (len(components) in (5, 6) and components[0].lower() == 'wedeo'
+                            and components[1] == version)
+    else:
+        filename_matches = artifact.name == f'wedeo-{version}.tar.gz'
+    if not filename_matches:
+        raise SystemExit('Package filename differs from artifact name/version metadata: ' + href)
     requirement = metadata.get('Requires-Python')
     if not requirement or link.get('data-requires-python') != requirement:
         raise SystemExit('Python requirement differs from artifact metadata: ' + href)
-print(json.dumps({'status': 'PASS', 'baseline_paths': len(files), 'package_index_root_link': True, 'package_downloads': len(parsed.links), 'python_requirements_checked': True,
+print(json.dumps({'status': 'PASS', 'baseline_paths': len(files), 'package_index_root_link': True, 'package_downloads': len(parsed.links), 'python_requirements_checked': True, 'package_names_and_versions_checked': True,
                   'extra_paths': sorted(paths - set(files)),
-                  'limits': 'Paths, linked package hashes and Python requirements only; compare other asset bytes, headers and routing separately.'}))
+                  'limits': 'Paths, linked package hashes, names, versions and Python requirements only; compare other asset bytes, headers and routing separately.'}))

@@ -13,6 +13,6 @@ python3 scripts/check_web_release.py --site /path/to/staged-site --baseline /pat
 ```
 
 The check rejects missing baseline paths or headers, a missing Wedeo project
-link in the package index root, unsafe links and incorrect checksums or Python-version requirements for artifacts referenced by the Python package index. It
+link in the package index root, unsafe links and incorrect checksums, names, versions or Python-version requirements for artifacts referenced by the Python package index. Filename/version comparison is conservative; unusual valid version spellings need manual review. It
 does not upload, compare every other asset byte, or prove that `_headers` and
 routing match production. Review those separately before deploying.
