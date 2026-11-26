@@ -9,13 +9,13 @@ import { join, resolve, sep } from "node:path";
 
 const root = resolve(process.argv[2] || "web");
 const profile = await mkdtemp(join(tmpdir(), "wedeo-race-firefox-"));
-const expected = ["index.html", "app.js", "wedeo.wasm", "samples/h264_aac_320x240.mp4", "samples/chord_48k.wav"];
+const expected = ["index.html", "app.js", "wedeo.wasm", "samples/h264_aac_320x240.mp4", "samples/multitrack.mp4", "samples/chord_48k.wav"];
 const hashes = {};
 for (const name of expected) hashes[name] = createHash("sha256").update(await readFile(join(root, name))).digest("hex");
 
 let server, firefox, socket;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-const timeout = setTimeout(() => { console.error("Timed out"); process.exitCode = 1; socket?.close(); firefox?.kill("SIGTERM"); server?.closeAllConnections(); server?.close(); }, 30000);
+const timeout = setTimeout(() => { console.error("Timed out"); process.exitCode = 1; socket?.close(); firefox?.kill("SIGTERM"); server?.closeAllConnections(); server?.close(); }, 45000);
 try {
   server = createServer(async (req, res) => {
     try {
@@ -25,7 +25,7 @@ try {
       if (!filename.startsWith(root + sep)) { res.writeHead(403).end(); return; }
       const bytes = await readFile(filename);
       if (pathname === "/wedeo.wasm") await sleep(1000);
-      if (pathname === "/samples/h264_aac_320x240.mp4") await sleep(3000);
+      if (pathname === "/samples/h264_aac_320x240.mp4" || pathname === "/samples/multitrack.mp4") await sleep(3000);
       const type = pathname.endsWith(".wasm") ? "application/wasm" : pathname.endsWith(".js") ? "text/javascript" : pathname.endsWith(".html") ? "text/html" : pathname.endsWith(".css") ? "text/css" : pathname.endsWith(".wav") ? "audio/wav" : pathname.endsWith(".mp4") ? "video/mp4" : "application/octet-stream";
       res.writeHead(200, { "Content-Type": type, "Cache-Control": "no-store" }).end(bytes);
     } catch { res.writeHead(404).end(); }
@@ -64,8 +64,8 @@ try {
     return JSON.parse(r.result.value);
   };
   const url = `http://127.0.0.1:${server.address().port}/`;
-  const run = async (name, expression, expectedFile) => {
-    await call("browsingContext.navigate", { context, url: url + "?" + name, wait: "interactive" });
+  const run = async (name, expression, expectedFile, query = name) => {
+    await call("browsingContext.navigate", { context, url: url + "?" + query, wait: "interactive" });
     const result = await evaluate(expression);
     if (!result.ready || !result.file.startsWith(expectedFile) || result.error || !result.audio) throw new Error(name + " failed: " + JSON.stringify(result));
     console.log(name + " passed");
@@ -74,6 +74,8 @@ try {
   await run("early-sample", `(async()=>{document.querySelector('[data-sample="samples/chord_48k.wav"]').click();await new Promise(r=>setTimeout(r,4000));return JSON.stringify(${status})})()`, "chord_48k.wav");
   await run("late-sample", `(async()=>{while(!document.querySelector("#wasm-status").textContent.includes("ready"))await new Promise(r=>setTimeout(r,20));document.querySelector('[data-sample="samples/chord_48k.wav"]').click();await new Promise(r=>setTimeout(r,4000));return JSON.stringify(${status})})()`, "chord_48k.wav");
   await run("local-file", `(async()=>{const data=await fetch("/samples/chord_48k.wav").then(r=>r.arrayBuffer());const dt=new DataTransfer();dt.items.add(new File([data],"selected.wav",{type:"audio/wav"}));const el=document.querySelector("#file-input");el.files=dt.files;el.dispatchEvent(new Event("change",{bubbles:true}));await new Promise(r=>setTimeout(r,4000));return JSON.stringify(${status})})()`, "selected.wav");
+  await run("drag-drop", `(async()=>{const data=await fetch("/samples/chord_48k.wav").then(r=>r.arrayBuffer());const dt=new DataTransfer();dt.items.add(new File([data],"dropped.wav",{type:"audio/wav"}));document.querySelector("#dropzone").dispatchEvent(new DragEvent("drop",{bubbles:true,cancelable:true,dataTransfer:dt}));await new Promise(r=>setTimeout(r,4000));return JSON.stringify(${status})})()`, "dropped.wav");
+  await run("clip-early-sample", `(async()=>{document.querySelector('[data-sample="samples/chord_48k.wav"]').click();await new Promise(r=>setTimeout(r,4000));return JSON.stringify(${status})})()`, "chord_48k.wav", "clip&clip-early-sample");
   for (const name of expected) {
     const current = createHash("sha256").update(await readFile(join(root, name))).digest("hex");
     if (current !== hashes[name]) throw new Error("Source changed during test: " + name);
