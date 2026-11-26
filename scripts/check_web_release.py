@@ -14,6 +14,8 @@ from urllib.parse import unquote, urljoin, urlsplit
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--site', required=True, type=Path, help='assembled static site directory')
 parser.add_argument('--baseline', required=True, type=Path, help='fresh deployment JSON with a files mapping')
+parser.add_argument('--reference-index', required=True, type=Path, help='current production package-index HTML')
+parser.add_argument('--allow-index-removal', action='store_true', help='allow explicitly reviewed changes to existing package links')
 args = parser.parse_args()
 root = args.site.resolve()
 baseline = json.loads(args.baseline.read_text(encoding='utf-8'))
@@ -59,6 +61,15 @@ parsed = Links()
 parsed.feed(page.read_text(encoding='utf-8'))
 if not parsed.links:
     raise SystemExit('Package index contains no download links')
+reference = Links()
+reference.feed(args.reference_index.read_text(encoding='utf-8'))
+if not reference.links:
+    raise SystemExit('Reference package index contains no download links')
+def signature(link):
+    return (link['href'], link.get('data-requires-python', ''))
+removed = sorted(set(map(signature, reference.links)) - set(map(signature, parsed.links)))
+if removed and not args.allow_index_removal:
+    raise SystemExit('Existing package links or requirements removed; review before release: ' + repr(removed))
 for link in parsed.links:
     href = link['href']
     url = urlsplit(href)
@@ -100,5 +111,5 @@ for link in parsed.links:
     if not requirement or link.get('data-requires-python') != requirement:
         raise SystemExit('Python requirement differs from artifact metadata: ' + href)
 print(json.dumps({'status': 'PASS', 'baseline_paths': len(files), 'package_index_root_link': True, 'package_downloads': len(parsed.links), 'python_requirements_checked': True, 'package_names_and_versions_checked': True,
-                  'extra_paths': sorted(paths - set(files)),
+                  'reviewed_removed_links': removed, 'extra_paths': sorted(paths - set(files)),
                   'limits': 'Paths, linked package hashes, names, versions and Python requirements only; compare other asset bytes, headers and routing separately.'}))
