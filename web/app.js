@@ -13,6 +13,8 @@
   let previewUrl = null;
   let audioStart = 0;
   let wasm = null;
+  let wasmReady = null;
+  let mediaSelection = 0;
   let currentFile = null; // { name, bytes: Uint8Array, inspect }
   let decodedFrames = []; // [{ imageData, meta, decodeMs }]
   let videoFps = 24;
@@ -95,7 +97,7 @@
       const ms = Math.round(performance.now() - t0);
       $("wasm-status").textContent = `wasm ready (${ms} ms)`;
       // Auto-load the vivid H.264 + AAC MP4 sample so visitors see it working immediately.
-      loadSample(sampleUrl, sampleRequest);
+      if (mediaSelection === 0) loadSample(sampleUrl, sampleRequest);
     } catch (e) {
       $("wasm-status").textContent = "wasm failed";
       showError(`Failed to initialize wedeo.wasm: ${e.message}`);
@@ -103,7 +105,9 @@
   }
 
   async function loadSample(url, pendingRequest = null) {
-    if (!wasm) return;
+    const selection = ++mediaSelection;
+    if (!wasm) await wasmReady;
+    if (!wasm || selection !== mediaSelection) return;
     showError(null);
     $("export-status").textContent = "loading sample…";
     try {
@@ -112,11 +116,12 @@
       const resp = result.response;
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const buf = new Uint8Array(await resp.arrayBuffer());
+      if (selection !== mediaSelection) return;
       const name = url.split("/").pop();
       await loadMediaBytes(name, buf);
-      $("export-status").textContent = "";
+      if (selection === mediaSelection) $("export-status").textContent = "";
     } catch (e) {
-      showError(`Failed to fetch sample ${url}: ${e.message}`);
+      if (selection === mediaSelection) showError(`Failed to fetch sample ${url}: ${e.message}`);
     }
   }
 
@@ -541,7 +546,10 @@
   $("file-input").addEventListener("change", async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    const selection = ++mediaSelection;
     const buf = new Uint8Array(await file.arrayBuffer());
+    if (!wasm) await wasmReady;
+    if (!wasm || selection !== mediaSelection) return;
     await loadMediaBytes(file.name, buf);
   });
 
@@ -557,7 +565,10 @@
     dz.classList.remove("dragover");
     const file = e.dataTransfer?.files?.[0];
     if (!file) return;
+    const selection = ++mediaSelection;
     const buf = new Uint8Array(await file.arrayBuffer());
+    if (!wasm) await wasmReady;
+    if (!wasm || selection !== mediaSelection) return;
     await loadMediaBytes(file.name, buf);
   });
 
@@ -601,5 +612,5 @@
   $("btn-remux-mp4").addEventListener("click", () => runRemux("mp4"));
   $("btn-export-wav").addEventListener("click", runExportWav);
 
-  initWasm();
+  wasmReady = initWasm();
 })();
