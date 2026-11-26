@@ -1,0 +1,7 @@
+# Wedeo browser media studio
+
+Wedeo is a Rust and WebAssembly media studio. The browser interface opens local media files. Sample clips and downloadable packages are separate from user-selected files.
+
+- [Browser studio](https://wedeo.sharifhsn.dev/)
+- [Python package index](https://wedeo.sharifhsn.dev/simple/wedeo/)
+- [Project source and documentation](https://github.com/sharifhsn/wedeo)
