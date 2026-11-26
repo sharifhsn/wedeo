@@ -6,7 +6,7 @@ from html.parser import HTMLParser
 import json
 from pathlib import Path
 import re
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote, urljoin, urlsplit
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--site', required=True, type=Path, help='assembled static site directory')
@@ -40,6 +40,15 @@ class Links(HTMLParser):
         if tag == 'a' and attrs.get('href'):
             self.links.append(attrs['href'])
 
+root_index = root / 'simple/index.html'
+if not root_index.is_file():
+    raise SystemExit('Missing package index root')
+root_links = Links()
+root_links.feed(root_index.read_text(encoding='utf-8'))
+expected_project = 'https://release.invalid/simple/wedeo/'
+if not any(urljoin('https://release.invalid/simple/', href) == expected_project for href in root_links.links):
+    raise SystemExit('Package index root does not link to Wedeo')
+
 page = root / 'simple/wedeo/index.html'
 if not page.is_file():
     raise SystemExit('Missing Wedeo package index')
@@ -56,6 +65,6 @@ for href in parsed.links:
         raise SystemExit('Package download missing: ' + href)
     if hashlib.sha256(artifact.read_bytes()).hexdigest() != url.fragment.removeprefix('sha256='):
         raise SystemExit('Package checksum mismatch: ' + href)
-print(json.dumps({'status': 'PASS', 'baseline_paths': len(files), 'package_downloads': len(parsed.links),
+print(json.dumps({'status': 'PASS', 'baseline_paths': len(files), 'package_index_root_link': True, 'package_downloads': len(parsed.links),
                   'extra_paths': sorted(paths - set(files)),
                   'limits': 'Paths and linked package hashes only; compare other asset bytes, headers and routing separately.'}))
