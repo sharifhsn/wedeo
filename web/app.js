@@ -71,6 +71,11 @@
 
   async function initWasm() {
     const t0 = performance.now();
+    const sampleUrl = clipMode ? "samples/multitrack.mp4" : "samples/h264_aac_320x240.mp4";
+    const sampleRequest = fetch(sampleUrl).then(
+      response => ({ response }),
+      error => ({ error })
+    );
     try {
       const resp = await fetch("wedeo.wasm?release=audition1");
       if (!resp.ok) throw new Error(`HTTP ${resp.status} loading wedeo.wasm`);
@@ -90,19 +95,21 @@
       const ms = Math.round(performance.now() - t0);
       $("wasm-status").textContent = `wasm ready (${ms} ms)`;
       // Auto-load the vivid H.264 + AAC MP4 sample so visitors see it working immediately.
-      loadSample(clipMode ? "samples/multitrack.mp4" : "samples/h264_aac_320x240.mp4");
+      loadSample(sampleUrl, sampleRequest);
     } catch (e) {
       $("wasm-status").textContent = "wasm failed";
       showError(`Failed to initialize wedeo.wasm: ${e.message}`);
     }
   }
 
-  async function loadSample(url) {
+  async function loadSample(url, pendingRequest = null) {
     if (!wasm) return;
     showError(null);
     $("export-status").textContent = "loading sample…";
     try {
-      const resp = await fetch(url);
+      const result = pendingRequest ? await pendingRequest : { response: await fetch(url) };
+      if (result.error) throw result.error;
+      const resp = result.response;
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const buf = new Uint8Array(await resp.arrayBuffer());
       const name = url.split("/").pop();
